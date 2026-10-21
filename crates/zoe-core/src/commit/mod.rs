@@ -233,19 +233,9 @@ struct Shadowed {
 /// What the serial check of a vote found.
 enum Check {
     /// No serial fails the vote. Each stale written oid can be resolved:
-    /// the check gives it with its committed record, or tier 1 merged it.
-    Passed {
-        /// The stale written oids that the caller resolves.
-        conflicts: Vec<(Oid, Record)>,
-        /// The records that tier 1 merged: the oid, the serial of the
-        /// committed record and the merged pickle.
-        merged: Vec<(Oid, Tid, Vec<u8>)>,
-        /// The merged oids whose committed record is the record of a
-        /// commit in flight, with that commit.
-        onto: Vec<(Oid, Arc<InFlight>)>,
-        /// The transaction size with the merged pickles.
-        stored_bytes: u64,
-    },
+    /// the check gives it with its committed record, or a tier merged it.
+    /// The check staged the merged records.
+    Passed(Vec<(Oid, Record)>),
     /// A stale serial fails the vote.
     Failed(Stale),
 }
@@ -261,6 +251,49 @@ struct Stale {
     /// True when the transaction read the oid as current and does not
     /// write it.
     read_only: bool,
+}
+
+impl Stale {
+    /// Return a stale written oid.
+    fn written(oid: Oid, current: Tid, read: Tid) -> Self {
+        Stale {
+            oid,
+            current: Some(current),
+            read,
+            read_only: false,
+        }
+    }
+
+    /// Return a stale read-current oid.
+    fn read_current(oid: Oid, current: Option<Tid>, read: Tid) -> Self {
+        Stale {
+            oid,
+            current,
+            read,
+            read_only: true,
+        }
+    }
+}
+
+/// A staged record as the vote reads it. It holds no pickle.
+#[derive(Clone, Copy)]
+struct Write {
+    /// The serial that the client read.
+    serial: Tid,
+    /// True when `restore` staged the record.
+    restored: bool,
+    /// The length of the pickle: 0 for a deletion.
+    len: usize,
+}
+
+impl Write {
+    fn of(staged: &staging::Staged) -> Self {
+        Write {
+            serial: staged.serial,
+            restored: staged.restored,
+            len: staged.pickle_len(),
+        }
+    }
 }
 
 impl<S: Deref<Target = Store>> Txn<S> {
@@ -1204,38 +1237,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let checked = self
             .check_undone()
-            .and_then(|()| self.check_serials(resolve, native))
-            .and_then(|check| match check {
-                Check::Passed {
-                    conflicts,
-                    merged,
-                    onto,
-                    stored_bytes,
-                } => {
-                    self.stage_merged(merged, stored_bytes)?;
-                    self.drop_resolved();
-                    self.onto.extend(onto);
-                    // A node that rule 1 let through counts once the vote
-                    // passes.
-                    for resolution in &mut self.resolutions[self.undo_resolutions..] {
-                        if resolution.split == Some(1)
-                            && resolution.outcome == Resolved::Merged
-                            && self.passed.contains(&resolution.oid)
-                        {
-                            resolution.applied = true;
-                        }
-                    }
-                    Ok(Check::Passed {
-                        conflicts,
-                        merged: Vec::new(),
-                        onto: Vec::new(),
-                        stored_bytes,
-                    })
-                }
-                failed => Ok(failed),
-            });
+            .and_then(|()| VoteCheck::new(resolve, native, self.stored_bytes).run(self));
         let error = match checked {
-            Ok(Check::Passed { conflicts, .. }) => return Ok(conflicts),
+            Ok(Check::Passed(conflicts)) => return Ok(conflicts),
             Ok(Check::Failed(stale)) => {
                 self.conflict = stale.current.map(|current| (current, stale.read));
                 let oid = stale.oid;
@@ -1331,458 +1335,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
     }
 
-    /// Compare the serial that the client read of each oid with its current
-    /// serial. The written oids come first, then the read-current oids.
-    ///
-    /// The first stale oid fails the check, unless tier 1 merges it, or
-    /// `resolve` is true and the oid is a written oid that the caller can
-    /// resolve. The check gives each such oid with its committed record.
-    /// When `native` is true, tier 1 runs on each stale written oid that
-    /// the caller could resolve, whether `resolve` is true or not, and its
-    /// entries go to `self.resolutions`.
-    fn check_serials(&mut self, resolve: bool, native: bool) -> Result<Check> {
-        let mut conflicts = Vec::new();
-        let mut merged = Vec::new();
-        let mut onto = Vec::new();
-        let mut stored_bytes = self.stored_bytes;
-        // The first conflict reads the merge policy. A vote without a
-        // conflict reads nothing.
-        let mut policy: Option<Option<Arc<Policy>>> = None;
-        // The first conflict of a vote that takes the locks makes the plan
-        // of the split merge (ADR 0048).
-        let mut plan: Option<split::Plan> = None;
-        // The first conflict of a written oid also makes the plan of the
-        // order merge (ADR 0052).
-        let mut orders: Option<order::Plan> = None;
-        // One backend read serves a chunk of oids. The chunk bounds the
-        // committed records in memory.
-        let staged: Vec<_> = self.staged.iter().collect();
-        for chunk in staged.chunks(READ_CHUNK) {
-            let serials = self.current_serials(chunk.iter().map(|(oid, _)| *oid))?;
-            for (&(oid, staged), serial) in chunk.iter().zip(serials) {
-                let mut current = serial.unwrap_or(Tid::ZERO);
-                // The store does not hold the commit in flight of a lock
-                // that came with a hand-off: its staged record is the
-                // committed record.
-                if let Some(handoff) = self.handed.get(&oid).cloned() {
-                    let checked = self.check_handed(
-                        oid,
-                        staged,
-                        &handoff,
-                        native,
-                        stored_bytes,
-                        &mut policy,
-                    )?;
-                    match checked {
-                        Handed::Passed => continue,
-                        Handed::Merged {
-                            pickle,
-                            size,
-                            resolution,
-                        } => {
-                            stored_bytes = size;
-                            // The serial is a placeholder: the finish writes
-                            // the tid of the commit in flight. Another vote
-                            // of the oid without the hand-off fails on it.
-                            merged.push((oid, Tid::ZERO, pickle));
-                            onto.push((oid, Arc::clone(&handoff.commit)));
-                            self.resolutions.push(resolution);
-                            continue;
-                        }
-                        Handed::Failed { stale, resolution } => {
-                            self.resolutions.extend(resolution);
-                            return Ok(Check::Failed(stale));
-                        }
-                        Handed::Store { waited } => {
-                            // The wait for the commit in flight counts in the
-                            // lock wait of the vote.
-                            if let Some(total) = &mut self.lock_waited {
-                                *total += waited;
-                            }
-                            current = self.current_serial(oid)?;
-                        }
-                        Handed::Late { waited } => {
-                            if let Some(total) = &mut self.lock_waited {
-                                *total += waited;
-                            }
-                            return Err(ZoeError::Conflict { oid });
-                        }
-                    }
-                }
-                if current == staged.serial {
-                    continue;
-                }
-                let stale = Stale {
-                    oid,
-                    current: Some(current),
-                    read: staged.serial,
-                    read_only: false,
-                };
-                if !(resolve || native)
-                    || staged.restored
-                    || staged.serial == Tid::ZERO
-                    || staged.pickle_len() == 0
-                {
-                    return Ok(Check::Failed(stale));
-                }
-                if native {
-                    if policy.is_none() {
-                        policy = Some(self.store.merge_policy()?);
-                    }
-                    if plan.is_none() {
-                        let rules = Rules {
-                            config: &self.store.structural_merges,
-                            policy: policy.as_ref().and_then(Option::as_deref),
-                        };
-                        let mut made = self.split_plan(&rules, stored_bytes)?;
-                        let refused = adopt(
-                            &mut made,
-                            &mut Adopted {
-                                resolutions: &mut self.resolutions,
-                                passed: &mut self.passed,
-                                waited: &mut self.lock_waited,
-                                locks: &mut self.locks,
-                                dropping: &mut self.dropping,
-                                unstored: &mut self.unstored,
-                            },
-                            &mut merged,
-                            &mut stored_bytes,
-                        );
-                        if let Some(stale) = refused {
-                            return Ok(Check::Failed(stale));
-                        }
-                        plan = Some(made);
-                    }
-                    // The split merge staged the merged record of the oid.
-                    if plan
-                        .as_ref()
-                        .is_some_and(|plan| plan.covered.contains(&oid))
-                    {
-                        continue;
-                    }
-                    if orders.is_none() {
-                        let rules = Rules {
-                            config: &self.store.structural_merges,
-                            policy: policy.as_ref().and_then(Option::as_deref),
-                        };
-                        let made = self.order_plan(&rules)?;
-                        if let Some((oid, current, read, entry)) = &made.refused {
-                            self.resolutions.push(entry.clone());
-                            return Ok(Check::Failed(Stale {
-                                oid: *oid,
-                                current: Some(*current),
-                                read: *read,
-                                read_only: false,
-                            }));
-                        }
-                        orders = Some(made);
-                    }
-                    if let Some(orders) = &orders {
-                        // The vote stages the merged order after the
-                        // check of every serial.
-                        if orders.covers(oid) {
-                            continue;
-                        }
-                        if let Some(entry) = orders.lines.get(&oid) {
-                            self.resolutions.push(entry.clone());
-                        }
-                    }
-                }
-                // Only a conflict reads its committed record. A deletion
-                // has an empty pickle and is never resolved. A record that
-                // is gone since the serials were read is a pack of it:
-                // the vote then fails as it does for a stale serial.
-                let record = match self.store.backend.load_before(oid, Tid::MAX)? {
-                    Some(record) if record.tid == current && !record.data.is_empty() => record,
-                    _ => return Ok(Check::Failed(stale)),
-                };
-                // Tier 2 never merges the order of a folder.
-                let order = orders
-                    .as_ref()
-                    .is_some_and(|orders| orders.known.contains(&oid));
-                let resolved = if native && !order {
-                    let rules = Rules {
-                        config: &self.store.structural_merges,
-                        policy: policy.as_ref().and_then(Option::as_deref),
-                    };
-                    self.native(oid, staged.serial, &record.data, &rules)?
-                        .map(|(mode, merge)| (mode, rules.version(), merge))
-                } else {
-                    None
-                };
-                if let Some((mode, version, merge)) = resolved {
-                    let mut resolution =
-                        Resolution::of(oid, mode, version, &merge, current, staged.serial);
-                    // In shadow mode, the entry tells what the split merge
-                    // gives for the oid.
-                    if let Some(shadow) = plan.as_ref().and_then(|plan| plan.shadows.get(&oid))
-                        && resolution.shadow.is_none()
-                    {
-                        resolution.shadow = Some(shadow.outcome);
-                        resolution.split = Some(shadow.rule);
-                    }
-                    if let (merge::Mode::Shadow, Outcome::Merged(pickle)) = (mode, &merge.outcome) {
-                        self.shadows.insert(
-                            oid,
-                            Shadowed {
-                                tier: merge.tier,
-                                class: merge.class.clone(),
-                                policy: version,
-                                digest: blake3::hash(pickle),
-                                committed: current,
-                                read: staged.serial,
-                            },
-                        );
-                    }
-                    match (mode, merge.outcome) {
-                        (merge::Mode::On, Outcome::Merged(pickle)) => {
-                            match self.merged_size(oid, &pickle, stored_bytes) {
-                                Some(size) => {
-                                    stored_bytes = size;
-                                    merged.push((oid, current, pickle));
-                                    self.resolutions.push(resolution);
-                                    continue;
-                                }
-                                None => {
-                                    resolution.outcome =
-                                        Resolved::Undecided("a merged record over a size limit");
-                                }
-                            }
-                        }
-                        (merge::Mode::On, Outcome::Refused(_)) => {
-                            resolution.applied = true;
-                            self.resolutions.push(resolution);
-                            return Ok(Check::Failed(stale));
-                        }
-                        _ => {}
-                    }
-                    self.resolutions.push(resolution);
-                }
-                if !resolve {
-                    return Ok(Check::Failed(stale));
-                }
-                conflicts.push((oid, record));
-            }
-        }
-        let read_current: Vec<_> = self.read_current.iter().collect();
-        for chunk in read_current.chunks(READ_CHUNK) {
-            let serials = self.current_serials(chunk.iter().map(|&(&oid, _)| oid))?;
-            for (&(&oid, &read), serial) in chunk.iter().zip(serials) {
-                // The last commit of an oid held with a hand-off can be in
-                // flight: the store does not hold it yet.
-                if let Some(handoff) = self.handed.get(&oid)
-                    && handoff.commit.ended().is_none()
-                    && handoff.commit.tid() != Some(read)
-                {
-                    return Ok(Check::Failed(Stale {
-                        oid,
-                        current: handoff.commit.tid(),
-                        read,
-                        read_only: true,
-                    }));
-                }
-                let current = serial.unwrap_or(Tid::ZERO);
-                if current == read || self.passed.contains(&oid) {
-                    continue;
-                }
-                if native {
-                    if policy.is_none() {
-                        policy = Some(self.store.merge_policy()?);
-                    }
-                    let rules = Rules {
-                        config: &self.store.structural_merges,
-                        policy: policy.as_ref().and_then(Option::as_deref),
-                    };
-                    if plan.is_none() {
-                        let mut made = self.split_plan(&rules, stored_bytes)?;
-                        let refused = adopt(
-                            &mut made,
-                            &mut Adopted {
-                                resolutions: &mut self.resolutions,
-                                passed: &mut self.passed,
-                                waited: &mut self.lock_waited,
-                                locks: &mut self.locks,
-                                dropping: &mut self.dropping,
-                                unstored: &mut self.unstored,
-                            },
-                            &mut merged,
-                            &mut stored_bytes,
-                        );
-                        if let Some(stale) = refused {
-                            return Ok(Check::Failed(stale));
-                        }
-                        plan = Some(made);
-                        // Rule 1 of the split merge lets the node through.
-                        if self.passed.contains(&oid) {
-                            continue;
-                        }
-                    }
-                    // The entry tells why rule 1 did not let the node
-                    // through, or what it gives in mode `shadow`.
-                    if let Some(plan) = &plan {
-                        if let Some(shadow) = plan.shadows.get(&oid) {
-                            let entry = split::read_shadow(oid, shadow, read, current, &rules);
-                            self.resolutions.push(entry);
-                        } else if let Some(&(ref class, why)) = plan.unanswered.get(&oid) {
-                            let entry = split::undecided(oid, class, 1, why, read, current, &rules);
-                            self.resolutions.push(entry);
-                        }
-                    }
-                }
-                return Ok(Check::Failed(Stale {
-                    oid,
-                    current: Some(current),
-                    read,
-                    read_only: true,
-                }));
-            }
-        }
-        // The order merge renumbers the records of the positions that the
-        // vote stages, then adds the merged lists.
-        if let Some(orders) = &orders
-            && !orders.merges.is_empty()
-        {
-            let current = policy.clone().flatten();
-            let failed = self.finish_orders(
-                orders,
-                current.as_deref(),
-                &mut merged,
-                &onto,
-                &mut stored_bytes,
-            )?;
-            if let Some((oid, current, read)) = failed {
-                let stale = Stale {
-                    oid,
-                    current: Some(current),
-                    read,
-                    read_only: false,
-                };
-                if !resolve {
-                    return Ok(Check::Failed(stale));
-                }
-                // The caller gets the order with its committed record.
-                match self.store.backend.load_before(oid, Tid::MAX)? {
-                    Some(record) if record.tid == current && !record.data.is_empty() => {
-                        conflicts.push((oid, record));
-                    }
-                    _ => return Ok(Check::Failed(stale)),
-                }
-            }
-        }
-        Ok(Check::Passed {
-            conflicts,
-            merged,
-            onto,
-            stored_bytes,
-        })
+    /// Return the committed record of `oid` when it is the record at
+    /// `current` and holds a pickle. A deletion has an empty pickle and is
+    /// never resolved. A record that is gone since the serials were read is
+    /// a pack of it. Both give `None`: the vote then fails as it does for a
+    /// stale serial.
+    fn committed_record(&self, oid: Oid, current: Tid) -> Result<Option<Record>> {
+        Ok(self
+            .store
+            .backend
+            .load_before(oid, Tid::MAX)?
+            .filter(|record| record.tid == current && !record.data.is_empty()))
     }
 
-    /// Check a written oid whose lock came with `handoff`.
-    ///
-    /// When the commit in flight of the hand-off is durable or failed, the
-    /// check goes on with the store. Otherwise its staged record is the
-    /// committed record: the tier of its class in mode `on` merges onto it,
-    /// or refuses. When no tier decides, the call waits until the commit is
-    /// durable or failed, at most until the lock deadline of the vote, and
-    /// the check then goes on with the store. A wait past the deadline, or
-    /// a cancel, ends as `Handed::Late`: the vote fails with `Conflict` on
-    /// the oid. A transaction that read the commit in flight checks the oid
-    /// against the store, which holds that commit.
-    fn check_handed(
-        &self,
-        oid: Oid,
-        staged: &staging::Staged,
-        handoff: &Handoff,
-        native: bool,
-        stored_bytes: u64,
-        policy: &mut Option<Option<Arc<Policy>>>,
-    ) -> Result<Handed> {
-        // The merge of the vote before, onto the same commit, stands.
-        if self.onto.contains_key(&oid) {
-            return Ok(Handed::Passed);
-        }
-        let commit = &handoff.commit;
-        // The transaction read the commit in flight: its batch is visible,
-        // and the store holds it.
-        if commit.ended().is_some() || commit.tid() == Some(staged.serial) {
-            return Ok(Handed::Store {
-                waited: Duration::ZERO,
-            });
-        }
-        let stale = Stale {
-            oid,
-            current: commit.tid(),
-            read: staged.serial,
-            read_only: false,
-        };
-        // The holder changed the oid, so the serial that the transaction
-        // read is stale. A restore, a new object or a deletion cannot be
-        // resolved.
-        if staged.restored
-            || staged.serial == Tid::ZERO
-            || staged.pickle_len() == 0
-            || handoff.record.is_empty()
-        {
-            return Ok(Handed::Failed {
-                stale,
-                resolution: None,
-            });
-        }
-        if native {
-            // The first conflict of the vote reads the merge policy.
-            if policy.is_none() {
-                *policy = Some(self.store.merge_policy()?);
-            }
-        }
-        let rules = Rules {
-            config: &self.store.structural_merges,
-            policy: policy.as_ref().and_then(Option::as_deref),
-        };
-        if native
-            && let Some((mode @ merge::Mode::On, merge)) =
-                self.native(oid, staged.serial, &handoff.record, &rules)?
-        {
-            let committed = commit.tid().unwrap_or(Tid::ZERO);
-            let mut resolution =
-                Resolution::of(oid, mode, rules.version(), &merge, committed, staged.serial);
-            match merge.outcome {
-                Outcome::Merged(pickle) => {
-                    if let Some(size) = self.merged_size(oid, &pickle, stored_bytes) {
-                        return Ok(Handed::Merged {
-                            pickle,
-                            size,
-                            resolution,
-                        });
-                    }
-                }
-                // The split merge can merge a split that tier 1 refuses, once
-                // the store holds the commit in flight: wait for it.
-                Outcome::Refused(merge::Reason::BTrees(0 | 11))
-                    if rules.split_merges() != merge::Mode::Off => {}
-                Outcome::Refused(_) => {
-                    resolution.applied = true;
-                    return Ok(Handed::Failed {
-                        stale,
-                        resolution: Some(resolution),
-                    });
-                }
-                Outcome::Undecided(_) => {}
-            }
-        }
-        let store: &Store = &self.store;
-        let started = store.observer().map(|_| store.clock.monotonic());
-        let outcome = commit.wait(
-            oid,
-            self.lock_deadline,
-            &*store.clock,
-            self.lock_cancel.as_ref(),
-        );
-        let waited = started.map_or(Duration::ZERO, |started| {
-            store.clock.monotonic().saturating_sub(started)
-        });
-        match outcome {
-            Waited::Durable | Waited::Failed => Ok(Handed::Store { waited }),
-            Waited::TimedOut | Waited::Cancelled => Ok(Handed::Late { waited }),
+    /// Add `waited` to the lock wait of the vote, when the observer
+    /// measures it.
+    fn add_lock_wait(&mut self, waited: Duration) {
+        if let Some(total) = &mut self.lock_waited {
+            *total += waited;
         }
     }
 
@@ -2237,46 +1807,569 @@ const READ_CHUNK: usize = 256;
 
 /// Takes a plan of the split merge into the check of a vote: its entries,
 /// the nodes that rule 1 lets through, its wait for commits in flight, its
-/// records and the transaction size with them. Returns the stale node of a
-/// refusal, which fails the vote.
-fn adopt(
+/// locks, its records and the transaction size with them. Returns the
+/// stale node of a refusal, which fails the vote.
+fn adopt<S: Deref<Target = Store>>(
     plan: &mut split::Plan,
-    into: &mut Adopted<'_>,
+    txn: &mut Txn<S>,
     merged: &mut Vec<(Oid, Tid, Vec<u8>)>,
     stored_bytes: &mut u64,
 ) -> Option<Stale> {
-    into.resolutions.append(&mut plan.resolutions);
-    into.passed.extend(plan.passed.iter().copied());
-    if let Some(total) = into.waited {
-        *total += plan.waited;
-    }
+    txn.resolutions.append(&mut plan.resolutions);
+    txn.passed.extend(plan.passed.iter().copied());
+    txn.add_lock_wait(plan.waited);
     // The vote holds the locks of the plan until the end of the
     // transaction, and releases them with its others.
     if !plan.locked.is_empty() {
-        let held = into.locks.get_or_insert_with(Vec::new);
+        let held = txn.locks.get_or_insert_with(Vec::new);
         held.append(&mut plan.locked);
         held.sort_by_key(|lock| lock.oid);
     }
-    into.dropping.append(&mut plan.dropped);
-    into.unstored.extend(plan.unstored.drain(..));
+    txn.dropping.append(&mut plan.dropped);
+    txn.unstored.extend(plan.unstored.drain(..));
     merged.append(&mut plan.records);
     *stored_bytes = plan.stored_bytes;
-    plan.refused.map(|(oid, current, read)| Stale {
-        oid,
-        current: Some(current),
-        read,
-        read_only: false,
-    })
+    plan.refused
+        .map(|(oid, current, read)| Stale::written(oid, current, read))
 }
 
-/// The parts of a transaction that `adopt` changes.
-struct Adopted<'t> {
-    resolutions: &'t mut Vec<Resolution>,
-    passed: &'t mut BTreeSet<Oid>,
-    waited: &'t mut Option<Duration>,
-    locks: &'t mut Option<Vec<Held>>,
-    dropping: &'t mut Vec<Oid>,
-    unstored: &'t mut BTreeSet<Oid>,
+/// The serial check of one vote, with the locks held. It compares the
+/// serial that the client read of each oid with its current serial: the
+/// written oids first, then the read-current oids. Then it renumbers the
+/// orders that the order merge merges.
+///
+/// The first stale oid fails the check, unless a tier merges it, or
+/// `resolve` is true and the oid is a written oid that the caller can
+/// resolve. The check gives each such oid with its committed record. When
+/// `native` is true, the tiers run on each stale written oid that the
+/// caller could resolve, whether `resolve` is true or not, and their
+/// entries go to the resolutions of the transaction.
+///
+/// The first conflict reads the merge policy, once: a vote without a
+/// conflict reads nothing. The first conflict of a vote that takes the
+/// locks makes the plan of the split merge (ADR 0048). The first conflict
+/// of a written oid also makes the plan of the order merge (ADR 0052).
+struct VoteCheck {
+    /// True when the caller resolves each stale written oid that it can.
+    resolve: bool,
+    /// True for the vote that takes the locks: the tiers and the plans run.
+    native: bool,
+    /// The stale written oids that the caller resolves, with their
+    /// committed records.
+    conflicts: Vec<(Oid, Record)>,
+    /// The merged records: the oid, the serial of the committed record and
+    /// the merged pickle.
+    merged: Vec<(Oid, Tid, Vec<u8>)>,
+    /// The merged oids whose committed record is the record of a commit in
+    /// flight, with that commit.
+    onto: Vec<(Oid, Arc<InFlight>)>,
+    /// The transaction size with the merged pickles.
+    stored_bytes: u64,
+    /// The merge policy, once the first conflict read it.
+    policy: Option<Option<Arc<Policy>>>,
+    /// The plan of the split merge, once the first conflict made it.
+    plan: Option<split::Plan>,
+    /// The plan of the order merge, once the first conflict of a written
+    /// oid made it.
+    orders: Option<order::Plan>,
+}
+
+/// What tier 1 or tier 2 did for a stale written oid of a vote.
+enum Tiered {
+    /// A tier merged the oid in mode `on`: the vote stages the merged
+    /// record.
+    Merged,
+    /// A tier refused the merge in mode `on`: the vote fails on the oid.
+    Refused,
+    /// No tier decided: the conflict stays.
+    Undecided,
+}
+
+impl VoteCheck {
+    fn new(resolve: bool, native: bool, stored_bytes: u64) -> Self {
+        VoteCheck {
+            resolve,
+            native,
+            conflicts: Vec::new(),
+            merged: Vec::new(),
+            onto: Vec::new(),
+            stored_bytes,
+            policy: None,
+            plan: None,
+            orders: None,
+        }
+    }
+
+    /// Check the serials of `txn`. When no serial fails the vote, stage the
+    /// merged records.
+    fn run<S: Deref<Target = Store>>(mut self, txn: &mut Txn<S>) -> Result<Check> {
+        if let Some(stale) = self.check_written(txn)? {
+            return Ok(Check::Failed(stale));
+        }
+        if let Some(stale) = self.check_read_current(txn)? {
+            return Ok(Check::Failed(stale));
+        }
+        if let Some(stale) = self.check_orders(txn)? {
+            return Ok(Check::Failed(stale));
+        }
+        txn.stage_merged(self.merged, self.stored_bytes)?;
+        txn.drop_resolved();
+        txn.onto.extend(self.onto);
+        // A node that rule 1 let through counts once the vote passes.
+        for resolution in &mut txn.resolutions[txn.undo_resolutions..] {
+            if resolution.split == Some(1)
+                && resolution.outcome == Resolved::Merged
+                && txn.passed.contains(&resolution.oid)
+            {
+                resolution.applied = true;
+            }
+        }
+        Ok(Check::Passed(self.conflicts))
+    }
+
+    /// Return the merge policy of `store`. The first call reads it, and
+    /// the next calls give the same.
+    fn policy(&mut self, store: &Store) -> Result<Option<&Policy>> {
+        if self.policy.is_none() {
+            self.policy = Some(store.merge_policy()?);
+        }
+        Ok(self.policy.as_ref().and_then(Option::as_deref))
+    }
+
+    /// Return the settings of the vote: the configuration of `store`, and
+    /// the merge policy once a conflict read it.
+    fn rules<'r>(&'r self, store: &'r Store) -> Rules<'r> {
+        Rules {
+            config: &store.structural_merges,
+            policy: self.policy.as_ref().and_then(Option::as_deref),
+        }
+    }
+
+    /// Make the plan of the split merge at the first conflict of the vote,
+    /// after a read of the merge policy, and take it into the check. Return
+    /// the stale node of a refusal, which fails the vote.
+    fn split_plan<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+    ) -> Result<Option<Stale>> {
+        self.policy(&txn.store)?;
+        if self.plan.is_some() {
+            return Ok(None);
+        }
+        let mut plan = txn.split_plan(&self.rules(&txn.store), self.stored_bytes)?;
+        let refused = adopt(&mut plan, txn, &mut self.merged, &mut self.stored_bytes);
+        if refused.is_none() {
+            self.plan = Some(plan);
+        }
+        Ok(refused)
+    }
+
+    /// Make the plan of the order merge at the first conflict of a written
+    /// oid. Return the order of a refusal, which fails the vote.
+    fn order_plan<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+    ) -> Result<Option<Stale>> {
+        if self.orders.is_some() {
+            return Ok(None);
+        }
+        let plan = txn.order_plan(&self.rules(&txn.store))?;
+        if let Some((oid, current, read, entry)) = plan.refused {
+            txn.resolutions.push(entry);
+            return Ok(Some(Stale::written(oid, current, read)));
+        }
+        self.orders = Some(plan);
+        Ok(None)
+    }
+
+    /// Check the serial of each written oid. Return the stale oid that
+    /// fails the vote.
+    fn check_written<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+    ) -> Result<Option<Stale>> {
+        // One backend read serves a chunk of oids. The chunk bounds the
+        // committed records in memory.
+        let staged: Vec<(Oid, Write)> = txn
+            .staged
+            .iter()
+            .map(|(oid, staged)| (oid, Write::of(staged)))
+            .collect();
+        for chunk in staged.chunks(READ_CHUNK) {
+            let serials = txn.current_serials(chunk.iter().map(|(oid, _)| *oid))?;
+            for (&(oid, staged), serial) in chunk.iter().zip(serials) {
+                let current = serial.unwrap_or(Tid::ZERO);
+                if let Some(stale) = self.check_written_oid(txn, oid, staged, current)? {
+                    return Ok(Some(stale));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check the written oid `oid`, of current serial `current` in the
+    /// store. Return the oid when it is stale and fails the vote.
+    fn check_written_oid<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+        oid: Oid,
+        staged: Write,
+        current: Tid,
+    ) -> Result<Option<Stale>> {
+        let mut current = current;
+        // The store does not hold the commit in flight of a lock that came
+        // with a hand-off: its staged record is the committed record.
+        if let Some(handoff) = txn.handed.get(&oid).cloned() {
+            match self.check_handed(txn, oid, staged, &handoff)? {
+                Handed::Passed => return Ok(None),
+                Handed::Merged {
+                    pickle,
+                    size,
+                    resolution,
+                } => {
+                    self.stored_bytes = size;
+                    // The serial is a placeholder: the finish writes the
+                    // tid of the commit in flight. Another vote of the oid
+                    // without the hand-off fails on it.
+                    self.merged.push((oid, Tid::ZERO, pickle));
+                    self.onto.push((oid, Arc::clone(&handoff.commit)));
+                    txn.resolutions.push(resolution);
+                    return Ok(None);
+                }
+                Handed::Failed { stale, resolution } => {
+                    txn.resolutions.extend(resolution);
+                    return Ok(Some(stale));
+                }
+                Handed::Store { waited } => {
+                    // The wait for the commit in flight counts in the lock
+                    // wait of the vote.
+                    txn.add_lock_wait(waited);
+                    current = txn.current_serial(oid)?;
+                }
+                Handed::Late { waited } => {
+                    txn.add_lock_wait(waited);
+                    return Err(ZoeError::Conflict { oid });
+                }
+            }
+        }
+        if current == staged.serial {
+            return Ok(None);
+        }
+        let stale = Stale::written(oid, current, staged.serial);
+        if !(self.resolve || self.native)
+            || staged.restored
+            || staged.serial == Tid::ZERO
+            || staged.len == 0
+        {
+            return Ok(Some(stale));
+        }
+        if self.native {
+            if let Some(refused) = self.split_plan(txn)? {
+                return Ok(Some(refused));
+            }
+            // The split merge staged the merged record of the oid.
+            if self
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.covered.contains(&oid))
+            {
+                return Ok(None);
+            }
+            if let Some(refused) = self.order_plan(txn)? {
+                return Ok(Some(refused));
+            }
+            if let Some(orders) = &self.orders {
+                // The vote stages the merged order after the check of
+                // every serial.
+                if orders.covers(oid) {
+                    return Ok(None);
+                }
+                if let Some(entry) = orders.lines.get(&oid) {
+                    txn.resolutions.push(entry.clone());
+                }
+            }
+        }
+        // Only a conflict reads its committed record.
+        let Some(record) = txn.committed_record(oid, current)? else {
+            return Ok(Some(stale));
+        };
+        // Tier 2 never merges the order of a folder.
+        let order = self
+            .orders
+            .as_ref()
+            .is_some_and(|orders| orders.known.contains(&oid));
+        if self.native && !order {
+            match self.merge_tiers(txn, oid, staged.serial, current, &record.data)? {
+                Tiered::Merged => return Ok(None),
+                Tiered::Refused => return Ok(Some(stale)),
+                Tiered::Undecided => {}
+            }
+        }
+        if !self.resolve {
+            return Ok(Some(stale));
+        }
+        self.conflicts.push((oid, record));
+        Ok(None)
+    }
+
+    /// Run tier 1 or tier 2 on the stale written oid `oid`: the transaction
+    /// read `read`, and `committed` is the pickle of the current record at
+    /// `current`. A merge in mode `on` joins the merged records, and each
+    /// outcome gives an entry.
+    fn merge_tiers<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+        oid: Oid,
+        read: Tid,
+        current: Tid,
+        committed: &[u8],
+    ) -> Result<Tiered> {
+        let rules = self.rules(&txn.store);
+        let Some((mode, merge)) = txn.native(oid, read, committed, &rules)? else {
+            return Ok(Tiered::Undecided);
+        };
+        let version = rules.version();
+        let mut resolution = Resolution::of(oid, mode, version, &merge, current, read);
+        // In shadow mode, the entry tells what the split merge gives for
+        // the oid.
+        if let Some(shadow) = self.plan.as_ref().and_then(|plan| plan.shadows.get(&oid))
+            && resolution.shadow.is_none()
+        {
+            resolution.shadow = Some(shadow.outcome);
+            resolution.split = Some(shadow.rule);
+        }
+        if let (merge::Mode::Shadow, Outcome::Merged(pickle)) = (mode, &merge.outcome) {
+            txn.shadows.insert(
+                oid,
+                Shadowed {
+                    tier: merge.tier,
+                    class: merge.class.clone(),
+                    policy: version,
+                    digest: blake3::hash(pickle),
+                    committed: current,
+                    read,
+                },
+            );
+        }
+        match (mode, merge.outcome) {
+            (merge::Mode::On, Outcome::Merged(pickle)) => {
+                match txn.merged_size(oid, &pickle, self.stored_bytes) {
+                    Some(size) => {
+                        self.stored_bytes = size;
+                        self.merged.push((oid, current, pickle));
+                        txn.resolutions.push(resolution);
+                        return Ok(Tiered::Merged);
+                    }
+                    None => {
+                        resolution.outcome =
+                            Resolved::Undecided("a merged record over a size limit");
+                    }
+                }
+            }
+            (merge::Mode::On, Outcome::Refused(_)) => {
+                resolution.applied = true;
+                txn.resolutions.push(resolution);
+                return Ok(Tiered::Refused);
+            }
+            _ => {}
+        }
+        txn.resolutions.push(resolution);
+        Ok(Tiered::Undecided)
+    }
+
+    /// Check the serial of each read-current oid. Return the stale oid that
+    /// fails the vote.
+    fn check_read_current<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+    ) -> Result<Option<Stale>> {
+        let read_current: Vec<(Oid, Tid)> = txn
+            .read_current
+            .iter()
+            .map(|(&oid, &read)| (oid, read))
+            .collect();
+        for chunk in read_current.chunks(READ_CHUNK) {
+            let serials = txn.current_serials(chunk.iter().map(|&(oid, _)| oid))?;
+            for (&(oid, read), serial) in chunk.iter().zip(serials) {
+                // The last commit of an oid held with a hand-off can be in
+                // flight: the store does not hold it yet.
+                if let Some(handoff) = txn.handed.get(&oid)
+                    && handoff.commit.ended().is_none()
+                    && handoff.commit.tid() != Some(read)
+                {
+                    return Ok(Some(Stale::read_current(oid, handoff.commit.tid(), read)));
+                }
+                let current = serial.unwrap_or(Tid::ZERO);
+                if current == read || txn.passed.contains(&oid) {
+                    continue;
+                }
+                if self.native {
+                    if let Some(refused) = self.split_plan(txn)? {
+                        return Ok(Some(refused));
+                    }
+                    // Rule 1 of the split merge lets the node through.
+                    if txn.passed.contains(&oid) {
+                        continue;
+                    }
+                    // The entry tells why rule 1 did not let the node
+                    // through, or what it gives in mode `shadow`.
+                    if let Some(plan) = &self.plan {
+                        let rules = self.rules(&txn.store);
+                        if let Some(shadow) = plan.shadows.get(&oid) {
+                            let entry = split::read_shadow(oid, shadow, read, current, &rules);
+                            txn.resolutions.push(entry);
+                        } else if let Some(&(ref class, why)) = plan.unanswered.get(&oid) {
+                            let entry = split::undecided(oid, class, 1, why, read, current, &rules);
+                            txn.resolutions.push(entry);
+                        }
+                    }
+                }
+                return Ok(Some(Stale::read_current(oid, Some(current), read)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Renumber the orders that the order merge merges, after the check of
+    /// every serial: the records of the positions that the vote stages,
+    /// then the merged lists. Return the order of a merge without an
+    /// answer when it fails the vote.
+    fn check_orders<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &mut Txn<S>,
+    ) -> Result<Option<Stale>> {
+        let Some(orders) = &self.orders else {
+            return Ok(None);
+        };
+        if orders.merges.is_empty() {
+            return Ok(None);
+        }
+        let policy = self.policy.clone().flatten();
+        let failed = txn.finish_orders(
+            orders,
+            policy.as_deref(),
+            &mut self.merged,
+            &self.onto,
+            &mut self.stored_bytes,
+        )?;
+        let Some((oid, current, read)) = failed else {
+            return Ok(None);
+        };
+        let stale = Stale::written(oid, current, read);
+        if !self.resolve {
+            return Ok(Some(stale));
+        }
+        // The caller gets the order with its committed record.
+        match txn.committed_record(oid, current)? {
+            Some(record) => {
+                self.conflicts.push((oid, record));
+                Ok(None)
+            }
+            None => Ok(Some(stale)),
+        }
+    }
+
+    /// Check a written oid whose lock came with `handoff`.
+    ///
+    /// When the commit in flight of the hand-off is durable or failed, the
+    /// check goes on with the store. Otherwise its staged record is the
+    /// committed record: the tier of its class in mode `on` merges onto it,
+    /// or refuses. When no tier decides, the call waits until the commit is
+    /// durable or failed, at most until the lock deadline of the vote, and
+    /// the check then goes on with the store. A wait past the deadline, or
+    /// a cancel, ends as `Handed::Late`: the vote fails with `Conflict` on
+    /// the oid. A transaction that read the commit in flight checks the oid
+    /// against the store, which holds that commit.
+    fn check_handed<S: Deref<Target = Store>>(
+        &mut self,
+        txn: &Txn<S>,
+        oid: Oid,
+        staged: Write,
+        handoff: &Handoff,
+    ) -> Result<Handed> {
+        // The merge of the vote before, onto the same commit, stands.
+        if txn.onto.contains_key(&oid) {
+            return Ok(Handed::Passed);
+        }
+        let commit = &handoff.commit;
+        // The transaction read the commit in flight: its batch is visible,
+        // and the store holds it.
+        if commit.ended().is_some() || commit.tid() == Some(staged.serial) {
+            return Ok(Handed::Store {
+                waited: Duration::ZERO,
+            });
+        }
+        let stale = Stale {
+            oid,
+            current: commit.tid(),
+            read: staged.serial,
+            read_only: false,
+        };
+        // The holder changed the oid, so the serial that the transaction
+        // read is stale. A restore, a new object or a deletion cannot be
+        // resolved.
+        if staged.restored
+            || staged.serial == Tid::ZERO
+            || staged.len == 0
+            || handoff.record.is_empty()
+        {
+            return Ok(Handed::Failed {
+                stale,
+                resolution: None,
+            });
+        }
+        if self.native {
+            // The first conflict of the vote reads the merge policy.
+            self.policy(&txn.store)?;
+        }
+        let rules = self.rules(&txn.store);
+        if self.native
+            && let Some((mode @ merge::Mode::On, merge)) =
+                txn.native(oid, staged.serial, &handoff.record, &rules)?
+        {
+            let committed = commit.tid().unwrap_or(Tid::ZERO);
+            let mut resolution =
+                Resolution::of(oid, mode, rules.version(), &merge, committed, staged.serial);
+            match merge.outcome {
+                Outcome::Merged(pickle) => {
+                    if let Some(size) = txn.merged_size(oid, &pickle, self.stored_bytes) {
+                        return Ok(Handed::Merged {
+                            pickle,
+                            size,
+                            resolution,
+                        });
+                    }
+                }
+                // The split merge can merge a split that tier 1 refuses, once
+                // the store holds the commit in flight: wait for it.
+                Outcome::Refused(merge::Reason::BTrees(0 | 11))
+                    if rules.split_merges() != merge::Mode::Off => {}
+                Outcome::Refused(_) => {
+                    resolution.applied = true;
+                    return Ok(Handed::Failed {
+                        stale,
+                        resolution: Some(resolution),
+                    });
+                }
+                Outcome::Undecided(_) => {}
+            }
+        }
+        let store: &Store = &txn.store;
+        let started = store.observer().map(|_| store.clock.monotonic());
+        let outcome = commit.wait(
+            oid,
+            txn.lock_deadline,
+            &*store.clock,
+            txn.lock_cancel.as_ref(),
+        );
+        let waited = started.map_or(Duration::ZERO, |started| {
+            store.clock.monotonic().saturating_sub(started)
+        });
+        match outcome {
+            Waited::Durable | Waited::Failed => Ok(Handed::Store { waited }),
+            Waited::TimedOut | Waited::Cancelled => Ok(Handed::Late { waited }),
+        }
+    }
 }
 
 /// The most records of the history of an oid that a line of the resolution
