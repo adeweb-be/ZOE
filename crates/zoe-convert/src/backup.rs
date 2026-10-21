@@ -58,6 +58,10 @@ const CHECK_PREFIX: &str = "zoe-backup-check-";
 /// The number of record keys that one read of the comparison takes.
 const KEY_CHUNK: usize = 1024;
 
+/// The database file in the directory of a store. A restore refuses a
+/// target with any entry of this name, also a directory or a link.
+const DATABASE: &str = "zoe.redb";
+
 /// The length of the header: the magic, then two tids.
 const HEADER: usize = 24;
 
@@ -1351,7 +1355,7 @@ fn check_target(target: &Path) -> Result<(), Error> {
     };
     match fs::symlink_metadata(target) {
         Ok(meta) if !meta.is_dir() => refuse("not a directory"),
-        Ok(_) if Store::exists(target) => {
+        Ok(_) if exists(&target.join(DATABASE))? => {
             refuse("holds a store; a restore never writes into a store")
         }
         // The restore builds the store beside the target and renames it,
@@ -1460,6 +1464,14 @@ fn sibling(path: &Path, suffix: &str) -> Result<PathBuf, Error> {
 }
 
 /// Tell if something exists at `path`.
+fn exists(path: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(path, error)),
+    }
+}
+
 fn damaged(path: &Path, reason: String) -> Error {
     Error::Dump {
         path: path.to_owned(),
@@ -1489,9 +1501,6 @@ mod tests {
 
     /// The record of a blob.
     const BLOB_RECORD: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
-
-    /// The database file in the directory of a store.
-    const DATABASE: &str = "zoe.redb";
 
     /// A record of a `PersistentMapping` that holds `value`, with no
     /// reference.
@@ -2059,6 +2068,31 @@ mod tests {
         drop(held);
         backup(&store, &dumps).unwrap();
         drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_target_whose_database_entry_is_a_directory_or_a_dangling_link_holds_a_store() {
+        let dir = test_dir("backup-target-entry");
+        let (source, dumps) = (dir.join("source"), dir.join("dumps"));
+        let store = sample(&source);
+        backup(&store, &dumps).unwrap();
+        drop(store);
+
+        // Any entry with the name of the database file counts.
+        let folder = dir.join("folder");
+        fs::create_dir_all(folder.join(DATABASE)).unwrap();
+        let link = dir.join("link");
+        fs::create_dir(&link).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), link.join(DATABASE)).unwrap();
+        for target in [&folder, &link] {
+            match restore(&dumps, target) {
+                Err(Error::Target { reason, .. }) => {
+                    assert!(reason.starts_with("holds a store"), "{reason}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
