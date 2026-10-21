@@ -23,18 +23,18 @@
 //! not take releases its locks at once. In mode `shadow`, the plan takes
 //! no lock and writes nothing.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::time::Duration;
 
+use super::source::TxnSource;
 use super::vote::Stale;
 use super::{READ_CHUNK, Txn};
 use crate::error::Result;
 use crate::lock::{Held, Waited};
 use crate::merge::policy::Rules;
-use crate::merge::split::{self, Source, Split, Written};
-use crate::merge::{Mode, Reason, Resolution, Resolved};
+use crate::merge::split::{self, Split, Written};
+use crate::merge::{Mode, Reason, Records, Resolution, Resolved};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
@@ -84,104 +84,12 @@ pub(super) struct Shadow {
     pub(super) class: String,
 }
 
-/// Returns the mode of two switches together: `Off` when one is off, else
-/// `Shadow` when one is in shadow mode, else `On`.
-fn both(a: Mode, b: Mode) -> Mode {
-    match (a, b) {
-        (Mode::Off, _) | (_, Mode::Off) => Mode::Off,
-        (Mode::Shadow, _) | (_, Mode::Shadow) => Mode::Shadow,
-        _ => Mode::On,
-    }
-}
-
-/// The records of a transaction and of its store, as the rules read them.
-struct TxnSource<'t, S: Deref<Target = Store>> {
-    txn: &'t Txn<S>,
-    /// The locks that the rules took.
-    locked: RefCell<Vec<Held>>,
-    /// True while the rules run in mode `shadow`: they take no lock.
-    shadow: Cell<bool>,
-}
-
-impl<S: Deref<Target = Store>> TxnSource<'_, S> {
-    /// Release the locks that the rules took after the first `kept`.
-    fn release_from(&self, kept: usize) {
-        let mut locked = self.locked.borrow_mut();
-        if locked.len() > kept {
-            let released = locked.split_off(kept);
-            self.txn.store.locks.release(&released);
-        }
-    }
-}
-
-impl<S: Deref<Target = Store>> Source for TxnSource<'_, S> {
-    fn staged(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
-        match self.txn.staged.record(oid) {
-            Some(staged) if !staged.restored && staged.pickle_len() > 0 => {}
-            _ => return Ok(None),
-        }
-        Ok(self
-            .txn
-            .staged
-            .get(oid)?
-            .map(|(serial, pickle)| (serial, pickle.into_owned())))
-    }
-
-    fn stores(&self, oid: Oid) -> bool {
-        self.txn.staged.record(oid).is_some()
-    }
-
-    fn current(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
-        Ok(self
-            .txn
-            .store
-            .backend
-            .load_before(oid, Tid::MAX)?
-            .filter(|record| !record.data.is_empty())
-            .map(|record| (record.tid, record.data)))
-    }
-
-    fn at(&self, oid: Oid, serial: Tid) -> Result<Option<Vec<u8>>> {
-        self.txn.store.backend.load_serial(oid, serial)
-    }
-
-    fn read_current(&self, oid: Oid) -> bool {
-        self.txn.read_current.contains_key(&oid)
-    }
-
-    fn server_writes(&self) -> bool {
-        self.txn.server_writes
-    }
-
-    fn lock(&self, oid: Oid) -> Result<bool> {
-        if self.shadow.get() {
-            return Ok(true);
-        }
-        let mut locked = self.locked.borrow_mut();
-        if locked.iter().any(|held| held.oid == oid) {
-            return Ok(true);
-        }
-        let store: &Store = &self.txn.store;
-        match store.locks.try_exclusive(oid, &*store.clock) {
-            Some(held) => {
-                locked.push(held);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-}
-
 impl<S: Deref<Target = Store>> Txn<S> {
     /// Makes the plan of the split merge of the vote, with the settings of
     /// `rules`, for a transaction of `stored_bytes`. The vote holds its
     /// locks.
     pub(super) fn split_plan(&self, rules: &Rules<'_>, stored_bytes: u64) -> Result<Plan> {
-        let source = TxnSource {
-            txn: self,
-            locked: RefCell::new(Vec::new()),
-            shadow: Cell::new(false),
-        };
+        let source = TxnSource::new(self);
         match self.plan_with(&source, rules, stored_bytes) {
             Ok(mut plan) => {
                 plan.locked = source.locked.into_inner();
@@ -269,7 +177,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             if !stale(&oid) && !stale_bucket {
                 continue;
             }
-            let node_mode = both(mode, rules.tier1_mode(&class));
+            let node_mode = mode.lower(rules.tier1_mode(&class));
             if node_mode == Mode::Off {
                 continue;
             }
@@ -278,7 +186,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             match split::written_node(source, oid)? {
                 Split::Merged { rule, records } => {
                     let group_mode = records.iter().fold(node_mode, |all, record| {
-                        both(all, rules.tier1_mode(&record.class))
+                        all.lower(rules.tier1_mode(&record.class))
                     });
                     if group_mode == Mode::Off
                         || records.iter().any(|record| claimed.contains(&record.oid))
@@ -341,7 +249,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     };
                     // The mode of the record of the refusal joins the mode
                     // of the node, as for a merged group.
-                    let group_mode = both(node_mode, rules.tier1_mode(&class));
+                    let group_mode = node_mode.lower(rules.tier1_mode(&class));
                     if group_mode == Mode::Off {
                         continue;
                     }
@@ -398,7 +306,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 let Some(class) = split::node_class(&record) else {
                     continue;
                 };
-                let node_mode = both(mode, rules.tier1_mode(&class));
+                let node_mode = mode.lower(rules.tier1_mode(&class));
                 if node_mode == Mode::Off {
                     continue;
                 }

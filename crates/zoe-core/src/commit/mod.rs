@@ -76,6 +76,7 @@ mod intent;
 mod log;
 mod observer;
 mod order;
+mod source;
 mod split;
 mod stage;
 mod staging;
