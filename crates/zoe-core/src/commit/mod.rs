@@ -93,6 +93,7 @@ use std::time::{Duration, SystemTime};
 use crate::blob::PendingBlob;
 use crate::error::{Result, ZoeError};
 use crate::lock::{Handoff, Held, InFlight, LockCancel};
+use crate::merge::policy::{Policy, Rules};
 use crate::merge::{Resolution, Verification};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -394,6 +395,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
 }
 
 impl Store {
+    /// Return the settings of a vote or of an undo: the configuration of
+    /// the store, and the merge policy `policy`.
+    pub(crate) fn rules<'r>(&'r self, policy: Option<&'r Policy>) -> Rules<'r> {
+        Rules {
+            config: &self.structural_merges,
+            policy,
+        }
+    }
+
     /// Release the locks `held`, then log each one held past `lock-warn`.
     /// The release reads no clock, so the locks are free before the log.
     pub(crate) fn release_locks(&self, held: &[Held]) {

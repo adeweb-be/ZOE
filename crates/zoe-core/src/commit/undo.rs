@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::backend::Record;
 use crate::error::{Result, ZoeError};
-use crate::merge::policy::Rules;
 use crate::merge::{self, Outcome, Resolution, Resolved};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -250,10 +249,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         before: &[u8],
     ) -> Result<bool> {
         let policy = self.store.merge_policy()?;
-        let rules = Rules {
-            config: &self.store.structural_merges,
-            policy: policy.as_deref(),
-        };
+        let rules = self.store.rules(policy.as_deref());
         let Some((mode, merged)) = undo_tiers(undone, current, before, &rules) else {
             return Ok(false);
         };

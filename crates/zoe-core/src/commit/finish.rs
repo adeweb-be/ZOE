@@ -11,7 +11,6 @@ use crate::error::{Result, ZoeError};
 use crate::guard::Ended;
 use crate::lock::{Handoff, Held, InFlight};
 use crate::merge;
-use crate::merge::policy::Rules;
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
@@ -146,10 +145,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let Ok(policy) = self.store.merge_policy() else {
             return (None, Vec::new());
         };
-        let rules = Rules {
-            config: &self.store.structural_merges,
-            policy: policy.as_deref(),
-        };
+        let rules = self.store.rules(policy.as_deref());
         let commit = Arc::new(InFlight::new(&self.user, &self.description));
         let handoffs: Vec<_> = contended
             .into_iter()

@@ -643,10 +643,7 @@ impl VoteCheck {
     /// Return the settings of the vote: the configuration of `store`, and
     /// the merge policy once a conflict read it.
     fn rules<'r>(&'r self, store: &'r Store) -> Rules<'r> {
-        Rules {
-            config: &store.structural_merges,
-            policy: self.policy.as_ref().and_then(Option::as_deref),
-        }
+        store.rules(self.policy.as_ref().and_then(Option::as_deref))
     }
 
     /// Make the plan of the split merge at the first conflict of the vote,
