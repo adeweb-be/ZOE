@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::time::Duration;
 
+use super::vote::Stale;
 use super::{READ_CHUNK, Txn};
 use crate::error::Result;
 use crate::lock::{Held, Waited};
@@ -556,6 +557,34 @@ pub(super) fn read_shadow(
         split: Some(shadow.rule),
         order: None,
     }
+}
+
+/// Takes a plan of the split merge into the check of a vote: its entries,
+/// the nodes that rule 1 lets through, its wait for commits in flight, its
+/// locks, its records and the transaction size with them. Returns the
+/// stale node of a refusal, which fails the vote.
+pub(super) fn adopt<S: Deref<Target = Store>>(
+    plan: &mut Plan,
+    txn: &mut Txn<S>,
+    merged: &mut Vec<(Oid, Tid, Vec<u8>)>,
+    stored_bytes: &mut u64,
+) -> Option<Stale> {
+    txn.resolutions.append(&mut plan.resolutions);
+    txn.passed.extend(plan.passed.iter().copied());
+    txn.add_lock_wait(plan.waited);
+    // The vote holds the locks of the plan until the end of the
+    // transaction, and releases them with its others.
+    if !plan.locked.is_empty() {
+        let held = txn.locks.get_or_insert_with(Vec::new);
+        held.append(&mut plan.locked);
+        held.sort_by_key(|lock| lock.oid);
+    }
+    txn.dropping.append(&mut plan.dropped);
+    txn.unstored.extend(plan.unstored.drain(..));
+    merged.append(&mut plan.records);
+    *stored_bytes = plan.stored_bytes;
+    plan.refused
+        .map(|(oid, current, read)| Stale::written(oid, current, read))
 }
 
 #[cfg(test)]
