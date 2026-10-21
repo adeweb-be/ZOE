@@ -1,6 +1,6 @@
 # zoe-mcp
 
-The MCP server for ops and content agents. Specification: "AI-native: MCP server and retrieval". ADR 0028 records `zoe mcp`.
+The MCP server for ops agents: read-only ops tools and prompts on a store folder. The content tools, the roles and the read-write tools of the specification are not built. Specification: "AI-native: MCP server and retrieval". ADR 0028 records `zoe mcp`.
 
 ## Layout
 
@@ -11,11 +11,7 @@ The MCP server for ops and content agents. Specification: "AI-native: MCP server
 
 ## Invariants
 
-- The server runs as a principal. Every content result goes through the roles bitmap before ranking.
-- Objects outside the catalog are visible to the ops role only.
-- Ops tools are read-only. `pack` and `backup` need the read-write role.
-- An anonymous principal never receives a restricted passage.
-- `zoe mcp` runs as the ops principal of the local operator, with the read-only role. It offers no tool that writes, and it does not offer `pack` or `backup`.
+- Every tool is read-only. `zoe mcp` offers no tool that writes, and it does not offer `pack` or `backup`.
 - The store opens with Loupe's `Folder::open_with_blob_dir`, so with `Store::open_read_only_repairing` and `Options::blob_dir`. The store does not record its blob directory, so `serve_stdio` takes it: `--blob-dir` of `zoe mcp`, `blobs` in the folder by default. On a store that was closed cleanly, the open creates nothing and changes no byte. A store that a writer left open gets its repair at the open (ADR 0032), and `serve_stdio` writes one line to stderr that holds `repaired the store`, never to stdout. A failed repair is an `Open` error, and the command exits with 1. The server holds the lock of the store while it runs.
 - The ops tools are Loupe's functions with an agent face. `object_get`, `history`, `diff`, `references` and `space` call `zoe-loupe`, and the JSON is Loupe's: `object_get` gives Loupe's `Object`. `history`, `diff` and `references` give an object with the oid and Loupe's list, because the structured content of a result is a JSON object. `space` gives Loupe's `Space`. The other reads go through the read-only store of the folder, `Folder::store`: `verify` calls `zoe_convert::verify`, and `explain_conflict` and the prompts read the transactions with the iterator of the core and the neighbours with Loupe's `history`. A class comes from the class pickle alone (`decode_class_name`), as in Loupe's space screen. No tool decodes a state itself. Oids and tids are ZODB-form strings, as Loupe writes them.
 - Each list of a result has a limit, and the result gives the full count next to it. `space` gives the newest 100 transactions of the growth and `transactions`, and at most 1000 largest records (20 by default). `verify` gives at most 100 findings in each list, with `totals` and `findings`. `explain_conflict` gives at most 100 objects, with `records`. Only `object_get` and `diff` give a decoded state. No result gives pickle bytes.
