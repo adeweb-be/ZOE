@@ -13,9 +13,8 @@
 //! and writes the count and the new format name in one backend write. A
 //! read-only open of such a store writes nothing and has no count.
 //!
-//! The test makes a store of format 1 with the test hook
-//! `zoe_core::testing::{remove_meta, write_meta}`, which this card adds.
-//! It checks the count against the oids of `Store::record_keys` after
+//! The test makes a store of format 1 with the test hooks
+//! `zoe_core::testing::{remove_meta, write_meta}`. It checks the count against the oids of `Store::record_keys` after
 //! each step, and on every crash image of commits, of a pack and of the
 //! upgrade.
 
@@ -94,7 +93,7 @@ fn root_and_orphans(store: &Store, n: usize) -> Vec<Oid> {
 }
 
 /// Make `store` a store of format 1: no `object_count`, and the format
-/// name of before this card. A close writes no count, so the change stays.
+/// name `ZOE format 1`. A close writes no count, so the change stays.
 fn downgrade(store: &Store) {
     testing::remove_meta(store, "object_count").unwrap();
     testing::write_meta(store, "format", b"ZOE format 1").unwrap();

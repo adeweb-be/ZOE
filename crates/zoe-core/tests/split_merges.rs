@@ -6,8 +6,8 @@
 //! `zoe_pickle::python`: a node is `((child, key, child, ...), first)`, a
 //! bucket `(items,)` or `(items, next)`, and a reference `(oid, class)`.
 //! After each merge, a walk of the committed tree checks its separators,
-//! the order of its keys and the chain of its next buckets. The model of
-//! the spike on real BTrees is the Python test `test_zoe_split_merges.py`.
+//! the order of its keys and the chain of its next buckets. The Python
+//! test `test_zoe_split_merges.py` does the same merges on real BTrees.
 
 mod support;
 
@@ -1496,9 +1496,9 @@ fn a_refusal_on_a_bucket_whose_tier_1_is_off_fails_as_without_the_switch() {
     assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 40, 50, 60, 70]);
 }
 
-/// The transaction T of the card: it read the tree after the split of the
-/// other side that made `y`, and inserts `key` into `y`, which holds
-/// `keys`. It marks the node read-current, as BTrees does.
+/// Begin a transaction that read the tree after the split of the other
+/// side that made `y`, and inserts `key` into `y`, which holds `keys`. It
+/// marks the node read-current, as BTrees does.
 fn insert_into<'s>(
     store: &'s Store,
     tree: &Tree,
