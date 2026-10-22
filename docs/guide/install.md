@@ -28,15 +28,15 @@ Run the commands below in that shell, at the root of the repository.
 
 ## The wheel
 
-No recipe builds the wheel alone yet. Build it with uv, for the CPython version of your instance:
+`just release wheel DIR VERSION...` builds the wheel into `DIR`, for each CPython version that you give, 3.13 by default:
 
 ```sh
-uv build --directory python --package zoedb --wheel --python 3.13 --out-dir target/wheels
+just release wheel target/wheels 3.13
 ```
 
-The wheel holds an extension module in Rust, so it is for one CPython version and one platform. Its name tells which, for example `zoedb-0.0.0-cp313-cp313-linux_x86_64.whl`. Build one wheel for each version that you use: 3.12, 3.13, 3.14 or 3.14t. Build it on the platform where it runs: Linux x86-64, or macOS on Apple silicon.
+The wheel holds an extension module in Rust, so it is for one CPython version and one platform. Its name tells which, for example `zoedb-0.0.0-cp313-cp313-linux_x86_64.whl`. Build one wheel for each version that you use: 3.12, 3.13, 3.14 or 3.14t, such as `just release wheel target/wheels 3.12 3.13`. Build it on the platform where it runs: Linux x86-64, or macOS on Apple silicon.
 
-Install the wheel into the Python environment of the instance, with the extras that you need. Use the name of the file that uv wrote:
+Install the wheel into the Python environment of the instance, with the extras that you need. Use the name of the file that the recipe wrote:
 
 ```sh
 pip install "target/wheels/zoedb-0.0.0-cp313-cp313-linux_x86_64.whl[plone]"
