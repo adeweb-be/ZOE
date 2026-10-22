@@ -2,10 +2,10 @@
 
 ZOE reads two kinds of `ZOE_*` variables:
 
-- the twins: each option of the `zoe` command and each key of `<zoe>` has a twin, `ZOE_` and the name of the option or key in upper case, with `_` for `-`;
+- the twins: each option of the `zoe` command and each key of `<zoe>` has a twin, `ZOE_` and the name of the option or key in upper case, with `_` for `-`. One name breaks this rule: the twin of `--structural-merge-class` and of the key `structural-merge-class` is `ZOE_STRUCTURAL_MERGE_CLASSES`, with `CLASS=MODE` pairs separated by commas;
 - a few variables that are not twins, such as `ZOE_OTLP_ENDPOINT`.
 
-A twin gives a value only when its option or key is not set: the command line and the `<zoe>` section win over the environment. An empty twin of `<zoe>` counts as not set. A twin takes the same values as its option or key (see [Values](cli.md#values)).
+A twin gives a value only when its option or key is not set: the command line and the `<zoe>` section win over the environment. An empty twin of `<zoe>` counts as not set. A twin takes the same values as its option or key (see [Values](cli.md#values)). A boolean twin of the `zoe` command takes the words of clap, and a boolean twin of `<zoe>` the words of ZConfig, which do not include `1` and `0` (see [zope.conf sections](zope-conf.md)). `ZOE_READ_ONLY` and `ZOE_PACK_GC` have both readers, so give them `true` or `false`: both readers accept these.
 
 One twin can serve several readers. For example, `ZOE_PATH` gives the store of each `zoe` subcommand and of the `<zoe>` section in the same environment. `<zoeclient>` has no twins, as `<zeoclient>` has none. `python -m zoe.serve` removes from the environment of the server the twin of each key that its `<zoe-server>` section sets.
 
@@ -70,7 +70,7 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_BINARY` | `python -m zoe.serve`, `zoe.testing` | The `zoe` binary to run. `python -m zoe.serve` takes the key `binary` first, then this variable, then the `zoe` binary on the PATH. `zoe.testing` takes this variable, else the debug build of the repository. |
 | `ZOE_PLONE_BACKENDS` | `zoe.plone`, `zoe.plone.testing` | The backends of `zoe.plone` to install, separated by commas: `locking`, `indexing` and `registry`. An instance sets it with `<environment>` in `zope.conf`; the ZCML of `zoe.plone` reads it when it loads. An unknown name raises `ValueError`. |
 
-The other `OTEL_EXPORTER_OTLP_*` variables, such as `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, change nothing in `zoe serve`.
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` change nothing in `zoe serve`. The exporter still reads the headers, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` else `OTEL_EXPORTER_OTLP_HEADERS`, and the timeout, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` else `OTEL_EXPORTER_OTLP_TIMEOUT`. So a header that the host sets for another collector, such as a token, also goes to `ZOE_OTLP_ENDPOINT`.
 
 ## Development and test variables
 

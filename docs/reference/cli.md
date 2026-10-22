@@ -13,11 +13,11 @@
 
 The extension module of the wheel has no server and no MCP server. So `zoe serve` and `zoe mcp` through the console script fail with exit code 1, write a message that names the `zoe` binary, and create nothing.
 
-`zoe --help` and `zoe <subcommand> --help` give the help. `zoe --version` gives the version. Both exit with 0.
+`zoe --help` and `zoe <subcommand> --help` give the help on stdout. `zoe --version` gives the version. Both exit with 0. `zoe` with no argument writes the help to stderr and exits with 2.
 
 ## Rules of all subcommands
 
-- Each option has an environment twin, `ZOE_` and the name of the option in upper case, with `_` for `-`. The help of each option names its twin. An option on the command line wins over its twin. [Environment variables](environment.md) lists the twins.
+- Each option has an environment twin, `ZOE_` and the name of the option in upper case, with `_` for `-`. One option breaks this rule: the twin of `--structural-merge-class` is `ZOE_STRUCTURAL_MERGE_CLASSES`, which takes `CLASS=MODE` pairs separated by commas. The help of each option names its twin. An option on the command line wins over its twin. [Environment variables](environment.md) lists the twins.
 - `zoe serve` also reads a [configuration file](config-file.md). The command line wins over the twin, and the twin wins over the file.
 - The command parses all its arguments before it opens a file. So a usage error changes nothing on disk.
 - The report of a subcommand goes to stdout. A failure goes to stderr, as `zoe <subcommand>: <message>`. A usage error goes to stderr, as `error: <message>` and the usage.
@@ -27,15 +27,15 @@ The extension module of the wheel has no server and no MCP server. So `zoe serve
 
 | Code | Meaning |
 | --- | --- |
-| 0 | success; also the help, the version, and the end of `zoe serve` on SIGTERM or SIGINT |
+| 0 | success; also `--help`, `--version`, and the end of `zoe serve` on SIGTERM or SIGINT |
 | 1 | a failure: the work failed, a conversion does not verify, `zoe verify` found a problem, or the report cannot go out |
-| 2 | a usage error: a bad option, a bad value, a missing option, or for `zoe serve` a configuration file that does not read or parse |
+| 2 | a usage error: no argument, a bad option, a bad value, a missing option, or for `zoe serve` a configuration file that does not read or parse |
 
 ## Values
 
 | Value | Syntax |
 | --- | --- |
-| `BOOL` | `true` or `false`, in any case. `yes`, `no`, `on`, `off`, `1` and `0` also work. The option alone means `true`. A value needs `=`: `--read-only=false`. `--read-only false` is a usage error. The twin takes the same values. |
+| `BOOL` | `true` or `false`, in any case. `yes`, `no`, `on`, `off`, `y`, `n`, `t`, `f`, `1` and `0` also work. The ZConfig sections take fewer words (see [zope.conf sections](zope-conf.md)). The option alone means `true`. A value needs `=`: `--read-only=false`. `--read-only false` is a usage error. The twin takes the same values. |
 | `SECONDS` | a whole number of seconds, 0 or more, with the suffix `s`, `m`, `h` or `d` in any case, or no suffix for seconds: `30`, `30s`, `5m`, `1h`, `1d`. It is the syntax of ZConfig's `time-interval`. |
 | `BYTES` of `--cache-size` | a whole number, with the suffix `KB`, `MB` or `GB` in any case, or no suffix for bytes. Each suffix is a power of 1024, as in ZConfig's `byte-size`. |
 | `MODE` | `on`, `shadow` or `off`, in any case. |
@@ -90,7 +90,7 @@ Serve stores with the ZEO 6 msgpack protocol until SIGTERM or SIGINT, each store
 | `--lock-warn SECONDS` | `ZOE_LOCK_WARN` | none: no line | Log each lock held longer than this, when the lock is released. 0 logs no lock. |
 | `--transaction-warn SECONDS` | `ZOE_TRANSACTION_WARN` | none: no line | Log each transaction open longer than this, when it ends. 0 logs no transaction. |
 | `--log-format FORMAT` | `ZOE_LOG_FORMAT` | `text` | The format of the log lines on stderr: `text`, or `json` for one JSON object on each line. |
-| `--max-frame-size BYTES` | `ZOE_MAX_FRAME_SIZE` | `268435456`, 256 MiB | The longest frame that a client can send, in bytes, 1 or more. A longer frame closes its connection. A `storea` or `restorea` frame holds a whole record, so a copy through the server needs a limit above the largest record of its source. |
+| `--max-frame-size BYTES` | `ZOE_MAX_FRAME_SIZE` | `268435456`, 256 MiB | The longest frame that a client can send: a whole number of bytes, 1 or more, with no suffix. A longer frame closes its connection. A `storea` or `restorea` frame holds a whole record, so a copy through the server needs a limit above the largest record of its source. |
 | `--shutdown-timeout SECONDS` | `ZOE_SHUTDOWN_TIMEOUT` | `30` | The longest time that a stop on SIGTERM or SIGINT takes. The server commits each `tpc_finish` that it received, aborts the other transactions, closes the connections and closes the stores. A call that still runs at the end keeps the store of its session open, and that store does not close cleanly. |
 | `--idle-timeout SECONDS` | `ZOE_IDLE_TIMEOUT` | `300` | The longest time that a connection sends no frame while no call of it runs. A heartbeat is a frame, and a stock client sends one every 60 seconds. The server closes an idle connection: its transaction aborts and its locks go. 0 closes no idle connection. |
 | `--transaction-timeout SECONDS` | `ZOE_TRANSACTION_TIMEOUT` | `0`, off | The longest time that a transaction stays open after its vote, as the key `transaction-timeout` of ZEO. Past it, the server closes the connection, and the transaction aborts. |
@@ -103,8 +103,8 @@ Serve stores with the ZEO 6 msgpack protocol until SIGTERM or SIGINT, each store
 | `--posting-dicts MODE` | `ZOE_POSTING_DICTS` | `off` | The mode of the posting-dict rule and the first-key rule of ADR 0042. A shadow mode needs `--resolution-log`. |
 | `--resolution-log FILE` | `ZOE_RESOLUTION_LOG` | none: no line | A file of JSON lines, one for each result of tier 1. The server opens it in append mode at its start, and never syncs it. |
 | `--shared-blob-dir[=BOOL]` | `ZOE_SHARED_BLOB_DIR` | `false` | Accept `storeBlobShared`: the server and its clients share the blob directory of each store, as with the option `shared-blob-dir` of a ZEO client. Run the clients as the user of the server. Without it, `storeBlobShared` fails the vote. |
-| `--tls-cert FILE` | `ZOE_TLS_CERT` | none: no TLS | The certificate chain of the server, as PEM, leaf first. With `--tls-key`, the ZEO port speaks TLS. The admin port stays plain HTTP. The server reads the file at its start only. |
-| `--tls-key FILE` | `ZOE_TLS_KEY` | none | The private key of `--tls-cert`, as PEM. |
+| `--tls-cert FILE` | `ZOE_TLS_CERT` | none: no TLS | The certificate chain of the server, as PEM, leaf first. It needs `--tls-key`. With both, the ZEO port speaks TLS. The admin port stays plain HTTP. The server reads the file at its start only. |
+| `--tls-key FILE` | `ZOE_TLS_KEY` | none | The private key of `--tls-cert`, as PEM. It needs `--tls-cert`. |
 | `--tls-client-ca FILE` | `ZOE_TLS_CLIENT_CA` | none | The CA certificates of the clients, as PEM. The server then requires a client certificate that chains to one of them, as the key `authenticate` of ZEO's `<ssl>` section does. It needs `--tls-cert`. |
 | `--tls-read-only-client-ca FILE` | `ZOE_TLS_READ_ONLY_CLIENT_CA` | none | The CA certificates of the read-only clients, as PEM. The holder of a certificate that chains to one of them registers read-only only. With this option, a client certificate is necessary. It needs `--tls-cert`. |
 

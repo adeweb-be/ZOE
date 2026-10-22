@@ -19,7 +19,7 @@ ADR 0006 records the targets and their reasons.
 | --- | --- | --- |
 | `zoedb` | `zoe` | `ZConfig>=4`, `ZODB>=6` |
 | `zoedb[plone]` | `zoe.plone` | `Products.CMFPlone>=6.1`, `msgpack>=1` |
-| `zoedb[uri]` | none | `zodb>=6.4` |
+| `zoedb[uri]` | none | `zodburi>=3`, for the `zoe://` URI |
 
 The wheel itself never imports Plone. Only `zoe.plone` does.
 

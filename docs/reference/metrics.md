@@ -25,8 +25,8 @@ So a port of 0 gives a free port, and a supervisor reads the address. With a uni
 | Path | 200 | 503 | Body |
 | --- | --- | --- | --- |
 | `/healthz` | while every store is open | before every store is open | one line for each storage, `NAME: open`, or `starting` |
-| `/readyz` | when every store is open, its open loaded its last tid, and its lock table held no entry after the open | before, and from the stop signal on | one line for each storage, `NAME: ready` or `NAME: not ready: the lock table held entries at the open`, or `starting`, or `stopping` |
-| `/metrics` | once every store is open | before every store is open | the metrics in the Prometheus text format, with the content type `text/plain; version=0.0.4; charset=utf-8` |
+| `/readyz` | when every store is open, its open loaded its last tid, and its lock table held no entry after the open | before; from the stop signal on; and when the lock table of a store held entries at the open | one line for each storage, `NAME: ready` or `NAME: not ready: the lock table held entries at the open`, or `starting`, or `stopping` |
+| `/metrics` | once every store is open | before every store is open | with 200, the metrics in the Prometheus text format, with the content type `text/plain; version=0.0.4; charset=utf-8`; with 503, `starting` |
 
 A known path with a method other than `GET` or `HEAD` gets 405. Another path gets 404. A request head that does not parse gets 400. A reply to `HEAD` has no body.
 
@@ -84,7 +84,7 @@ Some lines that an operator looks for:
 `zoe serve` exports its spans over OTLP when `ZOE_OTLP_ENDPOINT` is set and not empty. The variable has no option and no key of the configuration file.
 
 - `OTEL_EXPORTER_OTLP_PROTOCOL` picks the protocol: `grpc`, to the endpoint; `http/protobuf`, the default, or `http/json`, to `<endpoint>/v1/traces`. Another value fails the start with 1. The exporter has no TLS.
-- The other `OTEL_EXPORTER_OTLP_*` variables change nothing.
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` change nothing. The exporter still reads the headers, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` else `OTEL_EXPORTER_OTLP_HEADERS`, and the timeout, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` else `OTEL_EXPORTER_OTLP_TIMEOUT`. So a header that the host sets for another collector, such as a token, also goes to `ZOE_OTLP_ENDPOINT`.
 - The service name is `zoe`, unless `OTEL_SERVICE_NAME` gives one.
 - Each call of a session is a span named after its method. A lock wait is a span `lock_wait`, with `oid`. The write and sync of a commit batch is a span `fsync`, with `commits`. Each batch of a pack is a span `pack_batch`, with `records`. Each span has the attribute `zoe.storage`.
 - A call of a client that negotiated the extension `trace_context` joins the trace of that client (see [Protocol](protocol.md)). Any other call is the root of its trace.

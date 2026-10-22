@@ -28,7 +28,7 @@ from pathlib import Path
 
 import zoe
 from zoe.config import KEYS, twin
-from zoe.testing import ZoeServer
+from zoe.testing import ZoeServer, _die_with_parent
 
 ROOT = Path(__file__).resolve().parents[3]
 REFERENCE = ROOT / "docs" / "reference"
@@ -166,31 +166,34 @@ def exported_metrics(tmp_path):
         "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0",
     ]  # fmt: skip
     environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
+    # On Linux, the server ends when the test process ends, also on SIGKILL.
     process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         env=environ,
         text=True,
+        preexec_fn=_die_with_parent(),
     )
-    # The kill closes stdout, so the read below ends.
-    timer = threading.Timer(TIMEOUT, process.kill)
-    timer.start()
     try:
         admin = None
-        for line in process.stdout:
-            word, _, value = line.strip().partition(" ")
-            if word == "admin":
-                admin = value
-            elif word == "listening":
-                break
-        timer.cancel()
+        # The kill closes stdout, so the read below ends.
+        timer = threading.Timer(TIMEOUT, process.kill)
+        timer.start()
+        try:
+            for line in process.stdout:
+                word, _, value = line.strip().partition(" ")
+                if word == "admin":
+                    admin = value
+                elif word == "listening":
+                    break
+        finally:
+            timer.cancel()
         assert admin, "zoe serve wrote no admin address"
         url = f"http://{admin}/metrics"
         with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
             text = reply.read().decode()
     finally:
-        timer.cancel()
         process.kill()
         process.wait()
         process.stdout.close()
