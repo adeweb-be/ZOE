@@ -3901,7 +3901,7 @@ plone = [
     { name = "products-cmfplone" },
 ]
 uri = [
-    { name = "zodb" },
+    { name = "zodburi" },
 ]
 
 [package.metadata]
@@ -3910,7 +3910,7 @@ requires-dist = [
     { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
     { name = "zconfig", specifier = ">=4" },
     { name = "zodb", specifier = ">=6" },
-    { name = "zodb", marker = "extra == 'uri'", specifier = ">=6.4" },
+    { name = "zodburi", marker = "extra == 'uri'", specifier = ">=3" },
 ]
 provides-extras = ["plone", "uri"]
 

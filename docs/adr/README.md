@@ -30,7 +30,7 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0022](0022-narrow-red-zones.md) | Red zones: the on-disk format, pack and the process files | merged into 0018 | Process |
 | [0023](0023-blob-record.md) | The blob record and the blob directory | accepted | Blobs |
 | [0024](0024-sequences.md) | Sequences: one row per name, reserved in durable blocks of 100 | accepted | |
-| [0025](0025-pack.md) | Pack: what it removes, batches, and the progress record | accepted; one point waits for the confirmation of the human | |
+| [0025](0025-pack.md) | Pack: what it removes, batches, and the progress record | accepted | |
 | [0026](0026-transaction-index.md) | The transaction index: a `(tid, oid)` key space | accepted | |
 | [0027](0027-blob-directory.md) | The blob directory is an option of the core | merged into 0023 | Blobs |
 | [0028](0028-the-zoe-command.md) | The zoe command: one binary in zoe-server, one code path for the console script, and tools that repair what they read | accepted | The zoe command |
