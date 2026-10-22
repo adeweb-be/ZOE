@@ -13,6 +13,8 @@
 //! after a lost connection, and verifies its cache, as `ZEO.ClientStorage`
 //! does.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 mod cache;
 mod client;
 mod endpoint;
@@ -24,8 +26,8 @@ mod tls;
 
 pub use cache::{Cache, CacheCounts, Copier};
 pub use client::{
-    BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Listed, Options,
-    Record, Transaction, Voted, traced,
+    BLOB_CHUNK, Client, HEARTBEAT_INTERVAL, HistoryEntry, Invalidation, Invalidations, Listed,
+    Options, Record, Transaction, Voted, traced,
 };
 pub use endpoint::{Address, Endpoint};
 pub use error::Error;
@@ -36,3 +38,9 @@ pub use pool::{
 pub use protocol::recycle;
 pub use runtime::{Runtime, Tokio};
 pub use tls::{Tls, TlsOptions};
+
+/// Lock `mutex`. A thread that panicked while it held the mutex left it
+/// poisoned: the lock takes it all the same.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}

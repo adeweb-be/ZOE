@@ -363,9 +363,7 @@ async fn a_conflict_that_the_client_resolves_enters_the_cache_with_its_resolutio
 
     // The resolution commits, and its turn replaces the entry of the oid
     // with the resolved pickle.
-    txn.store_resolved(oid, second, &record(b"d"))
-        .await
-        .unwrap();
+    txn.store(oid, second, &record(b"d")).await.unwrap();
     assert_eq!(txn.vote_listed().await.unwrap(), Voted::default());
     let turn = txn.finish().await.unwrap().turn().await.unwrap();
     let tid = turn.tid();

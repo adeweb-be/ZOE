@@ -1524,7 +1524,7 @@ impl NativeTransaction {
                 let stored = py.detach(|| {
                     let mut slot = lock(&self.txn);
                     let txn = slot.as_mut().ok_or_else(not_open)?;
-                    let store = txn.store_resolved(listed.oid, listed.committed, bytes);
+                    let store = txn.store(listed.oid, listed.committed, bytes);
                     runtime.block_on(traced(trace, store))
                 });
                 if let Err(error) = stored {

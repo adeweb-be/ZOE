@@ -25,7 +25,7 @@ use std::mem;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -36,13 +36,13 @@ use zoe_core::{Flavour, Oid, Tid};
 use zoe_wire::extension::{KV, LOCK_INTENT, SEQUENCES, TRACE_CONTEXT};
 use zoe_wire::{PROTOCOL, p64, u64_of};
 
-use crate::Error;
+use crate::{Error, lock};
 use crate::endpoint::{Address, Endpoint};
 use crate::protocol::{self, Message, get};
 use crate::runtime::{Runtime, Stream, Tokio};
 
 /// The time between two heartbeats, as `ZEO.ClientStorage` sends them.
-pub const HEARTBEAT: Duration = Duration::from_secs(60);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The number of frames that wait for the writer. A call waits while the
 /// channel is full.
@@ -255,10 +255,6 @@ struct Pending {
     finish: bool,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 impl Client {
     /// Connect to the ZEO 6 server at `addr` on the tokio runtime, and
     /// register with the storage `storage`, as `"1"`.
@@ -365,9 +361,8 @@ impl Client {
     /// of a TLS handshake or of a bad stream (`InvalidData`), else the last
     /// error of a connection. When `wait` passes first, it fails with that
     /// error too, or with `Error::Io` of the kind `TimedOut` when no attempt
-    /// failed yet. The
-    /// attempts run in the task of the caller and through `runtime`, in the
-    /// order of `endpoints`.
+    /// failed yet. The attempts run in the task of the caller and through
+    /// `runtime`, in the order of `endpoints`.
     pub async fn open_first(
         runtime: Arc<dyn Runtime>,
         endpoints: &[Endpoint],
@@ -705,24 +700,9 @@ impl Client {
     /// the extension `sequences`: without it, it fails with
     /// `Error::Unsupported` and sends nothing.
     pub async fn sequence_next(&self, name: &str) -> Result<u64, Error> {
-        if !self.extensions.iter().any(|accepted| accepted == SEQUENCES) {
-            return Err(Error::Unsupported(format!(
-                "the server did not accept the extension {SEQUENCES}"
-            )));
-        }
+        self.check_extension(SEQUENCES)?;
         let reply = self.inner.call("sequence_next", vec![name.into()]).await?;
         reply.as_u64().ok_or_else(|| bad("sequence_next", &reply))
-    }
-
-    /// Fail with `Error::Unsupported` when the server did not accept the
-    /// extension `kv` of the namespaces.
-    fn check_kv(&self) -> Result<(), Error> {
-        if self.extensions.iter().any(|accepted| accepted == KV) {
-            return Ok(());
-        }
-        Err(Error::Unsupported(format!(
-            "the server did not accept the extension {KV}"
-        )))
     }
 
     /// Return the value of `key` in the namespace `name` of `flavour`, or
@@ -735,7 +715,7 @@ impl Client {
         name: &str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, Error> {
-        self.check_kv()?;
+        self.check_extension(KV)?;
         let args = vec![flavour.name().into(), name.into(), key.into()];
         match self.inner.call("kv_get", args).await? {
             Value::Nil => Ok(None),
@@ -756,7 +736,7 @@ impl Client {
         stop: Option<&[u8]>,
         limit: u64,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
-        self.check_kv()?;
+        self.check_extension(KV)?;
         let bound = |bound: Option<&[u8]>| bound.map_or(Value::Nil, Value::from);
         let args = vec![
             flavour.name().into(),
@@ -786,7 +766,7 @@ impl Client {
     /// the last commit that wrote it, or `Tid(0)`. It needs the extension
     /// `kv`, as `kv_get` does.
     pub async fn kv_generation(&self, name: &str) -> Result<Tid, Error> {
-        self.check_kv()?;
+        self.check_extension(KV)?;
         let reply = self.inner.call("kv_generation", vec![name.into()]).await?;
         self::tid(&reply, "kv_generation")
     }
@@ -838,9 +818,7 @@ impl Client {
         if self.extensions.iter().any(|accepted| accepted == name) {
             return Ok(());
         }
-        Err(Error::Unsupported(format!(
-            "the server did not accept the extension {name}"
-        )))
+        Err(unsupported(name))
     }
 
     /// Call `method` of the server with `args`, and return its reply, as
@@ -937,7 +915,7 @@ impl Client {
             open: true,
             ended: false,
             guard: Some(guard),
-            kv: self.check_kv().is_ok(),
+            kv: self.check_extension(KV).is_ok(),
         })
     }
 
@@ -1020,7 +998,8 @@ pub struct Transaction {
     /// `true` after a failed vote or an abort. The server ended the
     /// transaction, so the client sends no more calls for it.
     ended: bool,
-    /// The commit lock of the client. The drop gives it to `abort_later`.
+    /// The commit lock of the client. The drop gives it to the `tpc_abort`
+    /// that it sends.
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// True when the server accepted the extension `kv`.
     kv: bool,
@@ -1117,9 +1096,7 @@ impl Transaction {
         if self.kv {
             return Ok(());
         }
-        Err(Error::Unsupported(format!(
-            "the server did not accept the extension {KV}"
-        )))
+        Err(unsupported(KV))
     }
 
     /// Copy a record of another storage into a transaction that began with
@@ -1335,8 +1312,12 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
+        // The commit lock goes only after the frame is in the channel, so
+        // the `tpc_begin` of the next transaction comes after this abort.
         if self.open {
-            self.inner.abort_later(self.id, self.guard.take());
+            let guard = Box::new(self.guard.take());
+            self.inner
+                .send_later("tpc_abort", vec![self.id.into()], guard);
         }
     }
 }
@@ -1519,33 +1500,6 @@ impl Inner {
             self.runtime.spawn(Box::pin(async move {
                 let _ = outgoing.send(frame).await;
                 drop(keep);
-            }));
-        }
-    }
-
-    /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
-    /// reply. The reader drops the reply, because no call waits for its id.
-    /// `guard` is the commit lock of the transaction. It is released only
-    /// after the frame is in the channel, so the `tpc_begin` of the next
-    /// transaction always comes after this abort.
-    fn abort_later(&self, txn: u64, guard: Option<tokio::sync::OwnedMutexGuard<()>>) {
-        let id = {
-            let mut calls = lock(&self.calls);
-            if calls.closed {
-                return;
-            }
-            let id = calls.next_id;
-            calls.next_id += 1;
-            id
-        };
-        let Ok(frame) = protocol::call(id, "tpc_abort", vec![txn.into()], None) else {
-            return;
-        };
-        if let Err(mpsc::error::TrySendError::Full(frame)) = self.outgoing.try_send(frame) {
-            let outgoing = self.outgoing.clone();
-            self.runtime.spawn(Box::pin(async move {
-                let _ = outgoing.send(frame).await;
-                drop(guard);
             }));
         }
     }
@@ -1762,15 +1716,15 @@ async fn write(
     let _ = stream.shutdown().await;
 }
 
-/// The heartbeat task: send a heartbeat every `HEARTBEAT`, busy or idle,
-/// as a stock client does.
+/// The heartbeat task: send a heartbeat every `HEARTBEAT_INTERVAL`, busy
+/// or idle, as a stock client does.
 async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
     let mut closing = inner.closing.subscribe();
     loop {
         tokio::select! {
             biased;
             () = closed(&mut closing) => break,
-            () = inner.runtime.sleep(HEARTBEAT) => {}
+            () = inner.runtime.sleep(HEARTBEAT_INTERVAL) => {}
         }
         let sent = tokio::select! {
             biased;
@@ -1975,6 +1929,12 @@ fn record(reply: Value) -> Result<Record, Error> {
         }),
         (data, ..) => Err(bad("loadBefore", &Value::Array(vec![data, start, end]))),
     }
+}
+
+/// The error of a call that needs the extension `name`, which the server
+/// did not accept.
+fn unsupported(name: &str) -> Error {
+    Error::Unsupported(format!("the server did not accept the extension {name}"))
 }
 
 /// The protocol error of a reply of `method` that has the wrong shape.

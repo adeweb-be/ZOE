@@ -60,7 +60,7 @@ use rmpv::Value;
 use tokio::sync::watch;
 use zoe_core::{Flavour, Oid, Tid};
 
-use crate::Error;
+use crate::{Error, lock};
 use crate::cache::Cache;
 use crate::client::{
     Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction, Voted, merge,
@@ -313,10 +313,6 @@ struct Slot {
     /// The oids of the commit, from its invalidation on the listener, when
     /// the dispatcher gave the turn and the finish needs them.
     oids: Option<Vec<Oid>>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Shared {
@@ -688,8 +684,9 @@ impl Pool {
     /// with `server_sync`, then wait until the pool delivered each tid that
     /// the listener read before the reply. So a read after `sync` sees each
     /// commit that the server published before its reply. A lost listener,
-    /// a new server or the close ends the wait. A caller that runs a delivery must not
-    /// wait: with `wait` false, `sync` returns after the reply.
+    /// a new server or the close ends the wait. A caller that runs a
+    /// delivery must not wait: with `wait` false, `sync` returns after the
+    /// reply.
     pub async fn sync(&self, wait: bool) -> Result<(), Error> {
         let generation = self.shared.lock().generation;
         let listener = self.shared.listener()?;
@@ -891,14 +888,7 @@ impl Pool {
             .client()
             .begin_with(user, description, extension, tid, status)
             .await?;
-        Ok(PoolTransaction {
-            txn: Some(txn),
-            lease,
-            writes: Vec::new(),
-            stored: HashSet::new(),
-            resolved: false,
-            unstored: false,
-        })
+        Ok(PoolTransaction::new(txn, lease))
     }
 
     /// Lease a connection for the early write-intent locks of one owner,
@@ -1184,14 +1174,8 @@ impl PoolIntents {
             .begin_with(user, description, extension, tid, status)
             .await?;
         self.held = false;
-        Ok(PoolTransaction {
-            txn: Some(txn),
-            lease: self.lease.take().expect("a lease"),
-            writes: Vec::new(),
-            stored: HashSet::new(),
-            resolved: false,
-            unstored: false,
-        })
+        let lease = self.lease.take().expect("a lease");
+        Ok(PoolTransaction::new(txn, lease))
     }
 }
 
@@ -1241,6 +1225,18 @@ pub struct PoolTransaction {
 }
 
 impl PoolTransaction {
+    /// Hold `txn`, which began on the connection of `lease`.
+    fn new(txn: Transaction, lease: Lease) -> PoolTransaction {
+        PoolTransaction {
+            txn: Some(txn),
+            lease,
+            writes: Vec::new(),
+            stored: HashSet::new(),
+            resolved: false,
+            unstored: false,
+        }
+    }
+
     fn txn(&mut self) -> &mut Transaction {
         self.txn.as_mut().expect("an open transaction")
     }
@@ -1254,7 +1250,11 @@ impl PoolTransaction {
         }
     }
 
-    /// Store `data` for `oid`, as `Transaction::store` does.
+    /// Store `data` for `oid`, as `Transaction::store` does. The resolution
+    /// of a conflict that a vote listed is a store over the serial
+    /// `committed` that the vote gave. The server stores these bytes
+    /// unchanged, so the turn adds them to the cache of the pool, as
+    /// `ZEO.ClientStorage` does.
     pub async fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<(), Error> {
         self.txn().store(oid, serial, data).await?;
         self.keep(oid, data);
@@ -1387,7 +1387,7 @@ impl PoolTransaction {
 
     /// Vote, as `Transaction::vote_listed` does, with the cache rules of
     /// `vote_resolved`. A listed conflict changes nothing in the cache: the
-    /// caller resolves it with `store_resolved`, or calls `unresolved`.
+    /// caller stores its resolution with `store`, or calls `unresolved`.
     pub async fn vote_listed(&mut self) -> Result<Voted, Error> {
         let voted = self.txn().vote_listed().await;
         match &voted {
@@ -1395,21 +1395,6 @@ impl PoolTransaction {
             Err(error) => self.failed(error),
         }
         voted
-    }
-
-    /// Store `data`, the resolution of a conflict that a vote listed, over
-    /// the serial `committed` that the vote gave. The server stores these
-    /// bytes unchanged, so the turn adds them to the cache of the pool, as
-    /// `ZEO.ClientStorage` does.
-    pub async fn store_resolved(
-        &mut self,
-        oid: Oid,
-        committed: Tid,
-        data: &[u8],
-    ) -> Result<(), Error> {
-        self.txn().store(oid, committed, data).await?;
-        self.keep(oid, data);
-        Ok(())
     }
 
     /// Drop the current entry of `oid` from the cache: the client did not
@@ -2211,9 +2196,9 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
 /// the cache. With a higher one, the server must hold a commit at the base,
 /// else its history is another one and the cache drops every entry. Then
 /// `getInvalidations(base)`: a reply drops the current entry of each of its
-/// oids, and `None` or an error drops every entry. A server tid below the base drops every entry too, and `applied`
-/// becomes the server tid. Then the cache serves. Return false at the
-/// close.
+/// oids, and `None` or an error drops every entry. A server tid below the
+/// base drops every entry too, and `applied` becomes the server tid. Then
+/// the cache serves. Return false at the close.
 async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
     let base = cache.applied();
     let check = if base == server_tid {
