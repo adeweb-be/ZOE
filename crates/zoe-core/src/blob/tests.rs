@@ -799,8 +799,6 @@ fn the_store_owns_only_its_names_in_tmp() {
         "layout.tmp",
         "0x03f0000000000010.intent",
         "0x00000000000000FF.intent",
-        "upload-0",
-        "upload-12",
     ] {
         assert!(is_owned_name(name), "{name}");
     }
@@ -818,6 +816,8 @@ fn the_store_owns_only_its_names_in_tmp() {
         "0x03f0000000000010.intent.old",
         "layout.tmp.1",
         "Layout.tmp",
+        "upload-0",
+        "upload-12",
         "upload-",
         "upload-3x",
         "upload--3",
@@ -836,7 +836,7 @@ fn an_open_keeps_a_file_of_a_client_in_tmp() {
     let vfs = MemVfs::new();
     drop(blob_file(&Store::open_vfs(vfs.clone()).unwrap(), b"x"));
     let client = format!("{TMP_DIR}/tmpk3x9q2b_");
-    let owned = format!("{TMP_DIR}/upload-3");
+    let owned = format!("{TMP_DIR}/3.tmp");
     for name in [&client, &owned] {
         let mut file = Vfs::create_file(&vfs, name).unwrap();
         file.write_all(b"client").unwrap();
