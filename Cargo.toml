@@ -17,6 +17,8 @@ zoe-core = { path = "crates/zoe-core" }
 zoe-loupe = { path = "crates/zoe-loupe" }
 zoe-mcp = { path = "crates/zoe-mcp" }
 zoe-pickle = { path = "crates/zoe-pickle" }
+# The bytes and the names of ZEO 6 that the server and the clients share.
+zoe-wire = { path = "crates/zoe-wire" }
 # Without `serve`. A member that serves turns the feature on.
 zoe-server = { path = "crates/zoe-server", default-features = false }
 blake3 = "1.8"

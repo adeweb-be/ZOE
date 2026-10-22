@@ -50,7 +50,7 @@ impl Pipe {
         self.framing.extend_from_slice(bytes);
         let mut names = Vec::new();
         while let Some(head) = self.framing.first_chunk::<4>() {
-            let len = u32::from_be_bytes(*head) as usize;
+            let len = zoe_wire::frame::length(*head) as usize;
             let Some(payload) = self.framing.get(4..4 + len) else {
                 break;
             };

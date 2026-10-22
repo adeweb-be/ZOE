@@ -7,6 +7,9 @@
 //! that got the extension `trace_context`, a call can have a fifth element:
 //! its trace context, a map whose key `traceparent` holds a W3C
 //! traceparent.
+//!
+//! `zoe-wire` holds the bytes and the names that the client shares with
+//! the server (ADR 0055). This module reads and writes them on a stream.
 
 use std::io;
 use std::sync::Mutex;
@@ -14,29 +17,14 @@ use std::sync::Mutex;
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zoe_core::{Oid, Tid};
+use zoe_wire::class::{
+    CONFLICT_ERROR as CONFLICT, POS_KEY_ERROR, READ_CONFLICT_ERROR as READ_CONFLICT,
+};
+use zoe_wire::frame::RESERVE;
+use zoe_wire::msgpack::{array_len, bin_len};
+use zoe_wire::{ERROR, HEARTBEAT, REPLY, TRACEPARENT, p64, u64_of};
 
 use crate::Error;
-
-/// The protocol of ZEO 6 with msgpack.
-pub(crate) const PROTOCOL: &[u8] = b"M5";
-
-/// The largest buffer that a read reserves before the bytes arrive. A
-/// longer frame grows its buffer as its bytes arrive, so a false length
-/// does not reserve memory.
-const RESERVE: usize = 1 << 20;
-
-/// The tid that `load` gives to `loadBefore`, as `ZEO.ClientStorage` does:
-/// `ZODB.utils.maxtid`.
-pub(crate) const MAX_TID: Tid = Tid(i64::MAX as u64);
-
-/// The flags of a reply that carries an error.
-const ERROR: i64 = 2;
-
-/// The class of the conflict error of ZODB.
-const CONFLICT: &str = "ZODB.POSException.ConflictError";
-
-/// The class of the read conflict error of ZODB.
-const READ_CONFLICT: &str = "ZODB.POSException.ReadConflictError";
 
 /// The shortest payload that `read_payload` reads in two parts: first its
 /// start, then the rest. A shorter payload is one read.
@@ -74,7 +62,7 @@ async fn read_len<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<usi
         }
         got += n;
     }
-    Ok(Some(u32::from_be_bytes(len) as usize))
+    Ok(Some(zoe_wire::frame::length(len) as usize))
 }
 
 /// Read `len` more bytes from `reader` at the end of `buffer`.
@@ -251,7 +239,7 @@ fn lead(head: &[u8]) -> Option<Lead> {
         Value::Boolean(flag) => i64::from(flag),
         other => other.as_i64()?,
     };
-    if flags & ERROR != 0 || item()?.as_str() != Some(".reply") {
+    if flags & i64::from(ERROR) != 0 || item()?.as_str() != Some(REPLY) {
         return None;
     }
     let items = match bytes.first()? {
@@ -267,39 +255,6 @@ fn lead(head: &[u8]) -> Option<Lead> {
     })
 }
 
-/// Read the head of a msgpack array, and return its number of items.
-fn array_len(bytes: &mut &[u8]) -> Option<usize> {
-    let (&marker, rest) = bytes.split_first()?;
-    let (len, size) = match marker {
-        0x90..=0x9f => (usize::from(marker & 0x0f), 0),
-        0xdc => (be(rest, 2)?, 2),
-        0xdd => (be(rest, 4)?, 4),
-        _ => return None,
-    };
-    *bytes = &rest[size..];
-    Some(len)
-}
-
-/// Read the head of a msgpack bin, and return its number of bytes.
-fn bin_len(bytes: &mut &[u8]) -> Option<usize> {
-    let (&marker, rest) = bytes.split_first()?;
-    let size = match marker {
-        0xc4 => 1,
-        0xc5 => 2,
-        0xc6 => 4,
-        _ => return None,
-    };
-    let len = be(rest, size)?;
-    *bytes = &rest[size..];
-    Some(len)
-}
-
-/// Read the big-endian number in the first `size` bytes of `bytes`.
-fn be(bytes: &[u8], size: usize) -> Option<usize> {
-    let bytes = bytes.get(..size)?;
-    Some(bytes.iter().fold(0, |n, &byte| n << 8 | usize::from(byte)))
-}
-
 /// Write the frame of `payload` to `writer`.
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
@@ -311,16 +266,9 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Return the frame of `payload`: its length, then its bytes.
 fn frame(payload: &[u8]) -> Result<Vec<u8>, Error> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| Error::Invalid(format!("a frame of {} bytes", payload.len())))?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
+    zoe_wire::frame::encode(payload)
+        .map_err(|_| Error::Invalid(format!("a frame of {} bytes", payload.len())))
 }
-
-/// The key of the W3C traceparent in the trace context of a call.
-const TRACEPARENT: &str = "traceparent";
 
 /// Return the frame of the message `[id, flags, method, args]`. With a
 /// `traceparent`, the message has a fifth element: the trace context.
@@ -365,7 +313,7 @@ pub(crate) fn notify(
 
 /// Return the frame of the heartbeat: `[-1, 0, ".reply", nil]`.
 pub(crate) fn heartbeat() -> Vec<u8> {
-    message(-1, 0.into(), ".reply", Value::Nil, None).expect("the heartbeat encodes")
+    message(HEARTBEAT, 0.into(), REPLY, Value::Nil, None).expect("the heartbeat encodes")
 }
 
 /// A message from the server.
@@ -448,7 +396,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Message, Error> {
     let Some(method) = method.as_str() else {
         return Err(Error::Protocol("a method that is not a str".into()));
     };
-    if method != ".reply" {
+    if method != REPLY {
         return Ok(Message::Call {
             method: method.to_owned(),
             args,
@@ -461,7 +409,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Message, Error> {
         Value::Boolean(flag) => i64::from(flag),
         other => other.as_i64().unwrap_or(0),
     };
-    let result = if flags & ERROR != 0 {
+    let result = if flags & i64::from(ERROR) != 0 {
         Err(server_error(args))
     } else {
         Ok(args)
@@ -513,9 +461,9 @@ fn server_error(args: Value) -> Error {
 /// without a record: one bytes argument, the oid.
 pub(crate) fn pos_key_error(oid: Oid) -> Error {
     Error::Server {
-        class: "ZODB.POSException.POSKeyError".into(),
+        class: POS_KEY_ERROR.into(),
         message: format!("{oid:?}"),
-        value: Value::Array(vec![bin8(oid.0)]),
+        value: Value::Array(vec![p64(oid.0)]),
     }
 }
 
@@ -524,11 +472,11 @@ pub(crate) fn pos_key_error(oid: Oid) -> Error {
 /// `[committed, read]`, or nil. A str `class_name` gives the class of the
 /// object.
 pub(crate) fn conflict(value: &Value) -> Option<Error> {
-    let oid = get(value, "oid").and_then(p64).map(Oid)?;
+    let oid = get(value, "oid").and_then(u64_of).map(Oid)?;
     let serials = match get(value, "serials") {
         None | Some(Value::Nil) => None,
         Some(Value::Array(items)) if items.len() == 2 => {
-            Some((Tid(p64(&items[0])?), Tid(p64(&items[1])?)))
+            Some((Tid(u64_of(&items[0])?), Tid(u64_of(&items[1])?)))
         }
         Some(_) => return None,
     };
@@ -551,20 +499,15 @@ pub(crate) fn get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         .map(|(_, v)| v)
 }
 
-/// Return the 8 big-endian bytes of an oid or a tid.
-pub(crate) fn bin8(n: u64) -> Value {
-    Value::Binary(n.to_be_bytes().to_vec())
-}
-
-/// Read an oid or a tid: a bin of 8 bytes.
-pub(crate) fn p64(value: &Value) -> Option<u64> {
-    let bytes: [u8; 8] = value.as_slice()?.try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Return the bin of the 8 big-endian bytes of `n`, as a stock server
+    /// sends an oid or a tid. The tests build it without `zoe-wire`.
+    fn bin8(n: u64) -> Value {
+        Value::Binary(n.to_be_bytes().to_vec())
+    }
 
     fn payload(frame: &[u8]) -> &[u8] {
         let len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;

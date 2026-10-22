@@ -176,7 +176,7 @@ pub async fn hot(
 ) -> Result<HotReport, Error> {
     let run = Run::now();
     let options = Options {
-        extensions: vec!["lock_intent".to_owned()],
+        extensions: vec![zoe_wire::extension::LOCK_INTENT.to_owned()],
         ..Options::default()
     };
     let setup = Client::open(Arc::new(Tokio), addr, &settings.storage, &options).await?;

@@ -69,7 +69,7 @@ ZOE, the Zope Object Engine, is the project name: an anagram of ZEO, a first nam
 | Thing | Name | Rule |
 | --- | --- | --- |
 | repository | `adeweb-be/ZOE` (the GitHub organisation is `adeweb-be`; the owner is adeweb) | one monorepo: `crates/` for Rust, `python/` for the extension and Python packages, `deploy/` for Helm and manifests |
-| Rust crates | `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py`, `zoe-catalog`, `zoe-vectors`, `zoe-mcp`, `zoe-bench`, `zoe-loupe`, `zoe-pickle`, `zoe-convert` | hyphens in crate names, `snake_case` modules, newtypes `Oid`, `Tid`, errors `ZoeError`; no bare `zoe` crate (taken on crates.io) |
+| Rust crates | `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py`, `zoe-catalog`, `zoe-vectors`, `zoe-mcp`, `zoe-bench`, `zoe-loupe`, `zoe-pickle`, `zoe-convert`, `zoe-wire` | hyphens in crate names, `snake_case` modules, newtypes `Oid`, `Tid`, errors `ZoeError`; no bare `zoe` crate (taken on crates.io) |
 | Python distribution | `zoedb` on PyPI (`ZOE` pending a PEP 541 transfer) | same version number as the crates; the wheel pins the exact core version |
 | Python import | `zoe` with `zoe.storage`, `zoe.serve`, `zoe.zeo`, `zoe.zodb`, `zoe.asyncio`, `zoe.kv`, `zoe.policy`, `zoe.testing` | no hyphens, PEP 8 inside |
 | CLI | `zoe` with subcommands `serve`, `pack`, `backup`, `restore`, `verify`, `scrub`, `convert`, `fork`, `feed`, `rename-class`, `export`, `admin`, `mcp` | one binary, one console script of the same name |

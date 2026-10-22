@@ -53,6 +53,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{oneshot, watch};
 use zoe_core::Store;
+use zoe_wire::PROTOCOL;
 
 use crate::runtime::{BoxFuture, Runtime, Tokio};
 
@@ -64,10 +65,6 @@ use pipeline::Calls;
 pub(crate) use pipeline::Pool;
 pub(crate) use resolution::ResolutionLog;
 use status::Stats;
-
-/// The protocol that the server announces and the only one it takes: ZEO 6
-/// with msgpack.
-pub(crate) const PROTOCOL: &[u8] = b"M5";
 
 /// The payload that a client sends in place of a protocol to ask for the
 /// status of the server.
@@ -1074,9 +1071,13 @@ mod tests {
 
         let mut client = registered(addr);
         client.set_nodelay(true).unwrap();
-        let loaded = Value::Array(vec![Value::Binary(record), session::p64(tid.0), Value::Nil]);
+        let loaded = Value::Array(vec![
+            Value::Binary(record),
+            zoe_wire::p64(tid.0),
+            Value::Nil,
+        ]);
         let mut load = |id: i64| {
-            let args = vec![session::p64(1), session::p64(u64::MAX)];
+            let args = vec![zoe_wire::p64(1), zoe_wire::p64(u64::MAX)];
             send(&mut client, id, "loadBefore", args);
             let reply = read_frame(&mut client);
             let reply = rmpv::decode::read_value(&mut reply.as_slice()).unwrap();
@@ -1224,12 +1225,12 @@ mod tests {
         let mut client = registered(addr);
         let loaded = Value::Array(vec![
             Value::Binary(record.clone()),
-            session::p64(tid.0),
+            zoe_wire::p64(tid.0),
             Value::Nil,
         ]);
         for id in 2..22 {
             let oid = 1 + u64::try_from(id % 4).unwrap();
-            let args = vec![session::p64(oid), session::p64(u64::MAX)];
+            let args = vec![zoe_wire::p64(oid), zoe_wire::p64(u64::MAX)];
             send(&mut client, id, "loadBefore", args);
             let reply = read_frame(&mut client);
             let reply = rmpv::decode::read_value(&mut reply.as_slice()).unwrap();
@@ -1305,7 +1306,7 @@ mod tests {
         let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
         send(client, 0, "tpc_begin", begin);
         let data = Value::Binary(b"pickle".to_vec());
-        let store = vec![session::p64(oid), session::p64(0), data, Value::from(7)];
+        let store = vec![zoe_wire::p64(oid), zoe_wire::p64(0), data, Value::from(7)];
         send(client, 0, "storea", store);
     }
 
@@ -1427,7 +1428,7 @@ mod tests {
         send(&mut ended, 0, "storeBlobStart", vec![]);
         send(&mut ended, 0, "storeBlobChunk", chunk());
         let data = Value::Binary(b"pickle".to_vec());
-        let end = vec![session::p64(2), session::p64(0), data, Value::from(7)];
+        let end = vec![zoe_wire::p64(2), zoe_wire::p64(0), data, Value::from(7)];
         send(&mut ended, 0, "storeBlobEnd", end);
         // The calls of a transaction run in order. So after the reply to an
         // abort of another transaction, each upload file holds its chunk.
@@ -1560,7 +1561,7 @@ mod tests {
         let begin = vec![Value::from(1), Value::Nil, Value::Nil, Value::Map(vec![])];
         send(&mut client, 0, "tpc_begin", begin);
         let large = Value::Binary(vec![7; 1 << 20]);
-        let store = vec![session::p64(1), session::p64(0), large, Value::from(1)];
+        let store = vec![zoe_wire::p64(1), zoe_wire::p64(0), large, Value::from(1)];
         send(&mut client, 0, "storea", store);
         send(&mut client, 2, "vote", vec![Value::from(1)]);
         read_frame(&mut client);
@@ -1572,7 +1573,7 @@ mod tests {
         // The client loads the large record and reads nothing. The first
         // bytes of the reply arrive, so the reader read the load before
         // the stop.
-        let load = vec![session::p64(1), session::p64(u64::MAX >> 1)];
+        let load = vec![zoe_wire::p64(1), zoe_wire::p64(u64::MAX >> 1)];
         send(&mut client, 4, "loadBefore", load);
         client.peek(&mut [0; 1]).unwrap();
         stop.send_replace(true);
@@ -1732,7 +1733,7 @@ mod tests {
         let mut setup = registered(server.addr());
         let begin = vec![Value::from(1), Value::Nil, Value::Nil, Value::Map(vec![])];
         send(&mut setup, 0, "tpc_begin", begin);
-        let store_large = vec![session::p64(1), session::p64(0), large, Value::from(1)];
+        let store_large = vec![zoe_wire::p64(1), zoe_wire::p64(0), large, Value::from(1)];
         send(&mut setup, 0, "storea", store_large);
         send(&mut setup, 2, "vote", vec![Value::from(1)]);
         read_frame(&mut setup);
@@ -1775,7 +1776,7 @@ mod tests {
         );
         assert!(!store.lock_table_is_empty());
         for id in 3..=7 {
-            let load = vec![session::p64(1), session::p64(u64::MAX >> 1)];
+            let load = vec![zoe_wire::p64(1), zoe_wire::p64(u64::MAX >> 1)];
             send(&mut client, id, "loadBefore", load);
         }
         // The idle close stops the writer, so the session ends and the
@@ -1868,7 +1869,7 @@ mod tests {
         let register = vec![Value::from("1"), Value::Boolean(false), declaration];
         send(&mut client, 1, "register", register);
         read_frame(&mut client);
-        let oids = Value::Array(vec![session::p64(oid)]);
+        let oids = Value::Array(vec![zoe_wire::p64(oid)]);
         send(&mut client, 2, "lock_intent", vec![oids]);
         client
     }
@@ -1946,7 +1947,7 @@ mod tests {
         assert!(line.contains("\"level\":\"WARN\""), "{line}");
         assert!(line.contains("\"first\":\"0x0000000000000003\""), "{line}");
         // The session goes on: another lock_intent comes after the release.
-        let oids = Value::Array(vec![session::p64(3)]);
+        let oids = Value::Array(vec![zoe_wire::p64(3)]);
         send(&mut client, 3, "lock_intent", vec![oids]);
         read_frame(&mut client);
         assert!(!store.lock_table_is_empty());
