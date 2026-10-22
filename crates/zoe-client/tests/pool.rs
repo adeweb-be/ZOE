@@ -7,11 +7,14 @@
 //! reply of a finish, so a finish waits for its reply as long as a test
 //! needs.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::{bin8, commit_other, fresh_dir, open_cached, record, start, start_with};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -27,50 +30,12 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// The time that a test waits to see that a call stays blocked.
 const BLOCKED: Duration = Duration::from_millis(200);
 
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-client-pool-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn start(name: &str) -> Server {
-    Server::start(ServeOptions::new(fresh_dir(name).join("store"))).unwrap()
-}
-
-/// A ZODB record of a `PersistentMapping` that holds `value`.
-fn record(value: &[u8]) -> Vec<u8> {
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
-}
-
 /// Open a pool of at most `bound` connections that commit on `server`.
 async fn open(server: &Server, bound: usize) -> Pool {
     let addr = server.addr();
     let listener = Client::connect(addr, "1").await.unwrap();
     let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
     Pool::new(Arc::new(Tokio), listener, connect, bound)
-}
-
-/// Open a pool as `open` does, with a client cache of 1 MB.
-async fn open_cached(server: &Server, bound: usize) -> Pool {
-    let addr = server.addr();
-    let listener = Client::connect(addr, "1").await.unwrap();
-    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
-    let cache = Cache::new(1 << 20).unwrap();
-    Pool::with_cache(Arc::new(Tokio), listener, connect, bound, Some(cache))
-}
-
-/// Commit `data` for `oid` through `client`, as another client.
-async fn commit_other(client: &Client, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = client.begin(b"", b"", b"").await.unwrap();
-    txn.store(oid, serial, data).await.unwrap();
-    txn.vote().await.unwrap();
-    txn.finish().await.unwrap()
 }
 
 /// Commit `data` for `oid` through `pool`, and return the turn.
@@ -272,7 +237,7 @@ async fn a_load_gives_the_position_of_its_connection() {
 #[tokio::test]
 async fn the_cache_applies_a_tid_of_another_client_before_its_delivery() {
     let server = start("cache-foreign");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oid = other.new_oids(1).await.unwrap()[0];
@@ -300,7 +265,7 @@ async fn the_cache_applies_a_tid_of_another_client_before_its_delivery() {
 #[tokio::test]
 async fn a_commit_of_the_pool_enters_the_cache_at_its_turn() {
     let server = start("cache-own");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let turn = commit(&pool, oid, Tid(0), &record(b"a")).await.unwrap();
@@ -314,7 +279,7 @@ async fn a_commit_of_the_pool_enters_the_cache_at_its_turn() {
 #[tokio::test]
 async fn a_conflict_of_a_vote_drops_the_current_entry() {
     let server = start("cache-conflict");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let tid = commit(&pool, oid, Tid(0), &record(b"a"))
@@ -343,7 +308,7 @@ async fn stale(pool: &Pool, oid: Oid, data: &[u8]) -> (PoolTransaction, Tid, Tid
 #[tokio::test]
 async fn a_conflict_that_the_client_resolves_enters_the_cache_with_its_resolution() {
     let server = start("cache-resolved");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let (mut txn, first, second) = stale(&pool, oid, &record(b"c")).await;
@@ -363,9 +328,7 @@ async fn a_conflict_that_the_client_resolves_enters_the_cache_with_its_resolutio
 
     // The resolution commits, and its turn replaces the entry of the oid
     // with the resolved pickle.
-    txn.store_resolved(oid, second, &record(b"d"))
-        .await
-        .unwrap();
+    txn.store(oid, second, &record(b"d")).await.unwrap();
     assert_eq!(txn.vote_listed().await.unwrap(), Voted::default());
     let turn = txn.finish().await.unwrap().turn().await.unwrap();
     let tid = turn.tid();
@@ -379,7 +342,7 @@ async fn a_conflict_that_the_client_resolves_enters_the_cache_with_its_resolutio
 #[tokio::test]
 async fn an_unresolved_conflict_drops_the_current_entry_and_waits_for_the_abort() {
     let server = start("cache-unresolved");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let (mut txn, _, second) = stale(&pool, oid, &record(b"c")).await;
@@ -394,7 +357,7 @@ async fn an_unresolved_conflict_drops_the_current_entry_and_waits_for_the_abort(
 #[tokio::test]
 async fn the_cache_applies_the_tid_of_a_dropped_finish_before_its_delivery() {
     let server = start("cache-dropped");
-    let pool = open_cached(&server, 1).await;
+    let pool = open_cached(&server, 1, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let first = commit(&pool, oid, Tid(0), &record(b"a"))
@@ -422,7 +385,7 @@ async fn the_cache_applies_the_tid_of_a_dropped_finish_before_its_delivery() {
 #[tokio::test]
 async fn a_lost_listener_empties_the_cache() {
     let server = start("cache-lost");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let tid = commit(&pool, oid, Tid(0), &record(b"a"))
@@ -1342,14 +1305,10 @@ fn key<'a>(value: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
         .map(|(_, v)| v)
 }
 
-fn bin8(n: u64) -> rmpv::Value {
-    rmpv::Value::Binary(n.to_be_bytes().to_vec())
-}
-
 #[tokio::test]
 async fn a_prefetch_loads_each_missing_oid_at_once_into_the_cache() {
     let server = start("prefetch");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oids = other.new_oids(3).await.unwrap();
@@ -1461,7 +1420,7 @@ async fn calls_on_the_listener_find_the_iterator_that_they_started() {
 #[tokio::test]
 async fn the_info_of_the_pool_has_the_sizes_of_the_last_commit() {
     let server = start("info");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let length = |pool: &Pool| key(&pool.info().unwrap(), "length").and_then(rmpv::Value::as_u64);
     // `Client::connect` calls no `get_info`: the info is only what the
     // server sent.
@@ -1477,7 +1436,7 @@ async fn the_info_of_the_pool_has_the_sizes_of_the_last_commit() {
 #[tokio::test]
 async fn a_deletion_ends_the_current_entry_of_its_oid() {
     let server = start("delete");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let tid = commit(&pool, oid, Tid(0), &record(b"a"))
@@ -1500,7 +1459,7 @@ async fn a_deletion_ends_the_current_entry_of_its_oid() {
 #[tokio::test]
 async fn a_restore_commits_under_the_tid_of_its_transaction() {
     let server = start("restore");
-    let pool = open_cached(&server, 2).await;
+    let pool = open_cached(&server, 2, None).await;
     let cache = pool.cache().unwrap().clone();
     let oid = pool.new_oids(1).await.unwrap()[0];
     let first = commit(&pool, oid, Tid(0), &record(b"a"))
@@ -1619,9 +1578,9 @@ async fn an_owner_of_intent_locks_releases_them_before_its_connection_serves_aga
 
 #[tokio::test]
 async fn an_owner_whose_first_lock_times_out_holds_nothing() {
-    let options = ServeOptions::new(fresh_dir("intent-timeout").join("store"))
-        .lock_timeout(Duration::from_millis(100));
-    let server = Server::start(options).unwrap();
+    let server = start_with("intent-timeout", |store| {
+        ServeOptions::new(store).lock_timeout(Duration::from_millis(100))
+    });
     let pool = open_locking(&server, 1).await;
     let other = Client::open(Arc::new(Tokio), server.addr(), "1", &locking())
         .await

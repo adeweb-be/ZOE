@@ -44,25 +44,34 @@
 //! ephemeral namespaces runs a sweep step once a minute, on a thread of
 //! the extension that runs no Python. The thread starts at the open of
 //! such a store, or at its first ephemeral write, and stops at the close.
+//!
+//! `table` holds the table of the open transactions and the part of the
+//! storage that the watcher shares. `resolution_log` holds the resolution
+//! log, and `blob` the take of a blob file.
+
+mod blob;
+mod resolution_log;
+mod table;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
+use zoe_client::lock;
 use zoe_core::{
-    BlobFile, Compression, Flavour, IntentLocks, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT,
-    Store, Tid, Txn, ZoeError,
+    Compression, Flavour, IntentLocks, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT, Store, Tid,
+    Txn, ZoeError,
 };
 
 use crate::errors::{self, Failure, p64, u64_of};
@@ -70,6 +79,10 @@ use crate::kv;
 use crate::publish::{Publication, Published};
 use crate::sequence::Sequence;
 use crate::signals;
+use blob::take_blob;
+use resolution_log::{ResolutionLog, warn_log_failure};
+pub(crate) use table::Shared;
+use table::{Entry, Table, abort_all};
 
 /// A transaction of the core that shares its store.
 type SharedTxn = Txn<StoreRef>;
@@ -123,166 +136,7 @@ pub(crate) struct Intents {
 
 impl Intents {
     fn lock(&self) -> MutexGuard<'_, Option<IntentLocks<StoreRef>>> {
-        self.intents.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// One open transaction.
-struct Entry {
-    /// The ZODB transaction object. The entry keeps it alive, so that its
-    /// address stays its key.
-    _transaction: Py<PyAny>,
-    /// The transaction of the core. It is `None` after `tpc_finish` or
-    /// `tpc_abort` took it.
-    txn: Mutex<Option<SharedTxn>>,
-}
-
-impl Entry {
-    fn lock(&self) -> MutexGuard<'_, Option<SharedTxn>> {
-        self.txn.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Call `f` with the transaction of the core. Fail when `tpc_finish`
-    /// or `tpc_abort` took it.
-    fn with<T>(&self, f: impl FnOnce(&mut SharedTxn) -> Result<T, Failure>) -> Result<T, Failure> {
-        match self.lock().as_mut() {
-            Some(txn) => f(txn),
-            None => Err(ZoeError::Protocol("the transaction is finished or aborted").into()),
-        }
-    }
-
-    /// Call `f` with the transaction of the core, as `with` does, if no
-    /// other call uses it now. Return `None` when another call uses it.
-    fn try_with<T>(
-        &self,
-        f: impl FnOnce(&mut SharedTxn) -> Result<T, Failure>,
-    ) -> Option<Result<T, Failure>> {
-        let mut txn = match self.txn.try_lock() {
-            Ok(txn) => txn,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
-        Some(match txn.as_mut() {
-            Some(txn) => f(txn),
-            None => Err(ZoeError::Protocol("the transaction is finished or aborted").into()),
-        })
-    }
-
-    /// Take the transaction of the core out of the entry.
-    fn take(&self) -> Option<SharedTxn> {
-        self.lock().take()
-    }
-
-    /// Take the transaction of the core out of the entry, if no call uses
-    /// it now. Fail when a call uses it.
-    fn try_take(&self) -> Result<Option<SharedTxn>, ()> {
-        match self.txn.try_lock() {
-            Ok(mut txn) => Ok(txn.take()),
-            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner().take()),
-            Err(TryLockError::WouldBlock) => Err(()),
-        }
-    }
-}
-
-/// The open transactions of a storage.
-#[derive(Default)]
-struct Table {
-    /// True after `close` or the close at a signal. The table then refuses
-    /// a new transaction.
-    closed: bool,
-    /// The open transactions, keyed by the address of the ZODB
-    /// transaction object.
-    entries: HashMap<usize, Arc<Entry>>,
-    /// The entries that the close at a signal took out of `entries`. They
-    /// hold Python references, so they stay here until `close` or the drop
-    /// of the storage removes them.
-    closing: Vec<Arc<Entry>>,
-}
-
-impl Table {
-    /// Remove every entry and return them.
-    fn drain(&mut self) -> Vec<Arc<Entry>> {
-        let mut entries: Vec<Arc<Entry>> = self.entries.drain().map(|(_, entry)| entry).collect();
-        entries.append(&mut self.closing);
-        entries
-    }
-}
-
-/// The parts of a storage that the watcher of the signals shares with it.
-///
-/// The watcher runs no Python code, so it drops no Python reference. The
-/// entries of the table hold Python references: the watcher takes the
-/// transaction of the core out of an entry and leaves the entry in the
-/// table. `close` and the drop of the storage remove the entries.
-pub(crate) struct Shared {
-    /// The store. It is `None` after `close`, the drop or the close at a
-    /// signal.
-    store: RwLock<Option<StoreRef>>,
-    table: Mutex<Table>,
-    /// True when the last share of the store dropped. A read through a
-    /// weak handle of the core can still hold the database then.
-    database_closed: Arc<AtomicBool>,
-}
-
-impl Shared {
-    fn new(store: Store) -> Self {
-        let database_closed = Arc::new(AtomicBool::new(false));
-        let store = StoreRef(Arc::new(Owned {
-            store,
-            _closed: SetOnDrop(Arc::clone(&database_closed)),
-        }));
-        Self {
-            store: RwLock::new(Some(store)),
-            table: Mutex::new(Table::default()),
-            database_closed,
-        }
-    }
-
-    fn table(&self) -> MutexGuard<'_, Table> {
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Take the store out of the storage. Return `None` when it is already
-    /// out.
-    fn take_store(&self) -> Option<StoreRef> {
-        self.store
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
-
-    /// Mark the storage closed and take its store, as `close` does. Return
-    /// `None` when `close` or the drop took the store first.
-    ///
-    /// The open transactions leave `entries`, so a later call with one of
-    /// them raises the error that it raises after `close`.
-    pub(crate) fn mark_closed(&self) -> Option<StoreRef> {
-        {
-            let mut table = self.table();
-            table.closed = true;
-            let entries: Vec<Arc<Entry>> = table.entries.drain().map(|(_, entry)| entry).collect();
-            table.closing.extend(entries);
-        }
-        self.take_store()
-    }
-
-    /// Abort each transaction that the close at a signal took out of
-    /// `entries` and that no call uses now. Leave the entries in the table.
-    pub(crate) fn abort_idle(&self) {
-        // The transactions drop after the guard of the table, because an
-        // abort can take time.
-        let idle: Vec<SharedTxn> = self
-            .table()
-            .closing
-            .iter()
-            .filter_map(|entry| entry.try_take().ok().flatten())
-            .collect();
-        drop(idle);
-    }
-
-    /// Tell if the last share of the store dropped.
-    pub(crate) fn database_closed(&self) -> bool {
-        self.database_closed.load(Ordering::Acquire)
+        lock(&self.intents)
     }
 }
 
@@ -318,7 +172,7 @@ impl Sweeper {
     /// Tell the thread to stop.
     fn signal(&self) {
         let (stopped, changed) = &*self.stop;
-        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        *lock(stopped) = true;
         changed.notify_all();
     }
 
@@ -344,10 +198,10 @@ impl Drop for Sweeper {
 /// halted store runs no step.
 fn sweep(store: &Weak<Owned>, stop: &(Mutex<bool>, Condvar)) {
     let (stopped, changed) = stop;
-    let is_stopped = || *stopped.lock().unwrap_or_else(PoisonError::into_inner);
+    let is_stopped = || *lock(stopped);
     loop {
         {
-            let guard = stopped.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = lock(stopped);
             let (guard, _) = changed
                 .wait_timeout_while(guard, SWEEP_INTERVAL, |stopped| !*stopped)
                 .unwrap_or_else(PoisonError::into_inner);
@@ -390,66 +244,15 @@ pub(crate) struct Storage {
     server_writes: AtomicBool,
 }
 
-/// The resolution log of ADR 0042: a file of JSON lines, one for each
-/// result of tier 1 in a vote. It is opened in append mode, each vote
-/// writes its lines in one write, and it is never synced.
-struct ResolutionLog {
-    file: Mutex<File>,
-    /// True after a write failed: the storage warns at the first one.
-    failed: AtomicBool,
-}
-
-impl ResolutionLog {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(ResolutionLog {
-            file: Mutex::new(file),
-            failed: AtomicBool::new(false),
-        })
-    }
-
-    /// Writes the lines of what the tiers did in the vote of `txn`. The
-    /// entries of the undos come first, and `_undo` wrote them already, so
-    /// they are left out. A failed write never fails the vote. Returns the
-    /// error of the first failed write, for the log of the storage.
-    fn write(&self, txn: &SharedTxn) -> Option<String> {
-        let vote = txn.undo_resolution_count()..txn.resolutions().len();
-        self.write_lines(txn.resolution_log_lines_of(vote, SystemTime::now(), None))
-    }
-
-    /// Writes the lines of the entries `range` of `txn`, that an undo gave,
-    /// as `write` does.
-    fn write_undo(&self, txn: &SharedTxn, range: std::ops::Range<usize>) -> Option<String> {
-        self.write_lines(txn.resolution_log_lines_of(range, SystemTime::now(), None))
-    }
-
-    /// Writes the lines of the checks of the merges of shadow mode of the
-    /// vote after `_vote_resolving` (ADR 0046), as `write` does.
-    fn write_verifications(&self, txn: &SharedTxn) -> Option<String> {
-        self.write_lines(txn.verification_log_lines(SystemTime::now(), None))
-    }
-
-    fn write_lines(&self, lines: Vec<String>) -> Option<String> {
-        if lines.is_empty() {
-            return None;
-        }
-        let mut text = String::new();
-        for line in lines {
-            text.push_str(&line);
-            text.push('\n');
-        }
-        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        match io::Write::write_all(&mut *file, text.as_bytes()) {
-            Err(error) if !self.failed.swap(true, Ordering::Relaxed) => Some(error.to_string()),
-            _ => None,
-        }
-    }
-}
-
 impl Storage {
+    /// Fail with `ReadOnlyError` when the storage is read-only.
+    fn writable(&self, py: Python<'_>) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        Ok(())
+    }
+
     /// Return the store, or fail when the storage is closed.
     fn opened(&self, py: Python<'_>) -> PyResult<StoreRef> {
         // The guard drops at the end of this statement. Building the
@@ -507,7 +310,7 @@ impl Storage {
         if self.read_only {
             return;
         }
-        let mut sweeper = self.sweeper.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sweeper = lock(&self.sweeper);
         if sweeper.is_some() {
             return;
         }
@@ -528,10 +331,7 @@ impl Storage {
     /// Take the thread of the sweep steps out of the storage. The caller
     /// stops it without the GIL.
     fn take_sweeper(&self) -> Option<Sweeper> {
-        self.sweeper
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        lock(&self.sweeper).take()
     }
 
     /// Stage a namespace write in `transaction` with `stage`, as `store`
@@ -542,9 +342,7 @@ impl Storage {
         transaction: &Bound<'_, PyAny>,
         stage: impl Fn(&mut SharedTxn) -> Result<(), Failure> + Send + Sync,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         let staged = match entry.try_with(&stage) {
             Some(staged) => staged,
@@ -556,9 +354,7 @@ impl Storage {
     /// Return the next value of the sequence `name`. A read-only storage
     /// refuses the call.
     pub(crate) fn next_value(&self, py: Python<'_>, name: &str) -> PyResult<u64> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         py.detach(move || store.sequence(name).next())
             .map_err(|e| core(py, e))
@@ -746,9 +542,7 @@ impl Storage {
 
     /// Return a new oid.
     fn new_oid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let oid = py
             .detach(move || store.new_oid())
@@ -907,9 +701,7 @@ impl Storage {
     /// while it runs. A read-only storage refuses the pack.
     #[pyo3(name = "_pack")]
     fn pack(&self, py: Python<'_>, tid: &Bound<'_, PyAny>) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let tid = Tid(u64_of(tid)?);
         let store = self.opened(py)?;
         py.detach(move || store.pack(tid))
@@ -1065,9 +857,7 @@ impl Storage {
         owner: &Intents,
         oids: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let oids = oids
             .iter()
             .map(|oid| u64_of(oid).map(Oid))
@@ -1114,9 +904,7 @@ impl Storage {
         status: Option<&Bound<'_, PyAny>>,
         intents: Option<&Intents>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let key = transaction.as_ptr() as usize;
         let begun = self.table().entries.contains_key(&key);
         if begun {
@@ -1191,9 +979,7 @@ impl Storage {
         version: &Bound<'_, PyAny>,
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         if version.is_truthy()? {
             return Err(errors::version(py));
@@ -1244,9 +1030,7 @@ impl Storage {
         oldserial: &Bound<'_, PyAny>,
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         let oid = Oid(u64_of(oid)?);
         let serial = serial_of(oldserial)?;
@@ -1274,9 +1058,7 @@ impl Storage {
         tid: &Bound<'py, PyAny>,
         transaction: &Bound<'py, PyAny>,
     ) -> PyResult<(Vec<Bound<'py, PyBytes>>, Vec<UndoRow<'py>>)> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         let tid = Tid(u64_of(tid)?);
         let log = self.resolution_log.clone();
@@ -1365,9 +1147,7 @@ impl Storage {
         version: &Bound<'_, PyAny>,
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let entry = self.entry(py, transaction)?;
         if version.is_truthy()? {
@@ -1412,9 +1192,7 @@ impl Storage {
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let _ = (serial, prev_txn);
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         if version.is_truthy()? {
             return Err(errors::version(py));
@@ -1446,9 +1224,7 @@ impl Storage {
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let _ = (serial, prev_txn);
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let entry = self.entry(py, transaction)?;
         let oid = Oid(u64_of(oid)?);
@@ -1499,9 +1275,7 @@ impl Storage {
     /// rename. A read-only storage raises `ReadOnlyError`.
     #[pyo3(name = "temporaryDirectory")]
     fn temporary_directory(&self, py: Python<'_>) -> PyResult<OsString> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let path = py
             .detach(move || store.blob_temp_dir())
@@ -1795,12 +1569,7 @@ impl Transactions {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<TxnRow<'py>>> {
         // The mutex is taken without the GIL, and no Python code runs while
         // it is held.
-        let next = py.detach(|| {
-            self.transactions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .next()
-        });
+        let next = py.detach(|| lock(&self.transactions).next());
         let txn = match next {
             None => return Ok(None),
             Some(txn) => txn.map_err(|e| core(py, e))?,
@@ -1823,29 +1592,6 @@ impl Transactions {
             PyBytes::new(py, &txn.extension),
             records,
         )))
-    }
-}
-
-/// Abort the transactions of `entries`.
-///
-/// A vote that waits for a lock uses its entry until the wait ends. So the
-/// transactions that no call uses go first: their abort releases their
-/// locks, and a vote that waits for one of them ends. Then the others go,
-/// as soon as their calls end.
-fn abort_all(entries: &[Arc<Entry>]) {
-    let mut busy: Vec<&Arc<Entry>> = entries.iter().collect();
-    loop {
-        busy.retain(|entry| match entry.try_take() {
-            Ok(txn) => {
-                drop(txn);
-                false
-            }
-            Err(()) => true,
-        });
-        if busy.is_empty() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -1922,20 +1668,6 @@ type TxnRow<'py> = (
     Bound<'py, PyBytes>,
     Vec<RecordRow<'py>>,
 );
-
-/// Log a failed write of the resolution log as a warning of the logger
-/// `zoe.storage`. Later failures are not logged.
-fn warn_log_failure(py: Python<'_>, error: &str) {
-    let message =
-        format!("a write of the resolution log failed; later failures are not logged: {error}");
-    let logged = py
-        .import("logging")
-        .and_then(|logging| logging.call_method1("getLogger", ("zoe.storage",)))
-        .and_then(|logger| logger.call_method1("warning", (message,)));
-    if let Err(error) = logged {
-        error.write_unraisable(py, None);
-    }
-}
 
 /// Return the `StorageError` for a staged pickle that the core cannot read
 /// back from the spill file. The error of the core is its cause, so its
@@ -2028,81 +1760,6 @@ fn text(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         Ok(string) => Ok(string.to_str()?.as_bytes().to_vec()),
         Err(_) => Ok(value.cast::<PyBytes>()?.as_bytes().to_vec()),
     }
-}
-
-/// Stage the blob in the file `path` in the transaction of `entry`.
-///
-/// A file in the blob temporary directory of `store`, or in one of its
-/// subdirectories, goes to `at`, which takes it by rename. A file of the
-/// store directory `store_dir` or of the blob directory outside that
-/// temporary directory, the database or a committed blob file for example,
-/// is refused with `Protocol`: the store owns it. Another file is copied
-/// into a new blob file of `store`, which goes to `copied`, and then it is
-/// removed. A refused call leaves the file in its place.
-fn take_blob(
-    store: &Store,
-    store_dir: &Path,
-    entry: &Entry,
-    path: &Path,
-    at: impl FnOnce(&mut SharedTxn, &Path) -> zoe_core::Result<()>,
-    copied: impl FnOnce(&mut SharedTxn, BlobFile) -> zoe_core::Result<()>,
-) -> Result<(), Failure> {
-    match blob_source(store, store_dir, path)? {
-        Source::Temporary(temporary) => entry.with(|txn| Ok(at(txn, &temporary)?)),
-        Source::Store => {
-            Err(ZoeError::Protocol("the blob file is a file of the store, not a new blob").into())
-        }
-        Source::Elsewhere => {
-            let mut file = store.new_blob_file()?;
-            io::copy(&mut File::open(path)?, &mut file)?;
-            entry.with(|txn| Ok(copied(txn, file)?))?;
-            fs::remove_file(path)?;
-            Ok(())
-        }
-    }
-}
-
-/// Where a blob file that a client gives is.
-enum Source {
-    /// In the blob temporary directory or in one of its subdirectories,
-    /// with the path that the core gives to the file.
-    Temporary(PathBuf),
-    /// In the store directory or in the blob directory, outside the blob
-    /// temporary directory.
-    Store,
-    /// Elsewhere.
-    Elsewhere,
-}
-
-/// Tell where the file `path` is. `store_dir` is the real path of the
-/// store directory.
-///
-/// The directories compare by their real paths, so a path through a
-/// symbolic link or a relative path is found too. The name of the file
-/// stays as it is: the core refuses a symbolic link.
-fn blob_source(store: &Store, store_dir: &Path, path: &Path) -> Result<Source, Failure> {
-    let temp = store.blob_temp_dir()?;
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-        return Ok(Source::Elsewhere);
-    };
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
-    let (Ok(dir), Ok(real_temp)) = (fs::canonicalize(dir), fs::canonicalize(&temp)) else {
-        return Ok(Source::Elsewhere);
-    };
-    if let Ok(rest) = dir.strip_prefix(&real_temp) {
-        return Ok(Source::Temporary(temp.join(rest).join(name)));
-    }
-    let in_blob_dir = real_temp
-        .parent()
-        .is_some_and(|blobs| dir.starts_with(blobs));
-    if in_blob_dir || dir.starts_with(store_dir) {
-        return Ok(Source::Store);
-    }
-    Ok(Source::Elsewhere)
 }
 
 /// Return the total size of the files in the directory `dir`, in bytes.

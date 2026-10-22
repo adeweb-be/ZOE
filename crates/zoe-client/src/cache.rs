@@ -32,7 +32,7 @@ mod mapping;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
 use zoe_core::{Oid, Tid};
@@ -348,7 +348,7 @@ impl Cache {
     }
 
     fn lock(&self) -> MutexGuard<'_, CacheCounts> {
-        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.writer)
     }
 
     /// Return the first word of the entry at the position `pos`.
@@ -844,11 +844,7 @@ impl Cache {
     /// lock of the file. A second close does nothing.
     pub fn close(&self) {
         let _counts = self.lock();
-        let file = self
-            .file
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let file = crate::lock(&self.file).take();
         if self.disabled.load(Ordering::Relaxed) && file.is_none() {
             return;
         }

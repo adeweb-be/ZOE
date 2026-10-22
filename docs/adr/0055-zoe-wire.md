@@ -75,7 +75,7 @@ Each side maps the errors of `zoe-wire` to its own error, with the text of today
 
 ### 5. Two clear names for an oid or a tid on the wire
 
-*Claude's choice, approved by the human.* `p64(n)` gives the bin of the 8 big-endian bytes of `n`, as `ZODB.utils.p64` does. `u64_of(value)` gives the number in 8 big-endian bytes, as `ZODB.utils.u64` does: it reads a bin or a str of 8 bytes, as the client reads them today, and gives `None` for another value. These are the names of the server and of `zoe-py` today. So the calls of the server (about 300) keep their name, and only the client renames (about 80 calls): its `bin8` becomes `p64`, and its `p64` becomes `u64_of`.
+*Claude's choice, approved by the human.* `p64(n)` gives the bin of the 8 big-endian bytes of `n`, as `ZODB.utils.p64` does. `u64_of(value)` gives the number in 8 big-endian bytes, as `ZODB.utils.u64` does: it reads a bin or a str of 8 bytes, as the client reads them today, and gives `None` for another value. These are the names of the server and of `zoe-py` today. So the calls of the server (about 300) keep their name, and only the client renames (about 43 calls outside the tests): its `bin8` becomes `p64`, and its `p64` becomes `u64_of`.
 
 The server keeps its own checks on top of `u64_of`, with the texts of its `TypeError`s: an oid or a tid must be a bin ("not bytes", "not 8 bytes"), and a serial can also be a str (`serial_of`). So neither side reads a value in a different way.
 
