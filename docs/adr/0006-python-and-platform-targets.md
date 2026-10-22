@@ -36,7 +36,7 @@ ZOE targets ZODB 6.0 or later and ZEO 6.0 or later, which means Plone 6.1 or lat
 
 ### A sync on macOS is fsync(2)
 
-On Apple systems, every sync of `OsVfs` calls `fsync(2)`: the sync of the database file, of the other files and of the directories. One function of `crates/zoe-core/src/vfs.rs` makes it, with one `unsafe` call to `libc::fsync` and its safety comment. On the other systems, a sync is `File::sync_all`, and the sync of the database file is `File::sync_data`.
+On Apple systems, every sync of `OsVfs` calls `fsync(2)`: the sync of the database file, of the other files and of the directories. One function of `crates/zoe-core/src/vfs/os.rs` makes it, with one `unsafe` call to `libc::fsync` and its safety comment. On the other systems, a sync is `File::sync_all`, and the sync of the database file is `File::sync_data`.
 
 ## Consequences
 
