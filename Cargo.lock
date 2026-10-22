@@ -2414,10 +2414,12 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "futures",
+ "redb",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "zoe-client",
  "zoe-core",
  "zoe-server",

@@ -48,7 +48,8 @@ fn noise(len: usize) -> Vec<u8> {
 #[test]
 fn raw_is_the_default() {
     assert_eq!(Options::default().compression, Compression::None);
-    let store = Store::open(fresh_dir("default")).unwrap();
+    let dir = fresh_dir("default");
+    let store = Store::open(&dir).unwrap();
     assert_eq!(store.compression(), Compression::None);
     let oid = store.new_oid().unwrap();
     let data = repetitive_pickle();
@@ -78,7 +79,8 @@ fn a_compressible_pickle_is_stored_with_zstd() {
 
 #[test]
 fn an_incompressible_pickle_is_stored_as_it_is() {
-    let store = open(&fresh_dir("noise"), Compression::Zstd { level: 3 });
+    let dir = fresh_dir("noise");
+    let store = open(&dir, Compression::Zstd { level: 3 });
     let oid = store.new_oid().unwrap();
     let data = noise(4096);
     let tid = commit(&store, oid, Tid::ZERO, &data);
@@ -90,7 +92,8 @@ fn an_incompressible_pickle_is_stored_as_it_is() {
 
 #[test]
 fn compression_off_writes_plain_records() {
-    let store = open(&fresh_dir("off"), Compression::None);
+    let dir = fresh_dir("off");
+    let store = open(&dir, Compression::None);
     let oid = store.new_oid().unwrap();
     let tid = commit(&store, oid, Tid::ZERO, &repetitive_pickle());
     assert_eq!(store.record_info(oid, tid).unwrap().codec, Codec::None);

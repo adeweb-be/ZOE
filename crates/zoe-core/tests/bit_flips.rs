@@ -17,9 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use redb::StorageBackend;
-use support::{Rng, compressible, fresh_dir};
+use support::{Rng, fresh_dir};
 use zoe_core::testing::{self, Key};
-use zoe_core::testing::{Meta, commit_as};
+use zoe_core::testing::{Meta, commit_as, compressible};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Codec, Compression, Oid, Options, Store, SystemClock, Tid, ZoeError};
 
@@ -190,7 +190,8 @@ fn assert_intact(store: &Store, records: &Records) {
 
 #[test]
 fn every_flipped_bit_in_a_record_frame_raises_corrupt_record() {
-    let store = open_zstd(fresh_dir("records"));
+    let dir = fresh_dir("records");
+    let store = open_zstd(&dir);
     let records = fill(&store);
     let mut rng = Rng::new(SEED);
 
@@ -224,7 +225,8 @@ fn every_flipped_bit_in_a_record_frame_raises_corrupt_record() {
 
 #[test]
 fn every_cut_or_grown_record_frame_raises_corrupt_record() {
-    let store = open_zstd(fresh_dir("cuts"));
+    let dir = fresh_dir("cuts");
+    let store = open_zstd(&dir);
     let records = fill(&store);
 
     for &(oid, tid) in records.records.keys() {
@@ -244,7 +246,8 @@ fn every_cut_or_grown_record_frame_raises_corrupt_record() {
 
 #[test]
 fn a_frame_under_another_key_raises_corrupt_record() {
-    let store = open_zstd(fresh_dir("moved"));
+    let dir = fresh_dir("moved");
+    let store = open_zstd(&dir);
     let records = fill(&store);
     let keys: Vec<(Oid, Tid)> = records.records.keys().copied().collect();
 
@@ -292,7 +295,8 @@ fn read_txn(store: &Store, tid: Tid, oid: Oid) -> Vec<(&'static str, Result<(), 
 
 #[test]
 fn every_flipped_bit_in_a_transaction_row_raises_corrupt_txn() {
-    let store = open_zstd(fresh_dir("txns"));
+    let dir = fresh_dir("txns");
+    let store = open_zstd(&dir);
     let records = fill(&store);
     let mut rng = Rng::new(SEED);
 
@@ -374,7 +378,8 @@ fn rewrite(path: &Path, bytes: &[u8]) {
 
 #[test]
 fn every_flipped_bit_in_a_blob_file_raises_corrupt_blob() {
-    let store = Store::open(fresh_dir("blob-files")).unwrap();
+    let dir = fresh_dir("blob-files");
+    let store = Store::open(&dir).unwrap();
     let (blobs, tid) = fill_blobs(&store);
     let mut rng = Rng::new(SEED);
 
@@ -421,7 +426,8 @@ fn every_flipped_bit_in_a_blob_file_raises_corrupt_blob() {
 
 #[test]
 fn every_flipped_bit_in_a_blob_record_raises_corrupt_blob() {
-    let store = Store::open(fresh_dir("blob-records")).unwrap();
+    let dir = fresh_dir("blob-records");
+    let store = Store::open(&dir).unwrap();
     let (blobs, tid) = fill_blobs(&store);
     let mut rng = Rng::new(SEED);
 

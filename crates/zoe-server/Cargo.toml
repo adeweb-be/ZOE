@@ -71,6 +71,8 @@ serde_json.workspace = true
 # This crate with the simulator. Cargo builds dev-dependencies only for
 # tests, examples and benchmarks.
 zoe-server = { workspace = true, features = ["sim"] }
+# The core with the test hooks that damage a store on purpose.
+zoe-core = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

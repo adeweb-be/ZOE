@@ -7,14 +7,15 @@
 //! the unit tests and the integration tests. `tests/support` holds the
 //! helpers that only the integration tests use.
 //!
-//! The feature `testing` builds this module. Only the dev-dependency of
-//! this crate on itself turns the feature on, so only test builds have
-//! the hook. A release build never has it.
+//! The feature `testing` builds this module and the test hooks of
+//! `Store`. Only dev-dependencies turn the feature on: the one of this
+//! crate on itself, and those of zoe-server and zoe-convert. So only test
+//! builds have the hook. A release build never has it.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -113,6 +114,18 @@ pub fn write_kv_expiry_key(store: &Store, key: &[u8], present: bool) -> Result<(
         .write_kv_stored(None, key, present.then_some(&[][..]))
 }
 
+/// A record that zstd shrinks, so that a store with compression keeps it
+/// with codec 1.
+pub fn compressible() -> Vec<u8> {
+    let mut data = b"\x80\x03capp.content\nDocument\nq\x00.\x80\x03}q\x01(".to_vec();
+    for i in 0..500u32 {
+        data.extend_from_slice(b"X\x0b\x00\x00\x00descriptionq\x02X\x05\x00\x00\x00title");
+        data.extend_from_slice(&i.to_le_bytes());
+    }
+    data.extend_from_slice(b"u.");
+    data
+}
+
 /// Return the number of zstd compressions of records that this thread
 /// made. The finish of a transaction runs on the thread that calls it
 /// when no other finish leads a batch, so a test reads what its finish
@@ -153,6 +166,15 @@ pub fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
     commit_all(store, &[(oid, serial, data)])
 }
 
+/// Commit `data` as `commit` does. Return the error of the first call that
+/// fails: `tpc_begin`, `store`, `vote` or `finish`.
+pub fn try_commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Result<Tid> {
+    let mut txn = store.tpc_begin(b"", b"", b"")?;
+    txn.store(oid, serial, data)?;
+    txn.vote()?;
+    txn.finish()
+}
+
 /// Return a new oid of `store` other than the root oid 0.
 pub fn new_oid(store: &Store) -> Oid {
     loop {
@@ -181,6 +203,57 @@ pub fn root(policy: Oid) -> Vec<u8> {
         b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
     ]
     .concat()
+}
+
+/// A new, empty directory for one test, in the temporary directory of the
+/// system. Its drop removes the directory and everything in it. When the
+/// test panics, the drop keeps the directory, so the files of a failed
+/// test stay to read.
+///
+/// A borrow of it is a path: `Store::open(&dir)`. The directory itself is
+/// no `AsRef<Path>`, so a call cannot take it by value and remove the
+/// directory at the end of the call.
+#[derive(Debug)]
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    /// Return the path of the directory.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for &TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+/// Return a new, empty directory `zoe-<name>-<process id>` in the temporary
+/// directory of the system. A directory of that name that a run before
+/// left goes first. The names of the directories of one process must
+/// differ.
+pub fn fresh_dir(name: &str) -> TempDir {
+    let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
 }
 
 /// Wait until `done` is true. Fail the test after 10 s.

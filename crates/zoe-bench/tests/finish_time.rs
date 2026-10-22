@@ -5,7 +5,7 @@
 //! release build on a real disk. Run it with:
 //!
 //! ```text
-//! cargo test -p zoe-core --release --test finish_time -- --ignored --nocapture
+//! cargo test -p zoe-bench --release --test finish_time -- --ignored --nocapture
 //! ```
 //!
 //! It runs four scenarios: `add` writes 100 new objects in each

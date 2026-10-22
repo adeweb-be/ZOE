@@ -6,7 +6,7 @@
 //! release build. Run it with:
 //!
 //! ```text
-//! cargo test -p zoe-core --release --test load_time -- --ignored --nocapture
+//! cargo test -p zoe-bench --release --test load_time -- --ignored --nocapture
 //! ```
 //!
 //! For each size and compression it prints the time of one load of the
@@ -26,7 +26,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use support::speedtest_record;
-use zoe_core::testing::commit_txn;
 use zoe_core::vfs::OsVfs;
 use zoe_core::{Compression, Oid, Options, Store, SystemClock, Tid, Txn};
 
@@ -41,6 +40,12 @@ fn writing<'s>(store: &'s Store, oids: &[(Oid, Tid)], version: u64, size: usize)
             .unwrap();
     }
     txn
+}
+
+/// Vote and finish `txn`. Return the tid of its commit.
+fn commit_txn(mut txn: Txn<&Store>) -> Tid {
+    txn.vote().unwrap();
+    txn.finish().unwrap()
 }
 
 /// Return the median, the 90th percentile and the mean of `samples`, in

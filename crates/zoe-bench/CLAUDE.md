@@ -11,6 +11,7 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 - `src/schedule.rs`: the seeded generator, the Zipf law and the schedule of a client.
 - `src/machine.rs`: the description of the machine and of the run.
 - `bench/schema/zoe-bench.schema.json`: the JSON schema of the reports of `load` and `saturate`. A unit test in `src/load.rs` checks that the schema requires each key of a report.
+- `tests/finish_time.rs` and `tests/load_time.rs`: two measurements of the core in the process, `finish` and `load_before`, on a store on the disk. They are ignored tests, and no recipe runs them: run them in release with `--ignored --nocapture`. They print text for a person, not a report of `zoe-bench`.
 
 ## Invariants
 

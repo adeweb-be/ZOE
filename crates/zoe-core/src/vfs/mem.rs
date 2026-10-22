@@ -1,0 +1,1315 @@
+//! The simulated filesystem of the crash tests. `MemVfs` keeps its files
+//! and directories in memory and records every write, length change, sync
+//! and directory change. `MemVfs::crash_images` replays that record and
+//! returns the states that a crash can leave on disk.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use super::{DirLock, Vfs, WriteFile, parent};
+
+/// The most pending operations for which `MemVfs::crash_images` makes an
+/// image of every subset. It makes at most 2^10 such images for one crash
+/// point.
+const MAX_SUBSET_PENDING: usize = 10;
+
+/// One recorded operation.
+#[derive(Clone, Debug)]
+enum Op {
+    Create {
+        file: String,
+    },
+    CreateDir {
+        dir: String,
+    },
+    Write {
+        file: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    SetLen {
+        file: String,
+        len: u64,
+    },
+    Sync {
+        file: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Link {
+        from: String,
+        to: String,
+    },
+    Remove {
+        file: String,
+    },
+    SyncDir {
+        dir: String,
+    },
+    Mark {
+        name: String,
+    },
+}
+
+/// The state of the process that uses a `MemVfs`.
+#[derive(Debug, Default)]
+enum Process {
+    #[default]
+    Alive,
+    /// The process dies at the next sync of this directory.
+    KillAtDirSync(String),
+    /// The process is dead. Every operation fails.
+    Dead,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    /// The files when the record starts.
+    initial: BTreeMap<String, Vec<u8>>,
+    /// The directories when the record starts.
+    initial_dirs: BTreeSet<String>,
+    /// The files as the program sees them.
+    files: BTreeMap<String, Vec<u8>>,
+    /// The directories as the program sees them, without the store
+    /// directory.
+    dirs: BTreeSet<String>,
+    /// Every operation since the record started, in order.
+    log: Vec<Op>,
+    process: Process,
+    /// The bytes that reads of the files returned.
+    bytes_read: u64,
+    /// The directories that a `lock_dir` holds.
+    locked: BTreeSet<String>,
+}
+
+impl State {
+    /// Return an error when the process is dead.
+    fn alive(&self) -> io::Result<()> {
+        match self.process {
+            Process::Dead => Err(io::Error::other("the process was killed")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record the sync of the directory `dir`, or kill the process when
+    /// it dies at this sync.
+    fn sync_dir(&mut self, dir: &str) -> io::Result<()> {
+        self.alive()?;
+        if matches!(&self.process, Process::KillAtDirSync(at) if at == dir) {
+            self.process = Process::Dead;
+            return Err(io::Error::other("the process was killed"));
+        }
+        self.log.push(Op::SyncDir {
+            dir: dir.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn has_dir(&self, dir: &str) -> bool {
+        dir.is_empty() || self.dirs.contains(dir)
+    }
+
+    /// Return an error unless the directory of `name` exists.
+    fn check_parent(&self, name: &str) -> io::Result<()> {
+        if self.has_dir(parent(name)) {
+            Ok(())
+        } else {
+            Err(not_found(parent(name)))
+        }
+    }
+}
+
+fn not_found(name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, name.to_owned())
+}
+
+/// An in-memory filesystem that records every operation.
+///
+/// Clones share the same files and the same record. The files and
+/// directories that exist when the record starts are durable.
+#[derive(Clone, Debug, Default)]
+pub struct MemVfs {
+    state: Arc<Mutex<State>>,
+}
+
+impl MemVfs {
+    /// Return an empty filesystem.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_tree(files: BTreeMap<String, Vec<u8>>, dirs: BTreeSet<String>) -> Self {
+        let state = State {
+            initial: files.clone(),
+            initial_dirs: dirs.clone(),
+            files,
+            dirs,
+            log: Vec::new(),
+            process: Process::Alive,
+            bytes_read: 0,
+            locked: BTreeSet::new(),
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // A panic in a test thread must not hide the files from the others.
+        crate::lock(&self.state)
+    }
+
+    /// Return the file `name`. Create it empty when it does not exist.
+    pub fn file(&self, name: &str) -> MemFile {
+        let mut state = self.lock();
+        if !state.files.contains_key(name) {
+            state.files.insert(name.to_owned(), Vec::new());
+            state.log.push(Op::Create {
+                file: name.to_owned(),
+            });
+        }
+        MemFile {
+            vfs: self.clone(),
+            name: name.to_owned(),
+        }
+    }
+
+    /// Return the names of the files, in order.
+    pub fn names(&self) -> Vec<String> {
+        self.lock().files.keys().cloned().collect()
+    }
+
+    /// Kill the process at the next sync of the directory `dir`, as
+    /// `kill -9` does. That sync and every later operation fail and are
+    /// not recorded. The files keep every earlier operation, synced or
+    /// not, as the page cache of the system does.
+    pub fn kill_at_dir_sync(&self, dir: &str) {
+        self.lock().process = Process::KillAtDirSync(dir.to_owned());
+    }
+
+    /// Start a new process on the files of a killed one. The record goes
+    /// on, so an operation that the killed process did not sync stays
+    /// pending in the crash images.
+    pub fn restart(&self) {
+        let mut state = self.lock();
+        state.process = Process::Alive;
+        // The system releases the locks of a killed process.
+        state.locked.clear();
+    }
+
+    /// Return a filesystem with the files and the directories of this one,
+    /// all durable, and an empty record. The crash images of the copy
+    /// cover only what comes after this call.
+    pub fn durable_copy(&self) -> MemVfs {
+        let state = self.lock();
+        MemVfs::with_tree(state.files.clone(), state.dirs.clone())
+    }
+
+    /// Return the number of bytes that reads of the files returned since
+    /// this filesystem was made. Clones share the count.
+    pub fn bytes_read(&self) -> u64 {
+        self.lock().bytes_read
+    }
+
+    /// Record a named point. `CrashImage::is_after` tells if a crash came
+    /// after it.
+    pub fn mark(&self, name: &str) {
+        self.lock().log.push(Op::Mark {
+            name: name.to_owned(),
+        });
+    }
+
+    /// Return the state that a crash now leaves on disk, as a filesystem
+    /// whose files and directories are all durable, with an empty record.
+    ///
+    /// Every synced operation lands, as in `crash_images`. `lands` gets the
+    /// number of pending operations and returns how many of them land, in
+    /// their recorded order: a crash that keeps the order of the writes. A
+    /// count above the number of pending operations lands them all. This
+    /// filesystem does not change: the caller drops it.
+    pub fn crash_now(&self, lands: impl FnOnce(usize) -> usize) -> MemVfs {
+        let state = self.lock();
+        let (synced, pending) = split_at_syncs(&state.log);
+        let n = lands(pending.len()).min(pending.len());
+        let mut which: Vec<usize> = synced
+            .into_iter()
+            .chain(pending[..n].iter().copied())
+            .collect();
+        which.sort_unstable();
+        let (files, dirs) = apply(
+            &state.initial,
+            &state.initial_dirs,
+            &state.log,
+            &which,
+            None,
+        );
+        drop(state);
+        MemVfs::with_tree(files, dirs)
+    }
+
+    /// Return the states that a crash can leave on disk.
+    ///
+    /// A crash point comes before the first operation and after each
+    /// operation. At a crash point, the synced operations are on disk. A
+    /// write or a length change is synced by a later sync of its file. A
+    /// creation, a removal or the creation of a directory is synced by a
+    /// later sync of the directory that holds it. A rename or a hard link is
+    /// synced by a later sync of the directory of its new name. The other operations
+    /// are pending. The images of a crash point are these:
+    ///
+    /// - With at most `MAX_SUBSET_PENDING` pending operations, one image
+    ///   for each subset of them, the empty subset and the full one
+    ///   included.
+    /// - With more pending operations, one image with none of them, one
+    ///   with all of them, one for each prefix of 1 to n - 1 of them, and
+    ///   one for each single one.
+    /// - For each pending write of 2 bytes or more, two images with all
+    ///   the pending operations, where only the first half of that write
+    ///   lands in one, and only the second half in the other.
+    ///
+    /// The operations of an image land in their recorded order. A write to
+    /// a file whose creation is not on disk is lost. A file or a directory
+    /// whose directory is not on disk is lost.
+    ///
+    /// An image holds only the list of the operations that land. It builds
+    /// its files when `CrashImage::vfs` is called, so a test that opens
+    /// one image at a time holds the files of one image at a time.
+    pub fn crash_images(&self) -> Vec<CrashImage> {
+        let recording = {
+            let state = self.lock();
+            Arc::new(Recording {
+                files: state.initial.clone(),
+                dirs: state.initial_dirs.clone(),
+                log: state.log.clone(),
+            })
+        };
+        let mut images = Vec::new();
+        for point in 0..=recording.log.len() {
+            let ops = &recording.log[..point];
+            let (synced, pending) = split_at_syncs(ops);
+            let mut push = |variant: Variant| {
+                let chosen = match &variant {
+                    Variant::Pending(chosen) => &chosen[..],
+                    Variant::Torn(..) => &pending[..],
+                };
+                let mut which: Vec<usize> = synced.iter().chain(chosen).copied().collect();
+                which.sort_unstable();
+                images.push(CrashImage {
+                    recording: Arc::clone(&recording),
+                    point,
+                    which,
+                    variant,
+                });
+            };
+
+            if pending.len() <= MAX_SUBSET_PENDING {
+                for subset in 0..1u32 << pending.len() {
+                    let chosen = (0..pending.len())
+                        .filter(|bit| subset & 1 << bit != 0)
+                        .map(|bit| pending[bit])
+                        .collect();
+                    push(Variant::Pending(chosen));
+                }
+            } else {
+                push(Variant::Pending(Vec::new()));
+                push(Variant::Pending(pending.clone()));
+                for n in 1..pending.len() {
+                    push(Variant::Pending(pending[..n].to_vec()));
+                }
+                for &i in &pending {
+                    push(Variant::Pending(vec![i]));
+                }
+            }
+            for &i in &pending {
+                if matches!(&ops[i], Op::Write { data, .. } if data.len() > 1) {
+                    push(Variant::Torn(i, Half::First));
+                    push(Variant::Torn(i, Half::Second));
+                }
+            }
+        }
+        images
+    }
+
+    /// Sync the store directory, for a test that kills no process.
+    #[cfg(test)]
+    fn sync_dir(&self) {
+        let _ = self.lock().sync_dir("");
+    }
+
+    /// Return the names of the entries in the directory `dir`, without the
+    /// directory part, in order: the files, and the directories too when
+    /// `entries` is true.
+    fn list(&self, dir: &str, entries: bool) -> io::Result<Vec<String>> {
+        let state = self.lock();
+        state.alive()?;
+        if !state.has_dir(dir) {
+            return Err(not_found(dir));
+        }
+        let dirs = state.dirs.iter().filter(|_| entries);
+        let mut names: Vec<String> = state
+            .files
+            .keys()
+            .chain(dirs)
+            .filter(|name| parent(name) == dir && !(entries && name.is_empty()))
+            .map(|name| name.rsplit('/').next().unwrap_or_default().to_owned())
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+}
+
+impl Vfs for MemVfs {
+    type File = MemFile;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        let state = self.lock();
+        state.alive()?;
+        Ok(state.files.contains_key(name) || state.has_dir(name))
+    }
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        self.lock().alive()?;
+        Ok(self.file(name))
+    }
+
+    /// Create the new, empty file `name`. Fail when `name` exists or its
+    /// directory does not.
+    fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        let mut state = self.lock();
+        state.alive()?;
+        if state.files.contains_key(name) || state.has_dir(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                name.to_owned(),
+            ));
+        }
+        state.check_parent(name)?;
+        state.files.insert(name.to_owned(), Vec::new());
+        state.log.push(Op::Create {
+            file: name.to_owned(),
+        });
+        Ok(MemFile {
+            vfs: self.clone(),
+            name: name.to_owned(),
+        })
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        state.check_parent(to)?;
+        let bytes = state.files.remove(from).ok_or_else(|| not_found(from))?;
+        state.files.insert(to.to_owned(), bytes);
+        state.log.push(Op::Rename {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// The simulation keeps the bytes of each name apart, so a link copies
+    /// the bytes of `from`. Only a file that nothing writes again gets a
+    /// link, so the two names give the same bytes, as on a real disk.
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        state.check_parent(to)?;
+        if state.files.contains_key(to) || state.has_dir(to) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, to.to_owned()));
+        }
+        let bytes = state
+            .files
+            .get(from)
+            .ok_or_else(|| not_found(from))?
+            .clone();
+        state.files.insert(to.to_owned(), bytes);
+        state.log.push(Op::Link {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        state.files.remove(name).ok_or_else(|| not_found(name))?;
+        state.log.push(Op::Remove {
+            file: name.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        self.lock().sync_dir("")
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        if !state.has_dir(dir) {
+            return Err(not_found(dir));
+        }
+        state.sync_dir(dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        if state.files.contains_key(name) || state.has_dir(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                name.to_owned(),
+            ));
+        }
+        state.check_parent(name)?;
+        state.dirs.insert(name.to_owned());
+        state.log.push(Op::CreateDir {
+            dir: name.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.list(dir, false)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.list(dir, true)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        let file = Vfs::create_new(self, name)?;
+        Ok(Box::new(MemWriteFile {
+            vfs: file.vfs,
+            name: file.name,
+            offset: 0,
+        }))
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        let state = self.lock();
+        state.alive()?;
+        if !state.files.contains_key(name) {
+            return Err(not_found(name));
+        }
+        Ok(Box::new(MemReadFile {
+            vfs: self.clone(),
+            name: name.to_owned(),
+            offset: 0,
+        }))
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        if !state.files.contains_key(name) {
+            return Err(not_found(name));
+        }
+        state.log.push(Op::Sync {
+            file: name.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// The simulation keeps no permissions, so this only checks that the
+    /// file exists.
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        let state = self.lock();
+        state.alive()?;
+        if state.files.contains_key(name) {
+            Ok(())
+        } else {
+            Err(not_found(name))
+        }
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        let mut state = self.lock();
+        state.alive()?;
+        if !state.has_dir(name) {
+            return Err(not_found(name));
+        }
+        if !state.locked.insert(name.to_owned()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, name.to_owned()));
+        }
+        Ok(DirLock::new(MemDirLock {
+            vfs: self.clone(),
+            name: name.to_owned(),
+        }))
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        PathBuf::from(name)
+    }
+}
+
+/// Split the indexes of the file and directory operations in `ops` into
+/// the synced ones and the pending ones.
+fn split_at_syncs(ops: &[Op]) -> (Vec<usize>, Vec<usize>) {
+    let mut last_sync: HashMap<&str, usize> = HashMap::new();
+    let mut last_dir_sync: HashMap<&str, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            Op::Sync { file } => {
+                last_sync.insert(file, i);
+            }
+            Op::SyncDir { dir } => {
+                last_dir_sync.insert(dir, i);
+            }
+            _ => {}
+        }
+    }
+    let mut synced = Vec::new();
+    let mut pending = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let dir_synced = |name: &str| last_dir_sync.get(parent(name)).is_some_and(|&s| i < s);
+        let is_synced = match op {
+            Op::Write { file, .. } | Op::SetLen { file, .. } => {
+                last_sync.get(file.as_str()).is_some_and(|&s| i < s)
+            }
+            Op::Create { file } | Op::Remove { file } => dir_synced(file),
+            Op::CreateDir { dir } => dir_synced(dir),
+            Op::Rename { to, .. } | Op::Link { to, .. } => dir_synced(to),
+            Op::Sync { .. } | Op::SyncDir { .. } | Op::Mark { .. } => continue,
+        };
+        if is_synced {
+            synced.push(i);
+        } else {
+            pending.push(i);
+        }
+    }
+    (synced, pending)
+}
+
+/// Apply the operations `which` of `ops` to a copy of `files` and `dirs`,
+/// in order. Of the write `torn`, only the given half of its bytes lands.
+fn apply(
+    files: &BTreeMap<String, Vec<u8>>,
+    dirs: &BTreeSet<String>,
+    ops: &[Op],
+    which: &[usize],
+    torn: Option<(usize, Half)>,
+) -> (BTreeMap<String, Vec<u8>>, BTreeSet<String>) {
+    let mut files = files.clone();
+    let mut dirs = dirs.clone();
+    for &i in which {
+        let has_dir = |dirs: &BTreeSet<String>, name: &str| {
+            let dir = parent(name);
+            dir.is_empty() || dirs.contains(dir)
+        };
+        match &ops[i] {
+            Op::Create { file } => {
+                if has_dir(&dirs, file) {
+                    files.entry(file.clone()).or_default();
+                }
+            }
+            Op::CreateDir { dir } => {
+                if has_dir(&dirs, dir) {
+                    dirs.insert(dir.clone());
+                }
+            }
+            Op::Write { file, offset, data } => {
+                let middle = data.len() / 2;
+                let (offset, data) = match torn {
+                    Some((t, Half::First)) if t == i => (*offset, &data[..middle]),
+                    Some((t, Half::Second)) if t == i => (*offset + middle as u64, &data[middle..]),
+                    _ => (*offset, &data[..]),
+                };
+                if let Some(bytes) = files.get_mut(file) {
+                    write_at(bytes, offset, data);
+                }
+            }
+            Op::SetLen { file, len } => {
+                if let Some(bytes) = files.get_mut(file) {
+                    bytes.resize(to_usize(*len), 0);
+                }
+            }
+            Op::Rename { from, to } => {
+                if has_dir(&dirs, to)
+                    && let Some(bytes) = files.remove(from)
+                {
+                    files.insert(to.clone(), bytes);
+                }
+            }
+            Op::Link { from, to } => {
+                if has_dir(&dirs, to)
+                    && let Some(bytes) = files.get(from).cloned()
+                {
+                    files.insert(to.clone(), bytes);
+                }
+            }
+            Op::Remove { file } => {
+                files.remove(file);
+            }
+            Op::Sync { .. } | Op::SyncDir { .. } | Op::Mark { .. } => {}
+        }
+    }
+    (files, dirs)
+}
+
+/// Write `data` at `offset`. Like a real file, a write past the end
+/// extends the file with zeros.
+fn write_at(bytes: &mut Vec<u8>, offset: u64, data: &[u8]) {
+    let start = to_usize(offset);
+    let end = start + data.len();
+    if bytes.len() < end {
+        bytes.resize(end, 0);
+    }
+    bytes[start..end].copy_from_slice(data);
+}
+
+fn to_usize(n: u64) -> usize {
+    usize::try_from(n).expect("the file fits in memory")
+}
+
+/// One file of a `MemVfs`. It is a redb storage backend.
+#[derive(Clone, Debug)]
+pub struct MemFile {
+    vfs: MemVfs,
+    name: String,
+}
+
+impl redb::StorageBackend for MemFile {
+    fn len(&self) -> io::Result<u64> {
+        let state = self.vfs.lock();
+        state.alive()?;
+        Ok(state.files.get(&self.name).map_or(0, |f| f.len() as u64))
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        let empty = Vec::new();
+        let bytes = state.files.get(&self.name).unwrap_or(&empty);
+        let start = to_usize(offset);
+        let end = start + out.len();
+        if end > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("read past the end of {}", self.name),
+            ));
+        }
+        out.copy_from_slice(&bytes[start..end]);
+        state.bytes_read += out.len() as u64;
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        state
+            .files
+            .entry(self.name.clone())
+            .or_default()
+            .resize(to_usize(len), 0);
+        state.log.push(Op::SetLen {
+            file: self.name.clone(),
+            len,
+        });
+        Ok(())
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        state.log.push(Op::Sync {
+            file: self.name.clone(),
+        });
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        write_at(
+            state.files.entry(self.name.clone()).or_default(),
+            offset,
+            data,
+        );
+        state.log.push(Op::Write {
+            file: self.name.clone(),
+            offset,
+            data: data.to_vec(),
+        });
+        Ok(())
+    }
+}
+
+/// A file of a `MemVfs` that the core writes from its start. Each write
+/// is one recorded operation.
+#[derive(Debug)]
+struct MemWriteFile {
+    vfs: MemVfs,
+    name: String,
+    offset: u64,
+}
+
+impl Write for MemWriteFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        let bytes = state
+            .files
+            .get_mut(&self.name)
+            .ok_or_else(|| not_found(&self.name))?;
+        write_at(bytes, self.offset, buf);
+        state.log.push(Op::Write {
+            file: self.name.clone(),
+            offset: self.offset,
+            data: buf.to_vec(),
+        });
+        self.offset += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl WriteFile for MemWriteFile {
+    fn sync(&mut self) -> io::Result<()> {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        state.log.push(Op::Sync {
+            file: self.name.clone(),
+        });
+        Ok(())
+    }
+}
+
+/// A lock on a directory of a `MemVfs`. Dropping it releases the lock.
+struct MemDirLock {
+    vfs: MemVfs,
+    name: String,
+}
+
+impl Drop for MemDirLock {
+    fn drop(&mut self) {
+        self.vfs.lock().locked.remove(&self.name);
+    }
+}
+
+/// A file of a `MemVfs` that the core reads from its start.
+#[derive(Debug)]
+struct MemReadFile {
+    vfs: MemVfs,
+    name: String,
+    offset: usize,
+}
+
+impl Read for MemReadFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let state = self.vfs.lock();
+        state.alive()?;
+        let bytes = state
+            .files
+            .get(&self.name)
+            .ok_or_else(|| not_found(&self.name))?;
+        let rest = bytes.get(self.offset..).unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        self.offset += n;
+        Ok(n)
+    }
+}
+
+/// The half of a torn write that lands.
+#[derive(Clone, Copy)]
+enum Half {
+    First,
+    Second,
+}
+
+/// Which pending operations of a crash point reached the disk.
+enum Variant {
+    /// These pending operations, each one whole.
+    Pending(Vec<usize>),
+    /// All the pending operations, but only one half of this write.
+    Torn(usize, Half),
+}
+
+impl fmt::Display for Variant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Variant::Pending(ops) if ops.is_empty() => write!(f, "synced operations only"),
+            Variant::Pending(ops) => write!(f, "pending operations {ops:?}"),
+            Variant::Torn(i, Half::First) => {
+                write!(f, "all pending operations, first half of operation {i}")
+            }
+            Variant::Torn(i, Half::Second) => {
+                write!(f, "all pending operations, second half of operation {i}")
+            }
+        }
+    }
+}
+
+/// The files and directories when a record starts, and the record. The
+/// crash images of one call share it.
+struct Recording {
+    files: BTreeMap<String, Vec<u8>>,
+    dirs: BTreeSet<String>,
+    log: Vec<Op>,
+}
+
+/// A state that a crash can leave on disk.
+pub struct CrashImage {
+    recording: Arc<Recording>,
+    /// The number of operations before the crash.
+    point: usize,
+    /// The indexes of the operations that land, in order.
+    which: Vec<usize>,
+    variant: Variant,
+}
+
+impl CrashImage {
+    /// Return a filesystem with the files and directories of this image
+    /// and an empty record.
+    pub fn vfs(&self) -> MemVfs {
+        let (files, dirs) = self.tree();
+        MemVfs::with_tree(files, dirs)
+    }
+
+    /// Tell if the crash came after the mark `name`.
+    pub fn is_after(&self, name: &str) -> bool {
+        self.recording.log[..self.point]
+            .iter()
+            .any(|op| matches!(op, Op::Mark { name: mark } if mark == name))
+    }
+
+    /// Build the files and the directories of this image.
+    fn tree(&self) -> (BTreeMap<String, Vec<u8>>, BTreeSet<String>) {
+        let torn = match self.variant {
+            Variant::Torn(i, half) => Some((i, half)),
+            Variant::Pending(_) => None,
+        };
+        let recording = &self.recording;
+        let ops = &recording.log[..self.point];
+        apply(&recording.files, &recording.dirs, ops, &self.which, torn)
+    }
+}
+
+impl fmt::Debug for CrashImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "crash image after operation {} ({})",
+            self.point, self.variant
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redb::{ReadableDatabase, StorageBackend, TableDefinition};
+
+    use super::*;
+
+    fn contents(image: &CrashImage, name: &str) -> Option<Vec<u8>> {
+        image.tree().0.get(name).cloned()
+    }
+
+    /// Return a filesystem with a durable, empty file `f`.
+    fn with_file() -> (MemVfs, MemFile) {
+        let vfs = MemVfs::new();
+        let file = vfs.file("f");
+        vfs.sync_dir();
+        (vfs, file)
+    }
+
+    #[test]
+    fn synced_writes_are_in_every_later_image() {
+        let (vfs, file) = with_file();
+        file.write(0, b"synced").unwrap();
+        file.sync_data().unwrap();
+        vfs.mark("synced");
+        file.write(6, b"+pending").unwrap();
+
+        let images = vfs.crash_images();
+        let after: Vec<_> = images.iter().filter(|i| i.is_after("synced")).collect();
+        assert!(
+            after
+                .iter()
+                .all(|i| contents(i, "f").unwrap().starts_with(b"synced"))
+        );
+        assert!(after.iter().any(|i| contents(i, "f").unwrap() == b"synced"));
+        assert!(
+            after
+                .iter()
+                .any(|i| contents(i, "f").unwrap() == b"synced+pending")
+        );
+    }
+
+    #[test]
+    fn a_crash_now_keeps_the_synced_writes_and_a_prefix_of_the_others() {
+        let (vfs, file) = with_file();
+        file.write(0, b"synced").unwrap();
+        file.sync_data().unwrap();
+        file.write(6, b"+a").unwrap();
+        file.write(8, b"+b").unwrap();
+        let read = |image: &MemVfs| {
+            let file = image.open("f").unwrap();
+            let mut bytes = vec![0; usize::try_from(file.len().unwrap()).unwrap()];
+            file.read(0, &mut bytes).unwrap();
+            bytes
+        };
+
+        let mut seen = 0;
+        let none = vfs.crash_now(|pending| {
+            seen = pending;
+            0
+        });
+        assert_eq!(seen, 2);
+        assert_eq!(read(&none), b"synced");
+        assert_eq!(read(&vfs.crash_now(|_| 1)), b"synced+a");
+        assert_eq!(read(&vfs.crash_now(|_| 99)), b"synced+a+b");
+        // The image is durable: a crash of the image keeps all of it.
+        let image = vfs.crash_now(|_| 1);
+        assert_eq!(read(&image.crash_now(|_| 0)), b"synced+a");
+        // The filesystem itself does not change.
+        assert_eq!(read(&vfs), b"synced+a+b");
+    }
+
+    #[test]
+    fn a_pending_write_can_land_without_an_earlier_one() {
+        let (vfs, file) = with_file();
+        file.write(0, b"a").unwrap();
+        file.write(1, b"b").unwrap();
+
+        let images = vfs.crash_images();
+        assert!(
+            images
+                .iter()
+                .any(|i| contents(i, "f").as_deref() == Some(&b"\0b"[..]))
+        );
+    }
+
+    #[test]
+    fn a_torn_write_keeps_its_first_half() {
+        let (vfs, file) = with_file();
+        file.write(0, b"abcd").unwrap();
+
+        let images = vfs.crash_images();
+        assert!(
+            images
+                .iter()
+                .any(|i| contents(i, "f").as_deref() == Some(&b"ab"[..]))
+        );
+    }
+
+    #[test]
+    fn each_pending_write_can_tear_in_either_half() {
+        let (vfs, file) = with_file();
+        file.write(0, b"ab").unwrap();
+        file.write(2, b"cd").unwrap();
+
+        let images = vfs.crash_images();
+        for torn in [&b"a\0cd"[..], b"\0bcd", b"abc", b"ab\0d"] {
+            assert!(
+                images
+                    .iter()
+                    .any(|i| contents(i, "f").as_deref() == Some(torn)),
+                "{torn:?}"
+            );
+        }
+    }
+
+    /// Return the contents of `f` in the images of the last crash point.
+    fn last_point(vfs: &MemVfs) -> Vec<Vec<u8>> {
+        let last = vfs.lock().log.len();
+        vfs.crash_images()
+            .iter()
+            .filter(|i| i.point == last)
+            .map(|i| contents(i, "f").unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_subset_of_few_pending_operations_is_an_image() {
+        let (vfs, file) = with_file();
+        for (offset, byte) in b"abc".iter().enumerate() {
+            file.write(offset as u64, &[*byte]).unwrap();
+        }
+
+        let mut found = last_point(&vfs);
+        found.sort();
+        let mut subsets: Vec<Vec<u8>> = [
+            &b""[..],
+            b"a",
+            b"\0b",
+            b"ab",
+            b"\0\0c",
+            b"a\0c",
+            b"\0bc",
+            b"abc",
+        ]
+        .map(<[u8]>::to_vec)
+        .into();
+        subsets.sort();
+        assert_eq!(found, subsets);
+    }
+
+    #[test]
+    fn many_pending_operations_give_prefixes_and_single_ones() {
+        let (vfs, file) = with_file();
+        let n = MAX_SUBSET_PENDING + 1;
+        for offset in 0..n {
+            file.write(offset as u64, b"x").unwrap();
+        }
+
+        // None, all, the n - 1 proper prefixes and the n single ones.
+        assert_eq!(last_point(&vfs).len(), 2 + (n - 1) + n);
+    }
+
+    #[test]
+    fn clones_share_the_count_of_bytes_read() {
+        let (vfs, file) = with_file();
+        file.write(0, b"abcdef").unwrap();
+        let mut out = [0; 4];
+        vfs.clone().file("f").read(1, &mut out).unwrap();
+        assert_eq!(&out, b"bcde");
+        assert_eq!(vfs.bytes_read(), 4);
+
+        // A read past the end fails and counts nothing.
+        assert!(file.read(4, &mut out).is_err());
+        assert_eq!(vfs.bytes_read(), 4);
+        // An image starts a fresh count.
+        assert_eq!(vfs.crash_images().pop().unwrap().vfs().bytes_read(), 0);
+    }
+
+    #[test]
+    fn a_file_without_a_directory_sync_can_vanish() {
+        let vfs = MemVfs::new();
+        let file = vfs.file("f");
+        file.write(0, b"x").unwrap();
+        file.sync_data().unwrap();
+
+        let images = vfs.crash_images();
+        assert!(images.iter().any(|i| contents(i, "f").is_none()));
+        assert!(
+            images
+                .iter()
+                .any(|i| contents(i, "f").as_deref() == Some(b"x"))
+        );
+    }
+
+    #[test]
+    fn a_rename_is_durable_after_a_directory_sync() {
+        let (vfs, file) = with_file();
+        file.write(0, b"x").unwrap();
+        file.sync_data().unwrap();
+        vfs.rename("f", "g").unwrap();
+        vfs.sync_dir();
+        vfs.mark("renamed");
+
+        let images = vfs.crash_images();
+        let before: Vec<_> = images.iter().filter(|i| !i.is_after("renamed")).collect();
+        assert!(before.iter().any(|i| contents(i, "f").is_some()));
+        assert!(before.iter().any(|i| contents(i, "g").is_some()));
+        for image in images.iter().filter(|i| i.is_after("renamed")) {
+            assert_eq!(contents(image, "f"), None);
+            assert_eq!(contents(image, "g").as_deref(), Some(&b"x"[..]));
+        }
+    }
+
+    /// Write `bytes` into the new file `name` and sync the file.
+    fn write_synced(vfs: &MemVfs, name: &str, bytes: &[u8]) {
+        let mut file = Vfs::create_file(vfs, name).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync().unwrap();
+    }
+
+    #[test]
+    fn a_file_whose_directory_is_not_durable_can_vanish() {
+        let vfs = MemVfs::new();
+        Vfs::create_dir(&vfs, "d").unwrap();
+        write_synced(&vfs, "d/f", b"x");
+        vfs.sync_dir_at("d").unwrap();
+
+        let images = vfs.crash_images();
+        let last = images.iter().filter(|i| i.point == vfs.lock().log.len());
+        let found: Vec<_> = last.map(|i| contents(i, "d/f")).collect();
+        assert!(found.contains(&None));
+        assert!(found.contains(&Some(b"x".to_vec())));
+    }
+
+    #[test]
+    fn a_rename_is_durable_after_a_sync_of_its_new_directory() {
+        let vfs = MemVfs::new();
+        for dir in ["a", "b"] {
+            Vfs::create_dir(&vfs, dir).unwrap();
+        }
+        vfs.sync_dir();
+        write_synced(&vfs, "a/f", b"x");
+        vfs.sync_dir_at("a").unwrap();
+        Vfs::rename(&vfs, "a/f", "b/f").unwrap();
+        vfs.sync_dir_at("b").unwrap();
+        vfs.mark("renamed");
+
+        for image in vfs.crash_images().iter().filter(|i| i.is_after("renamed")) {
+            assert_eq!(contents(image, "a/f"), None);
+            assert_eq!(contents(image, "b/f").as_deref(), Some(&b"x"[..]));
+        }
+    }
+
+    #[test]
+    fn a_sync_of_another_directory_leaves_a_rename_pending() {
+        let vfs = MemVfs::new();
+        for dir in ["a", "b"] {
+            Vfs::create_dir(&vfs, dir).unwrap();
+        }
+        vfs.sync_dir();
+        write_synced(&vfs, "a/f", b"x");
+        vfs.sync_dir_at("a").unwrap();
+        Vfs::rename(&vfs, "a/f", "b/f").unwrap();
+        vfs.sync_dir_at("a").unwrap();
+        vfs.mark("synced");
+
+        let images = vfs.crash_images();
+        let after: Vec<_> = images.iter().filter(|i| i.is_after("synced")).collect();
+        assert!(after.iter().any(|i| contents(i, "a/f").is_some()));
+        assert!(after.iter().any(|i| contents(i, "b/f").is_some()));
+    }
+
+    #[test]
+    fn a_directory_lists_only_its_own_files() {
+        let vfs = MemVfs::new();
+        Vfs::create_dir(&vfs, "d").unwrap();
+        Vfs::create_dir(&vfs, "d/e").unwrap();
+        write_synced(&vfs, "d/f", b"");
+        write_synced(&vfs, "d/e/g", b"");
+        write_synced(&vfs, "h", b"");
+        assert_eq!(Vfs::list_files(&vfs, "d").unwrap(), ["f"]);
+        assert_eq!(Vfs::list_files(&vfs, "").unwrap(), ["h"]);
+        assert_eq!(vfs.names(), ["d/e/g", "d/f", "h"]);
+        assert!(Vfs::list_files(&vfs, "x").is_err());
+        assert!(Vfs::create_file(&vfs, "x/f").is_err());
+        assert!(Vfs::create_file(&vfs, "h").is_err());
+        assert!(Vfs::create_dir(&vfs, "d").is_err());
+    }
+
+    #[test]
+    fn a_written_file_reads_back() {
+        let vfs = MemVfs::new();
+        write_synced(&vfs, "f", b"abc");
+        let mut bytes = Vec::new();
+        Vfs::read_file(&vfs, "f")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(Vfs::path(&vfs, "d/f"), PathBuf::from("d/f"));
+    }
+
+    #[test]
+    fn a_file_sync_makes_the_earlier_writes_durable() {
+        let vfs = MemVfs::new();
+        let mut file = Vfs::create_file(&vfs, "f").unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+        vfs.sync_dir();
+        Vfs::sync_file(&vfs, "f").unwrap();
+        vfs.mark("synced");
+        assert!(Vfs::sync_file(&vfs, "g").is_err());
+
+        for image in vfs.crash_images().iter().filter(|i| i.is_after("synced")) {
+            assert_eq!(contents(image, "f").as_deref(), Some(&b"x"[..]));
+        }
+    }
+
+    #[test]
+    fn marks_split_the_images() {
+        let (vfs, file) = with_file();
+        file.write(0, b"x").unwrap();
+        vfs.mark("done");
+        file.write(1, b"y").unwrap();
+
+        let images = vfs.crash_images();
+        let first_after = images.iter().position(|i| i.is_after("done")).unwrap();
+        assert!(images[..first_after].iter().all(|i| !i.is_after("done")));
+        assert!(images[first_after..].iter().all(|i| i.is_after("done")));
+    }
+
+    #[test]
+    fn an_image_starts_a_fresh_record() {
+        let (vfs, file) = with_file();
+        file.write(0, b"x").unwrap();
+        file.sync_data().unwrap();
+
+        let image = vfs.crash_images().pop().unwrap();
+        let reopened = image.vfs();
+        assert_eq!(reopened.file("f").len().unwrap(), 1);
+        assert_eq!(reopened.crash_images().len(), 1);
+    }
+
+    /// redb with immediate durability survives every crash image: the
+    /// database opens, and a commit that returned is never lost.
+    #[test]
+    fn redb_survives_every_crash_image() {
+        const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("simulation");
+
+        // Create the database first and record only the commit. A crash
+        // during the creation is a different case: see the next test.
+        let created = MemVfs::new();
+        drop(
+            redb::Builder::new()
+                .create_with_backend(created.file("db"))
+                .unwrap(),
+        );
+        let vfs = MemVfs::with_tree(created.lock().files.clone(), BTreeSet::new());
+        {
+            let db = redb::Builder::new()
+                .create_with_backend(vfs.file("db"))
+                .unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(TABLE)
+                .unwrap()
+                .insert(1, &b"value"[..])
+                .unwrap();
+            txn.commit().unwrap();
+            vfs.mark("committed");
+        }
+
+        let images = vfs.crash_images();
+        assert!(images.len() > 10);
+        for image in &images {
+            let db = redb::Builder::new()
+                .create_with_backend(image.vfs().file("db"))
+                .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            let txn = db.begin_read().unwrap();
+            let found = match txn.open_table(TABLE) {
+                Ok(table) => table.get(1).unwrap().map(|v| v.value().to_vec()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => panic!("{image:?}: {e}"),
+            };
+            match found {
+                Some(value) => assert_eq!(value, b"value", "{image:?}"),
+                None => assert!(!image.is_after("committed"), "{image:?} lost a commit"),
+            }
+        }
+    }
+
+    /// A crash while redb creates a database can leave a file that redb
+    /// refuses to open. So the store must create its database atomically.
+    #[test]
+    fn a_crash_during_creation_can_leave_an_unreadable_file() {
+        let vfs = MemVfs::new();
+        drop(
+            redb::Builder::new()
+                .create_with_backend(vfs.file("db"))
+                .unwrap(),
+        );
+
+        let refused = vfs.crash_images().iter().any(|image| {
+            redb::Builder::new()
+                .create_with_backend(image.vfs().file("db"))
+                .is_err()
+        });
+        assert!(refused);
+    }
+}

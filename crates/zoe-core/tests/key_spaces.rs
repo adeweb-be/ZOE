@@ -19,8 +19,8 @@ mod support;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-use support::{compressible, fresh_dir};
-use zoe_core::testing::{self, Key};
+use support::fresh_dir;
+use zoe_core::testing::{self, Key, compressible};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Codec, Compression, Oid, Options, Store, Tid, ZoeError};
 
