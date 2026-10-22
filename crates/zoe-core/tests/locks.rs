@@ -2,22 +2,17 @@
 //! written oids, shared locks for read-current oids, a wait queue per oid
 //! in arrival order, and a lock-wait timeout that becomes a conflict.
 
-use std::path::PathBuf;
+mod support;
+
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use support::fresh_dir;
 use zoe_core::{Oid, Options, Store, Tid, ZoeError};
 
 const PICKLE: &[u8] =
     b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datag\x01s.";
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-locks-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn open(name: &str, lock_timeout: Duration) -> Store {
     let options = Options {

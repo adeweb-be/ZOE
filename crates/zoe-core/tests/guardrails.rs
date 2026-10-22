@@ -4,19 +4,16 @@
 //! transaction open past `transaction-warn` are logged through `tracing`
 //! with the oid and the duration. No log line holds pickle bytes.
 
-use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+mod support;
 
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
+
+use support::fresh_dir;
 use tracing::Level;
-use tracing::field::{Field, Visit};
-use tracing::span::{Attributes, Id, Record};
-use tracing::{Event, Metadata, Subscriber};
-use zoe_core::vfs::MemVfs;
-use zoe_core::{Clock, Oid, Options, SizeLimit, Store, Tid, ZoeError};
+use zoe_core::testing::{Captured, capture_events, commit, events, open_with_clock};
+use zoe_core::{Oid, Options, SizeLimit, Store, Tid, ZoeError};
 
 /// A text in every pickle of this test. No log line and no error may hold
 /// it.
@@ -45,20 +42,6 @@ fn pickle(len: usize) -> Vec<u8> {
 
 fn content(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + 3) as u8).collect()
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-guardrails-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(oid, serial, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
 }
 
 fn blob_files(dir: &Path) -> usize {
@@ -251,128 +234,6 @@ fn blob_bytes_do_not_count_toward_the_transaction_size() {
     txn.vote().unwrap();
     let tid = txn.finish().unwrap();
     store.verify_blob(blob, tid).unwrap();
-}
-
-/// A clock that moves only when the test moves it.
-#[derive(Clone)]
-struct ManualClock(Arc<Mutex<SystemTime>>);
-
-impl ManualClock {
-    fn new() -> Self {
-        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        Self(Arc::new(Mutex::new(start)))
-    }
-
-    fn advance(&self, by: Duration) {
-        *self.0.lock().unwrap() += by;
-    }
-}
-
-impl Clock for ManualClock {
-    fn now(&self) -> SystemTime {
-        *self.0.lock().unwrap()
-    }
-}
-
-/// Open a store in memory with a clock that the test moves.
-fn open_with_clock(options: Options) -> (Store, ManualClock) {
-    let clock = ManualClock::new();
-    let store = Store::open_full(MemVfs::new(), clock.clone(), options).unwrap();
-    (store, clock)
-}
-
-/// One event that the subscriber captured.
-#[derive(Clone, Debug)]
-struct Captured {
-    level: Level,
-    /// Each field of the event and its value as text. The message is the
-    /// field `message`.
-    fields: BTreeMap<String, String>,
-}
-
-impl Captured {
-    fn message(&self) -> &str {
-        self.fields.get("message").map_or("", String::as_str)
-    }
-
-    fn number(&self, field: &str) -> Option<u64> {
-        self.fields.get(field)?.parse().ok()
-    }
-}
-
-/// Every event of this test binary, from every thread.
-static EVENTS: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
-
-/// A `tracing` subscriber that keeps every event in `EVENTS`.
-struct Capture {
-    next_span: AtomicU64,
-}
-
-#[derive(Default)]
-struct Fields(BTreeMap<String, String>);
-
-impl Visit for Fields {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().to_owned(), format!("{value:?}"));
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().to_owned(), value.to_owned());
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.0.insert(field.name().to_owned(), value.to_string());
-    }
-
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.0.insert(field.name().to_owned(), value.to_string());
-    }
-}
-
-impl Subscriber for Capture {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, _: &Attributes<'_>) -> Id {
-        Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed))
-    }
-
-    fn record(&self, _: &Id, _: &Record<'_>) {}
-
-    fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-    fn event(&self, event: &Event<'_>) {
-        let mut fields = Fields::default();
-        event.record(&mut fields);
-        let captured = Captured {
-            level: *event.metadata().level(),
-            fields: fields.0,
-        };
-        EVENTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(captured);
-    }
-
-    fn enter(&self, _: &Id) {}
-
-    fn exit(&self, _: &Id) {}
-}
-
-/// Install the capturing subscriber for the whole process, once.
-fn capture_events() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let capture = Capture {
-            next_span: AtomicU64::new(1),
-        };
-        tracing::subscriber::set_global_default(capture).unwrap();
-    });
-}
-
-fn events() -> Vec<Captured> {
-    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The `lock-warn` events of `oid`. The tests use oids that no other test

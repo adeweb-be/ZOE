@@ -3,8 +3,9 @@
 //! the writes that change no record, and the opens that refuse a store.
 
 use zoe_core::testing;
+use zoe_core::testing::commit_txn;
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Options, Store, SystemClock, Tid, ZoeError};
+use zoe_core::{Oid, Options, Store, SystemClock, Tid, Txn, ZoeError};
 
 /// A `PersistentMapping` record with no reference.
 const PICKLE: &[u8] = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
@@ -31,14 +32,13 @@ fn serial(store: &Store, oid: Oid) -> Tid {
         .unwrap_or(Tid::ZERO)
 }
 
-/// Commit a store of `PICKLE` for each oid of `oids`.
-fn commit(store: &Store, oids: &[Oid]) -> Tid {
+/// Begin a transaction that stores `PICKLE` for each oid of `oids`.
+fn writing<'s>(store: &'s Store, oids: &[Oid]) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     for &oid in oids {
         txn.store(oid, serial(store, oid), PICKLE).unwrap();
     }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
+    txn
 }
 
 /// Commit the root and `n` objects that nothing refers to.
@@ -46,7 +46,7 @@ fn root_and_orphans(store: &Store, n: usize) -> Vec<Oid> {
     let oids: Vec<Oid> = (0..n).map(|_| store.new_oid().unwrap()).collect();
     let mut all = vec![ROOT];
     all.extend(&oids);
-    commit(store, &all);
+    commit_txn(writing(store, &all));
     oids
 }
 

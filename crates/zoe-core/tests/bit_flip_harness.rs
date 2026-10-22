@@ -37,6 +37,8 @@
 //! and `ZOE_FLIPS` sets the number of flips of each run, for a longer
 //! search.
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -47,6 +49,7 @@ use std::thread;
 use std::time::Duration;
 
 use redb::StorageBackend;
+use support::Rng;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 use zoe_core::testing::{self, Key};
 use zoe_core::vfs::MemVfs;
@@ -79,23 +82,6 @@ const TAG: &str = "zoe-flip";
 const FIRST_TID: u64 = 0x03f0_0000_0000_0000;
 
 const BLOB_PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
-
-/// A seeded xorshift generator.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        // A xorshift generator stays at 0 forever.
-        Self(seed.max(1))
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % n as u64) as usize
-    }
-}
 
 /// Return the seed of the flips: `ZOE_FLIP_SEED`, in hex with `0x` or in
 /// decimal, or `SEED`.
@@ -363,7 +349,7 @@ fn pickle(oid: Oid, tid: Tid, len: usize) -> Vec<u8> {
 }
 
 /// A pickle that zstd shrinks, so that the store keeps it compressed.
-fn compressible(oid: Oid, tid: Tid) -> Vec<u8> {
+fn compressible_record(oid: Oid, tid: Tid) -> Vec<u8> {
     let mut data = pickle(oid, tid, 8);
     for i in 0..60u32 {
         data.extend_from_slice(b"X\x0b\x00\x00\x00descriptionq\x02X\x05\x00\x00\x00title");
@@ -425,7 +411,7 @@ fn build(vfs: &MemVfs) -> Model {
                     Some(BLOB_PICKLE.to_vec())
                 }
                 2..=4 => {
-                    let data = compressible(oid, tid);
+                    let data = compressible_record(oid, tid);
                     txn.restore(oid, Some(&data)).unwrap();
                     Some(data)
                 }
@@ -447,7 +433,7 @@ fn build(vfs: &MemVfs) -> Model {
     let (&(oid, tid), _) = model
         .records
         .iter()
-        .find(|&(&(oid, tid), data)| data.as_ref() == Some(&compressible(oid, tid)))
+        .find(|&(&(oid, tid), data)| data.as_ref() == Some(&compressible_record(oid, tid)))
         .expect("no compressed record");
     assert_eq!(store.record_info(oid, tid).unwrap().codec, Codec::Zstd);
     model
@@ -1302,7 +1288,7 @@ fn read_current(
 fn a_damaged_zstd_payload_under_a_valid_checksum_raises_corrupt_record_or_decodes() {
     let store = open_vfs(MemVfs::new()).unwrap();
     let (oid, tid) = (Oid(1), Tid(FIRST_TID));
-    let data = compressible(oid, tid);
+    let data = compressible_record(oid, tid);
     let mut txn = store.tpc_begin_restore(tid, b"", b"zstd", b"").unwrap();
     txn.restore(oid, Some(&data)).unwrap();
     txn.vote().unwrap();

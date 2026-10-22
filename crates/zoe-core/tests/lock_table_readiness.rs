@@ -11,19 +11,15 @@
 //! checks that meaning at each state of a transaction, then the
 //! documentation.
 
-use std::path::{Path, PathBuf};
+mod support;
 
+use std::path::Path;
+
+use support::fresh_dir;
 use zoe_core::{Oid, Store, Tid};
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-lock-table-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// A `PersistentMapping` whose state holds `value` under the key `v`.
-fn record(value: &[u8]) -> Vec<u8> {
+fn mapping_record(value: &[u8]) -> Vec<u8> {
     assert!(value.len() < 256);
     let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
     pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
@@ -42,7 +38,7 @@ fn the_lock_table_is_empty_unless_a_transaction_holds_a_lock() {
 
     // A vote takes the locks, and finish releases them.
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(Oid(1), Tid(0), &record(b"a")).unwrap();
+    txn.store(Oid(1), Tid(0), &mapping_record(b"a")).unwrap();
     assert!(store.lock_table_is_empty(), "a store takes no lock");
     txn.vote().unwrap();
     assert!(!store.lock_table_is_empty());
@@ -51,7 +47,7 @@ fn the_lock_table_is_empty_unless_a_transaction_holds_a_lock() {
 
     // An abort after the vote releases them.
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(Oid(1), tid, &record(b"b")).unwrap();
+    txn.store(Oid(1), tid, &mapping_record(b"b")).unwrap();
     txn.vote().unwrap();
     assert!(!store.lock_table_is_empty());
     txn.abort();
@@ -59,7 +55,7 @@ fn the_lock_table_is_empty_unless_a_transaction_holds_a_lock() {
 
     // A drop after the vote releases them.
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(Oid(1), tid, &record(b"c")).unwrap();
+    txn.store(Oid(1), tid, &mapping_record(b"c")).unwrap();
     txn.vote().unwrap();
     drop(txn);
     assert!(store.lock_table_is_empty());

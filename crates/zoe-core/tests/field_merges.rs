@@ -6,6 +6,7 @@
 //! comparison with a Python reference of each strategy is the acceptance
 //! test `test_field_merges.py`.
 
+use zoe_core::testing::{commit, new_oid, root};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{
     Mode, Oid, Options, Reason, Resolution, Resolved, Store, SystemClock, Tid, ZoeError,
@@ -66,7 +67,7 @@ fn value(heap: &mut Heap, v: &V) -> Value {
 }
 
 /// Returns the record of an object of `class` whose state holds `fields`.
-fn record(class: (&str, &str), fields: &[(&str, V)]) -> Vec<u8> {
+fn fields_record(class: (&str, &str), fields: &[(&str, V)]) -> Vec<u8> {
     let mut heap = Heap::new();
     let class = heap.new_class(class.0, class.1);
     let items = fields
@@ -83,19 +84,7 @@ fn record(class: (&str, &str), fields: &[(&str, V)]) -> Vec<u8> {
 const DOCUMENT: (&str, &str) = ("m", "Document");
 
 fn doc(fields: &[(&str, V)]) -> Vec<u8> {
-    record(DOCUMENT, fields)
-}
-
-/// The root of ZODB, a `PersistentMapping` that names the policy at
-/// `policy`, as ZODB writes it.
-fn root(policy: Oid) -> Vec<u8> {
-    [
-        &b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00\
-           dataq\x02}q\x03X\x10\x00\x00\x00zoe.merge_policyq\x04C\x08"[..],
-        &policy.0.to_be_bytes(),
-        b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
-    ]
-    .concat()
+    fields_record(DOCUMENT, fields)
 }
 
 /// An entry of the policy: its keys and values, as text.
@@ -155,22 +144,6 @@ fn policy(version: i128, classes: &[(&str, Entry)]) -> Vec<u8> {
 
 fn open() -> Store {
     Store::open_full(MemVfs::new(), SystemClock, Options::default()).unwrap()
-}
-
-fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(oid, serial, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
-fn new_oid(store: &Store) -> Oid {
-    loop {
-        let oid = store.new_oid().unwrap();
-        if oid != Oid(0) {
-            return oid;
-        }
-    }
 }
 
 /// Opens a store whose policy has an entry of `m.Document`. Returns the
@@ -301,7 +274,7 @@ fn coupled_fields_stay_strict() {
 #[test]
 fn a_class_without_an_entry_never_merges() {
     let (store, _, _) = with_policy(ON);
-    let other = |fields: &[(&str, V)]| record(("m", "Other"), fields);
+    let other = |fields: &[(&str, V)]| fields_record(("m", "Other"), fields);
     let (oid, read) = conflict(
         &store,
         &other(&base()),
@@ -553,7 +526,7 @@ fn a_new_version_of_the_policy_applies_at_the_next_conflict() {
 fn records_of_different_classes_give_no_answer() {
     let (store, _, _) = with_policy(ON);
     // The committed transaction changed the class of the object.
-    let other = record(("m", "Other"), &changed(&[("title", V::Str("B"))]));
+    let other = fields_record(("m", "Other"), &changed(&[("title", V::Str("B"))]));
     let (oid, read) = conflict(&store, &doc(&base()), &other);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(oid, read, &doc(&changed(&[("description", V::Str("two"))])))
@@ -729,7 +702,7 @@ fn a_policy_that_does_not_read_counts_as_no_policy() {
         &store,
         oid,
         Tid::ZERO,
-        &record(("m", "Junk"), &[("version", V::Int(1))]),
+        &fields_record(("m", "Junk"), &[("version", V::Int(1))]),
     );
     commit(&store, Oid(0), Tid::ZERO, &root(oid));
     let (doc_oid, read) = conflict(

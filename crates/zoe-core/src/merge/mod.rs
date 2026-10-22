@@ -49,13 +49,16 @@ pub(crate) mod order;
 pub mod policy;
 mod posting;
 pub(crate) mod split;
+mod step;
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use zoe_pickle::Limits;
 use zoe_pickle::btrees::classify;
+use zoe_pickle::python::{Heap, Pickler, Value};
 
+use crate::error;
 use crate::types::{Oid, Tid};
 
 /// What tier 1 does for a class.
@@ -77,6 +80,15 @@ impl Mode {
             Mode::Off => "off",
             Mode::Shadow => "shadow",
             Mode::On => "on",
+        }
+    }
+
+    /// Returns the lower of two modes: `Off`, then `Shadow`, then `On`.
+    pub(crate) fn lower(self, other: Mode) -> Mode {
+        match (self, other) {
+            (Mode::Off, _) | (_, Mode::Off) => Mode::Off,
+            (Mode::Shadow, _) | (_, Mode::Shadow) => Mode::Shadow,
+            _ => Mode::On,
         }
     }
 }
@@ -286,6 +298,32 @@ pub(crate) fn budget(len: usize) -> usize {
     len.saturating_mul(STEPS_PER_BYTE).saturating_add(4096)
 }
 
+/// Returns the pickle of a record of `class` and `state` in `heap`, or why
+/// the pickler cannot write it.
+fn pickle(heap: &Heap, class: Value, state: Value) -> Result<Vec<u8>, &'static str> {
+    let mut pickler = Pickler::new(heap);
+    match pickler.dump(class).and_then(|()| pickler.dump(state)) {
+        Ok(()) => Ok(pickler.into_bytes()),
+        Err(unsupported) => Err(unsupported.0),
+    }
+}
+
+/// The records that a merge of a vote reads: the records that the
+/// transaction stored, and the records of its store.
+pub(crate) trait Records {
+    /// Returns the serial that the transaction read and the pickle that it
+    /// stored for `oid`, or `None` when it stored none, restored it or
+    /// deleted it.
+    fn staged(&self, oid: Oid) -> error::Result<Option<(Tid, Vec<u8>)>>;
+
+    /// Returns the serial and the pickle of the current record of `oid`, or
+    /// `None` when it has none or is deleted.
+    fn current(&self, oid: Oid) -> error::Result<Option<(Tid, Vec<u8>)>>;
+
+    /// Returns the pickle of the record of `oid` at `serial`.
+    fn at(&self, oid: Oid, serial: Tid) -> error::Result<Option<Vec<u8>>>;
+}
+
 /// Returns the class of `record` as `module.name` when tier 1 merges that
 /// class. Reads the class pickle alone.
 pub fn tier1_class(record: &[u8]) -> Option<String> {
@@ -349,8 +387,7 @@ pub fn tier2(
 /// Returns the class of `record` as `module.name`, from its class pickle
 /// alone.
 pub fn class_name(record: &[u8]) -> Option<String> {
-    let (module, name) = zoe_pickle::decode_class_name(record).ok()??;
-    Some(format!("{module}.{name}"))
+    zoe_pickle::decode_class_key(record).ok()?
 }
 
 /// The decoded records of one conflict, in the order of ZODB's resolver:
@@ -500,7 +537,7 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
         "storage",
         context.storage.map_or_else(|| "null".to_owned(), json),
     );
-    field("oid", json(&format!("0x{:016x}", resolution.oid.0)));
+    field("oid", json(&resolution.oid.hex()));
     field("class", json(&resolution.class));
     field("tier", resolution.tier.to_string());
     field("mode", json(resolution.mode.as_str()));
@@ -532,11 +569,8 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     field("changed", resolution.changed.to_string());
     let fields: Vec<String> = resolution.fields.iter().map(|name| json(name)).collect();
     field("fields", format!("[{}]", fields.join(",")));
-    field(
-        "committed",
-        json(&format!("0x{:016x}", resolution.committed.0)),
-    );
-    field("read", json(&format!("0x{:016x}", resolution.read.0)));
+    field("committed", json(&resolution.committed.hex()));
+    field("read", json(&resolution.read.hex()));
     let text = |bytes: Option<&[u8]>| {
         bytes.map_or_else(|| "null".to_owned(), |b| json(&String::from_utf8_lossy(b)))
     };
@@ -565,13 +599,13 @@ pub fn verification_line(verification: &Verification, context: &LogContext<'_>) 
         time.as_secs(),
         time.subsec_micros(),
         context.storage.map_or_else(|| "null".to_owned(), json),
-        json(&format!("0x{:016x}", verification.oid.0)),
+        json(&verification.oid.hex()),
         json(&verification.class),
         verification.tier,
         version(verification.policy),
         verification.same,
-        json(&format!("0x{:016x}", verification.committed.0)),
-        json(&format!("0x{:016x}", verification.read.0)),
+        json(&verification.committed.hex()),
+        json(&verification.read.hex()),
         text(Some(context.user)),
         text(Some(context.description)),
         text(context.committed_user),
@@ -604,6 +638,72 @@ fn json(text: &str) -> String {
 }
 
 impl Resolution {
+    /// Returns an entry of tier 1 for `oid` of the class `class`, not
+    /// applied yet: the outcome `outcome` in `mode`, with the version
+    /// `policy` of the merge policy, over the serial `committed` of the
+    /// committed record and the serial `read` that the transaction read.
+    pub(crate) fn new(
+        oid: Oid,
+        class: impl Into<String>,
+        mode: Mode,
+        policy: Option<u64>,
+        outcome: Resolved,
+        committed: Tid,
+        read: Tid,
+    ) -> Self {
+        Resolution {
+            oid,
+            tier: 1,
+            class: class.into(),
+            mode,
+            policy,
+            outcome,
+            applied: false,
+            undo: false,
+            keys: Vec::new(),
+            changed: 0,
+            committed,
+            read,
+            shadow: None,
+            fields: Vec::new(),
+            split: None,
+            order: None,
+        }
+    }
+
+    /// Returns the entry, applied.
+    pub(crate) fn applied(mut self) -> Self {
+        self.applied = true;
+        self
+    }
+
+    /// Returns the entry with the keys `keys` that the new side changed,
+    /// of `changed` keys in all.
+    pub(crate) fn with_keys(mut self, keys: Vec<String>, changed: usize) -> Self {
+        self.keys = keys;
+        self.changed = changed;
+        self
+    }
+
+    /// Returns the entry with the outcome `shadow` of mode `shadow`.
+    pub(crate) fn with_shadow(mut self, shadow: Option<Resolved>) -> Self {
+        self.shadow = shadow;
+        self
+    }
+
+    /// Returns the entry of the rule `rule` of the split merge.
+    pub(crate) fn with_split(mut self, rule: u8) -> Self {
+        self.split = Some(rule);
+        self
+    }
+
+    /// Returns the entry of the part `part` of the order merge: `list` or
+    /// `pos`.
+    pub(crate) fn with_order(mut self, part: &'static str) -> Self {
+        self.order = Some(part);
+        self
+    }
+
     /// Returns the entry of a merge in `mode` of `oid`, not applied yet.
     pub(crate) fn of(
         oid: Oid,

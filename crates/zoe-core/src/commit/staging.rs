@@ -132,7 +132,7 @@ impl StagingArea {
     }
 
     fn lock_ready(&self) -> std::sync::MutexGuard<'_, bool> {
-        self.ready.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.ready)
     }
 
     /// Create a new, empty spill file. Create `staging/` first when it
