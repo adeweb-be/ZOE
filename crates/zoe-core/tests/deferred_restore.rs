@@ -9,14 +9,10 @@
 //! their blob files: the intent file of each deferred commit stays in
 //! `blobs/tmp/` until a durable commit covers it.
 
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{Read, Write};
 
-use redb::StorageBackend;
-
-use zoe_core::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
+use zoe_core::testing::CountingVfs;
+use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, SystemClock, Tid, ZoeError};
 
 /// A `PersistentMapping` record.
@@ -29,9 +25,6 @@ const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
 /// The tid of the durable restore that each test starts with.
 const BASE: Tid = Tid(10);
-
-/// The database file of a store.
-const DATABASE: &str = "zoe.redb";
 
 /// The bytes of the blob of `oid`.
 fn blob_bytes(oid: Oid) -> Vec<u8> {
@@ -248,135 +241,14 @@ fn every_crash_image_of_deferred_restores_holds_a_prefix_without_orphans() {
     }
 }
 
-/// A `MemVfs` that counts the syncs of the database file.
-struct Counting {
-    vfs: MemVfs,
-    syncs: Arc<AtomicU64>,
-}
-
-/// A file of `Counting`.
-#[derive(Debug)]
-struct CountedFile {
-    file: MemFile,
-    /// The counter of the database file, `None` for another file.
-    syncs: Option<Arc<AtomicU64>>,
-}
-
-impl Counting {
-    fn counted(&self, name: &str, file: MemFile) -> CountedFile {
-        let syncs = (name == DATABASE).then(|| self.syncs.clone());
-        CountedFile { file, syncs }
-    }
-}
-
-impl StorageBackend for CountedFile {
-    fn len(&self) -> io::Result<u64> {
-        self.file.len()
-    }
-
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.file.read(offset, out)
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        self.file.set_len(len)
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        if let Some(syncs) = &self.syncs {
-            syncs.fetch_add(1, Ordering::SeqCst);
-        }
-        self.file.sync_data()
-    }
-
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.file.write(offset, data)
-    }
-}
-
-impl Vfs for Counting {
-    type File = CountedFile;
-
-    fn exists(&self, name: &str) -> io::Result<bool> {
-        self.vfs.exists(name)
-    }
-
-    fn open(&self, name: &str) -> io::Result<CountedFile> {
-        Ok(self.counted(name, self.vfs.open(name)?))
-    }
-
-    fn create_new(&self, name: &str) -> io::Result<CountedFile> {
-        Ok(self.counted(name, self.vfs.create_new(name)?))
-    }
-
-    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.vfs.rename(from, to)
-    }
-
-    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
-        self.vfs.hard_link(from, to)
-    }
-
-    fn remove(&self, name: &str) -> io::Result<()> {
-        self.vfs.remove(name)
-    }
-
-    fn sync_dir(&self) -> io::Result<()> {
-        self.vfs.sync_dir()
-    }
-
-    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
-        self.vfs.sync_dir_at(dir)
-    }
-
-    fn create_dir(&self, name: &str) -> io::Result<()> {
-        self.vfs.create_dir(name)
-    }
-
-    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
-        self.vfs.list_files(dir)
-    }
-
-    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
-        self.vfs.list_entries(dir)
-    }
-
-    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
-        self.vfs.create_file(name)
-    }
-
-    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
-        self.vfs.read_file(name)
-    }
-
-    fn sync_file(&self, name: &str) -> io::Result<()> {
-        self.vfs.sync_file(name)
-    }
-
-    fn set_read_only(&self, name: &str) -> io::Result<()> {
-        self.vfs.set_read_only(name)
-    }
-
-    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
-        self.vfs.lock_dir(name)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.vfs.path(name)
-    }
-}
-
 #[test]
 fn deferred_restores_take_one_sync_of_the_database_file() {
-    let syncs = Arc::new(AtomicU64::new(0));
-    let vfs = Counting {
-        vfs: MemVfs::new(),
-        syncs: syncs.clone(),
-    };
+    let vfs = CountingVfs::default();
+    let counter = vfs.clone();
     let store = Store::open_in(vfs, SystemClock).unwrap();
 
     // The counter works: each durable restore syncs the database file.
-    let before = syncs.load(Ordering::SeqCst);
+    let before = counter.syncs();
     for n in 1..=20 {
         let mut txn = store
             .tpc_begin_restore(Tid(n), b"", b"durable", b"")
@@ -385,14 +257,14 @@ fn deferred_restores_take_one_sync_of_the_database_file() {
         txn.vote().unwrap();
         txn.finish().unwrap();
     }
-    assert!(syncs.load(Ordering::SeqCst) - before >= 20);
+    assert!(counter.syncs() - before >= 20);
 
-    let before = syncs.load(Ordering::SeqCst);
+    let before = counter.syncs();
     for n in 21..=220 {
         restore_deferred(&store, Tid(n), Oid(n));
     }
     store.sync().unwrap();
-    let taken = syncs.load(Ordering::SeqCst) - before;
+    let taken = counter.syncs() - before;
     assert!(
         taken <= 2,
         "200 deferred restores and one sync took {taken} syncs of the database file"

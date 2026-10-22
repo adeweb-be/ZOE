@@ -50,3 +50,11 @@ pub use sequence::Sequence;
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};
 pub use undo::{UndoConflict, Undone, undo_id, undo_tid};
+
+/// Lock `mutex`. A thread that panicked while it held the mutex does not
+/// stop the others: they take the data as that thread left it.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

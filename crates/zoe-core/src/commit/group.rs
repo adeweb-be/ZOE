@@ -117,7 +117,7 @@ impl GroupCommit {
     fn lock(&self) -> MutexGuard<'_, Queue> {
         // The queue stays valid after a panic: `Lead` ends the lead when
         // it unwinds.
-        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.queue)
     }
 
     /// Commit `member` in a batch of `store`. Return the member and its
@@ -466,161 +466,21 @@ fn copy(error: &ZoeError) -> ZoeError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::io::{self, Read};
-    use std::path::PathBuf;
+    use std::io;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use zoe_pickle::btrees::new_bucket_state;
-    use zoe_pickle::python::{Heap, Pickler, Value};
+    use zoe_pickle::python::{Heap, Value};
 
     use super::*;
     use crate::commit::Txn;
     use crate::lock::LockCancel;
     use crate::merge::{Resolution, Resolved};
-    use crate::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
-
-    /// The database file of a store.
-    const DATABASE: &str = "zoe.redb";
-
-    /// A `MemVfs` that counts the syncs and the writes of the database
-    /// file.
-    #[derive(Clone, Default)]
-    struct Counting {
-        vfs: MemVfs,
-        syncs: Arc<AtomicU64>,
-        writes: Arc<AtomicU64>,
-    }
-
-    /// A file of `Counting`.
-    #[derive(Debug)]
-    struct CountedFile {
-        file: MemFile,
-        /// The counters of the database file, `None` for another file.
-        counters: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
-    }
-
-    impl Counting {
-        fn counted(&self, name: &str, file: MemFile) -> CountedFile {
-            let counters = (name == DATABASE).then(|| (self.syncs.clone(), self.writes.clone()));
-            CountedFile { file, counters }
-        }
-
-        fn syncs(&self) -> u64 {
-            self.syncs.load(Ordering::SeqCst)
-        }
-    }
-
-    impl redb::StorageBackend for CountedFile {
-        fn len(&self) -> io::Result<u64> {
-            self.file.len()
-        }
-
-        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-            self.file.read(offset, out)
-        }
-
-        fn set_len(&self, len: u64) -> io::Result<()> {
-            self.file.set_len(len)
-        }
-
-        fn sync_data(&self) -> io::Result<()> {
-            if let Some((syncs, _)) = &self.counters {
-                syncs.fetch_add(1, Ordering::SeqCst);
-            }
-            self.file.sync_data()
-        }
-
-        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-            if let Some((_, writes)) = &self.counters {
-                writes.fetch_add(1, Ordering::SeqCst);
-            }
-            self.file.write(offset, data)
-        }
-    }
-
-    impl Vfs for Counting {
-        type File = CountedFile;
-
-        fn exists(&self, name: &str) -> io::Result<bool> {
-            self.vfs.exists(name)
-        }
-
-        fn open(&self, name: &str) -> io::Result<CountedFile> {
-            Ok(self.counted(name, self.vfs.open(name)?))
-        }
-
-        fn create_new(&self, name: &str) -> io::Result<CountedFile> {
-            Ok(self.counted(name, self.vfs.create_new(name)?))
-        }
-
-        fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-            self.vfs.rename(from, to)
-        }
-
-        fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
-            self.vfs.hard_link(from, to)
-        }
-
-        fn remove(&self, name: &str) -> io::Result<()> {
-            self.vfs.remove(name)
-        }
-
-        fn sync_dir(&self) -> io::Result<()> {
-            self.vfs.sync_dir()
-        }
-
-        fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
-            self.vfs.sync_dir_at(dir)
-        }
-
-        fn create_dir(&self, name: &str) -> io::Result<()> {
-            self.vfs.create_dir(name)
-        }
-
-        fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
-            self.vfs.list_files(dir)
-        }
-
-        fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
-            self.vfs.list_entries(dir)
-        }
-
-        fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
-            self.vfs.create_file(name)
-        }
-
-        fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
-            self.vfs.read_file(name)
-        }
-
-        fn sync_file(&self, name: &str) -> io::Result<()> {
-            self.vfs.sync_file(name)
-        }
-
-        fn set_read_only(&self, name: &str) -> io::Result<()> {
-            self.vfs.set_read_only(name)
-        }
-
-        fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
-            self.vfs.lock_dir(name)
-        }
-
-        fn path(&self, name: &str) -> PathBuf {
-            self.vfs.path(name)
-        }
-    }
-
-    /// Wait until `done` is true. Fail the test after 10 s.
-    fn wait_until(done: impl Fn() -> bool) {
-        let start = Instant::now();
-        while !done() {
-            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
+    use crate::testing::{CountingVfs, record, wait_until};
+    use crate::vfs::MemVfs;
 
     /// Begin a transaction that writes `data` for the new oid `oid`, and
     /// vote.
@@ -661,7 +521,7 @@ mod tests {
     #[test]
     fn concurrent_finishes_share_one_sync() {
         const FINISHES: u64 = 16;
-        let vfs = Counting::default();
+        let vfs = CountingVfs::default();
         let store = Store::open_in(vfs.clone(), crate::clock::SystemClock).unwrap();
         let txns = (0..FINISHES)
             .map(|_| voted(&store, store.new_oid().unwrap(), b"pickle"))
@@ -750,7 +610,7 @@ mod tests {
 
     #[test]
     fn a_batch_of_deferred_restores_does_not_sync() {
-        let vfs = Counting::default();
+        let vfs = CountingVfs::default();
         let store = Store::open_in(vfs.clone(), crate::clock::SystemClock).unwrap();
         let batches = Arc::new(Batches::default());
         assert!(store.set_observer(batches.clone()));
@@ -891,13 +751,6 @@ mod tests {
         let flat = vec![Value::Int(key), heap.new_dict(dict)];
         let state = new_bucket_state(&mut heap, flat, None);
         record(&heap, class, state)
-    }
-
-    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-        let mut pickler = Pickler::new(heap);
-        pickler.dump(class).unwrap();
-        pickler.dump(state).unwrap();
-        pickler.into_bytes()
     }
 
     /// Commit `data` as a new object. Return its oid and its serial.

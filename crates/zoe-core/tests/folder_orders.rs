@@ -12,19 +12,22 @@
 //! commit, the test reads the store: the order holds each id once, and the
 //! positions are `{id: index}` of the order.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
+use support::CountingClock;
+use zoe_core::testing::{commit_txn, new_oid, record, root, wait_until};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{
-    Clock, Mode, Observer, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, Waiter,
-    ZoeError,
+    Clock, Mode, Observer, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, ZoeError,
 };
 use zoe_pickle::btrees::{TreeState, bucket_state, new_bucket_state, tree_state};
-use zoe_pickle::python::{Heap, Object, Pickler, Value};
+use zoe_pickle::python::{Heap, Object, Value};
 
 // The records.
 
@@ -34,13 +37,6 @@ fn reference(heap: &mut Heap, oid: Oid, module: &str, name: &str) -> Value {
     let class = heap.new_class(module, name);
     let data = heap.new_tuple(vec![bytes, class]);
     heap.new_reference(data).unwrap()
-}
-
-fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-    let mut pickler = Pickler::new(heap);
-    pickler.dump(class).unwrap();
-    pickler.dump(state).unwrap();
-    pickler.into_bytes()
 }
 
 /// The record of a folder whose annotations are `annotations`.
@@ -137,18 +133,6 @@ fn pos_node(children: &[(Option<&str>, Oid)], child: &str, first: Oid) -> Vec<u8
     record(&heap, class, state)
 }
 
-/// The root of ZODB, a `PersistentMapping` that names the policy at
-/// `policy`, as ZODB writes it.
-fn root(policy: Oid) -> Vec<u8> {
-    [
-        &b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00\
-           dataq\x02}q\x03X\x10\x00\x00\x00zoe.merge_policyq\x04C\x08"[..],
-        &policy.0.to_be_bytes(),
-        b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
-    ]
-    .concat()
-}
-
 /// The settings of a policy of the tests.
 #[derive(Clone, Copy)]
 struct Settings<'a> {
@@ -237,15 +221,6 @@ fn open_on(clock: impl Clock + 'static, settings: Settings<'_>) -> Store {
     txn.vote().unwrap();
     txn.finish().unwrap();
     store
-}
-
-fn new_oid(store: &Store) -> Oid {
-    loop {
-        let oid = store.new_oid().unwrap();
-        if oid != Oid(0) {
-            return oid;
-        }
-    }
 }
 
 // The site and its snapshots.
@@ -597,13 +572,6 @@ fn begin<'s>(store: &'s Store, writes: &[Write], server_writes: bool) -> Txn<&'s
     txn
 }
 
-/// Commits `writes` with `server_writes`.
-fn commit(store: &Store, writes: &[Write]) -> Tid {
-    let mut txn = begin(store, writes, true);
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
 /// Votes and commits `writes`; returns the oids that the vote resolved.
 fn merge(store: &Store, writes: &[Write]) -> Vec<Oid> {
     let mut txn = begin(store, writes, true);
@@ -655,9 +623,9 @@ fn appends_on_both_sides_merge_in_an_inline_positions_tree() {
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
     // The other side commits two creations after the snapshot.
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let between = snap(&store, site);
-    commit(&store, &create(site, &between, &[id(4)]));
+    commit_txn(begin(&store, &create(site, &between, &[id(4)]), true));
     let resolved = merge(&store, &create(site, &old, &[id(5)]));
     assert!(resolved.contains(&site.order), "{resolved:?}");
     assert!(resolved.contains(&site.pos), "{resolved:?}");
@@ -669,7 +637,7 @@ fn two_ids_of_the_transaction_follow_the_committed_ids() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     merge(&store, &create(site, &old, &[id(4), id(5)]));
     assert_eq!(assert_agrees(&store, site), ids(0..6));
 }
@@ -679,7 +647,7 @@ fn appends_into_one_bucket_merge_with_tier_1_and_renumber() {
     let store = open(ON);
     let site = site(&store, &ids(0..10), Some(4));
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(10)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(10)]), true));
     let resolved = merge(&store, &create(site, &old, &[id(11)]));
     let Pos::Node(buckets) = snap(&store, site).pos else {
         panic!("a node")
@@ -697,7 +665,7 @@ fn an_id_in_a_bucket_that_the_other_side_did_not_write_is_staged_again() {
         panic!("a node")
     };
     let first = buckets[0].oid;
-    commit(&store, &create(site, &old, &[id(10)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(10)]), true));
     // An id that sorts into the first bucket, which the other side did
     // not write: that record of the transaction is not stale.
     let mut txn = begin(&store, &create(site, &old, &["a-first".to_owned()]), true);
@@ -732,7 +700,11 @@ fn a_split_of_one_bucket_by_both_sides_puts_the_ids_in_the_bucket_of_the_other_s
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
     let theirs = [new_oid(&store)];
-    commit(&store, &create_split(site, &old, &[id(6)], &theirs, 2));
+    commit_txn(begin(
+        &store,
+        &create_split(site, &old, &[id(6)], &theirs, 2),
+        true,
+    ));
     let ours = [new_oid(&store)];
     let resolved = merge(&store, &create_split(site, &old, &[id(7)], &ours, 2));
     assert!(resolved.contains(&theirs[0]), "{resolved:?}");
@@ -744,10 +716,11 @@ fn a_split_of_one_bucket_by_both_sides_without_server_writes_conflicts() {
     let store = open(ON);
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
-    commit(
+    commit_txn(begin(
         &store,
         &create_split(site, &old, &[id(6)], &[new_oid(&store)], 2),
-    );
+        true,
+    ));
     let writes = create_split(site, &old, &[id(7)], &[new_oid(&store)], 2);
     let Pos::Node(buckets) = &old.pos else {
         panic!("a node")
@@ -765,7 +738,11 @@ fn a_split_of_the_inline_bucket_by_both_sides_merges() {
     let site = site(&store, &ids(0..4), None);
     let old = snap(&store, site);
     let theirs = [new_oid(&store), new_oid(&store)];
-    commit(&store, &create_split(site, &old, &[id(4)], &theirs, 2));
+    commit_txn(begin(
+        &store,
+        &create_split(site, &old, &[id(4)], &theirs, 2),
+        true,
+    ));
     let ours = [new_oid(&store), new_oid(&store)];
     merge(&store, &create_split(site, &old, &[id(5)], &ours, 2));
     assert_eq!(assert_agrees(&store, site), ids(0..6));
@@ -777,7 +754,7 @@ fn a_split_by_the_transaction_alone_renumbers_its_new_bucket() {
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
     // The other side inserts into the last bucket without a split.
-    commit(&store, &create(site, &old, &[id(6)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(6)]), true));
     let ours = [new_oid(&store)];
     let resolved = merge(&store, &create_split(site, &old, &[id(7)], &ours, 2));
     assert!(resolved.contains(&ours[0]), "{resolved:?}");
@@ -789,7 +766,7 @@ fn a_rename_on_create_in_an_inline_tree_merges() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     // The rename rebuilds the positions: in an inline tree, the root holds
     // the old items and the new id.
     merge(&store, &create(site, &old, &["renamed".to_owned()]));
@@ -824,7 +801,7 @@ fn a_rename_on_create_in_buckets_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(6)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(6)]), true));
     let writes = rename_on_create(&store, site, &old, "renamed");
     let entries = conflict(&store, &writes, site.order);
     let entry = list_entry(&entries, site).expect("a line of the order");
@@ -837,7 +814,7 @@ fn a_node_that_drops_a_child_that_the_transaction_did_not_store_gives_no_answer(
     let store = open(ON);
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(6)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(6)]), true));
     let Pos::Node(buckets) = &old.pos else {
         panic!("a node")
     };
@@ -864,7 +841,7 @@ fn a_change_of_another_position_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(6)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(6)]), true));
     let Pos::Node(buckets) = &old.pos else {
         panic!("a node")
     };
@@ -892,7 +869,7 @@ fn both_sides_adding_one_id_refuse() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut txn = begin(&store, &create(site, &old, &[id(3)]), true);
     let voted = txn.vote();
     assert!(voted.is_err());
@@ -917,14 +894,15 @@ fn a_delete_on_the_committed_side_gives_no_answer() {
     let old = snap(&store, site);
     // The other side deletes the first id: notifyRemoved rebuilds pos.
     let order = ids(1..3);
-    commit(
+    commit_txn(begin(
         &store,
         &[
             Write::Store(site.folder, old.folder, folder(site.annotations, 7)),
             Write::Store(site.order, old.order_serial, list(&order)),
             Write::Store(site.pos, old.pos_serial, pos_inline(&positions(&order))),
         ],
-    );
+        true,
+    ));
     let entries = conflict(&store, &create(site, &old, &[id(3)]), site.order);
     let entry = list_entry(&entries, site).expect("a line of the order");
     assert_eq!(
@@ -938,7 +916,7 @@ fn a_move_by_the_transaction_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut order = old.order.clone();
     order.swap(0, 1);
     order.push(id(4));
@@ -956,7 +934,7 @@ fn an_item_that_is_not_a_str_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut writes = create(site, &old, &[id(4)]);
     let mut heap = Heap::with_instances();
     let mut values: Vec<Value> = old.order.iter().map(|id| heap.new_str(id)).collect();
@@ -992,7 +970,7 @@ fn an_order_of_another_class_on_the_committed_side_gives_no_answer() {
             *data = other.clone();
         }
     }
-    commit(&store, &theirs);
+    commit_txn(begin(&store, &theirs, true));
     let entries = conflict(&store, &create(site, &old, &[id(4)]), site.order);
     assert_eq!(
         list_entry(&entries, site).unwrap().outcome,
@@ -1005,7 +983,7 @@ fn an_order_that_no_stored_record_names_gives_no_line() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut writes = create(site, &old, &[id(4)]);
     writes.retain(|write| !matches!(write, Write::Store(oid, _, _) if *oid == site.folder));
     let entries = conflict(&store, &writes, site.order);
@@ -1017,7 +995,7 @@ fn annotations_of_the_transaction_that_name_another_order_give_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let (_, annotations_serial) = store.load(site.annotations).unwrap();
     let mut writes = create(site, &old, &[id(4)]);
     let other = new_oid(&store);
@@ -1038,7 +1016,7 @@ fn a_transaction_that_appended_nothing_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let writes = vec![
         Write::Store(site.folder, old.folder, folder(site.annotations, 9)),
         Write::Store(site.order, old.order_serial, list(&old.order)),
@@ -1058,7 +1036,7 @@ fn with_tier_1_of_the_buckets_off_the_merge_does_not_run() {
     });
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let entries = conflict(&store, &create(site, &old, &[id(4)]), site.order);
     assert!(list_entry(&entries, site).is_none(), "{entries:?}");
 }
@@ -1074,7 +1052,7 @@ fn without_the_switch_the_order_conflicts() {
         });
         let site = site(&store, &ids(0..3), None);
         let old = snap(&store, site);
-        commit(&store, &create(site, &old, &[id(3)]));
+        commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
         let entries = conflict(&store, &create(site, &old, &[id(4)]), site.order);
         assert!(list_entry(&entries, site).is_none(), "{entries:?}");
     }
@@ -1088,7 +1066,7 @@ fn in_shadow_mode_the_vote_conflicts_and_the_line_tells_the_outcome() {
     });
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let entries = conflict(&store, &create(site, &old, &[id(4)]), site.order);
     let entry = list_entry(&entries, site).unwrap();
     assert_eq!(entry.mode, Mode::Shadow);
@@ -1146,7 +1124,7 @@ fn tier_2_never_merges_an_order() {
         let store = open(settings);
         let site = site(&store, &ids(0..3), None);
         let old = snap(&store, site);
-        commit(&store, &create(site, &old, &[id(3)]));
+        commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
         // Tier 2 would append to the order without the positions.
         let mut txn = begin(
             &store,
@@ -1197,7 +1175,7 @@ fn two_votes_at_once_on_one_folder_both_commit() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let first = create(site, &old, &[id(4)]);
     let second = create(site, &old, &[id(5)]);
     std::thread::scope(|scope| {
@@ -1216,7 +1194,7 @@ fn an_undo_of_a_merged_creation_gives_back_the_order_and_the_positions_before_it
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut txn = begin(&store, &create(site, &old, &[id(4)]), true);
     txn.vote().unwrap();
     let merged = txn.finish().unwrap();
@@ -1283,7 +1261,7 @@ fn a_positions_tree_of_three_levels_merges() {
     let old = snap(&store, site);
     let (_, n1) = store.load(n[1]).unwrap();
     let theirs = with_node(create(site, &old, &[id(8)]), n[1], n1);
-    commit(&store, &theirs);
+    commit_txn(begin(&store, &theirs, true));
     let ours = with_node(create(site, &old, &[id(9)]), n[1], n1);
     merge(&store, &ours);
     assert_eq!(assert_agrees(&store, site), ids(0..10));
@@ -1301,7 +1279,7 @@ fn a_resolving_vote_merges_the_order() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut txn = begin(&store, &create(site, &old, &[id(4)]), true);
     // The merge leaves no conflict to the caller, so the resolving vote is
     // the vote.
@@ -1358,7 +1336,7 @@ fn the_merged_records_name_no_other_change() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let committed = snap(&store, site);
     merge(&store, &create(site, &old, &[id(4)]));
     let after = snap(&store, site);
@@ -1403,7 +1381,7 @@ fn a_sort_on_either_side_gives_no_answer() {
         } else {
             (create(site, &old, &[id(3)]), rewrite(site, &old, &sorted))
         };
-        commit(&store, &theirs);
+        commit_txn(begin(&store, &theirs, true));
         let entries = conflict(&store, &ours, site.order);
         let entry = list_entry(&entries, site).expect("a line of the order");
         assert_eq!(
@@ -1418,7 +1396,7 @@ fn a_rename_of_an_existing_item_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut renamed = old.order.clone();
     renamed[1] = "renamed".to_owned();
     let entries = conflict(&store, &rewrite(site, &old, &renamed), site.order);
@@ -1433,7 +1411,7 @@ fn a_delete_by_the_transaction_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let entries = conflict(&store, &rewrite(site, &old, &ids(1..3)), site.order);
     assert_eq!(
         list_entry(&entries, site).unwrap().outcome,
@@ -1462,7 +1440,7 @@ fn an_order_of_another_class_as_the_old_record_gives_no_answer() {
     txn.vote().unwrap();
     txn.finish().unwrap();
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let entries = conflict(&store, &create(site, &old, &[id(4)]), site.order);
     assert_eq!(
         list_entry(&entries, site).unwrap().outcome,
@@ -1475,7 +1453,7 @@ fn an_order_of_another_class_as_the_new_record_is_not_an_order() {
     let store = open(ON);
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     let mut writes = create(site, &old, &[id(4)]);
     let mut order = old.order.clone();
     order.push(id(4));
@@ -1495,7 +1473,11 @@ fn a_rename_on_create_on_the_committed_side_in_buckets_gives_no_answer() {
     let store = open(ON);
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
-    commit(&store, &rename_on_create(&store, site, &old, "renamed"));
+    commit_txn(begin(
+        &store,
+        &rename_on_create(&store, site, &old, "renamed"),
+        true,
+    ));
     // The rebuild gave the root new children: rule 1 of the split merge
     // gives no answer, and the vote fails on the root that the transaction
     // marked read-current.
@@ -1511,42 +1493,6 @@ fn a_rename_on_create_on_the_committed_side_in_buckets_gives_no_answer() {
 }
 
 // A commit in flight.
-
-/// A clock of the system that counts the waits on the waiters that it
-/// gives, so a test tells when a vote waits.
-#[derive(Clone, Default)]
-struct Counting {
-    waits: Arc<AtomicUsize>,
-}
-
-impl Clock for Counting {
-    fn now(&self) -> SystemTime {
-        SystemClock.now()
-    }
-
-    fn waiter(&self) -> Arc<dyn Waiter> {
-        Arc::new(Counted {
-            inner: SystemClock.waiter(),
-            waits: Arc::clone(&self.waits),
-        })
-    }
-}
-
-struct Counted {
-    inner: Arc<dyn Waiter>,
-    waits: Arc<AtomicUsize>,
-}
-
-impl Waiter for Counted {
-    fn wait(&self, timeout: Duration) {
-        self.waits.fetch_add(1, Ordering::SeqCst);
-        self.inner.wait(timeout);
-    }
-
-    fn wake(&self) {
-        self.inner.wake();
-    }
-}
 
 /// An observer that stops the finish after the sync of its batch, while
 /// the gate is armed, until the test opens it. The commit of that finish
@@ -1569,17 +1515,9 @@ impl Observer for Gate {
     }
 }
 
-fn wait_until(done: impl Fn() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
 #[test]
 fn a_record_of_the_positions_merged_onto_a_commit_in_flight_gives_no_answer() {
-    let clock = Counting::default();
+    let clock = CountingClock::default();
     // Tier 1 merges onto the commit in flight when no plan waits for it
     // first. That is the case without the split merge, as here. With the
     // split merge, its plan waits for a commit in flight before it reads
@@ -1598,7 +1536,7 @@ fn a_record_of_the_positions_merged_onto_a_commit_in_flight_gives_no_answer() {
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
     // The other side appends, so the order of the creation is stale.
-    commit(&store, &create(site, &old, &[id(3)]));
+    commit_txn(begin(&store, &create(site, &old, &[id(3)]), true));
     // A transaction writes the positions without the order, from the
     // current snapshot, and holds their lock after its vote.
     let now = snap(&store, site);

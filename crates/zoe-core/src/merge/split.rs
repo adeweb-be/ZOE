@@ -47,33 +47,22 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use zoe_pickle::Limits;
 use zoe_pickle::btrees::{
     BucketState, Class, Family, Shape, TreeState, bucket_state, classify, new_bucket_state,
     tree_state,
 };
-use zoe_pickle::python::{Heap, Pickler, Value};
+use zoe_pickle::python::Value;
 
 use super::btrees::{compare_keys, merge_range};
-use super::{Outcome, Reason};
-use crate::error::{Result, ZoeError};
+use super::step::{self, Loader, Stop, no};
+use super::{Outcome, Reason, Records, pickle};
+use crate::error::Result;
 use crate::types::{Oid, Tid};
 
 /// The records that the rules read.
-pub(crate) trait Source {
-    /// Returns the serial and the pickle that the transaction stored for
-    /// `oid`, or `None` when it stored none, restored it or deleted it.
-    fn staged(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>>;
-
+pub(crate) trait Source: Records {
     /// Tells if the transaction stored, restored or deleted `oid`.
     fn stores(&self, oid: Oid) -> bool;
-
-    /// Returns the serial and the pickle of the current record of `oid`, or
-    /// `None` when it has none or is deleted.
-    fn current(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>>;
-
-    /// Returns the pickle of the record of `oid` at `serial`.
-    fn at(&self, oid: Oid, serial: Tid) -> Result<Option<Vec<u8>>>;
 
     /// Tells if the transaction marked `oid` read-current.
     fn read_current(&self, oid: Oid) -> bool;
@@ -167,19 +156,14 @@ pub(crate) fn read_node(source: &dyn Source, oid: Oid, read: Tid) -> Result<Spli
     Group::new(source).answer(|group| group.read(oid, read))
 }
 
-/// Why a rule stops before its end: an answer, or an error of the store.
-enum Stop {
-    Answer(Split),
-    Store(ZoeError),
-}
-
-impl From<ZoeError> for Stop {
-    fn from(error: ZoeError) -> Self {
-        Stop::Store(error)
+impl From<&'static str> for Split {
+    /// No answer, for this reason.
+    fn from(why: &'static str) -> Self {
+        Split::Undecided(why)
     }
 }
 
-impl From<Outcome> for Stop {
+impl From<Outcome> for Stop<Split> {
     /// An outcome of a comparison that gives no merge. Only the merge of a
     /// range refuses: [`Group::merge`] names the record of its refusal.
     fn from(outcome: Outcome) -> Self {
@@ -196,13 +180,8 @@ impl From<Outcome> for Stop {
 /// section 9).
 pub(crate) const LOCKED: &str = "a bucket of the other side that another transaction locks";
 
-/// The result of a step of a rule.
-type Step<T> = std::result::Result<T, Stop>;
-
-/// Returns the stop of no answer, for `why`.
-fn no<T>(why: &'static str) -> Step<T> {
-    Err(Stop::Answer(Split::Undecided(why)))
-}
+/// The result of a step of a rule: an answer stops it.
+type Step<T> = step::Step<T, Split>;
 
 /// A child of a node: its separator, none for the first child, and its
 /// reference.
@@ -240,9 +219,7 @@ struct Leaf {
 /// persistent reference is one object.
 struct Group<'s> {
     source: &'s dyn Source,
-    heap: Heap,
-    /// The bytes of the records that the group loaded, for the step budget.
-    len: usize,
+    loader: Loader,
     family: Family,
     /// True for a BTree, false for a tree set.
     mapping: bool,
@@ -252,8 +229,7 @@ impl<'s> Group<'s> {
     fn new(source: &'s dyn Source) -> Self {
         Group {
             source,
-            heap: Heap::with_instances(),
-            len: 0,
+            loader: Loader::new(),
             family: Family {
                 keys: zoe_pickle::btrees::KeyType::Object,
                 values: zoe_pickle::btrees::ValueType::Object,
@@ -290,21 +266,10 @@ impl<'s> Group<'s> {
     /// records that the group loaded, so a merge takes a number of steps in
     /// proportion to its records.
     fn load(&mut self, record: &[u8]) -> Step<(Value, Value)> {
-        let limits = Limits {
-            node_budget: record.len(),
-        };
-        let Ok(tree) = zoe_pickle::decode_record_with(record, limits) else {
-            return no("a record that does not decode");
-        };
-        self.len = self.len.saturating_add(record.len());
-        self.heap.set_budget(super::budget(self.len));
-        let (class, state) = self
-            .heap
-            .load(&tree)
-            .map_err(|unsupported| Stop::Answer(Split::Undecided(unsupported.0)))?;
+        let (class, state) = self.loader.load(record)?;
         // ZODB writes the class of a bucket and of a BTree as a GLOBAL
         // alone.
-        if self.heap.class(class).is_none() {
+        if self.loader.heap.class(class).is_none() {
             return no("a class pickle of another format");
         }
         Ok((class, state))
@@ -312,40 +277,35 @@ impl<'s> Group<'s> {
 
     /// Compares two keys of the family, with the order of key references.
     fn compare(&self, a: Value, b: Value) -> Step<Ordering> {
-        compare_keys(&self.heap, self.family.keys, true, a, b).map_err(|outcome| match outcome {
-            // A separator that Python cannot compare is not a refusal of
-            // `bucket_merge`.
-            Outcome::Refused(_) => {
-                Stop::Answer(Split::Undecided("keys that Python cannot compare"))
+        compare_keys(&self.loader.heap, self.family.keys, true, a, b).map_err(|outcome| {
+            match outcome {
+                // A separator that Python cannot compare is not a refusal of
+                // `bucket_merge`.
+                Outcome::Refused(_) => {
+                    Stop::Answer(Split::Undecided("keys that Python cannot compare"))
+                }
+                other => Stop::from(other),
             }
-            other => Stop::from(other),
         })
     }
 
     /// Returns the oid of a persistent reference to an object of the same
     /// database.
     fn oid(&self, value: Value) -> Step<Oid> {
-        let Some(reference) = self.heap.reference(value) else {
-            return no("a child that is not a persistent reference");
-        };
-        if reference.database.is_some() || reference.weak {
-            return no("a reference to another database, or a weak reference");
-        }
-        let Ok(oid) = <[u8; 8]>::try_from(&reference.oid[..]) else {
-            return no("an oid that is not 8 bytes");
-        };
-        Ok(Oid(u64::from_be_bytes(oid)))
+        Ok(self
+            .loader
+            .oid(value, "a child that is not a persistent reference")?)
     }
 
     /// Reads the state of a BTree or a tree set.
     fn tree(&self, state: Value) -> Step<Tree> {
-        match tree_state(&self.heap, state) {
+        match tree_state(&self.loader.heap, state) {
             Some(TreeState::Inline(bucket)) => Ok(Tree::Inline(bucket)),
             Some(TreeState::Split) => {
-                let Some(&[children, first]) = self.heap.tuple(state) else {
+                let Some(&[children, first]) = self.loader.heap.tuple(state) else {
                     return no("a node state of another shape");
                 };
-                let Some(items) = self.heap.tuple(children) else {
+                let Some(items) = self.loader.heap.tuple(children) else {
                     return no("a node state of another shape");
                 };
                 if items.len().is_multiple_of(2) {
@@ -379,7 +339,8 @@ impl<'s> Group<'s> {
 
     /// Reads the state of a bucket or a set.
     fn bucket(&self, state: Value) -> Step<Leaf> {
-        let Some(BucketState { items, next }) = bucket_state(&self.heap, state, self.mapping)
+        let Some(BucketState { items, next }) =
+            bucket_state(&self.loader.heap, state, self.mapping)
         else {
             return no("a bucket state of another shape");
         };
@@ -395,7 +356,7 @@ impl<'s> Group<'s> {
     /// class value, its class as `module.name` and its state.
     fn leaf(&mut self, record: &[u8]) -> Step<(Value, String, Leaf)> {
         let (class, state) = self.load(record)?;
-        let Some((module, name)) = self.heap.class(class) else {
+        let Some((module, name)) = self.loader.heap.class(class) else {
             return no("a class pickle of another format");
         };
         let shape = if self.mapping {
@@ -430,11 +391,7 @@ impl<'s> Group<'s> {
 
     /// Returns the pickle of `node`, of the class `class`.
     fn pickle(&self, class: Value, state: Value) -> Step<Vec<u8>> {
-        let mut pickler = Pickler::new(&self.heap);
-        match pickler.dump(class).and_then(|()| pickler.dump(state)) {
-            Ok(()) => Ok(pickler.into_bytes()),
-            Err(unsupported) => no(unsupported.0),
-        }
+        Ok(pickle(&self.loader.heap, class, state)?)
     }
 
     /// Returns the new children of `after` against `before`, by the index of
@@ -532,7 +489,7 @@ impl<'s> Group<'s> {
         stale: (Oid, &str),
     ) -> Step<Cut> {
         let merged = merge_range(
-            &mut self.heap,
+            &mut self.loader.heap,
             self.family,
             self.mapping,
             old,
@@ -706,12 +663,13 @@ impl<'s> Group<'s> {
                 [a_name, x_name],
             );
         }
-        let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
-        let x_state = new_bucket_state(&mut self.heap, high, None);
+        let a_state = new_bucket_state(&mut self.loader.heap, low, a_new.next);
+        let x_state = new_bucket_state(&mut self.loader.heap, high, None);
         let children = self
+            .loader
             .heap
             .new_tuple(vec![a.reference, separator, x.reference]);
-        let root = self.heap.new_tuple(vec![children, new.first]);
+        let root = self.loader.heap.new_tuple(vec![children, new.first]);
         let records = vec![
             Written {
                 oid: node.oid,
@@ -843,8 +801,8 @@ impl<'s> Group<'s> {
                 items.extend(child.separator);
                 items.push(child.reference);
             }
-            let children = self.heap.new_tuple(items);
-            let state = self.heap.new_tuple(vec![children, committed.first]);
+            let children = self.loader.heap.new_tuple(items);
+            let state = self.loader.heap.new_tuple(vec![children, committed.first]);
             let (keys, changed) = records.first().map_or((Vec::new(), 0), |record: &Written| {
                 (record.keys.clone(), record.changed)
             });
@@ -931,8 +889,8 @@ impl<'s> Group<'s> {
         if let Some((y, y_current, y_class, y_name, y_next)) = theirs {
             // The keys go to the anchor and to the new bucket of the other
             // side, with their next buckets of the committed side.
-            let a_state = new_bucket_state(&mut self.heap, low, a_next);
-            let y_state = new_bucket_state(&mut self.heap, high, y_next);
+            let a_state = new_bucket_state(&mut self.loader.heap, low, a_next);
+            let y_state = new_bucket_state(&mut self.loader.heap, high, y_next);
             return Ok(vec![
                 Written {
                     oid: anchor.child.oid,
@@ -957,8 +915,8 @@ impl<'s> Group<'s> {
                 dropped(x.oid, &x_name, Tid::ZERO, Tid::ZERO, keys, changed),
             ]);
         }
-        let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
-        let x_state = new_bucket_state(&mut self.heap, high, x_new.next);
+        let a_state = new_bucket_state(&mut self.loader.heap, low, a_new.next);
+        let x_state = new_bucket_state(&mut self.loader.heap, high, x_new.next);
         Ok(vec![
             Written {
                 oid: anchor.child.oid,
@@ -1022,7 +980,7 @@ impl<'s> Group<'s> {
         )];
         for ((child, current, class, name, next), items) in [(theirs.low, low), (theirs.high, high)]
         {
-            let state = new_bucket_state(&mut self.heap, items, next);
+            let state = new_bucket_state(&mut self.loader.heap, items, next);
             records.push(Written {
                 oid: child.oid,
                 class: name,
@@ -1188,13 +1146,9 @@ mod tests {
         stored: BTreeSet<Oid>,
     }
 
-    impl Source for Records {
+    impl crate::merge::Records for Records {
         fn staged(&self, _: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
             Ok(None)
-        }
-
-        fn stores(&self, oid: Oid) -> bool {
-            self.stored.contains(&oid)
         }
 
         fn current(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
@@ -1203,6 +1157,12 @@ mod tests {
 
         fn at(&self, oid: Oid, serial: Tid) -> Result<Option<Vec<u8>>> {
             Ok((oid == NODE && serial == READ).then(|| self.old.clone()))
+        }
+    }
+
+    impl Source for Records {
+        fn stores(&self, oid: Oid) -> bool {
+            self.stored.contains(&oid)
         }
 
         fn read_current(&self, oid: Oid) -> bool {

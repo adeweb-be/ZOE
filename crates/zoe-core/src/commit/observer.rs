@@ -59,6 +59,30 @@ impl Store {
     }
 }
 
+/// A stopwatch on the monotonic time of the store clock, for the
+/// observer. A store without an observer reads no clock for it. The
+/// monotonic time is the time of the lock timeout, so a simulator gives it
+/// on simulated time.
+pub(crate) struct Stopwatch<'s> {
+    store: &'s Store,
+    started: Option<Duration>,
+}
+
+impl<'s> Stopwatch<'s> {
+    /// Start a stopwatch on the clock of `store`.
+    pub(crate) fn start(store: &'s Store) -> Self {
+        let started = store.observer().map(|_| store.clock.monotonic());
+        Stopwatch { store, started }
+    }
+
+    /// Return the time since the start, or `None` when the store has no
+    /// observer.
+    pub(crate) fn elapsed(&self) -> Option<Duration> {
+        self.started
+            .map(|started| self.store.clock.monotonic().saturating_sub(started))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

@@ -3,20 +3,16 @@
 //! BLAKE3 hash in the blob record. The blob file and its record become
 //! durable together.
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+mod support;
 
+use std::io::{Read, Write};
+use std::path::Path;
+
+use support::fresh_dir;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, Tid, ZoeError};
 
 const PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-blobs-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn content(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + 3) as u8).collect()

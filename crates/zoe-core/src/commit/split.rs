@@ -23,17 +23,19 @@
 //! not take releases its locks at once. In mode `shadow`, the plan takes
 //! no lock and writes nothing.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::time::Duration;
 
+use super::observer::Stopwatch;
+use super::source::TxnSource;
+use super::vote::Stale;
 use super::{READ_CHUNK, Txn};
 use crate::error::Result;
 use crate::lock::{Held, Waited};
 use crate::merge::policy::Rules;
-use crate::merge::split::{self, Source, Split, Written};
-use crate::merge::{Mode, Reason, Resolution, Resolved};
+use crate::merge::split::{self, Split, Written};
+use crate::merge::{Mode, Reason, Records, Resolution, Resolved};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
@@ -83,104 +85,12 @@ pub(super) struct Shadow {
     pub(super) class: String,
 }
 
-/// Returns the mode of two switches together: `Off` when one is off, else
-/// `Shadow` when one is in shadow mode, else `On`.
-fn both(a: Mode, b: Mode) -> Mode {
-    match (a, b) {
-        (Mode::Off, _) | (_, Mode::Off) => Mode::Off,
-        (Mode::Shadow, _) | (_, Mode::Shadow) => Mode::Shadow,
-        _ => Mode::On,
-    }
-}
-
-/// The records of a transaction and of its store, as the rules read them.
-struct TxnSource<'t, S: Deref<Target = Store>> {
-    txn: &'t Txn<S>,
-    /// The locks that the rules took.
-    locked: RefCell<Vec<Held>>,
-    /// True while the rules run in mode `shadow`: they take no lock.
-    shadow: Cell<bool>,
-}
-
-impl<S: Deref<Target = Store>> TxnSource<'_, S> {
-    /// Release the locks that the rules took after the first `kept`.
-    fn release_from(&self, kept: usize) {
-        let mut locked = self.locked.borrow_mut();
-        if locked.len() > kept {
-            let released = locked.split_off(kept);
-            self.txn.store.locks.release(&released);
-        }
-    }
-}
-
-impl<S: Deref<Target = Store>> Source for TxnSource<'_, S> {
-    fn staged(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
-        match self.txn.staged.record(oid) {
-            Some(staged) if !staged.restored && staged.pickle_len() > 0 => {}
-            _ => return Ok(None),
-        }
-        Ok(self
-            .txn
-            .staged
-            .get(oid)?
-            .map(|(serial, pickle)| (serial, pickle.into_owned())))
-    }
-
-    fn stores(&self, oid: Oid) -> bool {
-        self.txn.staged.record(oid).is_some()
-    }
-
-    fn current(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
-        Ok(self
-            .txn
-            .store
-            .backend
-            .load_before(oid, Tid::MAX)?
-            .filter(|record| !record.data.is_empty())
-            .map(|record| (record.tid, record.data)))
-    }
-
-    fn at(&self, oid: Oid, serial: Tid) -> Result<Option<Vec<u8>>> {
-        self.txn.store.backend.load_serial(oid, serial)
-    }
-
-    fn read_current(&self, oid: Oid) -> bool {
-        self.txn.read_current.contains_key(&oid)
-    }
-
-    fn server_writes(&self) -> bool {
-        self.txn.server_writes
-    }
-
-    fn lock(&self, oid: Oid) -> Result<bool> {
-        if self.shadow.get() {
-            return Ok(true);
-        }
-        let mut locked = self.locked.borrow_mut();
-        if locked.iter().any(|held| held.oid == oid) {
-            return Ok(true);
-        }
-        let store: &Store = &self.txn.store;
-        match store.locks.try_exclusive(oid, &*store.clock) {
-            Some(held) => {
-                locked.push(held);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-}
-
 impl<S: Deref<Target = Store>> Txn<S> {
     /// Makes the plan of the split merge of the vote, with the settings of
     /// `rules`, for a transaction of `stored_bytes`. The vote holds its
     /// locks.
     pub(super) fn split_plan(&self, rules: &Rules<'_>, stored_bytes: u64) -> Result<Plan> {
-        let source = TxnSource {
-            txn: self,
-            locked: RefCell::new(Vec::new()),
-            shadow: Cell::new(false),
-        };
+        let source = TxnSource::new(self);
         match self.plan_with(&source, rules, stored_bytes) {
             Ok(mut plan) => {
                 plan.locked = source.locked.into_inner();
@@ -217,16 +127,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
             if handoff.commit.ended().is_some() {
                 continue;
             }
-            let started = store.observer().map(|_| store.clock.monotonic());
+            let watch = Stopwatch::start(store);
             let waited = handoff.commit.wait(
                 oid,
                 self.lock_deadline,
                 &*store.clock,
                 self.lock_cancel.as_ref(),
             );
-            if let Some(started) = started {
-                plan.waited += store.clock.monotonic().saturating_sub(started);
-            }
+            plan.waited += watch.elapsed().unwrap_or_default();
             if matches!(waited, Waited::TimedOut | Waited::Cancelled) {
                 return Ok(plan);
             }
@@ -268,7 +176,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             if !stale(&oid) && !stale_bucket {
                 continue;
             }
-            let node_mode = both(mode, rules.tier1_mode(&class));
+            let node_mode = mode.lower(rules.tier1_mode(&class));
             if node_mode == Mode::Off {
                 continue;
             }
@@ -277,7 +185,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             match split::written_node(source, oid)? {
                 Split::Merged { rule, records } => {
                     let group_mode = records.iter().fold(node_mode, |all, record| {
-                        both(all, rules.tier1_mode(&record.class))
+                        all.lower(rules.tier1_mode(&record.class))
                     });
                     if group_mode == Mode::Off
                         || records.iter().any(|record| claimed.contains(&record.oid))
@@ -340,7 +248,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     };
                     // The mode of the record of the refusal joins the mode
                     // of the node, as for a merged group.
-                    let group_mode = both(node_mode, rules.tier1_mode(&class));
+                    let group_mode = node_mode.lower(rules.tier1_mode(&class));
                     if group_mode == Mode::Off {
                         continue;
                     }
@@ -397,7 +305,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 let Some(class) = split::node_class(&record) else {
                     continue;
                 };
-                let node_mode = both(mode, rules.tier1_mode(&class));
+                let node_mode = mode.lower(rules.tier1_mode(&class));
                 if node_mode == Mode::Off {
                     continue;
                 }
@@ -443,24 +351,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
 /// merged, or of a node that rule 1 lets through, in mode `on`. The vote
 /// marks it applied when it passes.
 fn entry(record: &Written, rule: u8, rules: &Rules<'_>) -> Resolution {
-    Resolution {
-        oid: record.oid,
-        tier: 1,
-        class: record.class.clone(),
-        mode: Mode::On,
-        policy: rules.version(),
-        outcome: Resolved::Merged,
-        applied: false,
-        undo: false,
-        keys: record.keys.clone(),
-        changed: record.changed,
-        committed: record.current,
-        read: record.read,
-        shadow: None,
-        fields: Vec::new(),
-        split: Some(rule),
-        order: None,
-    }
+    Resolution::new(
+        record.oid,
+        record.class.clone(),
+        Mode::On,
+        rules.version(),
+        Resolved::Merged,
+        record.current,
+        record.read,
+    )
+    .with_keys(record.keys.clone(), record.changed)
+    .with_split(rule)
 }
 
 /// Returns the entry of the resolution log of a refusal of `rule` on the
@@ -474,24 +375,17 @@ fn refusal(
     reason: Reason,
     rules: &Rules<'_>,
 ) -> Resolution {
-    Resolution {
+    Resolution::new(
         oid,
-        tier: 1,
         class,
-        mode: Mode::On,
-        policy: rules.version(),
-        outcome: Resolved::Refused(reason),
-        applied: true,
-        undo: false,
-        keys: Vec::new(),
-        changed: 0,
-        committed: current,
+        Mode::On,
+        rules.version(),
+        Resolved::Refused(reason),
+        current,
         read,
-        shadow: None,
-        fields: Vec::new(),
-        split: Some(rule),
-        order: None,
-    }
+    )
+    .applied()
+    .with_split(rule)
 }
 
 /// Returns the entry of the resolution log of a stale node for which
@@ -508,24 +402,16 @@ pub(super) fn undecided(
     current: Tid,
     rules: &Rules<'_>,
 ) -> Resolution {
-    Resolution {
+    Resolution::new(
         oid,
-        tier: 1,
-        class: class.to_owned(),
-        mode: Mode::On,
-        policy: rules.version(),
-        outcome: Resolved::Undecided(why),
-        applied: false,
-        undo: false,
-        keys: Vec::new(),
-        changed: 0,
-        committed: current,
+        class,
+        Mode::On,
+        rules.version(),
+        Resolved::Undecided(why),
+        current,
         read,
-        shadow: None,
-        fields: Vec::new(),
-        split: Some(rule),
-        order: None,
-    }
+    )
+    .with_split(rule)
 }
 
 /// Returns the entry of the resolution log of a stale read-current node in
@@ -538,46 +424,61 @@ pub(super) fn read_shadow(
     current: Tid,
     rules: &Rules<'_>,
 ) -> Resolution {
-    Resolution {
+    Resolution::new(
         oid,
-        tier: 1,
-        class: shadow.class.clone(),
-        mode: Mode::Shadow,
-        policy: rules.version(),
-        outcome: Resolved::Undecided("a read-current oid"),
-        applied: false,
-        undo: false,
-        keys: Vec::new(),
-        changed: 0,
-        committed: current,
+        shadow.class.clone(),
+        Mode::Shadow,
+        rules.version(),
+        Resolved::Undecided("a read-current oid"),
+        current,
         read,
-        shadow: Some(shadow.outcome),
-        fields: Vec::new(),
-        split: Some(shadow.rule),
-        order: None,
+    )
+    .with_shadow(Some(shadow.outcome))
+    .with_split(shadow.rule)
+}
+
+/// Takes a plan of the split merge into the check of a vote: its entries,
+/// the nodes that rule 1 lets through, its wait for commits in flight, its
+/// locks, its records and the transaction size with them. Returns the
+/// stale node of a refusal, which fails the vote.
+pub(super) fn adopt<S: Deref<Target = Store>>(
+    plan: &mut Plan,
+    txn: &mut Txn<S>,
+    merged: &mut Vec<(Oid, Tid, Vec<u8>)>,
+    stored_bytes: &mut u64,
+) -> Option<Stale> {
+    txn.resolutions.append(&mut plan.resolutions);
+    txn.passed.extend(plan.passed.iter().copied());
+    txn.add_lock_wait(plan.waited);
+    // The vote holds the locks of the plan until the end of the
+    // transaction, and releases them with its others.
+    if !plan.locked.is_empty() {
+        let held = txn.locks.get_or_insert_with(Vec::new);
+        held.append(&mut plan.locked);
+        held.sort_by_key(|lock| lock.oid);
     }
+    txn.dropping.append(&mut plan.dropped);
+    txn.unstored.extend(plan.unstored.drain(..));
+    merged.append(&mut plan.records);
+    *stored_bytes = plan.stored_bytes;
+    plan.refused
+        .map(|(oid, current, read)| Stale::written(oid, current, read))
 }
 
 #[cfg(test)]
 mod tests {
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use zoe_pickle::btrees::new_bucket_state;
-    use zoe_pickle::python::{Heap, Pickler, Value};
+    use zoe_pickle::python::{Heap, Value};
 
     use crate::error::ZoeError;
     use crate::merge::Resolved;
     use crate::store::Store;
+    use crate::testing::{commit_all, new_oid, record, root, wait_until};
     use crate::types::{Oid, Tid};
     use crate::vfs::MemVfs;
-
-    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-        let mut pickler = Pickler::new(heap);
-        pickler.dump(class).unwrap();
-        pickler.dump(state).unwrap();
-        pickler.into_bytes()
-    }
 
     /// Returns a reference to the `IIBucket` `oid`.
     fn reference(heap: &mut Heap, oid: Oid) -> Value {
@@ -632,40 +533,7 @@ mod tests {
             (heap.new_str("split_merges"), heap.new_str(mode)),
         ];
         let state = heap.new_dict(items);
-        let root = [
-            &b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\
-               \x00dataq\x02}q\x03X\x10\x00\x00\x00zoe.merge_policyq\x04C\x08"[..],
-            &policy.0.to_be_bytes(),
-            b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
-        ]
-        .concat();
-        (record(&heap, class, state), root)
-    }
-
-    fn commit(store: &Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-        for (oid, serial, data) in writes {
-            txn.store(*oid, *serial, data).unwrap();
-        }
-        txn.vote().unwrap();
-        txn.finish().unwrap()
-    }
-
-    fn new_oid(store: &Store) -> Oid {
-        loop {
-            let oid = store.new_oid().unwrap();
-            if oid != Oid(0) {
-                return oid;
-            }
-        }
-    }
-
-    fn wait_until(done: impl Fn() -> bool) {
-        let start = Instant::now();
-        while !done() {
-            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-            thread::sleep(Duration::from_millis(1));
-        }
+        (record(&heap, class, state), root(policy))
     }
 
     /// Two transactions split the two buckets of one node from one
@@ -679,12 +547,12 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
         let (policy_record, root) = policy_and_root(policy, mode);
-        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
-        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        commit_all(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit_all(&store, &[(Oid(0), Tid::ZERO, root)]);
         let counter = new_oid(&store);
-        let counted = commit(&store, &[(counter, Tid::ZERO, length(0))]);
+        let counted = commit_all(&store, &[(counter, Tid::ZERO, length(0))]);
         let (n, b0, b1) = (new_oid(&store), new_oid(&store), new_oid(&store));
-        let read = commit(
+        let read = commit_all(
             &store,
             &[
                 (n, Tid::ZERO, node(b0, &[(40, b1)])),
@@ -693,7 +561,7 @@ mod tests {
             ],
         );
         if stale_first {
-            commit(&store, &[(counter, counted, length(1))]);
+            commit_all(&store, &[(counter, counted, length(1))]);
         }
         let (y, x) = (new_oid(&store), new_oid(&store));
         let mut first = store.tpc_begin(b"", b"", b"").unwrap();
@@ -781,10 +649,10 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
         let (policy_record, root) = policy_and_root(policy, "on");
-        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
-        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        commit_all(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit_all(&store, &[(Oid(0), Tid::ZERO, root)]);
         let (n, b0, b1) = (new_oid(&store), new_oid(&store), new_oid(&store));
-        let read = commit(
+        let read = commit_all(
             &store,
             &[
                 (n, Tid::ZERO, node(b0, &[(40, b1)])),
@@ -793,7 +661,7 @@ mod tests {
             ],
         );
         let y = new_oid(&store);
-        let s1 = commit(
+        let s1 = commit_all(
             &store,
             &[
                 (n, read, node(b0, &[(40, b1), (60, y)])),
@@ -930,13 +798,13 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
         let (policy_record, root) = policy_and_root(policy, "on");
-        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
-        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        commit_all(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit_all(&store, &[(Oid(0), Tid::ZERO, root)]);
         let n = new_oid(&store);
-        let read = commit(&store, &[(n, Tid::ZERO, inline(&[10, 20, 30]))]);
+        let read = commit_all(&store, &[(n, Tid::ZERO, inline(&[10, 20, 30]))]);
         // S1 splits the inline bucket into y1 and y2.
         let (y1, y2) = (new_oid(&store), new_oid(&store));
-        let s1 = commit(
+        let s1 = commit_all(
             &store,
             &[
                 (n, read, node(y1, &[(30, y2)])),

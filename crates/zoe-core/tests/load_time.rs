@@ -20,43 +20,27 @@
 //! default at 1 KB; at 100 KB it is one tenth of that. `ZOE_LOAD_DIR` sets
 //! the directory of the store, the temporary directory of cargo by default.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use support::speedtest_record;
+use zoe_core::testing::commit_txn;
 use zoe_core::vfs::OsVfs;
-use zoe_core::{Compression, Oid, Options, Store, SystemClock, Tid};
+use zoe_core::{Compression, Oid, Options, Store, SystemClock, Tid, Txn};
 
 /// The records of a transaction.
 const RECORDS: usize = 100;
 
-/// The record of `oid` in its `version`, of `size` bytes. The first half
-/// is text that zstd compresses well, the second half is pseudo-random
-/// bytes that it does not, as the records of zodbshootout.
-fn record(oid: Oid, version: u64, size: usize) -> Vec<u8> {
-    let mut data = Vec::with_capacity(size);
-    data.extend_from_slice(b"\x80\x03czodbshootout.speedtest\nPObject\nq\x00.\x80\x03}q\x01(");
-    while data.len() < size / 2 {
-        data.extend_from_slice(b"X\x04\x00\x00\x00attrq\x02K\x01X\x04\x00\x00\x00dataq\x03");
-    }
-    let mut state = oid.0 ^ (version << 32) ^ 0x9e37_79b9_7f4a_7c15;
-    while data.len() < size {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        data.extend_from_slice(&state.to_le_bytes());
-    }
-    data.truncate(size);
-    data
-}
-
-/// Commit `oids` in `version`. Return the tid.
-fn commit(store: &Store, oids: &[(Oid, Tid)], version: u64, size: usize) -> Tid {
+/// Begin a transaction that writes `oids` in `version`.
+fn writing<'s>(store: &'s Store, oids: &[(Oid, Tid)], version: u64, size: usize) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"user", b"load time", b"").unwrap();
     for &(oid, serial) in oids {
-        txn.store(oid, serial, &record(oid, version, size)).unwrap();
+        txn.store(oid, serial, &speedtest_record(oid, version, size))
+            .unwrap();
     }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
+    txn
 }
 
 /// Return the median, the 90th percentile and the mean of `samples`, in
@@ -107,7 +91,7 @@ fn run(dir: &Path, compression: Compression, size: usize, objects: usize) {
     let mut first = Vec::new();
     for chunk in oids.chunks(RECORDS) {
         let new: Vec<(Oid, Tid)> = chunk.iter().map(|&oid| (oid, Tid::ZERO)).collect();
-        first.push(commit(&store, &new, 0, size));
+        first.push(commit_txn(writing(&store, &new, 0, size)));
     }
     let between = Tid(first.last().unwrap().0 + 1);
     let (single, double) = oids.split_at(objects / 2);
@@ -117,7 +101,7 @@ fn run(dir: &Path, compression: Compression, size: usize, objects: usize) {
     };
     for chunk in double.chunks(RECORDS) {
         let again: Vec<(Oid, Tid)> = chunk.iter().map(|&oid| (oid, serial_of(oid))).collect();
-        commit(&store, &again, 1, size);
+        commit_txn(writing(&store, &again, 1, size));
     }
     let name = match compression {
         Compression::None => "none",
