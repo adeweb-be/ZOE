@@ -2,6 +2,8 @@
 
 This directory holds the files that run `zoe serve`: the Tier 1 manifests for Kubernetes, the units for a host, and the Grafana dashboard of the metrics. `just deploy check` checks them. The Helm chart comes in phase 5.
 
+The user guide gives the steps for a user: [Deploy on a host](../docs/guide/deploy-host.md), [Deploy on Kubernetes](../docs/guide/deploy-kubernetes.md) and [Monitoring](../docs/guide/monitoring.md).
+
 | Path | Holds |
 | --- | --- |
 | `tier1/` | the Tier 1 manifests: one server as a StatefulSet |
@@ -40,7 +42,7 @@ On SIGTERM, the server completes the `tpc_finish` calls that it received, aborts
 
 The PodDisruptionBudget stops a node drain from evicting the server, because one replica means that an eviction stops all writes. Move the pod in a manual window: delete it, and the StatefulSet starts it again.
 
-The manifests hold no backup job yet. The backup job of Tier 1 comes with the backup of a store through the admin port of the server. Until then, `zoe backup --path` opens the store itself, and a running server holds the lock of the store: the backup runs only while the server is stopped (see `zoe backup` and `zoe restore` in the specification).
+The manifests hold no backup job yet. The backup job of Tier 1 comes with the backup of a store through the admin port of the server. Until then, `zoe backup --path` opens the store itself, and a running server holds the lock of the store: the backup runs only while the server is stopped (see [Back up and restore](../docs/guide/backup-restore.md) in the user guide).
 
 ## A host with systemd or supervisor
 
