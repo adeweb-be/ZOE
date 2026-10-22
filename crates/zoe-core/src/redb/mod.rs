@@ -156,7 +156,7 @@ impl<const N: usize> Bounds<N> {
 fn newest<'k, T>(
     records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
     oid: Oid,
-    range: impl RangeBounds<&'k [u8; 16]> + RangeBounds<[u8; 16]> + Clone,
+    range: impl RangeBounds<&'k [u8; 16]> + RangeBounds<[u8; 16]> + Clone + 'k,
     read: impl FnOnce(&[u8; 16], &[u8]) -> Result<T>,
 ) -> Result<Option<T>> {
     let mut scan = records

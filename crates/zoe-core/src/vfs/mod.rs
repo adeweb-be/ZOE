@@ -23,7 +23,9 @@ mod mem;
 mod os;
 
 pub use mem::{CrashImage, MemFile, MemVfs};
-pub(crate) use os::{LOCK, list_dir};
+#[cfg(test)]
+pub(crate) use os::LOCK;
+pub(crate) use os::list_dir;
 pub use os::{OsFile, OsVfs};
 
 /// The directory of a store, as the core sees it.
