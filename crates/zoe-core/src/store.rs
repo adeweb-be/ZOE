@@ -302,7 +302,8 @@ impl Store {
     /// Open the store in the simulated filesystem `vfs` with no page
     /// cache, and create it if necessary. Each page that a read needs then
     /// comes from the file, so a test can count the bytes that a read
-    /// costs.
+    /// costs. Only the feature `testing` builds it.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn open_vfs_uncached(vfs: MemVfs) -> Result<Self> {
         Self::open_cached(vfs, SystemClock, Options::default(), Some(0))
@@ -694,7 +695,8 @@ impl Store {
 
     /// Remove the key `(tid, oid)` of the transaction index and keep the
     /// record. A test uses it to damage the store. Fail with `NotFound`
-    /// when the key does not exist.
+    /// when the key does not exist. Only the feature `testing` builds it.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
         self.backend.remove_index_key_for_test(tid, oid)
@@ -702,7 +704,9 @@ impl Store {
 
     /// Remove the record of `oid` at `tid` and keep its key in the
     /// transaction index. A test uses it to damage the store. Fail with
-    /// `NotFound` when the record does not exist.
+    /// `NotFound` when the record does not exist. Only the feature
+    /// `testing` builds it.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
         self.backend.remove_record_for_test(oid, tid)

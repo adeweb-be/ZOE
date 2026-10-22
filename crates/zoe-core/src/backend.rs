@@ -285,7 +285,7 @@ pub trait Backend: Send + Sync {
     /// Remove the key `(tid, oid)` of the transaction index and keep the
     /// record. A test uses it to damage a store. Fail with `NotFound` when
     /// the key does not exist.
-    #[doc(hidden)]
+    #[cfg(feature = "testing")]
     fn remove_index_key_for_test(&self, _tid: Tid, _oid: Oid) -> Result<()> {
         Err(ZoeError::Backend("this backend has no test hooks".into()))
     }
@@ -293,7 +293,7 @@ pub trait Backend: Send + Sync {
     /// Remove the record of `oid` at `tid` and keep its key in the
     /// transaction index. A test uses it to damage a store. Fail with
     /// `NotFound` when the record does not exist.
-    #[doc(hidden)]
+    #[cfg(feature = "testing")]
     fn remove_record_for_test(&self, _oid: Oid, _tid: Tid) -> Result<()> {
         Err(ZoeError::Backend("this backend has no test hooks".into()))
     }

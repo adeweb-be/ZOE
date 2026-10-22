@@ -430,6 +430,7 @@ impl RedbBackend {
 
     /// Remove `key` from `table` in a write transaction of its own. Fail
     /// with `NotFound` for `oid` when the key does not exist.
+    #[cfg(feature = "testing")]
     fn remove_for_test<V: redb::Value + 'static>(
         &self,
         table: TableDefinition<&[u8; 16], V>,
@@ -960,10 +961,12 @@ impl Backend for RedbBackend {
         txn.commit().map_err(backend)
     }
 
+    #[cfg(feature = "testing")]
     fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
         self.remove_for_test(TXN_OIDS, &format::txn_oid_key(tid, oid), oid)
     }
 
+    #[cfg(feature = "testing")]
     fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
         self.remove_for_test(RECORDS, &format::record_key(oid, tid), oid)
     }

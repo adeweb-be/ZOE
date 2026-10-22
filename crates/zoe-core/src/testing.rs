@@ -7,9 +7,10 @@
 //! the unit tests and the integration tests. `tests/support` holds the
 //! helpers that only the integration tests use.
 //!
-//! The feature `testing` builds this module. Only the dev-dependency of
-//! this crate on itself turns the feature on, so only test builds have
-//! the hook. A release build never has it.
+//! The feature `testing` builds this module and the test hooks of
+//! `Store`. Only dev-dependencies turn the feature on: the one of this
+//! crate on itself, and those of zoe-server and zoe-convert. So only test
+//! builds have the hook. A release build never has it.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
