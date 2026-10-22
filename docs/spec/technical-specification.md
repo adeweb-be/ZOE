@@ -581,15 +581,17 @@ In a buildout, `plone.recipe.zope2instance` knows only filestorage, ZEO client a
 | `--shutdown-timeout SECONDS` | `ZOE_SHUTDOWN_TIMEOUT` | 30 s | the longest stop (see "Stop") |
 | `--idle-timeout SECONDS` | `ZOE_IDLE_TIMEOUT` | 300 s; 0 turns it off | closes a connection that sends no frame for that time while no call of it runs (N20, see "Wire contract") |
 | `--transaction-timeout SECONDS` | `ZOE_TRANSACTION_TIMEOUT` | 0, off | the `transaction-timeout` of ZEO's `<zeo>` section (N20), below |
-| `--read-only` | `ZOE_READ_ONLY` | `false` | every store serves reads only (see "Modes") |
-| `--pack-gc BOOL` | `ZOE_PACK_GC` | `true` | `false` packs every store without garbage collection; a store packs with garbage collection only when this option and the `pack-gc` of its table are true |
+| `--read-only[=BOOL]` | `ZOE_READ_ONLY` | `false` | every store serves reads only (see "Modes") |
+| `--pack-gc[=BOOL]` | `ZOE_PACK_GC` | `true` | `false` packs every store without garbage collection; a store packs with garbage collection only when this option and the `pack-gc` of its table are true |
 | `--cache-size SIZE` | `ZOE_CACHE_SIZE` | 1 GiB | the page cache of each store, a whole number with `KB`, `MB` or `GB` (powers of 1024), or none for bytes |
 | `--compression MODE` | `ZOE_COMPRESSION` | `none` | `none`, `zstd` or `zstd:LEVEL` for the records that each store writes |
 | `--blocking-threads N` | `ZOE_BLOCKING_THREADS` | the number of cores | the threads of the read pool (see "Connection handling") |
-| `--shared-blob-dir` | `ZOE_SHARED_BLOB_DIR` | off | accepts `storeBlobShared` (see the row blobs of the protocol matrix) |
+| `--shared-blob-dir[=BOOL]` | `ZOE_SHARED_BLOB_DIR` | off | accepts `storeBlobShared` (see the row blobs of the protocol matrix) |
 | `--structural-merges`, `--structural-merge-class CLASS=MODE`, `--posting-dicts`, `--resolution-log FILE` | `ZOE_STRUCTURAL_MERGES`, `ZOE_STRUCTURAL_MERGE_CLASSES`, `ZOE_POSTING_DICTS`, `ZOE_RESOLUTION_LOG` | as in `<zoe>` | see "Modes and the resolution log"; the file takes a table `[structural-merge-classes]` |
 | `--lock-warn SECONDS`, `--transaction-warn SECONDS`, `--log-format json` | `ZOE_LOCK_WARN`, `ZOE_TRANSACTION_WARN`, `ZOE_LOG_FORMAT` | off, off, text | see "Logs" |
 | `--tls-cert`, `--tls-key`, `--tls-client-ca`, `--tls-read-only-client-ca` | `ZOE_TLS_CERT`, `ZOE_TLS_KEY`, `ZOE_TLS_CLIENT_CA`, `ZOE_TLS_READ_ONLY_CLIENT_CA` | off | see "TLS" |
+
+A boolean option alone means `true`, and it takes a value only with `=`: `--pack-gc=false`. `--pack-gc false` is a usage error (exit code 2). The same holds for `--read-only`, `--shared-blob-dir`, and `--dry-run` and `--force` of the other subcommands.
 
 The transaction timeout counts from the end of a vote that passed until the transaction ends, also through the second vote of a conflict that the client resolves, because the locks stay held between the two votes. When the thread of the transaction waits for the next call past that time, or gets a call after it, the server logs one ERROR line, `transaction timeout after the vote: closing the connection`, with the field `seconds`, and closes the connection as the idle timeout does: the calls that wait do not run, the transaction aborts and releases its locks, and the client gets no reply. A call of the transaction that runs, such as a `tpc_finish`, runs whole. Heartbeats and other calls do not reset the time, and the transaction timeout closes no connection without a voted transaction.
 
@@ -711,7 +713,7 @@ A client without a shared blob directory uploads a blob in chunks. `storeBlobSta
 
 #### Health and readiness
 
-`--admin-listen HOST:PORT` opens the admin port, a small HTTP/1.1 server that binds with the ZEO port, before the stores open; a port that does not bind fails the start and creates no store. `GET /healthz` gives 200 while every store is open, and 503 before. `GET /readyz` gives 200 when every store is open, loaded its last tid, and held no lock after its open, and, with Tier 2, when the replica is caught up; it gives 503 before, and from the stop signal on. The body is plain text with one line per storage, `NAME: open` or `NAME: ready`, or the line `starting` or `stopping`; `HEAD` gives the reply without the body, another method 405, another path 404. The port serves one request per connection, with a head of at most 8 KiB that must arrive within 2 s, and at most 64 connections at once, so it belongs on a private address. It never speaks ZEO, and it answers until the end of a stop.
+`--admin-listen HOST:PORT` opens the admin port, a small HTTP/1.1 server that binds with the ZEO port, before the stores open; a port that does not bind fails the start and creates no store. `GET /healthz` gives 200 while every store is open, and 503 before. `GET /readyz` gives 200 when every store is open, loaded its last tid, and held no lock after its open, and, with Tier 2, when the replica is caught up; it gives 503 before, and from the stop signal on. It also gives 503 when the lock table of a store held entries at the open. The body is plain text with one line per storage, `NAME: open`, `NAME: ready` or `NAME: not ready: the lock table held entries at the open`, or the line `starting` or `stopping`; `HEAD` gives the reply without the body, another method 405, another path 404. The port serves one request per connection, with a head of at most 8 KiB that must arrive within 2 s, and at most 64 connections at once, so it belongs on a private address. It never speaks ZEO, and it answers until the end of a stop.
 
 #### Metrics
 

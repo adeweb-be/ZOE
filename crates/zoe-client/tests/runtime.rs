@@ -1,11 +1,14 @@
 //! Tests of the client through its `Runtime`: a scripted server on an
 //! in-memory stream, and a heartbeat on a fast clock.
 
+mod common;
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{bin8, fresh_dir};
 use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use zoe_client::runtime::{BoxFuture, Stream};
@@ -117,10 +120,6 @@ impl Peer {
         assert_eq!(args, Value::Array(vec!["1".into(), false.into()]));
         self.reply(id, bin8(last)).await;
     }
-}
-
-fn bin8(n: u64) -> Value {
-    Value::Binary(n.to_be_bytes().to_vec())
 }
 
 /// A runtime with one scripted connection, and the server side of it.
@@ -473,9 +472,7 @@ async fn the_heartbeat_goes_out_on_the_clock_of_the_runtime() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_heartbeat_keeps_an_idle_connection() {
-    let dir = std::env::temp_dir().join(format!("zoe-client-idle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = fresh_dir("idle");
     let server =
         Server::start(ServeOptions::new(dir.join("store")).idle_timeout(Duration::from_secs(1)))
             .unwrap();
@@ -570,8 +567,7 @@ async fn a_blob_goes_out_as_a_stock_client_sends_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_commits_against_the_server() {
-    let dir = std::env::temp_dir().join(format!("zoe-client-blob-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = fresh_dir("blob");
     let path = dir.join("store");
     let server = Server::start(ServeOptions::new(&path)).unwrap();
     let blob: Vec<u8> = (0..zoe_client::BLOB_CHUNK + 3)

@@ -9,24 +9,20 @@
 //! The test makes its certificates with the `openssl` command, as the TLS
 //! tests of `zoe-server` do, so the repository holds no key.
 
+mod common;
+
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 
+use common::{Fresh, Started, fresh_dir, start, start_with};
 use zoe_client::{Client, Endpoint, Error, Options, Tls, TlsOptions, Tokio};
 use zoe_server::serve::{ServeOptions, Server};
 
 /// The extensions of a self-signed CA certificate, without spaces.
 const CA: &str = "-addext basicConstraints=critical,CA:TRUE \
                   -addext keyUsage=critical,keyCertSign,cRLSign,digitalSignature";
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-client-tls-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// Run `openssl` with the arguments `args`, split at the spaces, in `dir`.
 /// Fail the test when it fails.
@@ -85,7 +81,8 @@ fn signed(dir: &Path, name: &str, ca: &str, extensions: &str) {
 /// - `pinned-cn` is self-signed, a CA, without a SAN: its CN is
 ///   `zodb.example`.
 fn certs() -> &'static Path {
-    static CERTS: OnceLock<PathBuf> = OnceLock::new();
+    // The directory lives as long as the process: a static never drops.
+    static CERTS: OnceLock<Fresh> = OnceLock::new();
     CERTS.get_or_init(|| {
         let dir = fresh_dir("certs");
         for name in ["server-ca", "client-ca", "other-ca"] {
@@ -126,13 +123,12 @@ fn certs() -> &'static Path {
 }
 
 /// Start a server with TLS that requires a certificate of `client-ca`.
-fn serve(name: &str) -> Server {
+fn serve(name: &str) -> Started {
     let certs = certs();
     let tls =
         zoe_server::serve::TlsOptions::new(certs.join("server.pem"), certs.join("server.key"))
             .client_ca(certs.join("client-ca.pem"));
-    let store = fresh_dir(name).join("store");
-    Server::start(ServeOptions::new(store).tls(tls)).unwrap()
+    start_with(name, |store| ServeOptions::new(store).tls(tls))
 }
 
 /// Open a client of `server` with the certificate `client`, the CA file
@@ -194,7 +190,7 @@ async fn without_the_name_check_a_ca_that_does_not_sign_the_server_fails_the_ope
 
 #[tokio::test]
 async fn a_tls_client_never_speaks_to_a_server_without_tls() {
-    let server = Server::start(ServeOptions::new(fresh_dir("plain").join("store"))).unwrap();
+    let server = start("plain");
     let opened = open(&server, "server-ca", false, "localhost").await;
     assert!(opened.is_err(), "{opened:?}");
 }
@@ -204,8 +200,7 @@ async fn a_client_without_a_certificate_opens_when_the_server_asks_for_none() {
     let certs = certs();
     let tls =
         zoe_server::serve::TlsOptions::new(certs.join("server.pem"), certs.join("server.key"));
-    let store = fresh_dir("anonymous").join("store");
-    let server = Server::start(ServeOptions::new(store).tls(tls)).unwrap();
+    let server = start_with("anonymous", |store| ServeOptions::new(store).tls(tls));
     let authenticate = certs.join("server-ca.pem");
     let options = TlsOptions::without_certificate(Some(&authenticate));
     let client = open_with(server.addr(), options, "localhost")
@@ -230,14 +225,15 @@ async fn a_client_without_a_certificate_fails_the_open_when_the_server_asks_for_
 
 /// Start a server with TLS that sends the self-signed certificate `name`
 /// and asks for no client certificate.
-fn serve_self_signed(name: &str) -> Server {
+fn serve_self_signed(name: &str) -> Started {
     let certs = certs();
     let tls = zoe_server::serve::TlsOptions::new(
         certs.join(format!("{name}.pem")),
         certs.join(format!("{name}.key")),
     );
-    let store = fresh_dir(&format!("pinned-{name}")).join("store");
-    Server::start(ServeOptions::new(store).tls(tls)).unwrap()
+    start_with(&format!("pinned-{name}"), |store| {
+        ServeOptions::new(store).tls(tls)
+    })
 }
 
 /// Open a client of `server` without a certificate, with the file
@@ -306,7 +302,7 @@ async fn a_certificate_signed_by_a_pinned_certificate_still_needs_its_chain() {
 
 /// Return a new directory `name` with a copy of the CA certificate of each
 /// of `cas`.
-fn ca_dir(name: &str, cas: &[&str]) -> PathBuf {
+fn ca_dir(name: &str, cas: &[&str]) -> Fresh {
     let dir = fresh_dir(name);
     for ca in cas {
         let file = format!("{ca}.pem");

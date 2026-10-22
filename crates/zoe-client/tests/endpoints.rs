@@ -2,6 +2,8 @@
 //! sockets and with the read-only fallback, through a `Runtime` of the
 //! test: scripted servers on in-memory streams.
 
+mod common;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -9,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::bin8;
 use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::oneshot;
@@ -147,10 +150,6 @@ impl Peer {
         let mut rest = Vec::new();
         self.0.read_to_end(&mut rest).await.unwrap();
     }
-}
-
-fn bin8(n: u64) -> Value {
-    Value::Binary(n.to_be_bytes().to_vec())
 }
 
 fn tcp(port: u16) -> Address {

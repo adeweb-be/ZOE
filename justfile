@@ -843,10 +843,12 @@ ci *functions="check test docs":
 # binary and the server image, as an OCI tarball, into target/dist through
 # the Dagger function release. `just release binary DIR` builds the static
 # binary in the shell and copies it to DIR; the Dagger function zoe-binary
-# runs it. `just release test` runs the tests of the Dagger functions
-# against the Dagger engine. The version bump, the wheels and the Helm chart
-# are not built yet.
-release command="dist" dir="target/dist":
+# runs it. `just release wheel DIR VERSION...` builds the zoedb wheel in the
+# shell into DIR, one wheel for each CPython version, 3.13 by default, as
+# `just plone` builds it. `just release test` runs the tests of the Dagger
+# functions against the Dagger engine. The version bump, the wheels of the
+# Dagger function release and the Helm chart are not built yet.
+release command="dist" dir="target/dist" *versions="3.13":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ command }}" in
@@ -862,6 +864,17 @@ release command="dist" dir="target/dist":
             mkdir -p "{{ dir }}"
             cp "${CARGO_TARGET_DIR:-target}/$target/release/zoe" "{{ dir }}/zoe"
             ;;
+        wheel)
+            # The extension module is for one CPython version and one
+            # platform, so each version gets its own wheel. uv runs the
+            # build in python/, so the output directory is absolute.
+            mkdir -p "{{ dir }}"
+            out="$(cd "{{ dir }}" && pwd)"
+            for py in {{ versions }}; do
+                uv build --directory python --package zoedb --wheel --python "$py" \
+                    --out-dir "$out"
+            done
+            ;;
         test)
             # uv installs the Python SDK of the module from ci/sdk, which
             # dagger develop writes.
@@ -869,7 +882,7 @@ release command="dist" dir="target/dist":
             uv run --locked --directory ci pytest -q tests
             ;;
         *)
-            echo "just release: unknown command {{ command }}. Use dist, binary or test." >&2
+            echo "just release: unknown command {{ command }}. Use dist, binary, wheel or test." >&2
             exit 2
             ;;
     esac
