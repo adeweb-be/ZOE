@@ -59,20 +59,22 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyException, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple, PyType,
+};
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
     Address, Cache, Connect, Copier, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open,
     Options, Pool, PoolIntents, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio,
-    Turn, Verification, traced,
+    Turn, Verification, lock, traced,
 };
 use zoe_core::{Oid, Tid};
 use zoe_wire::extension::TRACE_CONTEXT;
@@ -117,10 +119,6 @@ const MODULES: [&str; 4] = [
     "transaction.interfaces",
     "builtins",
 ];
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Return the runtime of the native clients of this process. The first
 /// call starts it. A child of `os.fork()` gets a runtime of its own: the
@@ -469,12 +467,7 @@ impl NativeClient {
         args: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = args_of(args)?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let reply = py
-            .detach(move || runtime.block_on(traced(trace, pool.call(&method, args))))
-            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        let reply = self.run_zeo(py, async move |pool| pool.call(&method, args).await)?;
         to_python(py, &reply, 0)
     }
 
@@ -493,14 +486,9 @@ impl NativeClient {
         generation: Option<u64>,
     ) -> PyResult<(Bound<'py, PyAny>, u64)> {
         let args = args_of(args)?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let (reply, generation) = py
-            .detach(move || {
-                runtime.block_on(traced(trace, pool.call_on(generation, &method, args)))
-            })
-            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        let (reply, generation) = self.run_zeo(py, async move |pool| {
+            pool.call_on(generation, &method, args).await
+        })?;
         Ok((to_python(py, &reply, 0)?, generation))
     }
 
@@ -517,13 +505,9 @@ impl NativeClient {
         generation: Option<u64>,
     ) -> PyResult<()> {
         let args = args_of(args)?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        py.detach(move || {
-            runtime.block_on(traced(trace, pool.notify_on(generation, &method, args)))
+        self.run(py, async move |pool| {
+            pool.notify_on(generation, &method, args).await
         })
-        .map_err(|e| client_error(py, e))
     }
 
     /// Load each of `oids` before `tid` that the cache does not hold, all
@@ -555,11 +539,7 @@ impl NativeClient {
     /// wait then until the client delivered each tid that the listener read
     /// before the reply. The thread that runs a delivery must not wait.
     fn sync(&self, py: Python<'_>, wait: bool) -> PyResult<()> {
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        py.detach(move || runtime.block_on(traced(trace, pool.sync(wait))))
-            .map_err(|e| client_error(py, e))
+        self.run(py, async |pool| pool.sync(wait).await)
     }
 
     /// Return the extensions that the server of the listener accepted.
@@ -654,12 +634,7 @@ impl NativeClient {
 
     /// Return `n` new oids.
     fn new_oids<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let oids = py
-            .detach(move || runtime.block_on(traced(trace, pool.new_oids(n))))
-            .map_err(|e| client_error(py, e))?;
+        let oids = self.run(py, async |pool| pool.new_oids(n).await)?;
         Ok(oids.into_iter().map(|oid| p64(py, oid.0)).collect())
     }
 
@@ -694,12 +669,7 @@ impl NativeClient {
                 end.map(|end| p64(py, end.0)),
             )));
         }
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let (record, _position) = py
-            .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
-            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        let (record, _position) = self.run_zeo(py, async |pool| pool.load_before(oid, tid).await)?;
         Ok(record.map(|record| {
             let data = PyBytes::new(py, &record.data);
             // The buffer goes back to the client for the next long reply.
@@ -730,14 +700,9 @@ impl NativeClient {
         {
             return Ok(Some((data, p64(py, start.0))));
         }
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let (record, _position) = py
-            .detach(move || {
-                runtime.block_on(traced(trace, pool.load_before(oid, Tid(zoe_wire::MAX_TID))))
-            })
-            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        let (record, _position) = self.run_zeo(py, async |pool| {
+            pool.load_before(oid, Tid(zoe_wire::MAX_TID)).await
+        })?;
         Ok(record.map(|record| {
             let data = PyBytes::new(py, &record.data);
             zoe_client::recycle(record.data);
@@ -780,12 +745,7 @@ impl NativeClient {
         serial: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let data = py
-            .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
-            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        let data = self.run_zeo(py, async |pool| pool.load_serial(oid, serial).await)?;
         let bytes = PyBytes::new(py, &data);
         zoe_client::recycle(data);
         Ok(bytes)
@@ -808,8 +768,7 @@ impl NativeClient {
         filename: PathBuf,
     ) -> PyResult<u64> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
+        let (pool, trace) = self.start(py)?;
         let runtime = self.runtime;
         py.detach(move || {
             let partial = partial_name(&filename);
@@ -831,11 +790,7 @@ impl NativeClient {
     /// Return the next value of the sequence `name` of the store. Raise
     /// `Unsupported` when the server did not accept `sequences`.
     fn sequence_next(&self, py: Python<'_>, name: String) -> PyResult<u64> {
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        py.detach(move || runtime.block_on(traced(trace, pool.sequence_next(&name))))
-            .map_err(|e| client_error(py, e))
+        self.run(py, async move |pool| pool.sequence_next(&name).await)
     }
 
     /// Return the value of `key` in the namespace `name` of `flavour`, or
@@ -848,12 +803,7 @@ impl NativeClient {
         key: Vec<u8>,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let flavour = kv::flavour(flavour)?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let value = py
-            .detach(move || runtime.block_on(traced(trace, pool.kv_get(flavour, &name, &key))))
-            .map_err(|e| client_error(py, e))?;
+        let value = self.run(py, async move |pool| pool.kv_get(flavour, &name, &key).await)?;
         Ok(value.map(|value| PyBytes::new(py, &value)))
     }
 
@@ -873,15 +823,10 @@ impl NativeClient {
         let flavour = kv::flavour(flavour)?;
         let limit = u64::try_from(limit)
             .map_err(|_| PyValueError::new_err("the limit of a scan is less than 1"))?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let pairs = py
-            .detach(move || {
-                let scan = pool.kv_scan(flavour, &name, start.as_deref(), stop.as_deref(), limit);
-                runtime.block_on(traced(trace, scan))
-            })
-            .map_err(|e| client_error(py, e))?;
+        let pairs = self.run(py, async move |pool| {
+            let (start, stop) = (start.as_deref(), stop.as_deref());
+            pool.kv_scan(flavour, &name, start, stop, limit).await
+        })?;
         Ok(pairs
             .iter()
             .map(|(key, value)| (PyBytes::new(py, key), PyBytes::new(py, value)))
@@ -891,13 +836,8 @@ impl NativeClient {
     /// Return the generation of the durable namespace `name`, as 8 bytes.
     /// Raise `Unsupported` when the server did not accept `kv`.
     fn kv_generation<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let tid = py
-            .detach(move || runtime.block_on(traced(trace, pool.kv_generation(&name))))
-            .map_err(|e| client_error(py, e))?;
-        Ok(PyBytes::new(py, &tid.0.to_be_bytes()))
+        let tid = self.run(py, async move |pool| pool.kv_generation(&name).await)?;
+        Ok(p64(py, tid.0))
     }
 
     /// Return a new owner of early write-intent locks (ADR 0045). It
@@ -921,35 +861,27 @@ impl NativeClient {
         &self,
         py: Python<'py>,
         owner: &NativeIntents,
-        oids: Vec<Vec<u8>>,
+        oids: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         self.check_process()?;
         let oids = oids
             .iter()
-            .map(|oid| <[u8; 8]>::try_from(oid.as_slice()).map(|b| Oid(u64::from_be_bytes(b))))
-            .collect::<Result<Vec<Oid>, _>>()
-            .map_err(|_| PyValueError::new_err("an oid is not 8 bytes"))?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
-        let serials = py
-            .detach(|| {
-                runtime.block_on(traced(trace, async {
-                    let mut intents = owner.intents.lock().await;
-                    if intents.is_none() {
-                        *intents = Some(pool.intents().await?);
-                    }
-                    let held = intents.as_mut().expect("an owner");
-                    let locked = held.lock(&oids).await;
-                    // An owner that holds nothing, or whose connection is
-                    // lost, gives its connection back to the pool.
-                    if locked.is_err() && (!held.holds() || !held.is_connected()) {
-                        *intents = None;
-                    }
-                    locked
-                }))
-            })
-            .map_err(|e| client_error(py, e))?;
+            .map(|oid| u64_of(oid).map(Oid))
+            .collect::<PyResult<Vec<Oid>>>()?;
+        let serials = self.run(py, async |pool| {
+            let mut intents = owner.intents.lock().await;
+            if intents.is_none() {
+                *intents = Some(pool.intents().await?);
+            }
+            let held = intents.as_mut().expect("an owner");
+            let locked = held.lock(&oids).await;
+            // An owner that holds nothing, or whose connection is lost,
+            // gives its connection back to the pool.
+            if locked.is_err() && (!held.holds() || !held.is_connected()) {
+                *intents = None;
+            }
+            locked
+        })?;
         Ok(serials.into_iter().map(|tid| p64(py, tid.0)).collect())
     }
 
@@ -993,31 +925,25 @@ impl NativeClient {
         let mut encoded = Vec::new();
         rmpv::encode::write_value(&mut encoded, &to_value(extension, 0)?)
             .map_err(|e| PyValueError::new_err(format!("the extension does not encode: {e}")))?;
-        let pool = self.pool(py)?;
-        let trace = self.traceparent(py, &pool)?;
-        let runtime = self.runtime;
         let (user, description) = (user.to_vec(), description.to_vec());
-        let txn = py
-            .detach(|| {
-                runtime.block_on(traced(trace, async {
-                    // An owner whose lock waits on another thread has no
-                    // locks to give yet: the transaction begins without them.
-                    let held = intents
-                        .and_then(|owner| owner.intents.try_lock().ok())
-                        .and_then(|mut held| held.take());
-                    match held {
-                        Some(held) => {
-                            held.begin_with(&user, &description, &encoded, tid, &status)
-                                .await
-                        }
-                        None => {
-                            pool.begin_with(&user, &description, &encoded, tid, &status)
-                                .await
-                        }
-                    }
-                }))
-            })
-            .map_err(|e| client_error(py, e))?;
+        let (txn, tracing) = self.run(py, async |pool| {
+            // An owner whose lock waits on another thread has no locks to
+            // give yet: the transaction begins without them.
+            let held = intents
+                .and_then(|owner| owner.intents.try_lock().ok())
+                .and_then(|mut held| held.take());
+            let txn = match held {
+                Some(held) => {
+                    held.begin_with(&user, &description, &encoded, tid, &status)
+                        .await?
+                }
+                None => {
+                    pool.begin_with(&user, &description, &encoded, tid, &status)
+                        .await?
+                }
+            };
+            Ok((txn, traces(pool)))
+        })?;
         let slot = Arc::new(Mutex::new(Some(txn)));
         {
             let mut open = lock(&self.open);
@@ -1026,13 +952,13 @@ impl NativeClient {
         }
         Ok(NativeTransaction {
             pid: self.pid,
-            runtime,
+            runtime: self.runtime,
             txn: slot,
             turn: Mutex::new(None),
             traceparent: self
                 .traceparent
                 .as_ref()
-                .filter(|_| traces(&pool))
+                .filter(|_| tracing)
                 .map(|t| t.clone_ref(py)),
         })
     }
@@ -1161,7 +1087,48 @@ impl NativeClient {
         traceparent(py, callable)
     }
 
-    /// Return the listener of the pool, if the client is open and has one.
+    /// Return the pool and the W3C traceparent of the calling thread, for a
+    /// call to the server.
+    fn start(&self, py: Python<'_>) -> PyResult<(Arc<Pool>, Option<String>)> {
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        Ok((pool, trace))
+    }
+
+    /// Run `call` on the pool: on the runtime, inside `traced` with the
+    /// traceparent of the calling thread, without the GIL. Return what
+    /// `call` gives.
+    fn wait<T: Send>(
+        &self,
+        py: Python<'_>,
+        call: impl AsyncFnOnce(&Pool) -> Result<T, Error> + Send,
+    ) -> PyResult<Result<T, Error>> {
+        let (pool, trace) = self.start(py)?;
+        let runtime = self.runtime;
+        Ok(py.detach(move || runtime.block_on(traced(trace, call(pool.as_ref())))))
+    }
+
+    /// Run `call` as `wait` does. Raise its error as `client_error` gives
+    /// it.
+    fn run<T: Send>(
+        &self,
+        py: Python<'_>,
+        call: impl AsyncFnOnce(&Pool) -> Result<T, Error> + Send,
+    ) -> PyResult<T> {
+        self.wait(py, call)?.map_err(|e| client_error(py, e))
+    }
+
+    /// Run `call` as `wait` does. Raise its error as `ZEO.ClientStorage`
+    /// raises the error of a reply (`zeo_error`).
+    fn run_zeo<T: Send>(
+        &self,
+        py: Python<'_>,
+        call: impl AsyncFnOnce(&Pool) -> Result<T, Error> + Send,
+    ) -> PyResult<T> {
+        self.wait(py, call)?
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))
+    }
+
     /// Return the address of the server as ZEO names its connection in
     /// its logs: `('host', port)`, or the path of a unix domain socket.
     fn peer_name(&self) -> String {
@@ -1172,6 +1139,7 @@ impl NativeClient {
         }
     }
 
+    /// Return the listener of the pool, if the client is open and has one.
     fn listener(&self) -> Option<Arc<zoe_client::Client>> {
         if self.pid != std::process::id() {
             return None;
@@ -1270,15 +1238,7 @@ impl NativeTransaction {
         data: &[u8],
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.store(oid, serial, data)))
-        })
-        .map_err(|e| client_error(py, e))
+        self.run(py, async |txn| txn.store(oid, serial, data).await)
     }
 
     /// Store `data` for `oid` with the blob in the file `filename`, and
@@ -1293,15 +1253,13 @@ impl NativeTransaction {
         filename: PathBuf,
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
+        let trace = self.trace(py)?;
         py.detach(|| {
+            // The file opens before the lock of the transaction.
             let mut file = File::open(&filename)?;
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            let store = txn.store_blob_from(oid, serial, data, &mut file);
-            runtime.block_on(traced(trace, store))
+            self.block(trace, async |txn| {
+                txn.store_blob_from(oid, serial, data, &mut file).await
+            })
         })
         .map_err(|e| blob_error(py, e))
     }
@@ -1318,16 +1276,9 @@ impl NativeTransaction {
         filename: &str,
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            let store = txn.store_blob_shared(oid, serial, data, filename);
-            runtime.block_on(traced(trace, store))
+        self.run(py, async |txn| {
+            txn.store_blob_shared(oid, serial, data, filename).await
         })
-        .map_err(|e| client_error(py, e))
     }
 
     /// Stage a write of `value` for `key` in the namespace `name` of
@@ -1345,30 +1296,16 @@ impl NativeTransaction {
     ) -> PyResult<()> {
         let flavour = kv::flavour(flavour)?;
         let ttl = kv::ttl_seconds(ttl)?;
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.kv_set(flavour, name, key, value, ttl)))
+        self.run(py, async |txn| {
+            txn.kv_set(flavour, name, key, value, ttl).await
         })
-        .map_err(|e| client_error(py, e))
     }
 
     /// Stage a delete of `key` in the namespace `name` of `flavour`, with
     /// the rules of `kv_set`.
     fn kv_delete(&self, py: Python<'_>, flavour: &str, name: &str, key: &[u8]) -> PyResult<()> {
         let flavour = kv::flavour(flavour)?;
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.kv_delete(flavour, name, key)))
-        })
-        .map_err(|e| client_error(py, e))
+        self.run(py, async |txn| txn.kv_delete(flavour, name, key).await)
     }
 
     /// Delete `oid`. `serial` is the serial that the transaction read: the
@@ -1380,15 +1317,7 @@ impl NativeTransaction {
         serial: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.delete_object(oid, serial)))
-        })
-        .map_err(|e| client_error(py, e))
+        self.run(py, async |txn| txn.delete_object(oid, serial).await)
     }
 
     /// Copy a record of another storage into this transaction, which began
@@ -1404,15 +1333,9 @@ impl NativeTransaction {
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         let prev_txn = prev_txn.map(u64_of).transpose()?.map(Tid);
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.restore(oid, serial, data, prev_txn)))
+        self.run(py, async |txn| {
+            txn.restore(oid, serial, data, prev_txn).await
         })
-        .map_err(|e| client_error(py, e))
     }
 
     /// Undo the transaction `trans_id` in this transaction: `undoa`, sent to
@@ -1424,14 +1347,7 @@ impl NativeTransaction {
             Ok(text) => text.to_str()?.as_bytes().to_vec(),
             Err(_) => trans_id.extract()?,
         };
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.undo(&trans_id)))
-        })
-        .map_err(|e| client_error(py, e))
+        self.run(py, async |txn| txn.undo(&trans_id).await)
     }
 
     /// Ask the server to check at the vote that `serial` is still the
@@ -1443,15 +1359,7 @@ impl NativeTransaction {
         serial: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
-        let runtime = self.runtime;
-        py.detach(|| {
-            let mut slot = lock(&self.txn);
-            let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.check_current_serial(oid, serial)))
-        })
-        .map_err(|e| client_error(py, e))
+        self.run(py, async |txn| txn.check_current_serial(oid, serial).await)
     }
 
     /// Vote, resolve the conflicts that the vote lists, and return the oids
@@ -1522,10 +1430,9 @@ impl NativeTransaction {
                 let trace = traceparent(py, self.traceparent.as_ref())?;
                 let bytes = data.as_bytes();
                 let stored = py.detach(|| {
-                    let mut slot = lock(&self.txn);
-                    let txn = slot.as_mut().ok_or_else(not_open)?;
-                    let store = txn.store(listed.oid, listed.committed, bytes);
-                    runtime.block_on(traced(trace, store))
+                    self.block(trace, async |txn| {
+                        txn.store(listed.oid, listed.committed, bytes).await
+                    })
                 });
                 if let Err(error) = stored {
                     self.unresolved(py, listed.oid);
@@ -1600,6 +1507,39 @@ impl NativeTransaction {
 }
 
 impl NativeTransaction {
+    /// Return the W3C traceparent of the calling thread for a call of the
+    /// transaction. In a child of `os.fork()`, raise `RuntimeError`.
+    fn trace(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        check_process(self.pid)?;
+        traceparent(py, self.traceparent.as_ref())
+    }
+
+    /// Run `call` on the open transaction, on the runtime, inside `traced`
+    /// with `trace`. The caller holds no GIL. Without an open transaction,
+    /// fail with `Error::Invalid`.
+    fn block<T>(
+        &self,
+        trace: Option<String>,
+        call: impl AsyncFnOnce(&mut PoolTransaction) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut slot = lock(&self.txn);
+        let txn = slot.as_mut().ok_or_else(not_open)?;
+        self.runtime.block_on(traced(trace, call(txn)))
+    }
+
+    /// Run `call` on the open transaction as `block` does, with the
+    /// traceparent of the calling thread, without the GIL. Raise its error
+    /// as `client_error` gives it.
+    fn run<T: Send>(
+        &self,
+        py: Python<'_>,
+        call: impl AsyncFnOnce(&mut PoolTransaction) -> Result<T, Error> + Send,
+    ) -> PyResult<T> {
+        let trace = self.trace(py)?;
+        py.detach(|| self.block(trace, call))
+            .map_err(|e| client_error(py, e))
+    }
+
     /// Drop the current cache entry of `oid`, whose listed conflict the
     /// client did not resolve. After the end of the transaction, do
     /// nothing.
@@ -2211,10 +2151,9 @@ fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
     };
     let made = (|| -> PyResult<PyErr> {
         let value = to_python(py, &value, 0)?;
-        let client = py.import("ZEO.asyncio.client")?;
-        let factories = client.getattr("exc_factories")?;
-        let exception = match factories.get_item(&class) {
-            Ok(factory) => {
+        let (client, factory) = factory(py, &class)?;
+        let exception = match factory {
+            Some(factory) => {
                 let exception = factory.call1((&class, &value))?;
                 // ZEO logs an error of the server that its factories make,
                 // but a POSKeyError and a ConflictError.
@@ -2225,7 +2164,7 @@ fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
                 }
                 exception
             }
-            Err(_) => py
+            None => py
                 .import("ZEO.Exceptions")?
                 .getattr("ServerException")?
                 .call1((&class, value))?,
@@ -2240,14 +2179,25 @@ fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
 /// factory has the class or the factory fails.
 fn factory_error(py: Python<'_>, class: &str, value: &Value) -> Option<PyErr> {
     let made = (|| -> PyResult<Option<PyErr>> {
-        let factories = py.import("ZEO.asyncio.client")?.getattr("exc_factories")?;
-        let Ok(factory) = factories.get_item(class) else {
+        let Some(factory) = factory(py, class)?.1 else {
             return Ok(None);
         };
         let value = to_python(py, value, 0)?;
         Ok(Some(PyErr::from_value(factory.call1((class, value))?)))
     })();
     made.ok().flatten()
+}
+
+/// Return the module `ZEO.asyncio.client` and the factory of its
+/// `exc_factories` for the class `class`, or `None` when no factory has the
+/// class.
+fn factory<'py>(
+    py: Python<'py>,
+    class: &str,
+) -> PyResult<(Bound<'py, PyModule>, Option<Bound<'py, PyAny>>)> {
+    let client = py.import("ZEO.asyncio.client")?;
+    let factory = client.getattr("exc_factories")?.get_item(class).ok();
+    Ok((client, factory))
 }
 
 /// Return the msgpack values of the args of a call: a list or a tuple.
