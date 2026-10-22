@@ -7,13 +7,22 @@
 //! histories, annotations, file records and `Length` counters. The words
 //! are made from random syllables, so the text is generic. A fixed seed
 //! makes the set the same on each run.
+//!
+//! The records go through the codec of the record frames of the core
+//! (`zoe_core::testing::encode_payload` and `decode_payload`). The
+//! measurement is ignored, because its numbers mean something only in a
+//! release build. Run it with:
+//!
+//! ```text
+//! cargo test -p zoe-bench --release --test shrink_ratio -- --ignored --nocapture
+//! ```
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use zoe_core::testing::{FRAME_HEADER_LEN, decode_payload, encode_payload};
+use zoe_core::{Codec, Compression};
 use zstd::bulk::{Compressor, Decompressor};
-
-use super::codec::{self, Codec, Compression};
 
 /// A generator of random numbers: xorshift64.
 struct Rng(u64);
@@ -679,7 +688,7 @@ impl Sizes {
     fn of<'a>(records: impl Iterator<Item = &'a [u8]>, compression: Compression) -> Self {
         let mut sizes = Self::default();
         for data in records {
-            let (codec, payload) = codec::encode(data, compression);
+            let (codec, payload) = encode_payload(data, compression);
             sizes.data += data.len() as u64;
             sizes.stored += payload.len() as u64;
             sizes.plain += usize::from(codec == Codec::None);
@@ -697,8 +706,8 @@ fn the_synthetic_set_round_trips_and_shrinks() {
     let records = records(1_000);
     let mut sizes = Sizes::default();
     for (_, data) in &records {
-        let (codec, payload) = codec::encode(data, Compression::default());
-        assert_eq!(&codec::decode(codec, &payload).unwrap()[..], &data[..]);
+        let (codec, payload) = encode_payload(data, Compression::default());
+        assert_eq!(&decode_payload(codec, &payload).unwrap()[..], &data[..]);
         sizes.data += data.len() as u64;
         sizes.stored += payload.len() as u64;
     }
@@ -741,19 +750,19 @@ fn shrink_ratio_and_time_per_record() {
     for level in [-5, 1, 3, 6, 9, 19] {
         let compression = Compression::Zstd { level };
         let sizes = Sizes::of(data.iter().copied(), compression);
-        let headers = (n * super::HEADER_LEN) as f64;
+        let headers = (n * FRAME_HEADER_LEN) as f64;
         let framed = (sizes.data as f64 + headers) / (sizes.stored as f64 + headers);
         let encoded: Vec<(Codec, Vec<u8>)> = data
             .iter()
             .map(|d| {
-                let (codec, payload) = codec::encode(d, compression);
+                let (codec, payload) = encode_payload(d, compression);
                 (codec, payload.into_owned())
             })
             .collect();
 
         let compress = per_record(n, || {
             for d in &data {
-                std::hint::black_box(codec::encode(d, compression));
+                std::hint::black_box(encode_payload(d, compression));
             }
         });
         let mut compressor = Compressor::new(level).unwrap();
@@ -765,7 +774,7 @@ fn shrink_ratio_and_time_per_record() {
         });
         let decompress = per_record(n, || {
             for (codec, payload) in &encoded {
-                std::hint::black_box(codec::decode(*codec, payload).unwrap());
+                std::hint::black_box(decode_payload(*codec, payload).unwrap());
             }
         });
         let mut decompressor = Decompressor::new().unwrap();

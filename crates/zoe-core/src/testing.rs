@@ -9,9 +9,10 @@
 //!
 //! The feature `testing` builds this module and the test hooks of
 //! `Store`. Only dev-dependencies turn the feature on: the one of this
-//! crate on itself, and those of zoe-server and zoe-convert. So only test
-//! builds have the hook. A release build never has it.
+//! crate on itself, and those of zoe-server, zoe-convert and zoe-bench. So
+//! only test builds have the hook. A release build never has it.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::ops::Deref;
@@ -29,6 +30,7 @@ use zoe_pickle::python::{Heap, Pickler, Value};
 use crate::clock::Clock;
 use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
+use crate::format::{Codec, Compression};
 use crate::kv::Flavour;
 use crate::store::{Options, Store};
 use crate::types::{Oid, Tid};
@@ -124,6 +126,21 @@ pub fn compressible() -> Vec<u8> {
     }
     data.extend_from_slice(b"u.");
     data
+}
+
+/// The length of the header of a frame.
+pub const FRAME_HEADER_LEN: usize = crate::format::HEADER_LEN;
+
+/// Encode `data` for the payload of a record frame, as the finish of a
+/// store with `compression` encodes it. Return the codec and the payload.
+pub fn encode_payload(data: &[u8], compression: Compression) -> (Codec, Cow<'_, [u8]>) {
+    crate::format::encode_payload(data, compression)
+}
+
+/// Decode the payload `stored` of the codec `codec`, as a read decodes
+/// it. Return the data, or `None` when the payload does not decode.
+pub fn decode_payload(codec: Codec, stored: &[u8]) -> Option<Cow<'_, [u8]>> {
+    crate::format::decode_payload(codec, stored).ok()
 }
 
 /// Return the number of zstd compressions of records that this thread
