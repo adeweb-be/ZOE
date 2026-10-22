@@ -43,7 +43,17 @@ Backed up the store var/zoe into backups/zoe
 
 The backup directory holds one file for each dump, named after its range of tids: `<after>-<last>.zoedump`. The command never changes a dump that it wrote. Copy the whole directory to your backup media. Keep the dumps of a chain together: a restore needs each dump from the full dump on.
 
-A pack between two backups does not break the chain: the next backup writes the transactions after the last dump.
+### A pack and the chain of dumps
+
+A pack keeps the chain when its pack time is at or before the last backup. For example, a daily backup and a pack with `--days 7` keep the chain.
+
+A pack past the last backup breaks the chain: the pack removed history that the next dump must hold. The next backup then refuses, writes nothing and exits with 1:
+
+```text
+zoe backup: backups/zoe: the store was packed at tid 0x040c80440de1d2aa, after the last tid 0x040c80440d4f6f11 of the dumps; write a new full dump into a new directory
+```
+
+Then start a new chain: write a new full dump into a new backup directory, such as `zoe backup --path var/zoe --to backups/zoe-2`. Keep the old directory as long as you need the history that it holds.
 
 ## Check a backup
 

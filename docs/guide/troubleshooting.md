@@ -136,6 +136,16 @@ zoe restore: var/zoe-restored: holds a store; a restore never writes into a stor
 
 **Fix.** Give a new or an empty directory. To restore in place, move the old store away first.
 
+### `zoe backup`: the store was packed after the last tid of the dumps
+
+```text
+zoe backup: backups/zoe: the store was packed at tid 0x040c80440de1d2aa, after the last tid 0x040c80440d4f6f11 of the dumps; write a new full dump into a new directory
+```
+
+**Cause.** A pack ran past the last backup. It removed history that the next dump of the chain must hold, so the command writes nothing.
+
+**Fix.** Write a new full dump into a new backup directory: `zoe backup --path var/zoe --to backups/zoe-2`. Keep the old directory as long as you need its history. To keep one chain, pack only as of a time at or before the last backup (see [Back up and restore](backup-restore.md#a-pack-and-the-chain-of-dumps)).
+
 ## `zoe serve`
 
 ### `no store to serve`
@@ -227,7 +237,7 @@ ValueError: <zoe> needs path, or the ZOE_PATH variable
 
 ### `zoe.WrongThread`
 
-**Cause.** A thread called `store` or `tpc_vote` in a transaction that another thread began. The thread that begins a transaction drives it. Application code that shares a connection between threads gets this error.
+**Cause.** A thread called a method of a transaction that another thread began, such as `store` or `tpc_vote`. The thread that begins a transaction drives it. Application code that shares a connection between threads gets this error.
 
 **Fix.** Give each thread its own connection.
 

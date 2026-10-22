@@ -55,6 +55,8 @@ Packed the store var/zoe as of tid 0x040c7f8a35f72679. It removed:
 
 `--days N` packs as of N days ago, as `DB.pack(days=N)` of ZODB does. `--days 0` packs as of now, as in the example. Keep some days of history, such as `--days 7`, to undo recent transactions.
 
+A pack past the last backup breaks the chain of the dumps: the next `zoe backup` needs a new full dump in a new directory (see [Back up and restore](backup-restore.md#a-pack-and-the-chain-of-dumps)). So `--days 0` breaks the chain when a commit came after the last backup.
+
 ## Without garbage collection
 
 A pack with garbage collection removes the objects that no object of the store refers to. A Plone site with mount points has references from one database to another, which the pack of one store does not see. So pack each store of such a site without garbage collection. Such a pack removes old revisions only, as the `pack-gc false` of FileStorage does.

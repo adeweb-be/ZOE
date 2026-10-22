@@ -35,11 +35,12 @@ Classes: 2
 
 The command checks:
 
-- the checksum of each record;
-- the blob file of each blob record: its size and its hash;
-- the references: each object that a record refers to has a record;
-- each pickle: its class decodes;
-- the object count of the store.
+- the checksum of each record and of each row of the store (the line `checksums`);
+- the blob file of each blob record: its size and its hash (`blob files`);
+- the references of each current record: each object that it refers to has a record (`references`);
+- each current record: the command reads its class and its references from the pickle (`pickles`);
+- the object count of the store (`count mismatch`);
+- with `--classes`, each class of the store against the classes of your application (`unknown classes`).
 
 Each problem is a finding. A finding fails the command with exit code 1. The report goes to stdout.
 

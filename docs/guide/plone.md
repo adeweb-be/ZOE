@@ -126,6 +126,6 @@ A client without `zoedb` cannot read the classes of `zoe.plone`. It loads the pr
 4. Pack the store with garbage collection, at a time after the uninstall (see [Pack](pack.md)). The pack removes the old records of the classes of `zoe.plone`.
 5. Remove the backends from `ZOE_PLONE_BACKENDS`, then remove the wheel.
 
-`zoe convert --to-data-fs` checks the first and the last steps. It refuses a store that still holds a moved registry or records of the classes of `zoe.plone`, and it writes nothing (see [Convert](convert.md#guards)).
+`zoe convert --to-data-fs` checks steps 1, 3 and 4. It refuses a store that still holds a moved registry or current records of the classes of `zoe.plone`, and it writes nothing (see [Convert](convert.md#guards)).
 
 A copy of the store to a `Data.fs` leaves out the KV namespaces. So it leaves out the queue of queued indexing and the locks of edit forms. An empty queue loses nothing. A lock lives for minutes.

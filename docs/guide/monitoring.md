@@ -12,7 +12,7 @@
 | `/readyz` | every store is open and ready | the stores still open; the server stops; the lock table of a store held entries at the open |
 | `/metrics` | every store is open | the stores still open |
 
-The body of `/healthz` and `/readyz` has one line for each storage, such as `1: ready`, or the line `starting` or `stopping`. A store whose lock table held entries at the open answers `NAME: not ready: the lock table held entries at the open`; see [Troubleshooting](troubleshooting.md#readyz-answers-not-ready).
+The body of `/healthz` has one line for each storage, such as `1: open`, or the line `starting`. During a stop, `/healthz` still answers 200. The body of `/readyz` has one line for each storage, such as `1: ready`, or the line `starting` or `stopping`. A store whose lock table held entries at the open answers `NAME: not ready: the lock table held entries at the open`; see [Troubleshooting](troubleshooting.md#readyz-answers-not-ready).
 
 Use `/healthz` for a liveness probe and `/readyz` for a readiness probe. An open after a stop that was not clean repairs the database file, and takes longer on a large store: give the startup probe time.
 

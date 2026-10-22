@@ -10,17 +10,17 @@ The command runs from the binary or from the console script of the wheel.
 2. Convert:
 
    ```sh
-   zoe convert --from-data-fs var/filestorage/Data.fs --data-fs-blob-dir var/blobstorage --path var/zoe
+   zoe convert --from-data-fs var/filestorage/Data.fs --data-fs-blob-dir var/blobstorage --path var/zoe --blob-dir var/zoe/blobs
    ```
 
 3. Read the report. The command verifies the store against the `Data.fs` and exits with 0 when the report lists no problem.
 4. Check the store (see [Verify and repair](verify-repair.md)):
 
    ```sh
-   zoe verify --path var/zoe
+   zoe verify --path var/zoe --blob-dir var/zoe/blobs
    ```
 
-5. In `zope.conf`, replace the `<filestorage>` section with a `<zoe>` section on `var/zoe` (see [Run in-process](in-process.md)), or serve the store with `zoe serve` (see [Run a server](server.md)).
+5. In `zope.conf`, replace the `<filestorage>` section with a `<zoe>` section with `path var/zoe` and `blob-dir var/zoe/blobs` (see [Run in-process](in-process.md)). Or serve the store with `zoe serve --path var/zoe --blob-dir var/zoe/blobs` (see [Run a server](server.md)).
 6. Start the instance.
 
 The output of a conversion:
@@ -31,7 +31,7 @@ Converted var/filestorage/Data.fs into the store var/zoe
   copied        5
   records       68
   blobs         1
-  last tid      0x040c7f8a7e3a0155
+  last tid      0x040c8044afd8db00
   problems      0
 ```
 
@@ -45,7 +45,8 @@ Converted var/filestorage/Data.fs into the store var/zoe
   zoe convert: the conversion does not verify: the report lists the problems
   ```
 
-- `--blob-dir` sets the blob directory of the store. Without it, the blobs go to `blobs` in the store directory. Give the same directory to `<zoe>` or to `zoe serve` later.
+- `--blob-dir` sets the blob directory of the store. Without it, the blobs go to `blobs` in the store directory, as in the example. Give the same directory to `<zoe>` or to `zoe serve` later.
+- Never give the store the blob directory of the `Data.fs`, such as `var/blobstorage`. The store writes its new blobs there, and a pack of the store removes blob files there. The `Data.fs` and its blob directory are your way back: keep them as they are.
 - A conversion that stops resumes: run the same command again. It copies the transactions after the last transaction of the store.
 
 `zodbconvert` of ZODB also works: give it a source `<filestorage>` and a destination `<zoe>` section, with `%import zoe`. `zoe convert` also verifies the result.
@@ -99,7 +100,7 @@ Both modes use one format of the store. To change the mode, change the configura
 From in-process to a server:
 
 1. Stop the Zope instance. It closes the store.
-2. Start `zoe serve` on the store directory, with the same blob directory: `zoe serve --path var/zoe --blob-dir var/blobstorage`.
+2. Start `zoe serve` on the store directory, with the blob directory of the store: `zoe serve --path var/zoe --blob-dir var/zoe/blobs`.
 3. In `zope.conf`, replace the `<zoe>` section with a `<zeoclient>` or a `<zoeclient>` section (see [Connect clients](clients.md)). Give the client a blob cache of its own, not the blob directory of the store.
 4. Start the instance.
 

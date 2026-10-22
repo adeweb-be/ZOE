@@ -15,7 +15,7 @@ One process opens a store at a time: the store holds a lock. For two or more Zop
      cache-size 30000
      <zoe>
        path var/zoe
-       blob-dir var/blobstorage
+       blob-dir var/zoe/blobs
      </zoe>
      mount-point /
    </zodb_db>
@@ -27,7 +27,7 @@ What each line does:
 
 - `%import zoe` loads the section types of the wheel. It comes before the first section that uses them.
 - `path` is the directory of the store. The storage creates it when it is missing.
-- `blob-dir` is the directory of the blob files. Without it, the blobs go to `blobs` in `path`. The store does not record its blob directory, so give the same one at each start.
+- `blob-dir` is the directory of the blob files. Without it, the blobs go to `blobs` in `path`, as here. The store does not record its blob directory, so give the same one at each start. Never give it the blob directory of a `Data.fs`, such as `var/blobstorage`: the store writes and removes blob files there.
 - A relative path is relative to the working directory of the process. Use absolute paths in production.
 
 To keep the content of an existing site, convert its `Data.fs` first (see [Convert](convert.md)).
@@ -101,6 +101,6 @@ The URI does not read the environment twins. [The zoe:// URI](../reference/zope-
 
 ## Stop the instance
 
-A stop by SIGTERM or SIGHUP closes the store cleanly. The storage installs a handler of both signals when the process has none. A commit that started before the signal completes. The handler waits at most 5 seconds, then the process ends. SIGINT, Ctrl-C, closes the store too.
+A stop by SIGTERM or SIGHUP closes the store cleanly. The storage installs a handler of both signals when the process has none. A `tpc_finish` that started before the signal completes. A transaction that has not reached `tpc_finish` aborts. The handler waits at most 5 seconds, then the process ends. SIGINT, Ctrl-C, closes the store too.
 
 A store that a process did not close, after SIGKILL or a crash, keeps every commit that a client saw complete. The next open repairs the database file, and takes longer on a large store. See [Verify and repair](verify-repair.md#a-store-that-was-not-closed-cleanly).

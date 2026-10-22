@@ -45,7 +45,7 @@ pip install "target/wheels/zoedb-0.0.0-cp313-cp313-linux_x86_64.whl[plone]"
 | Extra | Adds | Use it for |
 | --- | --- | --- |
 | none | `ZConfig` and `ZODB` | a Zope application, or a script, on `zoe.Storage` or `<zoeclient>` |
-| `plone` | `zoe.plone`, with `Products.CMFPlone` 6.1 or later and `msgpack` | a Plone site |
+| `plone` | `Products.CMFPlone` 6.1 or later and `msgpack`, for `zoe.plone`, which every wheel holds | a Plone site |
 | `uri` | `zodburi` 3 or later | the `zoe://` URI (see [Run in-process](in-process.md#the-zoe-uri)) |
 
 [Compatibility](../reference/compatibility.md) gives the versions of CPython, ZODB, ZEO and Plone. On the free-threaded CPython 3.14t, read [Known issues](known-issues.md) first.
