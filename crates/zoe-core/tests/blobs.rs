@@ -51,7 +51,8 @@ fn a_committed_blob_reads_back_after_reopen() {
 
 #[test]
 fn each_revision_keeps_its_own_file() {
-    let store = Store::open(fresh_dir("revisions")).unwrap();
+    let dir = fresh_dir("revisions");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_blob(&store, oid, Tid::ZERO, b"first");
     let t2 = commit_blob(&store, oid, t1, b"second");

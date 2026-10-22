@@ -4,23 +4,17 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use zoe_core::{Clock, Oid, SystemClock, Waiter};
+use zoe_core::testing::TempDir;
+use zoe_core::{Clock, SystemClock, Waiter};
 
 /// Return a new empty directory for the test `name` of this test binary.
-pub fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zoe-{}-{name}-{}",
-        env!("CARGO_CRATE_NAME"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// The drop of the directory removes it.
+pub fn fresh_dir(name: &str) -> TempDir {
+    zoe_core::testing::fresh_dir(&format!("{}-{name}", env!("CARGO_CRATE_NAME")))
 }
 
 /// A clock of the system that counts the waiters that it gives and the
@@ -87,36 +81,4 @@ impl Rng {
     pub fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
-}
-
-/// A record that zstd shrinks, so that a store with compression keeps it
-/// with codec 1.
-pub fn compressible() -> Vec<u8> {
-    let mut data = b"\x80\x03capp.content\nDocument\nq\x00.\x80\x03}q\x01(".to_vec();
-    for i in 0..500u32 {
-        data.extend_from_slice(b"X\x0b\x00\x00\x00descriptionq\x02X\x05\x00\x00\x00title");
-        data.extend_from_slice(&i.to_le_bytes());
-    }
-    data.extend_from_slice(b"u.");
-    data
-}
-
-/// The record of `oid` in its `version`, of `size` bytes. The first half
-/// is text that zstd compresses well, the second half is pseudo-random
-/// bytes that it does not, as the records of zodbshootout.
-pub fn speedtest_record(oid: Oid, version: u64, size: usize) -> Vec<u8> {
-    let mut data = Vec::with_capacity(size);
-    data.extend_from_slice(b"\x80\x03czodbshootout.speedtest\nPObject\nq\x00.\x80\x03}q\x01(");
-    while data.len() < size / 2 {
-        data.extend_from_slice(b"X\x04\x00\x00\x00attrq\x02K\x01X\x04\x00\x00\x00dataq\x03");
-    }
-    let mut state = oid.0 ^ (version << 32) ^ 0x9e37_79b9_7f4a_7c15;
-    while data.len() < size {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        data.extend_from_slice(&state.to_le_bytes());
-    }
-    data.truncate(size);
-    data
 }

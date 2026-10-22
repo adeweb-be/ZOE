@@ -30,8 +30,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use redb::StorageBackend;
 use xxhash_rust::xxh3::xxh3_64;
@@ -42,48 +42,16 @@ use crate::error::{Result, ZoeError};
 use crate::format::Codec;
 use crate::kv::Flavour;
 use crate::types::{Oid, Tid};
-use crate::vfs::Vfs;
+use crate::vfs::Dir;
 
 /// The directory of the spill files.
 pub(crate) const STAGING_DIR: &str = "staging";
-
-/// The operations of a `Vfs` that the staging area uses, in a form that a
-/// trait object can hold. Every `Vfs` has them.
-pub(crate) trait StagingDir: Send + Sync {
-    fn exists(&self, name: &str) -> io::Result<bool>;
-    fn create_dir(&self, name: &str) -> io::Result<()>;
-    fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
-    fn remove(&self, name: &str) -> io::Result<()>;
-    fn create_new(&self, name: &str) -> io::Result<Box<dyn StorageBackend>>;
-}
-
-impl<V: Vfs> StagingDir for V {
-    fn exists(&self, name: &str) -> io::Result<bool> {
-        Vfs::exists(self, name)
-    }
-
-    fn create_dir(&self, name: &str) -> io::Result<()> {
-        Vfs::create_dir(self, name)
-    }
-
-    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
-        Vfs::list_files(self, dir)
-    }
-
-    fn remove(&self, name: &str) -> io::Result<()> {
-        Vfs::remove(self, name)
-    }
-
-    fn create_new(&self, name: &str) -> io::Result<Box<dyn StorageBackend>> {
-        Ok(Box::new(Vfs::create_new(self, name)?))
-    }
-}
 
 /// The staging area of a store: the limit of each transaction and the
 /// directory of the spill files.
 pub(crate) struct StagingArea {
     /// The store directory. The blob store shares it.
-    dir: Box<dyn StagingDir>,
+    dir: Arc<dyn Dir>,
     /// The most bytes of staged pickles that a transaction keeps in
     /// memory.
     memory: usize,
@@ -101,7 +69,7 @@ impl StagingArea {
     /// transaction keeps at most `memory` bytes of pickles in memory. The
     /// area of a read-only store writes nothing. This reads nothing:
     /// `open` checks the directory.
-    pub(crate) fn new(dir: Box<dyn StagingDir>, memory: usize, read_only: bool) -> Self {
+    pub(crate) fn new(dir: Arc<dyn Dir>, memory: usize, read_only: bool) -> Self {
         Self {
             dir,
             memory,
@@ -521,13 +489,13 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::commit::Txn;
     use crate::store::{Options, Store};
-    use crate::vfs::MemVfs;
+    use crate::vfs::{MemVfs, Vfs};
 
     /// Return a staging area in a new filesystem. Each transaction keeps
     /// `memory` bytes of pickles in memory.
     fn area(memory: usize) -> (MemVfs, StagingArea) {
         let vfs = MemVfs::new();
-        let area = StagingArea::new(Box::new(vfs.clone()), memory, false);
+        let area = StagingArea::new(Arc::new(vfs.clone()), memory, false);
         (vfs, area)
     }
 

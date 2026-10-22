@@ -422,7 +422,8 @@ fn assert_packed(store: &Store, s: &Scenario) {
 
 #[test]
 fn a_pack_keeps_what_readers_at_or_after_the_pack_tid_see() {
-    let store = Store::open(fresh_dir("reachability")).unwrap();
+    let dir = fresh_dir("reachability");
+    let store = Store::open(&dir).unwrap();
     let s = scenario(&store);
     let before = views(&store, &s.kept(), &s.snapshots());
 
@@ -499,7 +500,8 @@ fn a_pack_removes_the_blob_files_of_the_records_it_removes() {
 
 #[test]
 fn a_pack_runs_while_other_threads_commit_and_read() {
-    let store = Arc::new(Store::open(fresh_dir("online")).unwrap());
+    let dir = fresh_dir("online");
+    let store = Arc::new(Store::open(&dir).unwrap());
     let s = scenario(&store);
     let kept = s.kept();
     let at_pack: Vec<_> = views(&store, &kept, &[s.pack_tid()]);
@@ -555,7 +557,8 @@ fn a_pack_runs_while_other_threads_commit_and_read() {
 
 #[test]
 fn a_reference_that_cannot_be_read_keeps_its_target() {
-    let store = Store::open(fresh_dir("unreadable")).unwrap();
+    let dir = fresh_dir("unreadable");
+    let store = Store::open(&dir).unwrap();
     let (u, x) = (Oid(1), Oid(2));
     let mut model = Model::default();
 

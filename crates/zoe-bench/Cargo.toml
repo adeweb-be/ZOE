@@ -23,6 +23,10 @@ zoe-core.workspace = true
 zoe-wire.workspace = true
 
 [dev-dependencies]
+# The measurements of the core: a storage backend of redb that times the
+# database file, and a subscriber of the span `fsync`.
+redb.workspace = true
+tracing.workspace = true
 zoe-server = { workspace = true, features = ["serve"] }
 
 [lints]

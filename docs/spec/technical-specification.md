@@ -417,7 +417,6 @@ pub trait Backend: Send + Sync {
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;  // the oids of each transaction of a range
     fn indexed_tids(&self, from: Tid, to: Tid, limit: usize) -> Result<Vec<Tid>>;  // a slice of the tids of the index, for the iterator
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>>;  // the current record of the first oid ≥ from
-    fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>; // not used: pack goes through the methods below
     fn pack_watermark(&self) -> Result<Tid>;  // the tid of the last pack, 0 before the first
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;  // the record keys of whole oids from `from`, for the pack scan
     fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;  // a transaction row, its index keys and their records, one snapshot
