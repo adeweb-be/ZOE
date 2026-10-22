@@ -8,15 +8,15 @@
 //! records, so every snapshot and every crash image holds the count of
 //! its records.
 //!
-//! The format becomes `ZOE format 2`. The first writer open of a store of
-//! `ZOE format 1`, which has no count, counts the oids of `records` once
-//! and writes the count and the new format name in one backend write. A
-//! read-only open of such a store writes nothing and has no count.
+//! The format is `ZOE format 2`. An open refuses a store of `ZOE format
+//! 1`, which has no count, with the error of any other format name. The
+//! refused open writes nothing.
 //!
 //! The test makes a store of format 1 with the test hooks
 //! `zoe_core::testing::{remove_meta, write_meta}`. It checks the count
 //! against the oids of `Store::record_keys` after each step, and on every
-//! crash image of commits, of a pack and of the upgrade.
+//! crash image of commits and of a pack. It checks the refusal of a store
+//! of format 1 on every crash image of the refused open.
 
 mod support;
 
@@ -24,7 +24,7 @@ use support::fresh_dir;
 use zoe_core::testing;
 use zoe_core::testing::commit_txn;
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Store, Tid, Txn};
+use zoe_core::{Oid, Store, Tid, Txn, ZoeError};
 
 /// A `PersistentMapping` record with no reference.
 const PICKLE: &[u8] =
@@ -99,6 +99,14 @@ fn downgrade(store: &Store) {
     testing::write_meta(store, "format", b"ZOE format 1").unwrap();
 }
 
+/// Check that `error` is the refusal of the format name `name`.
+fn assert_refused(error: Option<ZoeError>, name: &str, context: &str) {
+    assert!(
+        matches!(&error, Some(ZoeError::Format(text)) if text == name),
+        "{context}: {error:?}"
+    );
+}
+
 #[test]
 fn a_new_store_counts_zero_objects() {
     let store = Store::open_vfs(MemVfs::new()).unwrap();
@@ -160,32 +168,26 @@ fn the_count_survives_a_reopen() {
 }
 
 #[test]
-fn the_first_writer_open_of_a_store_of_format_1_counts_once() {
-    let dir = fresh_dir("upgrade");
+fn a_store_of_format_1_does_not_open() {
+    let dir = fresh_dir("format-1");
     let store = Store::open(&dir).unwrap();
     let oids = root_and_orphans(&store, 4);
     commit_txn(writing(&store, &[(oids[1], None)]));
     downgrade(&store);
     drop(store);
 
-    // A read-only open writes nothing and has no count.
+    // A read-only open refuses the store and writes nothing.
     let database = dir.join("zoe.redb");
     let before = std::fs::read(&database).unwrap();
-    let reader = Store::open_read_only(&dir).unwrap();
-    assert_eq!(reader.object_count(), None);
-    drop(reader);
+    let refused = Store::open_read_only(&dir).err();
+    assert_refused(refused, "ZOE format 1", "the read-only open");
     assert_eq!(std::fs::read(&database).unwrap(), before);
 
-    // The first writer open counts and writes the count.
-    let store = Store::open(&dir).unwrap();
-    assert_eq!(store.object_count(), Some(5));
-    assert_exact(&store, "after the upgrade");
-    drop(store);
-
-    // Then a read-only open reads it.
-    let reader = Store::open_read_only(&dir).unwrap();
-    assert_eq!(reader.object_count(), Some(5));
-    drop(reader);
+    // A writer open refuses it too and counts nothing, so the next open
+    // refuses it again.
+    assert_refused(Store::open(&dir).err(), "ZOE format 1", "the writer open");
+    let refused = Store::open_read_only(&dir).err();
+    assert_refused(refused, "ZOE format 1", "the next open");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -236,7 +238,7 @@ fn every_crash_image_of_a_pack_holds_the_count_of_its_records() {
 }
 
 #[test]
-fn every_crash_image_of_the_upgrade_opens_with_an_exact_count() {
+fn every_crash_image_of_a_refused_open_of_format_1_is_refused() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
     let oids = root_and_orphans(&store, 6);
@@ -244,15 +246,12 @@ fn every_crash_image_of_the_upgrade_opens_with_an_exact_count() {
     downgrade(&store);
     drop(store);
     let vfs = vfs.durable_copy();
-    let store = Store::open_vfs(vfs.clone()).unwrap();
-    assert_eq!(store.object_count(), Some(7));
-    drop(store);
+    let refused = Store::open_vfs(vfs.clone()).err();
+    assert_refused(refused, "ZOE format 1", "the writer open");
 
     for image in vfs.crash_images() {
-        // A crash before the write of the upgrade leaves format 1, and
-        // this open counts again.
-        let reopened =
-            Store::open_vfs(image.vfs()).unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
-        assert_eq!(reopened.object_count(), Some(7), "{image:?}");
+        // The refused open changes no row, so each image stays format 1.
+        let refused = Store::open_vfs(image.vfs()).err();
+        assert_refused(refused, "ZOE format 1", &format!("{image:?}"));
     }
 }

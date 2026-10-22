@@ -84,13 +84,8 @@ pub(crate) use codec::{decode as decode_payload, encode as encode_payload};
 
 /// The name and version of the format, in the `format` row of `meta`.
 /// A store of this format has the row `object_count` in `meta`. An open
-/// refuses a store with a name other than this one and `FORMAT_1_NAME`.
+/// refuses a store with another name.
 pub const FORMAT_NAME: &[u8] = b"ZOE format 2";
-
-/// The name of the format without the row `object_count`. A writer open
-/// counts the objects of such a store once, then writes the count and
-/// `FORMAT_NAME`. A read-only open reads such a store and has no count.
-pub const FORMAT_1_NAME: &[u8] = b"ZOE format 1";
 
 /// The key space of a frame. Its tag is the first byte of the checksum
 /// input, so a frame verifies only in the key space that wrote it.

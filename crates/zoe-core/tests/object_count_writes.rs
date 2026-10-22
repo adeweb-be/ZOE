@@ -181,14 +181,18 @@ fn another_format_name_does_not_open() {
 }
 
 #[test]
-fn the_upgrade_replaces_a_count_that_format_1_left() {
+fn a_store_of_format_1_with_a_count_does_not_open() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
     root_and_orphans(&store, 2);
-    // A store of format 1 with a stale row: the upgrade counts again.
+    // A store of format 1 with a row of 8 bytes: the name refuses it, as
+    // another format name.
     testing::write_meta(&store, "object_count", &99u64.to_be_bytes()).unwrap();
     testing::write_meta(&store, "format", b"ZOE format 1").unwrap();
     drop(store);
-    let store = Store::open_vfs(vfs).unwrap();
-    assert_eq!(store.object_count(), Some(3));
+    let error = Store::open_vfs(vfs).err();
+    assert!(
+        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 1"),
+        "{error:?}"
+    );
 }

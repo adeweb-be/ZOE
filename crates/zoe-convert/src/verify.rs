@@ -13,9 +13,8 @@
 //! A store error is a finding, never a failure of the call.
 //!
 //! The walk counts the oids that have at least one record, deletions
-//! included. A store of format 2 keeps this count in `object_count`, and
-//! a count that differs is a finding. A store of format 1 has no count
-//! yet, which is no finding.
+//! included. The store keeps this count in `object_count`, and a count
+//! that differs is a finding. A store without a count gives no finding.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -105,8 +104,8 @@ pub struct Verification {
     pub objects: u64,
     /// The blob records.
     pub blobs: u64,
-    /// The `object_count` that the store keeps. A store of format 1 has
-    /// none until its first writer open: that is no finding.
+    /// The `object_count` that the store keeps. A store without a count
+    /// gives `None`: that is no finding.
     pub object_count: Option<u64>,
     /// The object count when it differs from the oids of the records. The
     /// check runs only when the walk read every record key.
@@ -815,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_of_format_1_has_no_count_and_no_finding() {
+    fn a_store_of_format_1_does_not_open_for_a_check() {
         let dir = std::env::temp_dir().join(format!("zoe-verify-format-1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
@@ -834,12 +833,11 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let store = Store::open_read_only(&dir).unwrap();
-        let report = verify(&store, None);
-        drop(store);
+        let error = Store::open_read_only(&dir).err();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(report.object_count, None);
-        assert_eq!(report.count, None);
-        assert_eq!(report.problems(), 0, "{report:?}");
+        assert!(
+            matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 1"),
+            "{error:?}"
+        );
     }
 }

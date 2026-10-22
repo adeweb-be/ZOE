@@ -246,10 +246,7 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "  blobs            {}", report.blobs)?;
     match report.object_count {
         Some(count) => writeln!(out, "  object count     {count}")?,
-        None => writeln!(
-            out,
-            "  object count     none: the store has no count yet (ZOE format 1)"
-        )?,
+        None => writeln!(out, "  object count     none: the store has no count yet")?,
     }
     writeln!(out, "Findings: {}", report.problems())?;
     writeln!(out, "  checksums        {}", report.checksums.len())?;
@@ -363,7 +360,7 @@ mod tests {
             write_text(&mut out, Path::new("store"), report).unwrap();
             String::from_utf8(out).unwrap()
         };
-        // A store of format 1 has no count: one line, and no finding.
+        // A store without a count: one line, and no finding.
         let format_1 = text(&Verification::default());
         assert!(
             format_1.contains("\n  object count     none: the store has no count yet"),
