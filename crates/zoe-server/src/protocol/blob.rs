@@ -16,9 +16,9 @@ use std::io::{self, Read};
 
 use rmpv::Value;
 use zoe_core::{BlobReader, Oid, Tid, ZoeError};
+use zoe_wire::p64;
 
 use super::message;
-use super::session::p64;
 
 /// The size of a chunk that `sendBlob` sends. The stock client takes a
 /// chunk of any size.

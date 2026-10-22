@@ -2371,6 +2371,7 @@ dependencies = [
  "zoe-convert",
  "zoe-core",
  "zoe-mcp",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2381,6 +2382,14 @@ dependencies = [
  "zoe-core",
  "zoe-pickle",
  "zoe-server",
+]
+
+[[package]]
+name = "zoe-wire"
+version = "0.0.0"
+dependencies = [
+ "rmpv",
+ "rustls",
 ]
 
 [[package]]

@@ -33,10 +33,12 @@ use rmpv::Value;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use zoe_core::{Flavour, Oid, Tid};
+use zoe_wire::extension::{KV, LOCK_INTENT, SEQUENCES, TRACE_CONTEXT};
+use zoe_wire::{PROTOCOL, p64, u64_of};
 
 use crate::Error;
 use crate::endpoint::{Address, Endpoint};
-use crate::protocol::{self, Message, bin8, get, p64};
+use crate::protocol::{self, Message, get};
 use crate::runtime::{Runtime, Stream, Tokio};
 
 /// The time between two heartbeats, as `ZEO.ClientStorage` sends them.
@@ -436,11 +438,11 @@ impl Client {
     async fn handshake(runtime: Arc<dyn Runtime>, endpoint: &Endpoint) -> Result<Client, Error> {
         let mut stream = endpoint.connect(runtime.as_ref()).await?;
         match protocol::read_frame(&mut stream).await? {
-            Some(theirs) if theirs == protocol::PROTOCOL => {}
+            Some(theirs) if theirs == PROTOCOL => {}
             Some(theirs) => return Err(Error::OtherProtocol(theirs)),
             None => return Err(Error::Disconnected),
         }
-        protocol::write_frame(&mut stream, protocol::PROTOCOL).await?;
+        protocol::write_frame(&mut stream, PROTOCOL).await?;
         Ok(Client::start(runtime, stream, endpoint.address().clone()))
     }
 
@@ -574,7 +576,7 @@ impl Client {
     /// Load the current record of `oid`: its pickle and its serial. An oid
     /// without a record fails with the `POSKeyError` of the server.
     pub async fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid), Error> {
-        match self.load_before(oid, protocol::MAX_TID).await? {
+        match self.load_before(oid, Tid(zoe_wire::MAX_TID)).await? {
             Some(record) => Ok((record.data, record.tid)),
             None => Err(protocol::pos_key_error(oid)),
         }
@@ -596,7 +598,7 @@ impl Client {
     pub async fn load_before_at(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
         let (reply, position) = self
             .inner
-            .call_at("loadBefore", vec![bin8(oid.0), bin8(tid.0)], false)
+            .call_at("loadBefore", vec![p64(oid.0), p64(tid.0)], false)
             .await;
         let reply = reply?;
         if reply.is_nil() {
@@ -612,7 +614,7 @@ impl Client {
     pub async fn load_serial(&self, oid: Oid, serial: Tid) -> Result<Vec<u8>, Error> {
         let reply = self
             .inner
-            .call("loadSerial", vec![bin8(oid.0), bin8(serial.0)])
+            .call("loadSerial", vec![p64(oid.0), p64(serial.0)])
             .await?;
         match reply {
             // The data moves out of the reply: no copy.
@@ -653,7 +655,7 @@ impl Client {
     pub async fn get_invalidations(&self, tid: Tid) -> Result<Option<Invalidation>, Error> {
         let reply = self
             .inner
-            .call("getInvalidations", vec![bin8(tid.0)])
+            .call("getInvalidations", vec![p64(tid.0)])
             .await?;
         if reply.is_nil() {
             return Ok(None);
@@ -683,7 +685,7 @@ impl Client {
     pub async fn holds_transaction(&self, tid: Tid) -> Result<bool, Error> {
         let id = self
             .inner
-            .call("iterator_start", vec![bin8(tid.0), bin8(tid.0)])
+            .call("iterator_start", vec![p64(tid.0), p64(tid.0)])
             .await?;
         let next = self.inner.call("iterator_next", vec![id.clone()]).await;
         self.inner
@@ -800,7 +802,7 @@ impl Client {
     /// timeout with its `ConflictError`.
     pub async fn lock_intent(&self, oids: &[Oid]) -> Result<Vec<Tid>, Error> {
         self.check_extension(LOCK_INTENT)?;
-        let oids = oids.iter().map(|oid| bin8(oid.0)).collect();
+        let oids = oids.iter().map(|oid| p64(oid.0)).collect();
         let reply = self
             .inner
             .call("lock_intent", vec![Value::Array(oids)])
@@ -866,7 +868,7 @@ impl Client {
     pub async fn history(&self, oid: Oid, size: usize) -> Result<Vec<HistoryEntry>, Error> {
         let reply = self
             .inner
-            .call("history", vec![bin8(oid.0), (size as u64).into()])
+            .call("history", vec![p64(oid.0), (size as u64).into()])
             .await?;
         let Value::Array(items) = &reply else {
             return Err(bad("history", &reply));
@@ -876,7 +878,7 @@ impl Client {
             .map(|item| {
                 let bytes = |key| get(item, key).and_then(Value::as_slice).map(<[u8]>::to_vec);
                 Some(HistoryEntry {
-                    tid: Tid(get(item, "tid").and_then(p64)?),
+                    tid: Tid(get(item, "tid").and_then(u64_of)?),
                     time: get(item, "time").and_then(Value::as_f64)?,
                     user_name: bytes("user_name")?,
                     description: bytes("description")?,
@@ -924,7 +926,7 @@ impl Client {
                     user.into(),
                     description.into(),
                     extension,
-                    tid.map_or(Value::Nil, |tid| bin8(tid.0)),
+                    tid.map_or(Value::Nil, |tid| p64(tid.0)),
                     status.into(),
                 ],
             )
@@ -1034,7 +1036,7 @@ impl Transaction {
         self.inner
             .notify(
                 "storea",
-                vec![bin8(oid.0), bin8(serial.0), data.into(), self.id.into()],
+                vec![p64(oid.0), p64(serial.0), data.into(), self.id.into()],
             )
             .await
     }
@@ -1048,7 +1050,7 @@ impl Transaction {
         self.inner
             .notify(
                 "checkCurrentSerialInTransaction",
-                vec![bin8(oid.0), bin8(serial.0), self.id.into()],
+                vec![p64(oid.0), p64(serial.0), self.id.into()],
             )
             .await
     }
@@ -1062,7 +1064,7 @@ impl Transaction {
         self.inner
             .notify(
                 "deleteObject",
-                vec![bin8(oid.0), bin8(serial.0), self.id.into()],
+                vec![p64(oid.0), p64(serial.0), self.id.into()],
             )
             .await
     }
@@ -1133,11 +1135,11 @@ impl Transaction {
     ) -> Result<(), Error> {
         self.check()?;
         let data = data.map_or(Value::Nil, Value::from);
-        let prev_txn = prev_txn.map_or(Value::Nil, |tid| bin8(tid.0));
+        let prev_txn = prev_txn.map_or(Value::Nil, |tid| p64(tid.0));
         self.inner
             .notify(
                 "restorea",
-                vec![bin8(oid.0), bin8(serial.0), data, prev_txn, self.id.into()],
+                vec![p64(oid.0), p64(serial.0), data, prev_txn, self.id.into()],
             )
             .await
     }
@@ -1184,7 +1186,7 @@ impl Transaction {
         blob: &mut R,
     ) -> Result<(), Error> {
         self.check()?;
-        let args = vec![bin8(oid.0), bin8(serial.0), data.into(), self.id.into()];
+        let args = vec![p64(oid.0), p64(serial.0), data.into(), self.id.into()];
         self.inner.notify("storea", args.clone()).await?;
         self.inner.notify("storeBlobStart", vec![]).await?;
         let mut chunk = vec![0; BLOB_CHUNK];
@@ -1225,7 +1227,7 @@ impl Transaction {
         filename: &str,
     ) -> Result<(), Error> {
         self.check()?;
-        let (oid, serial) = (bin8(oid.0), bin8(serial.0));
+        let (oid, serial) = (p64(oid.0), p64(serial.0));
         let args = vec![oid.clone(), serial.clone(), data.into(), self.id.into()];
         self.inner.notify("storea", args).await?;
         let args = vec![oid, serial, data.into(), filename.into(), self.id.into()];
@@ -1443,7 +1445,7 @@ impl Inner {
             id,
             sent: false,
         };
-        let args = vec![bin8(oid.0), bin8(serial.0)];
+        let args = vec![p64(oid.0), p64(serial.0)];
         let frame = protocol::call(id, "sendBlob", args, self.traceparent().as_deref())?;
         if self.outgoing.send(frame).await.is_err() {
             return Err(Error::Disconnected);
@@ -1580,7 +1582,7 @@ impl Inner {
                 if let Some(pending) = pending {
                     if pending.finish
                         && let Ok(reply) = &result
-                        && let Some(committed) = p64(reply)
+                        && let Some(committed) = u64_of(reply)
                     {
                         self.last_tid.fetch_max(committed, Ordering::SeqCst);
                     }
@@ -1781,17 +1783,6 @@ async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
     }
 }
 
-/// The extension of the sequences.
-const SEQUENCES: &str = "sequences";
-
-/// The extension of the KV namespaces.
-const KV: &str = "kv";
-/// The extension of the early write-intent locks.
-const LOCK_INTENT: &str = "lock_intent";
-
-/// The extension that lets a call carry the trace context of the client.
-const TRACE_CONTEXT: &str = "trace_context";
-
 /// Tell if `class` is the class of a `TypeError`, as `builtins.TypeError`.
 fn is_type_error(class: &str) -> bool {
     class.rsplit('.').next() == Some("TypeError")
@@ -1858,11 +1849,11 @@ pub(crate) fn merge(into: &mut Vec<(Value, Value)>, entries: &[(Value, Value)]) 
 fn invalidation(args: &Value) -> Option<Invalidation> {
     let [tid, oids] = <&[Value; 2]>::try_from(args.as_array()?.as_slice()).ok()?;
     Some(Invalidation {
-        tid: Tid(p64(tid)?),
+        tid: Tid(u64_of(tid)?),
         oids: oids
             .as_array()?
             .iter()
-            .map(|oid| p64(oid).map(Oid))
+            .map(|oid| u64_of(oid).map(Oid))
             .collect::<Option<_>>()?,
     })
 }
@@ -1884,12 +1875,12 @@ fn extension_map(bytes: &[u8]) -> Result<Value, Error> {
 
 /// Read a tid, or fail with a protocol error of `method`.
 fn tid(value: &Value, method: &str) -> Result<Tid, Error> {
-    p64(value).map(Tid).ok_or_else(|| bad(method, value))
+    u64_of(value).map(Tid).ok_or_else(|| bad(method, value))
 }
 
 /// Read an oid, or fail with a protocol error of `method`.
 fn oid(value: &Value, method: &str) -> Result<Oid, Error> {
-    p64(value).map(Oid).ok_or_else(|| bad(method, value))
+    u64_of(value).map(Oid).ok_or_else(|| bad(method, value))
 }
 
 /// Read the items of a vote reply: an oid that the server resolved, or a
@@ -1911,7 +1902,7 @@ fn vote_reply(items: &[Value]) -> Result<Voted, Error> {
 /// Read a conflict that a vote lists. A map without the serials or the
 /// data does not read.
 fn listed(value: &Value) -> Option<Listed> {
-    let oid = get(value, "oid").and_then(p64).map(Oid)?;
+    let oid = get(value, "oid").and_then(u64_of).map(Oid)?;
     let Some(Value::Array(serials)) = get(value, "serials") else {
         return None;
     };
@@ -1921,8 +1912,8 @@ fn listed(value: &Value) -> Option<Listed> {
     let data = get(value, "data")?.as_slice()?.to_vec();
     Some(Listed {
         oid,
-        committed: Tid(p64(committed)?),
-        read: Tid(p64(read)?),
+        committed: Tid(u64_of(committed)?),
+        read: Tid(u64_of(read)?),
         data,
     })
 }
@@ -1942,7 +1933,7 @@ fn piece(method: &str, args: Value) -> Result<((u64, u64), Piece), Error> {
         },
         _ => return Err(bad(method, &Value::Array(items))),
     };
-    match (p64(&items[0]), p64(&items[1])) {
+    match (u64_of(&items[0]), u64_of(&items[1])) {
         (Some(oid), Some(serial)) => Ok(((oid, serial), piece)),
         _ => Err(bad(method, &Value::Array(items))),
     }
@@ -1974,9 +1965,9 @@ fn record(reply: Value) -> Result<Record, Error> {
         .map_err(|items| bad("loadBefore", &Value::Array(items)))?;
     let next = match &end {
         Value::Nil => Some(None),
-        end => p64(end).map(Some),
+        end => u64_of(end).map(Some),
     };
-    match (data, p64(&start), next) {
+    match (data, u64_of(&start), next) {
         (Value::Binary(data), Some(tid), Some(next)) => Ok(Record {
             data,
             tid: Tid(tid),
@@ -1994,6 +1985,12 @@ fn bad(method: &str, value: &Value) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Return the bin of the 8 big-endian bytes of `n`, as a stock server
+    /// sends an oid or a tid. The tests build it without `zoe-wire`.
+    fn bin8(n: u64) -> Value {
+        Value::Binary(n.to_be_bytes().to_vec())
+    }
 
     #[test]
     fn the_record_of_a_reply_keeps_the_buffer_of_its_data() {
