@@ -29,8 +29,8 @@ use redb::{
 };
 
 use crate::backend::{
-    Backend, BlobRecord, Bytes, NewPayload, NewRecord, PackStats, Payload, Record, RecordEncoding,
-    RecordMeta, TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
+    Backend, BlobRecord, Bytes, NewPayload, NewRecord, Payload, Record, RecordEncoding, RecordMeta,
+    TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
@@ -491,26 +491,6 @@ impl Backend for RedbBackend {
         .collect()
     }
 
-    fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
-        // One read transaction serves every oid.
-        let txn = self.db.begin_read().map_err(backend)?;
-        let records = txn.open_table(RECORDS).map_err(backend)?;
-        oids.map(|oid| {
-            let start = format::record_key(oid, Tid::ZERO);
-            let end = format::record_key(oid, Tid::MAX);
-            let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
-            match range.next_back() {
-                Some(entry) => {
-                    let (key, value) = entry.map_err(backend)?;
-                    inside(oid, key.value(), start..end)?;
-                    Self::record(oid, key.value(), value.value()).map(Some)
-                }
-                None => Ok(None),
-            }
-        })
-        .collect()
-    }
-
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
         let txn = self.db.begin_read().map_err(backend)?;
         let records = txn.open_table(RECORDS).map_err(backend)?;
@@ -788,12 +768,6 @@ impl Backend for RedbBackend {
             }
             None => Ok(None),
         }
-    }
-
-    fn pack(&self, _before: Tid, _reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
-        Err(ZoeError::Backend(
-            "pack goes through Store::pack and the removal methods".into(),
-        ))
     }
 
     fn pack_watermark(&self) -> Result<Tid> {
@@ -1612,19 +1586,19 @@ mod tests {
     }
 
     #[test]
-    fn load_current_reads_each_oid_as_load_before_does() {
+    fn current_serials_reads_each_oid_as_load_before_does() {
         let backend = empty();
         commit_record(&backend, Oid(1), Tid(10), b"a");
         commit_record(&backend, Oid(1), Tid(20), &compressible());
         commit_record(&backend, Oid(3), Tid(30), b"c");
         let oids = [Oid(3), Oid(2), Oid(1)];
-        let current = backend.load_current(&mut oids.into_iter()).unwrap();
+        let current = backend.current_serials(&mut oids.into_iter()).unwrap();
         let expected: Vec<_> = oids
             .iter()
-            .map(|&oid| backend.load_before(oid, Tid::MAX).unwrap())
+            .map(|&oid| backend.load_before(oid, Tid::MAX).unwrap().map(|r| r.tid))
             .collect();
         assert_eq!(current, expected);
-        assert_eq!(current[2].as_ref().unwrap().data, compressible());
+        assert_eq!(current, [Some(Tid(30)), None, Some(Tid(20))]);
     }
 
     #[test]

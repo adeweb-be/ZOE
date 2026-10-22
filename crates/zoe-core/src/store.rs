@@ -865,9 +865,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::backend::{
-        BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnRecords, WriteTxn,
-    };
+    use crate::backend::{BlobRecord, Bytes, Record, RecordMeta, TxnIter, TxnRecords, WriteTxn};
     use crate::format;
     use crate::format::Codec;
     use crate::kv::{Flavour, Swept};
@@ -1048,10 +1046,6 @@ mod tests {
 
         fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
             self.inner.current_from(from)
-        }
-
-        fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
-            self.inner.pack(before, reachable)
         }
 
         fn pack_watermark(&self) -> Result<Tid> {

@@ -93,15 +93,6 @@ pub struct TxnMeta {
     pub status: TxnStatus,
 }
 
-/// What a pack removed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PackStats {
-    /// The number of record versions that the pack removed.
-    pub records_removed: u64,
-    /// The number of bytes that the pack removed.
-    pub bytes_removed: u64,
-}
-
 /// A durable store of records and transactions.
 ///
 /// The trait is dyn-compatible, so that the configuration can select the
@@ -110,23 +101,16 @@ pub trait Backend: Send + Sync {
     /// Return the newest version of `oid` with a tid lower than `tid`.
     fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>>;
 
-    /// Return the current version of each oid of `oids`, in the order of
-    /// `oids`, as `load_before` at `Tid::MAX` does. A backend can read
-    /// them all in one snapshot.
-    fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
-        oids.map(|oid| self.load_before(oid, Tid::MAX)).collect()
-    }
-
     /// Return the serial of the current version of each oid of `oids`, in
     /// the order of `oids`: the tid of its newest record, or `None` for an
     /// oid without a record. A backend can read them all in one snapshot,
     /// from the keys of the records alone, so the call decodes no record.
+    ///
+    /// This default loads each current record with `load_before` at
+    /// `Tid::MAX`.
     fn current_serials(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
-        let records = self.load_current(oids)?;
-        Ok(records
-            .into_iter()
-            .map(|record| record.map(|record| record.tid))
-            .collect())
+        oids.map(|oid| Ok(self.load_before(oid, Tid::MAX)?.map(|record| record.tid)))
+            .collect()
     }
 
     /// Return the pickle that `tid` wrote for `oid`.
@@ -209,12 +193,6 @@ pub trait Backend: Send + Sync {
     /// Return the first oid at or after `from` that has a version, with
     /// its newest version.
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>>;
-
-    /// Remove the versions older than `before` that `reachable` rejects.
-    ///
-    /// The core does not call this method: pack removes records through
-    /// the removal methods of `WriteTxn`, in batches.
-    fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>;
 
     /// Return the tid of the last pack, from `pack_watermark` in `meta`.
     /// A store that was never packed gives `Tid::ZERO`.
@@ -615,10 +593,6 @@ mod tests {
 
         fn current_from(&self, _: Oid) -> Result<Option<(Oid, Record)>> {
             Ok(None)
-        }
-
-        fn pack(&self, _: Tid, _: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
-            Ok(PackStats::default())
         }
 
         fn pack_watermark(&self) -> Result<Tid> {

@@ -4,7 +4,7 @@
 //! Both skins call it: the in-process storage (`zoe-py`) and the server
 //! (`zoe-server`). The core owns correctness: the data model, two-phase
 //! commit, per-OID locks, conflict handling, pack and blobs. A backend
-//! owns bytes, behind the [`Backend`] trait.
+//! owns bytes, behind the internal trait `Backend`.
 
 mod backend;
 mod blob;
@@ -28,10 +28,7 @@ mod types;
 mod undo;
 pub mod vfs;
 
-pub use backend::{
-    Backend, BlobRecord, Bytes, NewPayload, NewRecord, PackStats, Payload, Record, RecordEncoding,
-    RecordMeta, TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
-};
+pub use backend::{BlobRecord, Bytes, Record, RecordEncoding, TxnMeta, TxnStatus};
 pub use blob::{BlobFile, BlobReader};
 pub use clock::{Clock, SystemClock, Waiter, civil_from_days, civil_from_tid, timestamp};
 pub use commit::{Encoded, Finished, IntentLocks, Observer, Txn};
