@@ -88,7 +88,7 @@ The gate is `every_flipped_bit_of_a_namespace_frame_raises_corrupt_kv` of `crate
 
 ### B. The registry backend
 
-The rows, check, cache and steps of `zoe.plone.registry`: specification, "Server mode", "`zoe.plone` and the registry (F31, ADR 0050)" ("the registry paragraph" below).
+The rows, check, cache and steps of `zoe.plone.registry`: specification, "Server mode", "`zoe.plone` and the registry (F31, ADR 0043)" ("the registry paragraph" below).
 
 #### B1. The option and the guard
 

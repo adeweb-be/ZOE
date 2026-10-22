@@ -51,7 +51,7 @@ A stock client needs nothing: the server merges at the vote and replies with the
 - Each result of tier 1 writes one line of JSON: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason, `shadow`, whether the outcome was that of the vote, `undo` (in an undo, `read` is the undone tid), the keys that the new transaction changed (at most 20, each written close to its Python `repr`: a `str` in double quotes, an `int` in digits, a `bytes` as `b'...'` or a tuple in parentheses, and cut at 80 characters, and their number; with the rules in shadow mode, the keys of the merge of the rules), the committed and the read serial, and the user and the description of both transactions.
 - The file opens in append mode, and each line is written whole. It is never synced, and it is not in the store.
 - The log holds text of the site, which the server log never holds, so the operator turns it on.
-- `zoe serve` counts `zoe_conflicts_resolved_total{path="native"}` and `zoe_structural_merges_total{mode, outcome}` (specification, "Server mode", "Health, metrics, shutdown").
+- `zoe serve` counts `zoe_conflicts_resolved_total{path="native"}` and `zoe_structural_merges_total{tier, mode, outcome}` (specification, "Server mode", "Health, metrics, shutdown").
 
 ## Consequences
 

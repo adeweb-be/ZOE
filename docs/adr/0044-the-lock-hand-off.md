@@ -1,6 +1,6 @@
 # 0044. The locks of hot objects: the lock hand-off at the vote, and early write-intent locks before the read
 
-Status: accepted. Part A changes the invariant of group commit in section 5 of the specification. Part B adds the extension `lock_intent` to the wire protocol, the keys `early-locks` and `early-lock-classes`, and a public Python API.
+Status: accepted. Part A changes the invariant of group commit in the specification ("Storage core", "Group commit"). Part B adds the extension `lock_intent` to the wire protocol, the keys `early-locks` and `early-lock-classes`, and a public Python API.
 
 ## Context
 
@@ -44,7 +44,7 @@ The hand-off is in `zoe-core`, so `zoe.Storage` and `zoe serve` both have it. It
 
 ### B. Early write-intent locks
 
-The mechanics: specification, "Storage core", "Early write-intent locks (extension, ADR 0045)", and "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0045)", which also lists the costs.
+The mechanics: specification, "Storage core", "Early write-intent locks (extension, ADR 0044)", and "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0044)", which also lists the costs.
 
 #### B1. The lock before the read
 
@@ -76,7 +76,7 @@ When a storage with hot classes opens, `zoe.zodb` patches `setstate`, `newTransa
 
 #### B8. `native false` and `readCurrent`
 
-`<zoeclient>` with `native false` refuses `early-locks on` (specification, "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0045)"). `readCurrent` keeps its shared lock at the vote: a shared intent lock of each node that a BTree passes would make the readers of a tree wait.
+`<zoeclient>` with `native false` refuses `early-locks on` (specification, "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0044)"). `readCurrent` keeps its shared lock at the vote: a shared intent lock of each node that a BTree passes would make the readers of a tree wait.
 
 #### B9. The versions of ZODB
 
@@ -115,4 +115,4 @@ The core owner `IntentLocks`, `Store::lock_intent(owner, oids)`, the metrics `zo
 
 ## Merged ADRs
 
-- ADR 0045, early write-intent locks: Decision, part B. Its section N is section BN here, for N from 1 to 11. The changes of its section 12 are in the sections B1, B3, B4, B5, B7 and B11 that hold their subject, or in the specification: "Storage core", "Early write-intent locks (extension, ADR 0045)", and "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0045)".
+- ADR 0045, early write-intent locks: Decision, part B. Its section N is section BN here, for N from 1 to 11. The changes of its section 12 are in the sections B1, B3, B4, B5, B7 and B11 that hold their subject, or in the specification: "Storage core", "Early write-intent locks (extension, ADR 0044)", and "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0044)".
