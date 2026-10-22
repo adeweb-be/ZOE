@@ -1,10 +1,10 @@
 //! Acceptance test of the recovery of the blob temporary directory (F2).
 //!
 //! A writer open removes only the files of `blobs/tmp/` whose names the
-//! server owns: `<digits>.tmp`, the intent files, `layout.tmp` and
-//! `upload-<digits>`. Every other file stays. With a shared blob
-//! directory, `blobs/tmp/` is the `temporaryDirectory()` of each ZEO
-//! client, so a restart of the server keeps the files of the clients.
+//! server owns: `<digits>.tmp`, the intent files and `layout.tmp`. Every
+//! other file stays. With a shared blob directory, `blobs/tmp/` is the
+//! `temporaryDirectory()` of each ZEO client, so a restart of the server
+//! keeps the files of the clients.
 
 mod support;
 
@@ -23,8 +23,6 @@ const OWNED: &[&str] = &[
     "layout.tmp",
     "0x03f0000000000010.intent",
     "0x00000000000000FF.intent",
-    "upload-3",
-    "upload-12",
 ];
 
 /// Names that the server does not own. A writer open keeps them.
@@ -40,6 +38,8 @@ const FOREIGN: &[&str] = &[
     "0x10.intent",
     "0x03f0000000000010.intent.old",
     "layout.tmp.1",
+    "upload-3",
+    "upload-12",
     "upload-",
     "upload-3x",
     "upload--3",

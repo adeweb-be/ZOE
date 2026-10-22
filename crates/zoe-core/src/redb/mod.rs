@@ -15,8 +15,8 @@
 //! records or without sequences.
 //!
 //! The row `object_count` of `meta` counts the oids that have a record.
-//! Each write that puts or removes records updates it, and the first
-//! writer open of a store of format 1 writes it.
+//! `initialise` writes it, and each write that puts or removes records
+//! updates it.
 //!
 //! `read` holds the `Backend` trait of the backend, `write` its write
 //! transaction, and `kv` the tables of the KV namespaces.
@@ -219,26 +219,6 @@ fn has_records(
     }
 }
 
-/// Return the number of distinct oids of the keys of `records`. The scan
-/// reads every key. Each key must come after the key before it, else the
-/// count fails with `CorruptRecord`.
-fn count_objects(records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>) -> Result<u64> {
-    let mut count = 0;
-    let mut previous: Option<[u8; 16]> = None;
-    for entry in records.iter().map_err(backend)? {
-        let (key, _) = entry.map_err(backend)?;
-        let key = *key.value();
-        let (oid, tid) = format::split_record_key(&key);
-        match previous {
-            Some(before) if key <= before => return Err(ZoeError::CorruptRecord { oid, tid }),
-            Some(before) if format::split_record_key(&before).0 == oid => {}
-            _ => count += 1,
-        }
-        previous = Some(key);
-    }
-    Ok(count)
-}
-
 /// Decode the row `object_count` of `meta`. A store of the current format
 /// without the row, or with a row that is not 8 bytes, is a `Format`
 /// error.
@@ -273,9 +253,6 @@ pub(crate) struct RedbBackend {
     /// writes under the commit sequencer change records, so they store
     /// it in their order.
     object_count: AtomicU64,
-    /// False only for a read-only open of a store of format 1, which has
-    /// no count.
-    counted: bool,
     /// How new records are written.
     compression: Compression,
 }
@@ -324,9 +301,8 @@ impl RedbBackend {
     /// a second time. The row counts only when its frame passes the
     /// checksum under its key. So a damaged key cannot raise the last tid.
     ///
-    /// A store of the current format must have `object_count`. A store of
-    /// format 1 has none: a writer open upgrades it (`upgrade`), and a
-    /// read-only open reads it without a count.
+    /// A store of the current format must have `object_count`. Any other
+    /// format name fails the open with `Format`.
     fn open_db(db: Db) -> Result<Self> {
         let (last_tid, object_count) = {
             let txn = db.begin_read().map_err(backend)?;
@@ -335,15 +311,12 @@ impl RedbBackend {
                 Ok(meta.get(key).map_err(backend)?.map(|v| v.value().to_vec()))
             };
             let format_name = read(META_FORMAT)?.unwrap_or_default();
-            let object_count = if format_name == format::FORMAT_NAME {
-                Some(decode_object_count(read(META_OBJECT_COUNT)?.as_deref())?)
-            } else if format_name == format::FORMAT_1_NAME {
-                None
-            } else {
+            if format_name != format::FORMAT_NAME {
                 return Err(ZoeError::Format(
                     String::from_utf8_lossy(&format_name).into_owned(),
                 ));
-            };
+            }
+            let object_count = decode_object_count(read(META_OBJECT_COUNT)?.as_deref())?;
             match txn.open_table(TXN_OIDS) {
                 Ok(_) => {}
                 Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -367,42 +340,12 @@ impl RedbBackend {
                 stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())));
             (last_tid, object_count)
         };
-        let object_count = match (object_count, &db) {
-            (Some(count), _) => Some(count),
-            (None, Db::ReadWrite(db)) => Some(Self::upgrade(db)?),
-            (None, Db::ReadOnly(_)) => None,
-        };
         Ok(Self {
             db,
             last_tid: AtomicU64::new(last_tid),
-            object_count: AtomicU64::new(object_count.unwrap_or(0)),
-            counted: object_count.is_some(),
+            object_count: AtomicU64::new(object_count),
             compression: Compression::default(),
         })
-    }
-
-    /// Upgrade a store of format 1 to the current format: count the
-    /// distinct oids of `records`, then write `object_count` and the
-    /// format name in one write transaction, with a sync. Return the
-    /// count.
-    ///
-    /// The count reads every key of `records`, so this open does not hold
-    /// N7. A crash before the commit leaves format 1, and the next writer
-    /// open counts again.
-    fn upgrade(db: &Database) -> Result<u64> {
-        let txn = db.begin_write().map_err(backend)?;
-        let count = {
-            let records = txn.open_table(RECORDS).map_err(backend)?;
-            let count = count_objects(&records)?;
-            let mut meta = txn.open_table(META).map_err(backend)?;
-            meta.insert(META_OBJECT_COUNT, &format::encode_u64(count)[..])
-                .map_err(backend)?;
-            meta.insert(META_FORMAT, format::FORMAT_NAME)
-                .map_err(backend)?;
-            count
-        };
-        txn.commit().map_err(backend)?;
-        Ok(count)
     }
 
     /// Write new records with `compression`. The backend reads records of

@@ -56,7 +56,7 @@ In-process, the open raises a `StorageError` that ends with `open the store with
 
 **Cause.** The directory holds a file `zoe.redb` that this build does not read: a store of a newer build of ZOE, or a file that is not a store.
 
-**Fix.** Open the store with the build that wrote it, or with a newer one. A store of the old `ZOE format 1` needs no fix: the first writer open upgrades it.
+**Fix.** Open the store with the build that wrote it, or with a newer one. A store of the old `ZOE format 1` gets this error too, and this build does not upgrade it.
 
 ### `a finish failed: reopen the store to commit again`
 

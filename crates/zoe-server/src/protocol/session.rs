@@ -1115,9 +1115,9 @@ impl Session {
     }
 
     /// The items `length` and `size` of the store. The length is the object
-    /// count of the store, as `len(zoe.Storage)` gives it. A read-only
-    /// store of format 1 has no count, and its length is 0. The size is
-    /// the size of the files in the store directory.
+    /// count of the store, as `len(zoe.Storage)` gives it. A store without
+    /// a count has the length 0. The size is the size of the files in the
+    /// store directory.
     fn sizes(&self) -> Result<[(Value, Value); 2], Fault> {
         let size = self
             .storage

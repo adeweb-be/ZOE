@@ -27,7 +27,11 @@ zoe-wire.workspace = true
 # database file, and a subscriber of the span `fsync`.
 redb.workspace = true
 tracing.workspace = true
+# The codec of the record frames, for the measurement of the shrink ratio.
+zoe-core = { workspace = true, features = ["testing"] }
 zoe-server = { workspace = true, features = ["serve"] }
+# The zstd contexts that the measurement of the shrink ratio keeps.
+zstd.workspace = true
 
 [lints]
 workspace = true

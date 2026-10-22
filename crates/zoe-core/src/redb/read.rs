@@ -307,8 +307,7 @@ impl Backend for RedbBackend {
     }
 
     fn object_count(&self) -> Option<u64> {
-        self.counted
-            .then(|| self.object_count.load(Ordering::Acquire))
+        Some(self.object_count.load(Ordering::Acquire))
     }
 
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {

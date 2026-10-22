@@ -20,9 +20,9 @@
 //! an intent file names and that have no blob record, then the intent
 //! files and the temporary files. In `blobs/tmp/` it removes only the
 //! regular files whose names the store owns: `<digits>.tmp`, the intent
-//! files, `layout.tmp` and `upload-<digits>`. Every other file stays. With
-//! a shared blob directory, `blobs/tmp/` is also the temporary directory of
-//! each ZEO client, so the files of the clients stay.
+//! files and `layout.tmp`. Every other file stays. With a shared blob
+//! directory, `blobs/tmp/` is also the temporary directory of each ZEO
+//! client, so the files of the clients stay.
 //!
 //! Pack uses the same intent files. Before it commits the removal of blob
 //! records, it writes and syncs an intent file for each tid of them. After
@@ -570,17 +570,12 @@ fn is_temp_name(file: &str) -> bool {
 }
 
 /// Tell if `file`, a name in `blobs/tmp/`, is a name that the store owns:
-/// a temporary file of the core, an intent file, the new layout file, or
-/// `upload-` and one or more ASCII digits. A store can hold a file with
-/// this last name from an upload of `zoe serve`. A writer open removes
-/// only these files in `blobs/tmp/`.
+/// a temporary file of the core, an intent file or the new layout file. A
+/// writer open removes only these files in `blobs/tmp/`.
 fn is_owned_name(file: &str) -> bool {
     is_temp_name(file)
         || intent_tid(file).is_some()
         || format!("{TMP_DIR}/{file}") == NEW_LAYOUT_FILE
-        || file
-            .strip_prefix("upload-")
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Tell if `name` is a name that `take_shared` takes: one part without `/`

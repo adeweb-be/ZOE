@@ -4,10 +4,10 @@
 //! full dump: every transaction of the store up to its last tid. Each later
 //! one is an incremental dump: the transactions after the last tid of the
 //! dump before it. A dump also holds the blob of each blob record, the end
-//! of each sequence and, from version 2 on, every row of the durable KV
-//! namespaces with their generation rows (ADR 0043). ADR 0030 gives the
-//! layout. A restore reads versions 1 and 2, and writes the durable rows of
-//! the last dump of the chain.
+//! of each sequence and every row of the durable KV namespaces with their
+//! generation rows (ADR 0043). ADR 0030 gives the layout. A restore reads
+//! only version 2, and writes the durable rows of the last dump of the
+//! chain.
 //!
 //! A backup reads the store through its transaction iterator. It writes a
 //! dump file once, under a temporary name, syncs it and renames it into
@@ -31,13 +31,9 @@ use zoe_core::{BlobRecord, DurableRow, Oid, Store, Tid, TxnInfo, ZoeError};
 use crate::Error;
 use crate::datafs::Problems;
 
-/// The first 8 bytes of a dump file that a backup writes: the name of the
-/// format, then its version, 2.
+/// The first 8 bytes of a dump file: the name of the format, then its
+/// version, 2. A restore refuses a file with other bytes there.
 const MAGIC: &[u8; 8] = b"ZOEDUMP\x02";
-
-/// The first 8 bytes of a dump file of version 1, which has no durable
-/// rows. A restore reads it.
-const MAGIC_1: &[u8; 8] = b"ZOEDUMP\x01";
 
 /// The durable rows that one read of a backup takes.
 const ROW_CHUNK: usize = 1024;
@@ -73,7 +69,7 @@ const CHUNK: usize = 1 << 16;
 
 /// The tag of the end of a sequence.
 const SEQUENCE: u8 = b'S';
-/// The tag of a durable row of a KV namespace, from version 2 on.
+/// The tag of a durable row of a KV namespace.
 const DURABLE: u8 = b'K';
 /// The tag of a transaction.
 const TRANSACTION: u8 = b'T';
@@ -474,7 +470,7 @@ fn read_header(path: &Path) -> Result<(Tid, Tid), Error> {
 
 /// Check the magic of `header` and return its two tids.
 fn parse_header(path: &Path, header: &[u8; HEADER]) -> Result<(Tid, Tid), Error> {
-    if header[..8] != MAGIC[..] && header[..8] != MAGIC_1[..] {
+    if header[..8] != MAGIC[..] {
         return Err(damaged(path, "not a dump file of ZOE".to_owned()));
     }
     let tid = |at: usize| Tid(u64::from_be_bytes(header[at..at + 8].try_into().unwrap()));
@@ -753,8 +749,6 @@ struct DumpReader {
     /// The tid of the last transaction read, or the last tid of the dump
     /// before.
     tid: Tid,
-    /// True for a dump of version 2, which can hold durable rows.
-    durable: bool,
     /// The blob of the last record, which the caller did not read yet.
     blob: Option<(Oid, BlobRecord)>,
 }
@@ -774,12 +768,10 @@ impl DumpReader {
             last: dump.last,
             state: State::Sequences,
             tid: dump.after,
-            durable: false,
             blob: None,
         };
         let mut header = [0; HEADER];
         reader.exact(&mut header, "the header")?;
-        reader.durable = header[..8] == MAGIC[..];
         if parse_header(path, &header)? != (dump.after, dump.last) {
             let reason = "the header names other tids than the file name";
             return Err(reader.damaged(reason.to_owned()));
@@ -810,7 +802,7 @@ impl DumpReader {
                 };
                 Ok(Entry::Sequence { name, end })
             }
-            (DURABLE, State::Sequences) if self.durable => {
+            (DURABLE, State::Sequences) => {
                 let name = self.field("the name of a namespace")?;
                 let key = self.field("a key of a namespace")?;
                 let payload = self.field("a value of a namespace")?;
@@ -1779,22 +1771,32 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_reads_a_dump_of_version_1() {
+    fn a_restore_refuses_a_dump_of_version_1() {
         let dir = test_dir("backup-version-1");
         let (source, dumps, target) = (dir.join("store"), dir.join("dumps"), dir.join("target"));
         let store = sample(&source);
         let full = backup(&store, &dumps).unwrap();
         drop(store);
-        // A dump of version 1 has the same layout without durable rows.
+        // A dump of version 1 gets the refusal of an unknown version, 3.
         let path = full.dump.unwrap();
-        let mut bytes = fs::read(&path).unwrap();
-        bytes[7] = 1;
-        let end = bytes.len() - HASH;
-        let hash = blake3::hash(&bytes[..end]);
-        bytes[end..].copy_from_slice(hash.as_bytes());
-        fs::write(&path, bytes).unwrap();
-        let restored = restore(&dumps, &target).unwrap();
-        assert_eq!((restored.transactions, restored.durable_rows), (2, 0));
+        let good = fs::read(&path).unwrap();
+        let mut refusals = Vec::new();
+        for version in [1, 3] {
+            let mut bytes = good.clone();
+            bytes[7] = version;
+            let end = bytes.len() - HASH;
+            let hash = blake3::hash(&bytes[..end]);
+            bytes[end..].copy_from_slice(hash.as_bytes());
+            fs::write(&path, bytes).unwrap();
+            let error = restore(&dumps, &target).unwrap_err();
+            assert!(
+                matches!(&error, Error::Dump { reason, .. } if reason == "not a dump file of ZOE"),
+                "version {version}: {error}"
+            );
+            assert!(!target.exists(), "version {version} left a target");
+            refusals.push(error.to_string());
+        }
+        assert_eq!(refusals[0], refusals[1]);
         let _ = fs::remove_dir_all(&dir);
     }
 

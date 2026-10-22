@@ -2424,6 +2424,7 @@ dependencies = [
  "zoe-core",
  "zoe-server",
  "zoe-wire",
+ "zstd",
 ]
 
 [[package]]
