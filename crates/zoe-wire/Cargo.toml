@@ -12,6 +12,8 @@ publish.workspace = true
 [dependencies]
 # The `Value` of an oid or a tid on the wire.
 rmpv.workspace = true
+# The PEM reader, `CertificateDer`, `UnixTime` and `CertificateError`.
+rustls.workspace = true
 
 [lints]
 workspace = true

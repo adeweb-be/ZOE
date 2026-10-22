@@ -2389,6 +2389,7 @@ name = "zoe-wire"
 version = "0.0.0"
 dependencies = [
  "rmpv",
+ "rustls",
 ]
 
 [[package]]

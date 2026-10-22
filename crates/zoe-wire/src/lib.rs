@@ -1,20 +1,24 @@
 //! The bytes and the names of the ZEO 6 msgpack protocol that `zoe serve`
-//! and its clients share (ADR 0055).
+//! and its clients share, and the reader of TLS certificates that the
+//! server and the client share (ADR 0055).
 //!
 //! The crate is sans-IO. It reads and writes bytes in memory. It opens no
 //! socket, reads no stream and has no async function. The read loops of
 //! the frames stay in the server and in the client, because their rules
-//! differ.
+//! differ. One function reads files: the PEM loader of [`tls`], which
+//! reads the certificate files of the configuration.
 //!
 //! - [`frame`]: the length of a frame, and the encode of a frame.
 //! - [`msgpack`]: the heads of a bin and of an array.
 //! - [`class`]: the class names of the exceptions that a reply names.
 //! - [`extension`]: the names of the ZOE extensions.
+//! - [`tls`]: the PEM loader, the pinned certificates and the DER reader.
 
 pub mod class;
 pub mod extension;
 pub mod frame;
 pub mod msgpack;
+pub mod tls;
 
 use rmpv::Value;
 
