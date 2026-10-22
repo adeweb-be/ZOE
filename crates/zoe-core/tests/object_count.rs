@@ -10,7 +10,7 @@
 //!
 //! The format is `ZOE format 2`. An open refuses a store of `ZOE format
 //! 1`, which has no count, with the error of any other format name. The
-//! refused open writes nothing.
+//! refused open writes no row, so the store keeps its format name.
 //!
 //! The test makes a store of format 1 with the test hooks
 //! `zoe_core::testing::{remove_meta, write_meta}`. It checks the count

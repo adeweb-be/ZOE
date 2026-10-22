@@ -24,7 +24,7 @@ A count by a scan of `records` at each call reads every key of the store. A coun
 
 **The format name.** The name becomes `ZOE format 2`. A new store starts with format 2 and a count of 0. A store of format 2 without `object_count`, or with a row that is not 8 bytes, fails the open with `Format`. Another name, `ZOE format 1` included, fails the open with `Format`. A build from before this change refuses a store of format 2, because it compares the name. So no older writer changes the records of a store and leaves its count wrong.
 
-**A store of format 1.** An open refuses a store of `ZOE format 1` with `Format`, as it refuses any other name, and writes nothing. No tool upgrades it. A read-only open of a store of format 2 reads the row.
+**A store of format 1.** An open refuses a store of `ZOE format 1` with `Format`, as it refuses any other name. The refused open writes no row, so the store keeps its format name. A read-only open changes no byte. A writer open lets redb write its own state into `zoe.redb` when the database closes, as for any other format name. No tool upgrades it. A read-only open of a store of format 2 reads the row.
 
 **`zoe verify`.** The walk of the record keys counts the distinct oids. When the store has `object_count` and the walk read every key, a count that differs is one finding.
 
