@@ -102,7 +102,8 @@ fn a_record_over_max_record_size_is_refused() {
         max_record_size: Some(1024),
         ..Options::default()
     };
-    let store = Store::open_with(fresh_dir("record"), options).unwrap();
+    let dir = fresh_dir("record");
+    let store = Store::open_with(&dir, options).unwrap();
     let (fits, over) = (store.new_oid().unwrap(), store.new_oid().unwrap());
     let before = store.last_transaction();
 
@@ -135,7 +136,8 @@ fn a_transaction_over_max_transaction_size_is_refused() {
         max_transaction_size: Some(1000),
         ..Options::default()
     };
-    let store = Store::open_with(fresh_dir("transaction"), options).unwrap();
+    let dir = fresh_dir("transaction");
+    let store = Store::open_with(&dir, options).unwrap();
     let oids: Vec<Oid> = (0..3).map(|_| store.new_oid().unwrap()).collect();
     let before = store.last_transaction();
 
@@ -221,7 +223,8 @@ fn blob_bytes_do_not_count_toward_the_transaction_size() {
         max_transaction_size: Some(1000),
         ..Options::default()
     };
-    let store = Store::open_with(fresh_dir("blob-in-transaction"), options).unwrap();
+    let dir = fresh_dir("blob-in-transaction");
+    let store = Store::open_with(&dir, options).unwrap();
     let (blob, record) = (store.new_oid().unwrap(), store.new_oid().unwrap());
 
     // The pickles hold 900 bytes and the blob 10,000 bytes.

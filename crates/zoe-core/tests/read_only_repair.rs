@@ -97,7 +97,8 @@ fn assert_only_the_database_changed(
 
 #[test]
 fn the_strict_read_only_open_still_refuses_a_store_left_open_and_writes_nothing() {
-    let (image, _) = crash_image(&fresh_dir("strict"));
+    let root = fresh_dir("strict");
+    let (image, _) = crash_image(&root);
     let before = tree(&image);
 
     let result = Store::open_read_only(&image);
@@ -112,7 +113,8 @@ fn the_strict_read_only_open_still_refuses_a_store_left_open_and_writes_nothing(
 
 #[test]
 fn the_repairing_open_repairs_a_store_left_open_and_reads_its_last_commit() {
-    let (image, last) = crash_image(&fresh_dir("repair"));
+    let root = fresh_dir("repair");
+    let (image, last) = crash_image(&root);
     let before = tree(&image);
 
     let store = Store::open_read_only_repairing(&image, Options::default()).unwrap();
@@ -141,7 +143,8 @@ fn the_repairing_open_repairs_a_store_left_open_and_reads_its_last_commit() {
 
 #[test]
 fn the_repairing_open_of_a_clean_store_writes_nothing() {
-    let dir = fresh_dir("clean").join("store");
+    let root = fresh_dir("clean");
+    let dir = root.join("store");
     let tid = clean_store(&dir);
     let before = tree(&dir);
 
@@ -154,7 +157,8 @@ fn the_repairing_open_of_a_clean_store_writes_nothing() {
 
 #[test]
 fn a_second_repairing_open_writes_nothing() {
-    let (image, last) = crash_image(&fresh_dir("twice"));
+    let root = fresh_dir("twice");
+    let (image, last) = crash_image(&root);
     drop(Store::open_read_only_repairing(&image, Options::default()).unwrap());
     let repaired = tree(&image);
 
@@ -167,7 +171,8 @@ fn a_second_repairing_open_writes_nothing() {
 
 #[test]
 fn the_repair_leaves_the_leftovers_of_the_writer_to_the_next_writer_open() {
-    let (image, last) = crash_image(&fresh_dir("leftovers"));
+    let root = fresh_dir("leftovers");
+    let (image, last) = crash_image(&root);
     // Files that a writer open removes: a blob file of an unfinished
     // commit and a spill file. The repair writes only the database file.
     fs::create_dir_all(image.join("blobs/tmp")).unwrap();
@@ -204,7 +209,8 @@ fn the_repairing_open_creates_nothing_in_a_blob_directory_elsewhere() {
 
 #[test]
 fn the_repairing_open_writes_nothing_while_another_open_holds_the_lock() {
-    let (image, _) = crash_image(&fresh_dir("locked"));
+    let root = fresh_dir("locked");
+    let (image, _) = crash_image(&root);
     let before = tree(&image);
     let holder = fs::File::open(image.join(LOCK)).unwrap();
     holder.try_lock().unwrap();
@@ -224,7 +230,8 @@ fn the_repairing_open_writes_nothing_while_another_open_holds_the_lock() {
 
 #[test]
 fn the_repaired_store_holds_its_lock_against_a_writer() {
-    let (image, _) = crash_image(&fresh_dir("exclusive"));
+    let root = fresh_dir("exclusive");
+    let (image, _) = crash_image(&root);
 
     let reader = Store::open_read_only_repairing(&image, Options::default()).unwrap();
 

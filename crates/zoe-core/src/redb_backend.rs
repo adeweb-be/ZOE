@@ -1498,6 +1498,7 @@ mod tests {
 
     use super::*;
     use crate::store::Store;
+    use crate::testing::compressible;
     use crate::vfs::MemVfs;
 
     impl RedbBackend {
@@ -1574,11 +1575,6 @@ mod tests {
             matches!(error, Err(ZoeError::CorruptRecord { .. })),
             "{error:?}"
         );
-    }
-
-    /// A pickle that zstd makes much smaller.
-    fn compressible() -> Vec<u8> {
-        b"X\x05\x00\x00\x00titleq\x02X\x0b\x00\x00\x00descriptionq\x03".repeat(100)
     }
 
     /// Commit the record of `oid` at `tid` with `data`.

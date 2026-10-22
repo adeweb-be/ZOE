@@ -95,6 +95,25 @@ fn blob_location(blob_dir: &Path) -> Result<(PathBuf, String)> {
     }
 }
 
+/// The directory that holds the blob directory of a store, and the name of
+/// the blob directory there. `None` keeps the blob files in `blobs` in the
+/// store directory.
+type Relocation = Option<(Box<dyn blob::BlobDir>, String)>;
+
+/// Return the relocation of the blob directory that `options` gives, with
+/// `open` to open the directory that holds it. Without `blob_dir`, return
+/// `None` and open nothing. `blob_location` checks the path first.
+fn relocation(
+    options: &Options,
+    open: impl FnOnce(PathBuf) -> Result<Box<dyn blob::BlobDir>>,
+) -> Result<Relocation> {
+    let Some(blob_dir) = options.blob_dir.as_deref() else {
+        return Ok(None);
+    };
+    let (parent, name) = blob_location(blob_dir)?;
+    Ok(Some((open(parent)?, name)))
+}
+
 /// The options of a store.
 ///
 /// Build it from the defaults, for example
@@ -275,16 +294,11 @@ impl Store {
     /// fails leaves no lock file and no database. The blob directory itself
     /// comes with the first blob.
     pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        let relocated = match options.blob_dir.as_deref().map(blob_location) {
-            Some(location) => {
-                let (parent, name) = location?;
-                let parent: Box<dyn blob::BlobDir> = Box::new(OsVfs::unlocked(&parent)?);
-                Some((parent, name))
-            }
-            None => None,
-        };
+        let relocated = relocation(&options, |parent| {
+            Ok(Box::new(OsVfs::unlocked(&parent)?))
+        })?;
         let vfs = OsVfs::new(dir.as_ref())?;
-        Self::open_parts(vfs, SystemClock, options, None, relocated)
+        Self::open_parts(vfs, SystemClock, options, relocated)
     }
 
     /// Open the store in the simulated filesystem `vfs`, and create it if
@@ -306,7 +320,11 @@ impl Store {
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn open_vfs_uncached(vfs: MemVfs) -> Result<Self> {
-        Self::open_cached(vfs, SystemClock, Options::default(), Some(0))
+        let options = Options {
+            cache_size: Some(0),
+            ..Options::default()
+        };
+        Self::open_full(vfs, SystemClock, options)
     }
 
     /// Open the store in the simulated filesystem `vfs`, with its blob
@@ -315,7 +333,7 @@ impl Store {
     pub(crate) fn open_relocated(vfs: MemVfs, parent: MemVfs, name: &str) -> Result<Self> {
         let parent: Box<dyn blob::BlobDir> = Box::new(parent);
         let relocated = Some((parent, name.to_owned()));
-        Self::open_parts(vfs, SystemClock, Options::default(), None, relocated)
+        Self::open_parts(vfs, SystemClock, Options::default(), relocated)
     }
 
     /// Open the store in `vfs` with the clock `clock` and `options`, and
@@ -330,29 +348,17 @@ impl Store {
         clock: impl Clock + 'static,
         options: Options,
     ) -> Result<Self> {
-        Self::open_cached(vfs, clock, options, None)
+        Self::open_parts(vfs, clock, options, None)
     }
 
-    /// Open the store as `open_full` does. `cache_size` sets the page cache
-    /// of the database in bytes. `None` keeps `options.cache_size`.
-    fn open_cached<V: Vfs>(
-        vfs: V,
-        clock: impl Clock + 'static,
-        options: Options,
-        cache_size: Option<usize>,
-    ) -> Result<Self> {
-        Self::open_parts(vfs, clock, options, cache_size, None)
-    }
-
-    /// Open the store in `vfs` as `open_cached` does. `relocated` is the
+    /// Open the store in `vfs` as `open_full` does. `relocated` is the
     /// directory that holds the blob directory, and the name of the blob
     /// directory there. `None` keeps the blob files in `blobs` in `vfs`.
     pub(crate) fn open_parts<V: Vfs>(
         vfs: V,
         clock: impl Clock + 'static,
         options: Options,
-        cache_size: Option<usize>,
-        relocated: Option<(Box<dyn blob::BlobDir>, String)>,
+        relocated: Relocation,
     ) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
@@ -370,7 +376,7 @@ impl Store {
         vfs.sync_dir()?;
 
         let mut builder = redb::Builder::new();
-        if let Some(bytes) = cache_size.or(options.cache_size) {
+        if let Some(bytes) = options.cache_size {
             builder.set_cache_size(bytes);
         }
         let db = builder
@@ -449,14 +455,9 @@ impl Store {
     /// `open_read_only_repairing` tells. Without it, such a store fails
     /// with `NotClosedCleanly`.
     fn open_reader(dir: &Path, options: Options, repair: bool) -> Result<Self> {
-        let relocated = match options.blob_dir.as_deref().map(blob_location) {
-            Some(location) => {
-                let (parent, name) = location?;
-                let parent: Box<dyn blob::BlobDir> = Box::new(blob::ReadOnlyDir::new(parent));
-                Some((parent, name))
-            }
-            None => None,
-        };
+        let relocated = relocation(&options, |parent| {
+            Ok(Box::new(blob::ReadOnlyDir::new(parent)))
+        })?;
         let dir = OsVfs::existing(dir, DATABASE)?;
         let path = dir.path(DATABASE);
         let (db, repaired) = match read_only_database(&path, options.cache_size) {
@@ -492,10 +493,10 @@ impl Store {
     /// Return the message of the repair of the store in `dir`, for the
     /// line that a tool writes when `repaired` is true:
     /// `<dir>: the store was not closed cleanly: repaired the store`.
-    pub fn repair_message(dir: &Path) -> String {
+    pub fn repair_message(dir: impl AsRef<Path>) -> String {
         format!(
             "{}: the store was not closed cleanly: repaired the store",
-            dir.display()
+            dir.as_ref().display()
         )
     }
 
@@ -509,7 +510,7 @@ impl Store {
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,
-        relocated: Option<(Box<dyn blob::BlobDir>, String)>,
+        relocated: Relocation,
     ) -> Result<Self> {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
@@ -555,11 +556,7 @@ impl Store {
     /// of the root or of the policy changed since its last read. Only a vote
     /// with a conflict calls this.
     pub(crate) fn merge_policy(&self) -> Result<Option<Arc<Policy>>> {
-        let mut cache = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.get(&**self.backend, &self.structural_merges)
+        crate::lock(&self.policy).get(&**self.backend, &self.structural_merges)
     }
 
     /// Fail with `ReadOnly` when the store is open for reads only.
@@ -814,7 +811,7 @@ impl Store {
     }
 
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
-        self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.sequencer)
     }
 
     /// Make the next oid greater than `oid`, so that `new_oid` never gives
@@ -873,6 +870,7 @@ mod tests {
     use crate::format;
     use crate::format::Codec;
     use crate::kv::{Flavour, Swept};
+    use crate::testing::{fresh_dir, try_commit as commit};
     use crate::vfs::LOCK;
 
     /// A clock that never moves.
@@ -1125,13 +1123,6 @@ mod tests {
             staging: StagingArea::new(Box::new(MemVfs::new()), 0, false),
         });
         (Store { backend, ..store }, faults)
-    }
-
-    fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Result<Tid> {
-        let mut txn = store.tpc_begin(b"", b"", b"")?;
-        txn.store(oid, serial, data)?;
-        txn.vote()?;
-        txn.finish()
     }
 
     /// An observer that keeps the count of each `intent_locks_acquired`.
@@ -1613,17 +1604,9 @@ mod tests {
 
     #[test]
     fn a_second_process_cannot_open_a_locked_store() {
-        let dir = std::env::temp_dir().join(format!("zoe-locked-{}", std::process::id()));
+        let dir = fresh_dir("locked");
         let _store = Store::open(&dir).unwrap();
         assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
-    }
-
-    /// Return a new empty directory for one test.
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     /// Write a store with one object to `dir` and close it. Return the oid

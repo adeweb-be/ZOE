@@ -157,8 +157,10 @@ fn an_attached_payload_gives_the_frames_of_an_inline_compression() {
                 staging_memory,
                 ..Options::default()
             };
-            let inline = open(&fresh_dir(&format!("inline-{name}")), options.clone());
-            let attached = open(&fresh_dir(&format!("attached-{name}")), options);
+            let inline_dir = fresh_dir(&format!("inline-{name}"));
+            let inline = open(&inline_dir, options.clone());
+            let attached_dir = fresh_dir(&format!("attached-{name}"));
+            let attached = open(&attached_dir, options);
             for tid in [Tid(0x0300_0000_0000_0001), Tid(0x0300_0000_0000_0002)] {
                 restore(&inline, tid, &records, false);
                 assert_eq!(restore(&attached, tid, &records, true), 0);

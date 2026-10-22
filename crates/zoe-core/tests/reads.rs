@@ -19,7 +19,8 @@ fn pickle(text: &str) -> Vec<u8> {
 
 #[test]
 fn load_before_returns_the_revision_and_the_next_serial() {
-    let store = Store::open(fresh_dir("load-before")).unwrap();
+    let dir = fresh_dir("load-before");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_as(
         &store,
@@ -54,7 +55,8 @@ fn load_before_returns_the_revision_and_the_next_serial() {
 
 #[test]
 fn load_serial_reads_one_revision() {
-    let store = Store::open(fresh_dir("load-serial")).unwrap();
+    let dir = fresh_dir("load-serial");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_as(
         &store,
@@ -78,7 +80,8 @@ fn load_serial_reads_one_revision() {
 
 #[test]
 fn history_lists_revisions_newest_first() {
-    let store = Store::open(fresh_dir("history")).unwrap();
+    let dir = fresh_dir("history");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_as(
         &store,
@@ -110,7 +113,8 @@ fn history_lists_revisions_newest_first() {
 
 #[test]
 fn the_iterator_walks_transactions_in_order_with_their_records() {
-    let store = Store::open(fresh_dir("iterator")).unwrap();
+    let dir = fresh_dir("iterator");
+    let store = Store::open(&dir).unwrap();
     let a = store.new_oid().unwrap();
     let b = store.new_oid().unwrap();
     let t1 = commit_as(
@@ -160,7 +164,8 @@ fn the_iterator_walks_transactions_in_order_with_their_records() {
 
 #[test]
 fn record_iternext_walks_the_current_records() {
-    let store = Store::open(fresh_dir("iternext")).unwrap();
+    let dir = fresh_dir("iternext");
+    let store = Store::open(&dir).unwrap();
     let oids: Vec<Oid> = (0..3).map(|_| store.new_oid().unwrap()).collect();
     let writes: Vec<_> = oids
         .iter()
@@ -195,7 +200,8 @@ fn record_iternext_walks_the_current_records() {
 
 #[test]
 fn restore_copies_transactions_with_their_tids() {
-    let source = Store::open(fresh_dir("restore-source")).unwrap();
+    let source_dir = fresh_dir("restore-source");
+    let source = Store::open(&source_dir).unwrap();
     let a = source.new_oid().unwrap();
     let b = source.new_oid().unwrap();
     let t1 = commit_as(
@@ -209,7 +215,8 @@ fn restore_copies_transactions_with_their_tids() {
         &[(a, t1, pickle("a2")), (b, Tid::ZERO, pickle("b1"))],
     );
 
-    let target = Store::open(fresh_dir("restore-target")).unwrap();
+    let target_dir = fresh_dir("restore-target");
+    let target = Store::open(&target_dir).unwrap();
     for txn in source.iterator(None, None).unwrap() {
         let txn = txn.unwrap();
         let mut copy = target
@@ -241,7 +248,8 @@ fn restore_copies_transactions_with_their_tids() {
 
 #[test]
 fn restore_refuses_a_tid_that_is_not_after_the_last_one() {
-    let store = Store::open(fresh_dir("restore-order")).unwrap();
+    let dir = fresh_dir("restore-order");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_as(
         &store,
@@ -258,7 +266,8 @@ fn restore_refuses_a_tid_that_is_not_after_the_last_one() {
 
 #[test]
 fn a_restored_deletion_removes_the_object() {
-    let store = Store::open(fresh_dir("restore-delete")).unwrap();
+    let dir = fresh_dir("restore-delete");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_as(
         &store,
