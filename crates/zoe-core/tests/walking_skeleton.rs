@@ -100,7 +100,7 @@ fn an_acknowledged_commit_survives_sigkill() {
             "--exact",
             "--nocapture",
         ])
-        .env(WRITER, &dir)
+        .env(WRITER, dir.path())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

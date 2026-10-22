@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-pub use zoe_core::testing::compressible;
 use zoe_core::testing::TempDir;
 use zoe_core::{Clock, SystemClock, Waiter};
 

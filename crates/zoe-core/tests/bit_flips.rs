@@ -17,9 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use redb::StorageBackend;
-use support::{Rng, compressible, fresh_dir};
+use support::{Rng, fresh_dir};
 use zoe_core::testing::{self, Key};
-use zoe_core::testing::{Meta, commit_as};
+use zoe_core::testing::{Meta, commit_as, compressible};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Codec, Compression, Oid, Options, Store, SystemClock, Tid, ZoeError};
 
