@@ -1,6 +1,6 @@
 # 0044. The locks of hot objects: the lock hand-off at the vote, and early write-intent locks before the read
 
-Status: accepted. Part A changes the invariant of group commit in section 5 of the specification. Part B adds the extension `lock_intent` to the wire protocol, the keys `early-locks` and `early-lock-classes`, and a public Python API.
+Status: accepted. Part A changes the invariant of group commit in the specification ("Storage core", "Group commit"). Part B adds the extension `lock_intent` to the wire protocol, the keys `early-locks` and `early-lock-classes`, and a public Python API.
 
 ## Context
 
