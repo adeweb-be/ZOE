@@ -28,8 +28,8 @@ use crate::endpoint::{Address, Endpoint};
 use crate::protocol::{self, get};
 use crate::runtime::{Runtime, Stream, Tokio};
 use crate::{Error, lock};
-use connection::{Inner, closed};
 pub use connection::traced;
+use connection::{Inner, closed};
 pub use transaction::{BLOB_CHUNK, Listed, Transaction, Voted};
 
 /// The time between two heartbeats, as `ZEO.ClientStorage` sends them.
