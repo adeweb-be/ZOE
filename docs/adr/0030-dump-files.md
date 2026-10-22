@@ -50,7 +50,7 @@ The rules of a file:
 
 A reader refuses a file that breaks a rule, a blob that does not match its hash, and a file whose hash does not match.
 
-**Versions.** The last byte of the magic is the version. A change of the layout takes the next version. Each build reads every earlier version and refuses a later one. A dump of version `0x01` has no durable rows.
+**Versions.** The last byte of the magic is the version. A change of the layout takes the next version. A build reads only the version that it writes. It refuses a dump of every other version as it refuses a file that is not a dump, version `0x01` included: nothing runs ZOE in production, so no dump of an earlier version needs a reader (#523).
 
 **The commands.** The rules of `zoe backup`, `zoe restore` and `zoe verify --backup`: specification, "Loupe: desktop inspector and editor", "`zoe backup` and `zoe restore`: dumps (N15)". These rules are not in the specification:
 
