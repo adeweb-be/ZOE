@@ -201,7 +201,7 @@ impl Target {
 
 /// The endpoints of one round of the open, and the error of each host that
 /// did not resolve.
-struct Round {
+pub(super) struct Round {
     endpoints: Vec<Endpoint>,
     unresolved: Vec<String>,
 }

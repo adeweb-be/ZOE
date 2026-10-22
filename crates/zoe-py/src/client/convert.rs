@@ -2,8 +2,6 @@
 //! back, the copy of a cache entry into `bytes`, and the exceptions of
 //! Python for the errors of the client.
 
-use std::io::Write;
-
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{

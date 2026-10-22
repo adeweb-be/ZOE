@@ -502,7 +502,7 @@ impl Drop for Downloading<'_> {
 }
 
 /// Wait until the connection closes.
-async fn closed(closing: &mut watch::Receiver<bool>) {
+pub(super) async fn closed(closing: &mut watch::Receiver<bool>) {
     let _ = closing.wait_for(|closing| *closing).await;
 }
 

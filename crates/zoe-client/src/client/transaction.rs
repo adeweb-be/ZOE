@@ -8,7 +8,7 @@ use rmpv::Value;
 use tokio::sync::OwnedMutexGuard;
 use zoe_core::{Flavour, Oid, Tid};
 use zoe_wire::extension::KV;
-use zoe_wire::p64;
+use zoe_wire::{p64, u64_of};
 
 use super::connection::Inner;
 use super::{bad, oid, tid, unsupported};
