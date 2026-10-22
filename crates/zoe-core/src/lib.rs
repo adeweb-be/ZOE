@@ -18,7 +18,7 @@ mod lock;
 pub mod merge;
 mod pack;
 mod read;
-mod redb_backend;
+mod redb;
 mod sequence;
 mod store;
 #[cfg(feature = "testing")]

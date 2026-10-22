@@ -18,7 +18,7 @@ use crate::lock::LockManager;
 use crate::merge::StructuralMerges;
 use crate::merge::policy::{Policy, PolicyCache};
 use crate::pack::PackState;
-use crate::redb_backend::RedbBackend;
+use crate::redb::RedbBackend;
 use crate::sequence::{Sequence, Sequences};
 use crate::types::{Oid, Tid};
 use crate::vfs::{MemVfs, OsVfs, Vfs};
