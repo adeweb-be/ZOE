@@ -11,7 +11,8 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyTuple};
 use zoe_client::{
-    Address, Connect, Dropping, Endpoint, Error, Options, REFUSED_POLL, Tls, TlsOptions, Tokio, lock,
+    Address, Connect, Dropping, Endpoint, Error, Options, REFUSED_POLL, Tls, TlsOptions, Tokio,
+    lock,
 };
 
 /// The time between two attempts to open a client, until `wait_timeout`.
@@ -105,7 +106,10 @@ impl Servers {
 
     /// Open a new listener for the pool, in one round. With `writable`, open
     /// only a writable one.
-    pub(super) async fn reopen(&self, writable: bool) -> Result<(zoe_client::Client, Connect), Error> {
+    pub(super) async fn reopen(
+        &self,
+        writable: bool,
+    ) -> Result<(zoe_client::Client, Connect), Error> {
         let options = match writable {
             true => Options {
                 read_only: false,

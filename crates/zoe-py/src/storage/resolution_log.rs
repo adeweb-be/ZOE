@@ -45,7 +45,11 @@ impl ResolutionLog {
 
     /// Writes the lines of the entries `range` of `txn`, that an undo gave,
     /// as `write` does.
-    pub(super) fn write_undo(&self, txn: &SharedTxn, range: std::ops::Range<usize>) -> Option<String> {
+    pub(super) fn write_undo(
+        &self,
+        txn: &SharedTxn,
+        range: std::ops::Range<usize>,
+    ) -> Option<String> {
         self.write_lines(txn.resolution_log_lines_of(range, SystemTime::now(), None))
     }
 

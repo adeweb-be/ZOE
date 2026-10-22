@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::{bin8, commit_other, fresh_dir, open_cached, record, start, start_with};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use common::{bin8, commit_other, fresh_dir, open_cached, record, start, start_with};
 use zoe_client::{
     Cache, Client, Connect, Delivery, Dropping, Error, Event, Invalidation, Listed, Open, Options,
     Pool, PoolTransaction, Reconnect, Tokio, Turn, Verification, Voted,

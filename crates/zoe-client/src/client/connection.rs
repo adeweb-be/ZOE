@@ -192,7 +192,12 @@ impl Inner {
     }
 
     /// Download a blob into `sink`. See `Client::send_blob`.
-    pub(super) async fn send_blob<W: Write>(&self, oid: Oid, serial: Tid, sink: &mut W) -> Result<u64, Error> {
+    pub(super) async fn send_blob<W: Write>(
+        &self,
+        oid: Oid,
+        serial: Tid,
+        sink: &mut W,
+    ) -> Result<u64, Error> {
         let key = (oid.0, serial.0);
         // Take the blob on this connection, or wait for the download that
         // has it.

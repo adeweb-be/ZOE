@@ -86,10 +86,10 @@ use zoe_wire::extension::TRACE_CONTEXT;
 use crate::errors::{self, p64, u64_of};
 use crate::kv;
 use convert::{args_of, blob_error, bytes, client_error, to_python, to_value, zeo_error};
-use open::{Opening, Secure, Servers, Target, TlsArgs, dropping_of, endpoints};
 pub(crate) use open::OtherProtocol;
-use transaction::Slot;
+use open::{Opening, Secure, Servers, Target, TlsArgs, dropping_of, endpoints};
 pub(crate) use transaction::NativeTransaction;
+use transaction::Slot;
 
 /// The number of worker threads of the runtime of the native clients.
 const WORKERS: usize = 2;
@@ -654,7 +654,8 @@ impl NativeClient {
                 end.map(|end| p64(py, end.0)),
             )));
         }
-        let (record, _position) = self.run_zeo(py, async |pool| pool.load_before(oid, tid).await)?;
+        let (record, _position) =
+            self.run_zeo(py, async |pool| pool.load_before(oid, tid).await)?;
         Ok(record.map(|record| {
             let data = PyBytes::new(py, &record.data);
             // The buffer goes back to the client for the next long reply.
@@ -788,7 +789,9 @@ impl NativeClient {
         key: Vec<u8>,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let flavour = kv::flavour(flavour)?;
-        let value = self.run(py, async move |pool| pool.kv_get(flavour, &name, &key).await)?;
+        let value = self.run(py, async move |pool| {
+            pool.kv_get(flavour, &name, &key).await
+        })?;
         Ok(value.map(|value| PyBytes::new(py, &value)))
     }
 

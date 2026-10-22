@@ -32,7 +32,10 @@ impl Entry {
 
     /// Call `f` with the transaction of the core. Fail when `tpc_finish`
     /// or `tpc_abort` took it.
-    pub(super) fn with<T>(&self, f: impl FnOnce(&mut SharedTxn) -> Result<T, Failure>) -> Result<T, Failure> {
+    pub(super) fn with<T>(
+        &self,
+        f: impl FnOnce(&mut SharedTxn) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
         match self.lock().as_mut() {
             Some(txn) => f(txn),
             None => Err(ZoeError::Protocol("the transaction is finished or aborted").into()),

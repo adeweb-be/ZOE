@@ -29,7 +29,11 @@ const MODULES: [&str; 4] = [
 /// The `out` of a lookup of the cache: a `bytes` of `len` bytes that
 /// `copy` writes and checks, or `None` when the check fails. The writer
 /// does not fill the bytes with zeros first, so the data takes one pass.
-pub(super) fn bytes<'py>(py: Python<'py>, len: usize, copy: &mut Copier<'_>) -> Option<Bound<'py, PyBytes>> {
+pub(super) fn bytes<'py>(
+    py: Python<'py>,
+    len: usize,
+    copy: &mut Copier<'_>,
+) -> Option<Bound<'py, PyBytes>> {
     PyBytes::new_with_writer(py, len, |writer| {
         let mut written = true;
         let good = copy(&mut |block| written &= writer.write_all(block).is_ok());
@@ -233,7 +237,11 @@ pub(super) fn to_value(object: &Bound<'_, PyAny>, depth: usize) -> PyResult<Valu
 
 /// Return the Python value of a msgpack value. An array becomes a tuple,
 /// and a map a dict. A str that is not UTF-8 becomes bytes.
-pub(super) fn to_python<'py>(py: Python<'py>, value: &Value, depth: usize) -> PyResult<Bound<'py, PyAny>> {
+pub(super) fn to_python<'py>(
+    py: Python<'py>,
+    value: &Value,
+    depth: usize,
+) -> PyResult<Bound<'py, PyAny>> {
     if depth > DEPTH {
         return Err(PyValueError::new_err("the value is nested too deep"));
     }

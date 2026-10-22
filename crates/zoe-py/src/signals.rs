@@ -170,10 +170,7 @@ fn watch(mut signals: Signals) {
 /// A store that a call still holds at `deadline` stays open, and the
 /// others close.
 fn close_all(deadline: Instant) {
-    let open: Vec<Arc<Shared>> = lock(&OPEN)
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect();
+    let open: Vec<Arc<Shared>> = lock(&OPEN).iter().filter_map(Weak::upgrade).collect();
     let mut closing: Vec<Closing> = open.into_iter().map(Closing::start).collect();
     loop {
         closing.retain_mut(|storage| !storage.step());

@@ -168,7 +168,12 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
 /// oids, and `None` or an error drops every entry. A server tid below the
 /// base drops every entry too, and `applied` becomes the server tid. Then
 /// the cache serves. Return false at the close.
-pub(super) async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
+pub(super) async fn verify_file(
+    shared: &Shared,
+    cache: &Cache,
+    client: &Client,
+    server_tid: Tid,
+) -> bool {
     let base = cache.applied();
     let check = if base == server_tid {
         cache.verify(server_tid, Some(&[]));
