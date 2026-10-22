@@ -21,7 +21,7 @@ use crate::pack::PackState;
 use crate::redb::RedbBackend;
 use crate::sequence::{Sequence, Sequences};
 use crate::types::{Oid, Tid};
-use crate::vfs::{MemVfs, OsVfs, Vfs};
+use crate::vfs::{Dir, MemVfs, OsVfs, Vfs};
 
 /// The name of the database file in the store directory.
 const DATABASE: &str = "zoe.redb";
@@ -98,14 +98,14 @@ fn blob_location(blob_dir: &Path) -> Result<(PathBuf, String)> {
 /// The directory that holds the blob directory of a store, and the name of
 /// the blob directory there. `None` keeps the blob files in `blobs` in the
 /// store directory.
-type Relocation = Option<(Box<dyn blob::BlobDir>, String)>;
+type Relocation = Option<(Box<dyn Dir>, String)>;
 
 /// Return the relocation of the blob directory that `options` gives, with
 /// `open` to open the directory that holds it. Without `blob_dir`, return
 /// `None` and open nothing. `blob_location` checks the path first.
 fn relocation(
     options: &Options,
-    open: impl FnOnce(PathBuf) -> Result<Box<dyn blob::BlobDir>>,
+    open: impl FnOnce(PathBuf) -> Result<Box<dyn Dir>>,
 ) -> Result<Relocation> {
     let Some(blob_dir) = options.blob_dir.as_deref() else {
         return Ok(None);
@@ -331,7 +331,7 @@ impl Store {
     /// directory `name` in the simulated filesystem `parent`.
     #[cfg(test)]
     pub(crate) fn open_relocated(vfs: MemVfs, parent: MemVfs, name: &str) -> Result<Self> {
-        let parent: Box<dyn blob::BlobDir> = Box::new(parent);
+        let parent: Box<dyn Dir> = Box::new(parent);
         let relocated = Some((parent, name.to_owned()));
         Self::open_parts(vfs, SystemClock, Options::default(), relocated)
     }
@@ -514,16 +514,17 @@ impl Store {
     ) -> Result<Self> {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
-        let dir = Arc::new(dir);
-        let store_dir: Box<dyn blob::BlobDir> = Box::new(Arc::clone(&dir));
-        let blob_dir = match relocated {
-            Some((parent, name)) => Box::new(blob::Relocated::new(store_dir, parent, name)),
-            None => store_dir,
+        // The store directory is held once. The blob store and the staging
+        // area share it.
+        let dir: Arc<dyn Dir> = Arc::new(dir);
+        let blob_dir: Arc<dyn Dir> = match relocated {
+            Some((parent, name)) => Arc::new(blob::Relocated::new(Arc::clone(&dir), parent, name)),
+            None => Arc::clone(&dir),
         };
         let opened = Arc::new(Opened {
             backend: Box::new(backend),
             blobs: BlobStore::new(blob_dir),
-            staging: StagingArea::new(Box::new(dir), options.staging_memory, read_only),
+            staging: StagingArea::new(dir, options.staging_memory, read_only),
         });
         // `Opened` holds the database and the directory here, so an error
         // drops them in order: the database closes before the lock goes.
@@ -1119,8 +1120,8 @@ mod tests {
         };
         let backend = Arc::new(Opened {
             backend: Box::new(faulty),
-            blobs: BlobStore::new(Box::new(MemVfs::new())),
-            staging: StagingArea::new(Box::new(MemVfs::new()), 0, false),
+            blobs: BlobStore::new(Arc::new(MemVfs::new())),
+            staging: StagingArea::new(Arc::new(MemVfs::new()), 0, false),
         });
         (Store { backend, ..store }, faults)
     }
