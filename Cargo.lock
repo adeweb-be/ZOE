@@ -2421,6 +2421,7 @@ dependencies = [
  "zoe-client",
  "zoe-core",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2443,6 +2444,7 @@ dependencies = [
  "zoe-core",
  "zoe-pickle",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2517,6 +2519,7 @@ dependencies = [
  "zoe-client",
  "zoe-core",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2544,11 +2547,19 @@ dependencies = [
  "zoe-mcp",
  "zoe-pickle",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
 name = "zoe-vectors"
 version = "0.0.0"
+
+[[package]]
+name = "zoe-wire"
+version = "0.0.0"
+dependencies = [
+ "rmpv",
+]
 
 [[package]]
 name = "zstd"

@@ -1,0 +1,17 @@
+[package]
+name = "zoe-wire"
+description = "The bytes and the names of the ZEO 6 msgpack protocol that zoe serve and its clients share, and the reader of TLS certificates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Sans-IO: no tokio, and no crate of ZOE (ADR 0055).
+[dependencies]
+# The `Value` of an oid or a tid on the wire.
+rmpv.workspace = true
+
+[lints]
+workspace = true

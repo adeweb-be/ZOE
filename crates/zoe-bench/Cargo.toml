@@ -19,6 +19,8 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util"] }
 zoe-client.workspace = true
 zoe-core.workspace = true
+# The names of the extensions.
+zoe-wire.workspace = true
 
 [dev-dependencies]
 zoe-server = { workspace = true, features = ["serve"] }

@@ -65,7 +65,7 @@ use crate::cache::Cache;
 use crate::client::{
     Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction, Voted, merge,
 };
-use crate::protocol::{self, MAX_TID};
+use crate::protocol;
 use crate::runtime::{BoxFuture, Runtime};
 
 /// A function that opens one more connection of the pool to the server of
@@ -747,7 +747,7 @@ impl Pool {
         let Some((listener, current)) = self.shared.listener_of(generation)? else {
             let id = args.into_iter().next().unwrap_or(Value::Nil);
             return Err(Error::Server {
-                class: "builtins.KeyError".into(),
+                class: zoe_wire::class::KEY_ERROR.into(),
                 message: id.to_string(),
                 value: Value::Array(vec![id]),
             });
@@ -800,7 +800,7 @@ impl Pool {
     /// connection, and store it in the cache as `load_before` does. An oid
     /// without a record fails with the `POSKeyError` of the server.
     pub async fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid), Error> {
-        match self.load_before(oid, MAX_TID).await? {
+        match self.load_before(oid, Tid(zoe_wire::MAX_TID)).await? {
             (Some(record), _) => Ok((record.data, record.tid)),
             (None, _) => Err(protocol::pos_key_error(oid)),
         }

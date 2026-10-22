@@ -29,13 +29,13 @@ use std::time::Duration;
 
 use zoe_client::{Client, Error, Options};
 use zoe_core::{Oid, Tid};
+use zoe_wire::extension::SERVER_WRITES;
 
 use super::rng::Rng;
 use super::server::SimRuntime;
 use super::tree::{self, MAX_KEYS};
 use super::world::{Acked, Shared, TreeCommit, phase, sleep};
 use crate::protocol::STORAGE_NAME;
-use crate::protocol::negotiation::SERVER_WRITES;
 
 /// The oids that the clients share.
 const OIDS: u64 = 6;

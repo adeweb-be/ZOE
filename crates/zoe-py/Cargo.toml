@@ -25,6 +25,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 # The native client of `zoe.zeo.ClientStorage`.
 zoe-client.workspace = true
 zoe-core.workspace = true
+# The names of the extensions and the `maxtid` of the wire.
+zoe-wire.workspace = true
 # The `zoe` command, without `serve`: the extension never links rmcp.
 zoe-server.workspace = true
 

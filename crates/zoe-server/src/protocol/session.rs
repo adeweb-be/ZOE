@@ -41,6 +41,13 @@ use zoe_core::{
     BlobFile, Compression, Finished, Flavour, IntentLocks, LockCancel, Oid, Store, Tid, Txn,
     TxnMeta, ZoeError, undo_id, undo_tid,
 };
+use zoe_wire::class::{
+    CONFLICT_ERROR, EXCEPTION, KEY_ERROR, MULTIPLE_UNDO_ERRORS as UNDO_ERRORS, POS_KEY_ERROR,
+    READ_CONFLICT_ERROR, READ_ONLY_ERROR, STORAGE_ERROR, STORAGE_SYSTEM_ERROR,
+    STORAGE_TRANSACTION_ERROR as TRANSACTION_ERROR, TYPE_ERROR, VALUE_ERROR,
+};
+use zoe_wire::extension::{SERVER_WRITES, TRACE_CONTEXT};
+use zoe_wire::p64;
 
 use super::blob::Download;
 use super::clock;
@@ -70,20 +77,6 @@ const LOAD_TRIES: usize = 3;
 /// the store, and then looks for it at the socket.
 #[cfg(test)]
 pub(crate) static LOADED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
-
-/// The class of a conflict error of ZODB.
-const CONFLICT_ERROR: &str = "ZODB.POSException.ConflictError";
-
-/// The class of a read conflict error of ZODB.
-const READ_CONFLICT_ERROR: &str = "ZODB.POSException.ReadConflictError";
-
-/// The class of a transaction error of ZODB.
-const TRANSACTION_ERROR: &str = "ZODB.POSException.StorageTransactionError";
-
-/// The class of the undo errors of ZODB that a stock client rebuilds: a
-/// `MultipleUndoErrors` is an `UndoError`, and the factories of
-/// `ZEO.asyncio.client` know only it.
-const UNDO_ERRORS: &str = "ZODB.POSException.MultipleUndoErrors";
 
 /// The reason of an undo that a later transaction stops, as in FileStorage.
 const CHANGED_LATER: &str = "Some data were modified by a later transaction";
@@ -163,11 +156,11 @@ impl Fault {
     }
 
     fn value_error(text: impl Into<String>) -> Self {
-        Self::new("builtins.ValueError", text)
+        Self::new(VALUE_ERROR, text)
     }
 
     fn type_error(text: impl Into<String>) -> Self {
-        Self::new("builtins.TypeError", text)
+        Self::new(TYPE_ERROR, text)
     }
 
     fn transaction(text: impl Into<String>) -> Self {
@@ -186,13 +179,13 @@ impl Fault {
 
     fn read_only() -> Self {
         Self {
-            class: "ZODB.POSException.ReadOnlyError",
+            class: READ_ONLY_ERROR,
             args: Value::Array(vec![]),
         }
     }
 
     fn storage(text: impl Into<String>) -> Self {
-        Self::new("ZODB.POSException.StorageError", text)
+        Self::new(STORAGE_ERROR, text)
     }
 
     /// An undo that `reason` refuses, on `oid` when an object stops it. A
@@ -212,7 +205,7 @@ impl Fault {
     /// the oid as the client sent it.
     fn no_object(oid: Value) -> Self {
         Self {
-            class: "ZODB.POSException.POSKeyError",
+            class: POS_KEY_ERROR,
             args: Value::Array(vec![oid]),
         }
     }
@@ -221,7 +214,7 @@ impl Fault {
     /// id, as ZEO gives it.
     fn no_iterator(id: &Value) -> Self {
         Self {
-            class: "builtins.KeyError",
+            class: KEY_ERROR,
             args: Value::Array(vec![id.clone()]),
         }
     }
@@ -231,7 +224,7 @@ impl Fault {
         match refused {
             Refused::Unknown => Self::no_iterator(id),
             Refused::OutOfOrder(tid) => Self::new(
-                "builtins.Exception",
+                EXCEPTION,
                 format!(
                     "Out-of-order request for record iterator for transaction {:016x}",
                     tid.0
@@ -250,14 +243,12 @@ impl Fault {
     /// that the stop of the server stopped fails with `StorageError`.
     fn of_pack(error: &ZoeError) -> Self {
         match error {
-            ZoeError::CorruptRecord { .. } => Self::new(
-                "ZODB.POSException.StorageSystemError",
-                format!("pack stopped: {error}"),
-            ),
-            ZoeError::Format(text) => Self::new(
-                "ZODB.POSException.StorageSystemError",
-                format!("pack stopped: {text}"),
-            ),
+            ZoeError::CorruptRecord { .. } => {
+                Self::new(STORAGE_SYSTEM_ERROR, format!("pack stopped: {error}"))
+            }
+            ZoeError::Format(text) => {
+                Self::new(STORAGE_SYSTEM_ERROR, format!("pack stopped: {text}"))
+            }
             ZoeError::Closed => Self::storage("pack stopped: the server stops"),
             _ => Self::of(error),
         }
@@ -342,8 +333,8 @@ impl Fault {
             | ZoeError::CorruptTxn { .. }
             | ZoeError::CorruptSequence { .. }
             | ZoeError::CorruptKv { .. }
-            | ZoeError::Backend(_) => Self::new("ZODB.POSException.StorageSystemError", text),
-            _ => Self::new("ZODB.POSException.StorageError", text),
+            | ZoeError::Backend(_) => Self::new(STORAGE_SYSTEM_ERROR, text),
+            _ => Self::new(STORAGE_ERROR, text),
         }
     }
 }
@@ -721,7 +712,7 @@ impl Session {
         self.registration
             .get()
             .and_then(|r| r.extensions.as_deref())
-            .is_some_and(|accepted| accepted.contains(&negotiation::TRACE_CONTEXT))
+            .is_some_and(|accepted| accepted.contains(&TRACE_CONTEXT))
     }
 
     /// Tell if the server accepted `server_writes` from the declaration of
@@ -731,7 +722,7 @@ impl Session {
         self.registration
             .get()
             .and_then(|r| r.extensions.as_deref())
-            .is_some_and(|accepted| accepted.contains(&negotiation::SERVER_WRITES))
+            .is_some_and(|accepted| accepted.contains(&SERVER_WRITES))
     }
 
     /// Tell if the client registered read-only.
@@ -2569,11 +2560,6 @@ fn ttl_of(value: &Value) -> Result<Option<Duration>, Fault> {
     }
 }
 
-/// An oid or a tid as the protocol sends it: 8 bytes, big-endian.
-pub(super) fn p64(n: u64) -> Value {
-    Value::Binary(n.to_be_bytes().to_vec())
-}
-
 /// A tid, or nil for none.
 fn optional_tid(value: &Value) -> Result<Option<Tid>, Fault> {
     match value {
@@ -2607,12 +2593,12 @@ fn serial_of(value: &Value) -> Result<Tid, Fault> {
     }
 }
 
-/// The number in the 8 big-endian bytes of `value`.
+/// The number in the 8 big-endian bytes of `value`, a bin. A str is not
+/// an oid or a tid here: only `serial_of` takes one.
 fn u64_of(value: &Value) -> Result<u64, Fault> {
     match value {
-        Value::Binary(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
-            .map(u64::from_be_bytes)
-            .map_err(|_| Fault::type_error("an oid or a tid is not 8 bytes")),
+        Value::Binary(_) => zoe_wire::u64_of(value)
+            .ok_or_else(|| Fault::type_error("an oid or a tid is not 8 bytes")),
         _ => Err(Fault::type_error("an oid or a tid is not bytes")),
     }
 }
