@@ -66,6 +66,16 @@
 
 # Reference
 
+- [Settings reference](reference/README.md)
+  - [The zoe command](reference/cli.md)
+  - [zope.conf sections and the zoe:// URI](reference/zope-conf.md)
+  - [The configuration file of zoe serve](reference/config-file.md)
+  - [Environment variables](reference/environment.md)
+  - [Admin port, metrics and logs](reference/metrics.md)
+  - [Python API](reference/python-api.md)
+  - [MCP tools](reference/mcp.md)
+  - [Protocol](reference/protocol.md)
+  - [Compatibility](reference/compatibility.md)
 - [Glossary](glossary.md)
 - [Spikes](spikes/README.md)
   - [The ZEO 6 wire contract, recorded from a stock server](spikes/zeo-wire.md)
