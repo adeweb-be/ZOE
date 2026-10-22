@@ -822,9 +822,9 @@ mod tests {
 
     use rmpv::Value;
     use zoe_core::{Store, Tid};
+    use zoe_wire::p64;
 
     use super::*;
-    use crate::protocol::session::p64;
     use crate::protocol::{NamedStorage, Queues};
     use crate::runtime::Tokio;
 

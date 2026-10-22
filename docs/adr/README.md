@@ -58,3 +58,4 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0050](0050-the-registry-backend.md) | The registry backend: a moved registry keeps its records in a durable namespace of its own | merged into 0043 | KV namespaces |
 | [0052](0052-the-order-of-a-folder-merges-at-the-vote.md) | The order of a folder of plone.folder merges at the vote | accepted | |
 | [0054](0054-one-published-format-for-every-benchmark.md) | One published format for every benchmark: one layout, the index of version 2, the B5 summary and `just bench publish` | accepted | |
+| [0055](0055-zoe-wire.md) | zoe-wire: the ZEO frame codec and the TLS certificate reader, written once in a sans-IO crate | accepted | |

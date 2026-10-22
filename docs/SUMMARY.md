@@ -63,9 +63,20 @@
     - [0049. The split merge keeps the bucket of the committed side](adr/0049-the-split-merge-keeps-the-bucket.md)
   - [0052. The order of a folder of plone.folder merges at the vote](adr/0052-the-order-of-a-folder-merges-at-the-vote.md)
   - [0054. One published format for every benchmark](adr/0054-one-published-format-for-every-benchmark.md)
+  - [0055. zoe-wire: the ZEO frame codec and the TLS certificate reader](adr/0055-zoe-wire.md)
 
 # Reference
 
+- [Settings reference](reference/README.md)
+  - [The zoe command](reference/cli.md)
+  - [zope.conf sections and the zoe:// URI](reference/zope-conf.md)
+  - [The configuration file of zoe serve](reference/config-file.md)
+  - [Environment variables](reference/environment.md)
+  - [Admin port, metrics and logs](reference/metrics.md)
+  - [Python API](reference/python-api.md)
+  - [MCP tools](reference/mcp.md)
+  - [Protocol](reference/protocol.md)
+  - [Compatibility](reference/compatibility.md)
 - [Glossary](glossary.md)
 - [Spikes](spikes/README.md)
   - [The ZEO 6 wire contract, recorded from a stock server](spikes/zeo-wire.md)

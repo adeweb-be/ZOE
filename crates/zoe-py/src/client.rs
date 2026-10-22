@@ -75,6 +75,7 @@ use zoe_client::{
     Turn, Verification, traced,
 };
 use zoe_core::{Oid, Tid};
+use zoe_wire::extension::TRACE_CONTEXT;
 
 use crate::errors::{self, p64, u64_of};
 use crate::kv;
@@ -99,12 +100,6 @@ const DEPTH: usize = 32;
 /// The most rounds of conflict resolution in one vote, as the vote of
 /// `ZEO.ClientStorage` has.
 const ROUNDS: usize = 9;
-
-/// The `before` of a load of the current record: ZODB's `maxtid`.
-const MAX_TID: Tid = Tid(i64::MAX as u64);
-
-/// The extension that lets a call carry the trace context of the client.
-const TRACE_CONTEXT: &str = "trace_context";
 
 /// The mode of a blob file of the cache: read-only for its owner, as
 /// `ZEO.ClientStorage` sets it (`stat.S_IREAD`).
@@ -739,7 +734,9 @@ impl NativeClient {
         let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         let (record, _position) = py
-            .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, MAX_TID))))
+            .detach(move || {
+                runtime.block_on(traced(trace, pool.load_before(oid, Tid(zoe_wire::MAX_TID))))
+            })
             .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(record.map(|record| {
             let data = PyBytes::new(py, &record.data);

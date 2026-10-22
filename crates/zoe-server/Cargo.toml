@@ -26,6 +26,7 @@ serve = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
     "dep:tracing-opentelemetry",
+    "dep:zoe-wire",
 ]
 # The module `fuzz`: the entry of the fuzz targets in `fuzz/`.
 fuzz = ["serve"]
@@ -62,6 +63,7 @@ tracing-opentelemetry = { workspace = true, optional = true }
 zoe-client = { workspace = true, optional = true }
 zoe-mcp = { workspace = true, optional = true }
 zoe-pickle = { workspace = true, optional = true }
+zoe-wire = { workspace = true, optional = true }
 
 [dev-dependencies]
 rmpv.workspace = true

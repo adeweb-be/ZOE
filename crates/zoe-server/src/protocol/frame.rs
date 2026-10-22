@@ -1,27 +1,16 @@
-//! The frames of the ZEO protocol: a 4-byte big-endian length, then the
-//! bytes of the frame. The read of a frame has a limit, the option
+//! The read and the write of the frames of the ZEO protocol on a stream.
+//! `zoe_wire::frame` holds the bytes of a frame: a 4-byte big-endian
+//! length, then the payload. The read of a frame has a limit, the option
 //! `--max-frame-size` of `zoe serve`.
 
 use std::io::{self, IoSlice};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zoe_wire::frame::{self, RESERVE};
 
-/// The largest buffer that a read reserves before the bytes arrive. A
-/// longer frame grows its buffer as its bytes arrive, so a false length
-/// does not reserve memory.
-const RESERVE: usize = 1 << 20;
-
-/// Return the frame of `payload`: its length, then its bytes. A payload
-/// longer than `u32::MAX` bytes fails with `InvalidInput`.
+/// The frame of a payload, for the tests of the crate.
 #[cfg(test)]
-pub(crate) fn encode(payload: &[u8]) -> io::Result<Vec<u8>> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too long"))?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
-}
+pub(crate) use zoe_wire::frame::encode;
 
 /// Read one frame of at most `max` bytes from `reader`. Return `None` at
 /// the end of the stream before a frame starts. An end inside a frame
@@ -43,7 +32,7 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
         }
         got += n;
     }
-    let len = u32::from_be_bytes(len);
+    let len = frame::length(len);
     if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -73,9 +62,8 @@ pub(crate) async fn write_parts<W: AsyncWrite + Unpin>(
     parts: &[&[u8]],
 ) -> io::Result<()> {
     let len: usize = parts.iter().map(|part| part.len()).sum();
-    let len = u32::try_from(len)
+    let len = frame::header(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too long"))?;
-    let len = len.to_be_bytes();
     let mut slices: Vec<IoSlice<'_>> = std::iter::once(&len[..])
         .chain(parts.iter().copied())
         .filter(|part| !part.is_empty())
