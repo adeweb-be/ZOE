@@ -28,7 +28,7 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | `just deploy check` | the tests of `deploy/tests` on the deployment files: the Tier 1 manifests, the host units, the Grafana dashboard; `just test` runs it at its end |
 | `just docs` | checks the links of the book, then builds the documentation site into `target/book`; a link to a missing file or to a page of `docs/` that `SUMMARY.md` does not list fails it |
 | `just ci` | runs the Dagger functions `check`, `test` and `docs` locally; `just ci <function>` runs one |
-| `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release test` runs the tests of `ci/`. Publishing is not built yet |
+| `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release wheel DIR VERSION...` builds the `zoedb` wheel in the shell, one for each CPython version, 3.13 by default; `just release test` runs the tests of `ci/`. Publishing is not built yet |
 
 `just ci` reproduces a CI result. Do not use it for the edit-test loop.
 
