@@ -2,6 +2,25 @@
 
 [Introduction](README.md)
 
+# User guide
+
+- [Install](guide/install.md)
+- [Run in-process](guide/in-process.md)
+- [Run a server](guide/server.md)
+- [Connect clients](guide/clients.md)
+- [Plone and zoe.plone](guide/plone.md)
+- [Convert](guide/convert.md)
+- [Back up and restore](guide/backup-restore.md)
+- [Pack](guide/pack.md)
+- [Verify and repair](guide/verify-repair.md)
+- [Deploy on a host](guide/deploy-host.md)
+- [Deploy on Kubernetes](guide/deploy-kubernetes.md)
+- [Monitoring](guide/monitoring.md)
+- [Loupe](guide/loupe.md)
+- [MCP](guide/mcp.md)
+- [Troubleshooting](guide/troubleshooting.md)
+- [Known issues](guide/known-issues.md)
+
 # Specification
 
 - [Technical specification](spec/technical-specification.md)
