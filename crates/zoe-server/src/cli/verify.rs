@@ -246,7 +246,7 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "  blobs            {}", report.blobs)?;
     match report.object_count {
         Some(count) => writeln!(out, "  object count     {count}")?,
-        None => writeln!(out, "  object count     none: the store keeps no count")?,
+        None => writeln!(out, "  object count     none: the store has no count yet")?,
     }
     writeln!(out, "Findings: {}", report.problems())?;
     writeln!(out, "  checksums        {}", report.checksums.len())?;
@@ -363,7 +363,7 @@ mod tests {
         // A store without a count: one line, and no finding.
         let no_count = text(&Verification::default());
         assert!(
-            no_count.contains("\n  object count     none: the store keeps no count"),
+            no_count.contains("\n  object count     none: the store has no count yet"),
             "{no_count}"
         );
         assert!(no_count.contains("Findings: 0\n"), "{no_count}");
