@@ -110,7 +110,12 @@ pub(super) fn has(db: &Db, flavour: Flavour) -> Result<bool> {
 
 /// Stage the row `row` of the namespaces of `flavour` with `payload` in
 /// `txn`, as `WriteTxn::put_kv` tells.
-pub(super) fn put(txn: &WriteTransaction, flavour: Flavour, row: &[u8], payload: &[u8]) -> Result<()> {
+pub(super) fn put(
+    txn: &WriteTransaction,
+    flavour: Flavour,
+    row: &[u8],
+    payload: &[u8],
+) -> Result<()> {
     let frame = main_frame(flavour.space(), row, payload);
     let mut table = txn.open_table(table(flavour)).map_err(backend)?;
     table.insert(row, frame.as_slice()).map_err(backend)?;

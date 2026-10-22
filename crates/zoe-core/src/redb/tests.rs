@@ -341,8 +341,7 @@ fn a_replaced_row_keeps_its_branch_and_its_previous_serial() {
     // A row of another branch, with a previous serial.
     let key = format::txn_key(tid);
     let row = backend.iter_txns(tid, tid).next().unwrap().unwrap();
-    let frame =
-        format::encode_frame(KeySpace::Txns, &key, 7, Tid(3), &format::encode_txn(&row));
+    let frame = format::encode_frame(KeySpace::Txns, &key, 7, Tid(3), &format::encode_txn(&row));
     let txn = backend.database().begin_write().unwrap();
     txn.open_table(TXNS)
         .unwrap()

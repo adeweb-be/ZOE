@@ -92,7 +92,6 @@ impl BlobStore {
         }
     }
 
-
     /// Tell if the blob file of `oid` at `tid` exists. This reads no byte
     /// of the file.
     pub(crate) fn has_file(&self, oid: Oid, tid: Tid) -> Result<bool> {

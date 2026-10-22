@@ -7,14 +7,14 @@ use std::sync::atomic::Ordering;
 
 use redb::ReadableTable;
 
+#[cfg(feature = "testing")]
+use super::KV_EXPIRY;
 use super::write::RedbWrite;
 use super::{
     BLOBS, Bounds, Db, META, META_PACK_WATERMARK, RECORDS, RedbBackend, SEQUENCES, TXN_OIDS, TXNS,
     backend, corrupt_index, corrupt_record, corrupt_txn, inside, kv, newest, open_optional,
     refused,
 };
-#[cfg(feature = "testing")]
-use super::KV_EXPIRY;
 use crate::backend::{
     Backend, BlobRecord, Bytes, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnRecords,
     WriteTxn,

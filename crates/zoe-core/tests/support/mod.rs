@@ -82,4 +82,3 @@ impl Rng {
         (self.next() % n as u64) as usize
     }
 }
-

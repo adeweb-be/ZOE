@@ -159,9 +159,7 @@ fn newest<'k, T>(
     range: impl RangeBounds<&'k [u8; 16]> + RangeBounds<[u8; 16]> + Clone + 'k,
     read: impl FnOnce(&[u8; 16], &[u8]) -> Result<T>,
 ) -> Result<Option<T>> {
-    let mut scan = records
-        .range::<&[u8; 16]>(range.clone())
-        .map_err(backend)?;
+    let mut scan = records.range::<&[u8; 16]>(range.clone()).map_err(backend)?;
     let Some(entry) = scan.next_back() else {
         return Ok(None);
     };

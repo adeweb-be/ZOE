@@ -294,9 +294,7 @@ impl Store {
     /// fails leaves no lock file and no database. The blob directory itself
     /// comes with the first blob.
     pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        let relocated = relocation(&options, |parent| {
-            Ok(Box::new(OsVfs::unlocked(&parent)?))
-        })?;
+        let relocated = relocation(&options, |parent| Ok(Box::new(OsVfs::unlocked(&parent)?)))?;
         let vfs = OsVfs::new(dir.as_ref())?;
         Self::open_parts(vfs, SystemClock, options, relocated)
     }

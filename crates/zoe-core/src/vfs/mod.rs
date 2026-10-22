@@ -287,4 +287,3 @@ pub trait WriteFile: Write + Send {
 pub(crate) fn parent(name: &str) -> &str {
     name.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
-
