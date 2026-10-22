@@ -22,7 +22,7 @@
 use std::ffi::c_int;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,7 @@ use pyo3::types::PyDict;
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::{Handle, Signals};
 use signal_hook::low_level::emulate_default_handler;
+use zoe_client::lock;
 
 use crate::storage::{Shared, StoreRef};
 
@@ -70,7 +71,7 @@ static WATCHER: PyOnceLock<Handle> = PyOnceLock::new();
 
 /// Add a storage to the open storages of the process.
 pub(crate) fn register(shared: &Arc<Shared>) {
-    let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut open = lock(&OPEN);
     open.retain(|storage| storage.strong_count() > 0);
     open.push(Arc::downgrade(shared));
 }
@@ -169,9 +170,7 @@ fn watch(mut signals: Signals) {
 /// A store that a call still holds at `deadline` stays open, and the
 /// others close.
 fn close_all(deadline: Instant) {
-    let open: Vec<Arc<Shared>> = OPEN
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    let open: Vec<Arc<Shared>> = lock(&OPEN)
         .iter()
         .filter_map(Weak::upgrade)
         .collect();

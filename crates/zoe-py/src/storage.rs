@@ -60,6 +60,7 @@ use std::time::{Duration, SystemTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
+use zoe_client::lock;
 use zoe_core::{
     BlobFile, Compression, Flavour, IntentLocks, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT,
     Store, Tid, Txn, ZoeError,
@@ -123,7 +124,7 @@ pub(crate) struct Intents {
 
 impl Intents {
     fn lock(&self) -> MutexGuard<'_, Option<IntentLocks<StoreRef>>> {
-        self.intents.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.intents)
     }
 }
 
@@ -139,7 +140,7 @@ struct Entry {
 
 impl Entry {
     fn lock(&self) -> MutexGuard<'_, Option<SharedTxn>> {
-        self.txn.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.txn)
     }
 
     /// Call `f` with the transaction of the core. Fail when `tpc_finish`
@@ -239,7 +240,7 @@ impl Shared {
     }
 
     fn table(&self) -> MutexGuard<'_, Table> {
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.table)
     }
 
     /// Take the store out of the storage. Return `None` when it is already
@@ -318,7 +319,7 @@ impl Sweeper {
     /// Tell the thread to stop.
     fn signal(&self) {
         let (stopped, changed) = &*self.stop;
-        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        *lock(stopped) = true;
         changed.notify_all();
     }
 
@@ -344,10 +345,10 @@ impl Drop for Sweeper {
 /// halted store runs no step.
 fn sweep(store: &Weak<Owned>, stop: &(Mutex<bool>, Condvar)) {
     let (stopped, changed) = stop;
-    let is_stopped = || *stopped.lock().unwrap_or_else(PoisonError::into_inner);
+    let is_stopped = || *lock(stopped);
     loop {
         {
-            let guard = stopped.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = lock(stopped);
             let (guard, _) = changed
                 .wait_timeout_while(guard, SWEEP_INTERVAL, |stopped| !*stopped)
                 .unwrap_or_else(PoisonError::into_inner);
@@ -441,7 +442,7 @@ impl ResolutionLog {
             text.push_str(&line);
             text.push('\n');
         }
-        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut file = lock(&self.file);
         match io::Write::write_all(&mut *file, text.as_bytes()) {
             Err(error) if !self.failed.swap(true, Ordering::Relaxed) => Some(error.to_string()),
             _ => None,
@@ -450,6 +451,14 @@ impl ResolutionLog {
 }
 
 impl Storage {
+    /// Fail with `ReadOnlyError` when the storage is read-only.
+    fn writable(&self, py: Python<'_>) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        Ok(())
+    }
+
     /// Return the store, or fail when the storage is closed.
     fn opened(&self, py: Python<'_>) -> PyResult<StoreRef> {
         // The guard drops at the end of this statement. Building the
@@ -507,7 +516,7 @@ impl Storage {
         if self.read_only {
             return;
         }
-        let mut sweeper = self.sweeper.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sweeper = lock(&self.sweeper);
         if sweeper.is_some() {
             return;
         }
@@ -528,10 +537,7 @@ impl Storage {
     /// Take the thread of the sweep steps out of the storage. The caller
     /// stops it without the GIL.
     fn take_sweeper(&self) -> Option<Sweeper> {
-        self.sweeper
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        lock(&self.sweeper).take()
     }
 
     /// Stage a namespace write in `transaction` with `stage`, as `store`
@@ -542,9 +548,7 @@ impl Storage {
         transaction: &Bound<'_, PyAny>,
         stage: impl Fn(&mut SharedTxn) -> Result<(), Failure> + Send + Sync,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         let staged = match entry.try_with(&stage) {
             Some(staged) => staged,
@@ -556,9 +560,7 @@ impl Storage {
     /// Return the next value of the sequence `name`. A read-only storage
     /// refuses the call.
     pub(crate) fn next_value(&self, py: Python<'_>, name: &str) -> PyResult<u64> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         py.detach(move || store.sequence(name).next())
             .map_err(|e| core(py, e))
@@ -746,9 +748,7 @@ impl Storage {
 
     /// Return a new oid.
     fn new_oid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let oid = py
             .detach(move || store.new_oid())
@@ -907,9 +907,7 @@ impl Storage {
     /// while it runs. A read-only storage refuses the pack.
     #[pyo3(name = "_pack")]
     fn pack(&self, py: Python<'_>, tid: &Bound<'_, PyAny>) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let tid = Tid(u64_of(tid)?);
         let store = self.opened(py)?;
         py.detach(move || store.pack(tid))
@@ -1065,9 +1063,7 @@ impl Storage {
         owner: &Intents,
         oids: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let oids = oids
             .iter()
             .map(|oid| u64_of(oid).map(Oid))
@@ -1114,9 +1110,7 @@ impl Storage {
         status: Option<&Bound<'_, PyAny>>,
         intents: Option<&Intents>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let key = transaction.as_ptr() as usize;
         let begun = self.table().entries.contains_key(&key);
         if begun {
@@ -1191,9 +1185,7 @@ impl Storage {
         version: &Bound<'_, PyAny>,
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         if version.is_truthy()? {
             return Err(errors::version(py));
@@ -1244,9 +1236,7 @@ impl Storage {
         oldserial: &Bound<'_, PyAny>,
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         let oid = Oid(u64_of(oid)?);
         let serial = serial_of(oldserial)?;
@@ -1274,9 +1264,7 @@ impl Storage {
         tid: &Bound<'py, PyAny>,
         transaction: &Bound<'py, PyAny>,
     ) -> PyResult<(Vec<Bound<'py, PyBytes>>, Vec<UndoRow<'py>>)> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         let tid = Tid(u64_of(tid)?);
         let log = self.resolution_log.clone();
@@ -1365,9 +1353,7 @@ impl Storage {
         version: &Bound<'_, PyAny>,
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let entry = self.entry(py, transaction)?;
         if version.is_truthy()? {
@@ -1412,9 +1398,7 @@ impl Storage {
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let _ = (serial, prev_txn);
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let entry = self.entry(py, transaction)?;
         if version.is_truthy()? {
             return Err(errors::version(py));
@@ -1446,9 +1430,7 @@ impl Storage {
         transaction: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let _ = (serial, prev_txn);
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let entry = self.entry(py, transaction)?;
         let oid = Oid(u64_of(oid)?);
@@ -1499,9 +1481,7 @@ impl Storage {
     /// rename. A read-only storage raises `ReadOnlyError`.
     #[pyo3(name = "temporaryDirectory")]
     fn temporary_directory(&self, py: Python<'_>) -> PyResult<OsString> {
-        if self.read_only {
-            return Err(errors::read_only(py));
-        }
+        self.writable(py)?;
         let store = self.opened(py)?;
         let path = py
             .detach(move || store.blob_temp_dir())
@@ -1795,12 +1775,7 @@ impl Transactions {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<TxnRow<'py>>> {
         // The mutex is taken without the GIL, and no Python code runs while
         // it is held.
-        let next = py.detach(|| {
-            self.transactions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .next()
-        });
+        let next = py.detach(|| lock(&self.transactions).next());
         let txn = match next {
             None => return Ok(None),
             Some(txn) => txn.map_err(|e| core(py, e))?,
