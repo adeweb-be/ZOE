@@ -53,6 +53,20 @@ impl Boolish for clap::Arg {
     }
 }
 
+/// Write each row of `rows` as a line of counts of a report: two spaces,
+/// the name of the row padded to `width` characters, then its value. A
+/// report keeps one width for its rows, so its values form a column.
+fn write_counts(
+    out: &mut dyn Write,
+    width: usize,
+    rows: &[(&str, &dyn fmt::Display)],
+) -> io::Result<()> {
+    for (name, value) in rows {
+        writeln!(out, "  {name:<width$}{value}")?;
+    }
+    Ok(())
+}
+
 /// The exit code of a command that succeeds.
 pub const SUCCESS: i32 = 0;
 
