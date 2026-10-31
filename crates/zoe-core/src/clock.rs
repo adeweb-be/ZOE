@@ -4,6 +4,7 @@
 //! The core reads the time only through `Clock`, so a test or a simulator
 //! can give its own time.
 
+use std::io;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +29,16 @@ pub trait Clock: Send + Sync {
     /// Return a new waiter for one lock request.
     fn waiter(&self) -> Arc<dyn Waiter> {
         Arc::new(ThreadWaiter::default())
+    }
+
+    /// Start a thread of the store with the name `name`, and run `work` on
+    /// it (ADR 0056). The default starts a thread of the system. A
+    /// simulator gives its own, so the thread runs under its schedule.
+    fn spawn(&self, name: &str, work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(work)
+            .map(drop)
     }
 }
 

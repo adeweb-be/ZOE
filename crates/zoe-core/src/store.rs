@@ -510,6 +510,16 @@ impl Store {
         Self::open_reader(dir.as_ref(), options, true)
     }
 
+    /// Open the existing store in the directory `dir` for reads only, with
+    /// `options`, and read the tables alone: the call does not read the
+    /// write-ahead log (ADR 0056, section 14). The open is strict, as
+    /// `open_read_only_with` is. Only `zoe verify` uses it, after the open
+    /// of the tools failed on a damaged log.
+    pub fn open_read_only_tables(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        let _ = (dir, options);
+        unimplemented!("the write-ahead log of ADR 0056")
+    }
+
     /// Open the existing store in `dir` for reads only, with `options`.
     /// With `repair`, repair a store that a writer left open, as
     /// `open_read_only_repairing` tells. Without it, such a store fails

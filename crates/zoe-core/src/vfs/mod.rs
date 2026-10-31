@@ -40,6 +40,12 @@ pub trait Vfs: Send + Sync + 'static {
     /// Open the file `name`. Create it empty when it does not exist.
     fn open(&self, name: &str) -> io::Result<Self::File>;
 
+    /// Open the segment `name` of the write-ahead log, as `open` does
+    /// (ADR 0056). The default is `open`.
+    fn open_log(&self, name: &str) -> io::Result<Self::File> {
+        self.open(name)
+    }
+
     /// Create the new, empty file `name` and open it, as `open` does. Fail
     /// when `name` exists. A symbolic link exists too, so the call never
     /// opens the target of a link.
@@ -116,6 +122,10 @@ impl<V: Vfs> Vfs for Arc<V> {
 
     fn open(&self, name: &str) -> io::Result<Self::File> {
         (**self).open(name)
+    }
+
+    fn open_log(&self, name: &str) -> io::Result<Self::File> {
+        (**self).open_log(name)
     }
 
     fn create_new(&self, name: &str) -> io::Result<Self::File> {
