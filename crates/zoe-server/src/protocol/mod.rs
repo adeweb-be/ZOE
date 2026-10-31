@@ -26,6 +26,7 @@ pub(crate) mod frame;
 mod invalidation;
 mod iteration;
 mod message;
+mod method;
 pub(crate) mod metrics;
 pub(crate) mod negotiation;
 mod outbox;
