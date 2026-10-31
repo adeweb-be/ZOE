@@ -43,13 +43,15 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 
 ## Red zones
 
-A pull request that touches a red zone needs the human's approval. `CODEOWNERS` lists them.
+The red zones need care. `CODEOWNERS` lists them. A pull request that touches one merges when CI is green, as any other, unless it carries a design decision (see "Stop and ask").
 
 - `crates/zoe-core/src/format/`: the on-disk format. A change to the data model (a key space, a `meta` key, a frame field) is a format change wherever its code lives.
 - `crates/zoe-core/src/pack/`: pack, because it deletes data.
 - `.github/` (the workflows and `CODEOWNERS`) and `loops/` (the role briefs). Only a human changes these.
 
 Everything else, `ci/` and `devenv.nix` included, merges when CI is green.
+
+The human takes the big design decisions only: a change to the on-disk format, the wire protocol or a public Python API, and a new ADR. The orchestrator merges the rest.
 
 ## Stop and ask
 
@@ -62,7 +64,7 @@ Stop and write a question on the card, instead of guessing, when:
 
 1. A card is a GitHub issue: one mechanism, one pull request. It names its acceptance test and its scope fence.
 2. The builder works on the branch `card/<id>` in its own worktree, and opens a pull request when the work is done. The description gives the card, what changed in one paragraph, and what did not run.
-3. The pull request merges by squash when CI is green, with the human's approval when it touches a red zone. No force pushes.
+3. The pull request merges by squash when CI is green. No force pushes.
 4. When `main` moves and the pull request conflicts, the builder merges `main` into its branch.
 5. A card that stops unfinished leaves `docs/handoffs/<card>.md`: the state and the next step.
 

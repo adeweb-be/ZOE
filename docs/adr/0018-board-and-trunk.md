@@ -20,7 +20,7 @@ Cards are GitHub issues on a Projects board with the columns Backlog, Ready, Bui
 
 ### Interactive sessions
 
-There are no automated loops and no conductor. A session builds cards, each on its branch. A pull request merges by squash when CI is green; the human approves the red zones and answers the questions on cards. The role briefs are in `loops/prompts/`. No card builds the loops.
+There are no automated loops and no conductor. A session builds cards, each on its branch. A pull request merges by squash when CI is green, red zones included. The human takes the big design decisions (the on-disk format, the wire protocol, a public Python API, a new ADR) and answers the questions on cards. The role briefs are in `loops/prompts/`. No card builds the loops.
 
 ### Red zones
 
@@ -40,7 +40,7 @@ Everything in the repository is licensed Apache-2.0, the Plone extra included.
 
 - Every merged line traces back to one card and one pull request.
 - No lease, kill switch, digest or cost cap exists, because nothing runs without the human.
-- The human is in a merge only for a red zone, so the throughput is the throughput of the sessions and of CI.
+- The human is in a merge only for a design decision, so the throughput is the throughput of the sessions and of CI.
 - Unattended loops can come back later as a new decision, with its own cards.
 - Of the phase 1 cards, four are red zones: blobs, compression, pack and sequences.
 - The stop-and-ask rules stay: a builder still stops before it changes the on-disk format, the wire protocol, a public Python API or a trait that another crate uses.

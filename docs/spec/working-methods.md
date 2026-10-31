@@ -6,11 +6,11 @@ How ZOE gets built: one human, a team of AI agents, cards gated by tests, worked
 
 ## Way of working
 
-ZOE is built by AI agents with one human as product owner and architect. The human owns the technical specification and the ADRs, answers the questions on cards and approves the red zones. The agents build. Nothing is a task until a test decides it.
+ZOE is built by AI agents with one human as product owner and architect. The human owns the technical specification and takes the big design decisions: a change to the on-disk format, the wire protocol or a public Python API, and a new ADR. The agents build and merge the rest. Nothing is a task until a test decides it.
 
 - A card is a GitHub issue: one mechanism, one pull request (see "Cards" below).
 - A builder works on the branch `card/<id>` in its own git worktree and opens the pull request. The pull request merges by squash when CI is green. Trunk-based: short-lived branches, no force pushes.
-- The red zones need the human's approval as well: the on-disk format, pack, and the process files (`.github/` and `loops/`). `CODEOWNERS` lists them (ADR 0018).
+- The red zones need care: the on-disk format, pack, and the process files (`.github/` and `loops/`). `CODEOWNERS` lists them (ADR 0018). A change to them merges on green CI unless it carries a design decision; the process files stay human-only.
 - CI runs `check`, `test` and `docs` on each pull request. The conformance and Plone suites, the crash loop, the benchmarks and `just tsan` run when the human asks, as a rule at the end of a phase.
 - The root `CLAUDE.md` gives the recipes, the hard constraints and the stop-and-ask rules. Each crate has a `CLAUDE.md` with its invariants in plain sentences. `docs/adr/` holds one record per decision. `CONTEXT.md` is the glossary.
 
