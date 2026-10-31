@@ -1074,7 +1074,6 @@ async fn accept(
         };
         match accepted {
             Ok(Accepted::Unix(stream, path)) => {
-                let running = tasks.start();
                 let connection = protocol::serve_unix_connection(
                     stream,
                     path,
@@ -1083,41 +1082,36 @@ async fn accept(
                     idle_timeout,
                     stopping.clone(),
                 );
-                tokio::spawn(async move {
-                    connection.await;
-                    drop(running);
-                });
+                spawn_counted(&tasks, connection);
             }
             Ok(Accepted::Tcp(stream, peer)) => {
                 let _ = stream.set_nodelay(true);
-                let running = tasks.start();
-                if let Some(tls) = &tls {
-                    let connection = serve_tls(
-                        stream,
-                        peer.to_string(),
-                        Arc::clone(tls),
-                        Arc::clone(&storages),
-                        max_frame_size,
-                        idle_timeout,
-                        stopping.clone(),
-                    );
-                    tokio::spawn(async move {
-                        connection.await;
-                        drop(running);
-                    });
-                    continue;
+                let storages = Arc::clone(&storages);
+                let stopping = stopping.clone();
+                match &tls {
+                    Some(tls) => spawn_counted(
+                        &tasks,
+                        serve_tls(
+                            stream,
+                            peer.to_string(),
+                            Arc::clone(tls),
+                            storages,
+                            max_frame_size,
+                            idle_timeout,
+                            stopping,
+                        ),
+                    ),
+                    None => spawn_counted(
+                        &tasks,
+                        protocol::serve_connection(
+                            stream,
+                            storages,
+                            max_frame_size,
+                            idle_timeout,
+                            stopping,
+                        ),
+                    ),
                 }
-                let connection = protocol::serve_connection(
-                    stream,
-                    Arc::clone(&storages),
-                    max_frame_size,
-                    idle_timeout,
-                    stopping.clone(),
-                );
-                tokio::spawn(async move {
-                    connection.await;
-                    drop(running);
-                });
             }
             Err(error) => {
                 tracing::warn!("accept failed: {error}");
@@ -1125,6 +1119,16 @@ async fn accept(
             }
         }
     }
+}
+
+/// Spawn `connection` on tokio, and count it in `tasks` while it runs. The
+/// count starts before the spawn, so a stop waits for the connection.
+fn spawn_counted(tasks: &Arc<Tasks>, connection: impl Future<Output = ()> + Send + 'static) {
+    let running = tasks.start();
+    tokio::spawn(async move {
+        connection.await;
+        drop(running);
+    });
 }
 
 /// Run the TLS handshake of `tls` on `stream`, then serve the client
@@ -1140,17 +1144,11 @@ async fn serve_tls(
     idle_timeout: Option<Duration>,
     mut stopping: Stopping,
 ) {
-    let idle = async {
-        match idle_timeout {
-            Some(timeout) => tokio::time::sleep(timeout).await,
-            None => std::future::pending().await,
-        }
-    };
     let handshake = tokio::select! {
         biased;
         () = stopping.wait() => return,
         handshake = tls.accept(stream) => handshake,
-        () = idle => {
+        () = protocol::idle(&Tokio, idle_timeout) => {
             tracing::info!(client = peer.as_str(), "no TLS handshake within the idle timeout: closing the connection");
             return;
         }
@@ -1162,16 +1160,10 @@ async fn serve_tls(
             return;
         }
     };
-    let socket = Some(stream.get_ref().0.as_raw_fd());
+    let socket = stream.get_ref().0.as_raw_fd();
+    let connection =
+        Connection::tokio(peer, socket, max_frame_size, idle_timeout).read_only(read_only);
     let (reader, writer) = tokio::io::split(stream);
-    let connection = Connection {
-        peer,
-        runtime: Arc::new(Tokio),
-        max_frame_size,
-        idle_timeout,
-        read_only,
-        socket,
-    };
     protocol::serve_stream(reader, writer, connection, storages, stopping).await;
 }
 
