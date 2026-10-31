@@ -21,6 +21,9 @@ use zoe_convert::{ProblemKind, from_datafs};
 use zoe_core::vfs::{DirLock, MemVfs, OsFile, OsVfs, Vfs, WriteFile};
 use zoe_core::{Oid, Store, SystemClock, Tid};
 
+mod support;
+use support::fresh_dir;
+
 /// The record of a blob: the class pickle of `ZODB.blob.Blob`, then the
 /// state `None`.
 const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
@@ -34,13 +37,6 @@ const BATCH: u64 = 1_000;
 /// The database file of a store.
 const DATABASE: &str = "zoe.redb";
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-batched-sync-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// A `PersistentMapping` whose state holds the number `n`.
 fn record(n: u64) -> Vec<u8> {
     let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
@@ -48,16 +44,6 @@ fn record(n: u64) -> Vec<u8> {
     pickle.extend_from_slice(&n.to_le_bytes());
     pickle.extend_from_slice(b"s.");
     pickle
-}
-
-/// Write an oid or a tid as ZODB's `oid_repr` does.
-fn repr(n: u64) -> String {
-    let digits = format!("{n:x}");
-    if digits.len() % 2 == 1 {
-        format!("0x0{digits}")
-    } else {
-        format!("0x{digits}")
-    }
 }
 
 /// The bytes of the blob of `oid`.
@@ -79,9 +65,9 @@ fn write_data_fs(dir: &Path, count: u64, blobs: &[u64]) -> (PathBuf, PathBuf, Ve
         let tid = FIRST_TID + i;
         let oid = i + 1;
         let data = if blobs.contains(&i) {
-            let oid_dir = blob_dir.join(repr(oid));
+            let oid_dir = blob_dir.join(Oid(oid).repr());
             fs::create_dir_all(&oid_dir).unwrap();
-            let path = oid_dir.join(format!("{}.blob", repr(tid)));
+            let path = oid_dir.join(format!("{}.blob", Tid(tid).repr()));
             fs::write(path, blob_bytes(Oid(oid))).unwrap();
             BLOB.to_vec()
         } else {
