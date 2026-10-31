@@ -1,24 +1,21 @@
 //! `zoe-bench hot`: writers of one hot object, with vote-time locks and
 //! with early write-intent locks (F7, N5, ADR 0044 and ADR 0045).
 
+mod support;
+
 use std::process::Command;
 use std::time::Duration;
 
 use zoe_server::serve::{ServeOptions, Server};
 
-const BENCH: &str = env!("CARGO_BIN_EXE_zoe-bench");
+use support::fresh_dir;
 
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-bench-hot-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const BENCH: &str = env!("CARGO_BIN_EXE_zoe-bench");
 
 /// Run `zoe-bench hot` with `args` against a new server, and return its
 /// report.
 fn hot(name: &str, args: &[&str]) -> serde_json::Value {
-    let dir = fresh_dir(name);
+    let dir = fresh_dir(&format!("hot-{name}"));
     let options = ServeOptions::new(dir.join("store"))
         .admin_listen("127.0.0.1:0".parse().unwrap())
         .lock_timeout(Duration::from_secs(60));

@@ -26,7 +26,9 @@ use serde::Serialize;
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
 use zoe_pickle::decode_class_key;
 
-use crate::{Error, Result, Snapshot, serialize_oid, serialize_tid, strong_references};
+use crate::ids::{serialize_oid, serialize_tid};
+use crate::snapshot::strong_references;
+use crate::{Error, Result, Snapshot};
 
 /// The most items of a path that [`PathSpace`] lists one by one. The
 /// others add up in [`PathSpace::others`].
@@ -447,27 +449,15 @@ fn normal_path(path: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
-impl Snapshot<'_> {
-    /// Return the record of `oid` and its serial, or `None` when `oid` has
-    /// no record in the view or its record is a deletion.
-    fn record(&self, oid: Oid) -> Result<Option<(Vec<u8>, Tid)>> {
-        match self.load(oid) {
-            Ok(found) => Ok(Some(found)),
-            Err(Error::NoRecordAsOf { .. } | Error::Store(ZoeError::NotFound { .. })) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::path::PathBuf;
 
+    use zoe_core::testing::TempDir;
     use zoe_pickle::testing::{record, text};
 
     use super::*;
-    use crate::Folder;
+    use crate::{Folder, fresh_dir};
 
     /// A persistent reference to `oid` with the class `m.C`.
     fn reference(oid: u64) -> Vec<u8> {
@@ -513,21 +503,13 @@ mod tests {
         record("BTrees.OOBTree", "OOBTree", &state)
     }
 
-    /// Return a new directory for one test.
-    fn fresh(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-loupe-space-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     /// The records of one transaction by oid. `None` is a deletion.
     type Records = Vec<(u64, Option<Vec<u8>>)>;
 
     /// Write a store with one restore transaction for each item of
     /// `txns`: its tid and its records by oid. `None` is a deletion.
-    fn store_with(name: &str, txns: &[(u64, Records)]) -> PathBuf {
-        let dir = fresh(name);
+    fn store_with(name: &str, txns: &[(u64, Records)]) -> TempDir {
+        let dir = fresh_dir(&format!("space-{name}"));
         let store = Store::open(&dir).unwrap();
         for (tid, records) in txns {
             let mut txn = store.tpc_begin_restore(Tid(*tid), b"", b"", b"").unwrap();
@@ -635,7 +617,7 @@ mod tests {
 
     #[test]
     fn the_space_counts_the_current_blob_files() {
-        let dir = fresh("blobs");
+        let dir = fresh_dir("space-blobs");
         {
             let store = Store::open(&dir).unwrap();
             for (oid, bytes) in [(1, &b"twelve bytes"[..]), (2, b"four")] {
@@ -701,7 +683,7 @@ mod tests {
 
     /// A site at `/site` with two items in its `_tree` that share an
     /// object, annotations, and a weak reference.
-    fn site() -> (PathBuf, BTreeMap<u64, Vec<u8>>) {
+    fn site() -> (TempDir, BTreeMap<u64, Vec<u8>>) {
         let records = BTreeMap::from([
             (0, root()),
             (1, item(&[("site", reference(2))])),

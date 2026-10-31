@@ -1,6 +1,16 @@
-//! The helpers that the measurements of the core share.
+//! The helpers that the tests of zoe-bench share. Each test binary uses
+//! some of them.
+
+#![allow(dead_code)]
 
 use zoe_core::Oid;
+use zoe_core::testing::TempDir;
+
+/// Return a new, empty directory for the test `name` of this test binary.
+/// The drop of the directory removes it, except when the test panics.
+pub fn fresh_dir(name: &str) -> TempDir {
+    zoe_core::testing::fresh_dir(&format!("bench-{name}"))
+}
 
 /// The record of `oid` in its `version`, of `size` bytes. The first half
 /// is text that zstd compresses well, the second half is pseudo-random

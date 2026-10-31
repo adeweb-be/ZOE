@@ -15,14 +15,7 @@ use serde_json::{Value, json};
 use zoe_core::{Oid, Store, Tid};
 use zoe_loupe::{Change, Folder, Object, Snapshot};
 
-use common::{Fixture, fresh_dir, write_store};
-
-/// Open the fixture store in a new directory.
-fn open(name: &str) -> (Fixture, Folder) {
-    let dir = fresh_dir(name);
-    let fixture = write_store(&dir);
-    (fixture, Folder::open(&dir).unwrap())
-}
+use common::{Fixture, fresh_dir, open, write_store};
 
 /// The tid of the transaction of the fixture with the description
 /// `description`.
@@ -69,7 +62,7 @@ fn changed(path: &str, before: Value, after: Value) -> (String, Option<Value>, O
 
 #[test]
 fn history_lists_tid_user_and_description_newest_first() {
-    let (fixture, folder) = open("history");
+    let (_dir, fixture, folder) = open("history");
 
     for path in ["/plone/folder/doc", "/plone/folder", "/plone/big"] {
         let (oid, _) = fixture.at_path(path);
@@ -113,7 +106,7 @@ fn history_lists_tid_user_and_description_newest_first() {
 
 #[test]
 fn as_of_a_tid_shows_every_object_as_it_was_after_that_transaction() {
-    let (fixture, folder) = open("as-of");
+    let (_dir, fixture, folder) = open("as-of");
     let created = fixture.created();
 
     for txn in &fixture.txns {
@@ -157,7 +150,7 @@ fn as_of_a_tid_shows_every_object_as_it_was_after_that_transaction() {
 
 #[test]
 fn as_of_a_tid_between_two_transactions_is_as_of_the_earlier_one() {
-    let (fixture, folder) = open("between");
+    let (_dir, fixture, folder) = open("between");
 
     for pair in fixture.txns.windows(2) {
         let (earlier, later) = (pair[0].tid, pair[1].tid);
@@ -185,7 +178,7 @@ fn as_of_a_tid_between_two_transactions_is_as_of_the_earlier_one() {
 
 #[test]
 fn the_folder_reads_as_of_its_last_tid() {
-    let (fixture, folder) = open("latest");
+    let (_dir, fixture, folder) = open("latest");
     let latest = folder.as_of(fixture.last_tid());
     assert_eq!(folder.root().unwrap(), latest.root().unwrap());
     for (path, _) in &fixture.txns.last().unwrap().paths {
@@ -201,7 +194,7 @@ fn the_folder_reads_as_of_its_last_tid() {
 
 #[test]
 fn an_older_tid_shows_the_older_values() {
-    let (fixture, folder) = open("older");
+    let (_dir, fixture, folder) = open("older");
     let created = tid_of(&fixture, "create the site");
     let edited = tid_of(&fixture, "edit the document");
     let annotated = tid_of(&fixture, "annotate the document");
@@ -238,7 +231,7 @@ fn an_older_tid_shows_the_older_values() {
 
 #[test]
 fn the_diff_compares_the_decoded_states_of_two_revisions() {
-    let (fixture, folder) = open("diff");
+    let (_dir, fixture, folder) = open("diff");
     let created = tid_of(&fixture, "create the site");
     let edited = tid_of(&fixture, "edit the document");
     let annotated = tid_of(&fixture, "annotate the document");
