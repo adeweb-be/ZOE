@@ -7,13 +7,17 @@ import sys
 from pathlib import Path
 
 import jsonschema
+from benchcommon import files
 
 from shootout import client, gate, native, publish, run
 from shootout.layout import result_path, write_index
 from shootout.storages import STORAGES
 
 # The harness runs from its source tree, so the schema is beside it.
-SCHEMA = Path(__file__).resolve().parents[3] / "schema" / "results.schema.json"
+SCHEMA = publish.SCHEMAS / publish.SCHEMA_OF["shootout"]
+# The families that write one result file, with the name of each in a
+# message.
+FAMILIES = {"client": "the client benchmark", "native": "the native gate"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,13 +111,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     gate_cmd.add_argument("root", type=Path, help="the root of a results tree")
 
+    # The options of a run of the client benchmark or of the native gate.
+    family = argparse.ArgumentParser(add_help=False)
+    family.add_argument(
+        "--machine",
+        help="the machine name in the result "
+        "(default: $ZOE_BENCH_MACHINE, else the CPU model)",
+    )
+    family.add_argument(
+        "--workdir",
+        type=Path,
+        default=Path("target/bench/work"),
+        help="where the servers write their stores and the caches their "
+        "files; the run removes them when it ends (default: %(default)s)",
+    )
+    family.add_argument(
+        "--output",
+        type=Path,
+        help="the result file (default: target/bench/<family>/<started>.json)",
+    )
+
     client_cmd = commands.add_parser(
         "client",
         help="the client benchmark: ZEO.ClientStorage against the native client",
     )
-    client_cmds = client_cmd.add_subparsers(dest="client_command", required=True)
+    client_cmds = client_cmd.add_subparsers(dest="action", required=True)
     client_run = client_cmds.add_parser(
-        "run", help="run both clients against each server and write one result"
+        "run",
+        parents=[family],
+        help="run both clients against each server and write one result",
     )
     client_run.add_argument(
         "--objects",
@@ -141,23 +167,6 @@ def main(argv: list[str] | None = None) -> int:
         default=client.ROUNDS,
         help="the rounds of each row, at least 3 (default: %(default)s)",
     )
-    client_run.add_argument(
-        "--machine",
-        help="the machine name in the result "
-        "(default: $ZOE_BENCH_MACHINE, else the CPU model)",
-    )
-    client_run.add_argument(
-        "--workdir",
-        type=Path,
-        default=Path("target/bench/work"),
-        help="where the servers and the caches write their files "
-        "(default: %(default)s)",
-    )
-    client_run.add_argument(
-        "--output",
-        type=Path,
-        help="the result file (default: target/bench/client/<started>.json)",
-    )
     client_report = client_cmds.add_parser(
         "report", help="print the rows of a result and the verdict"
     )
@@ -167,9 +176,11 @@ def main(argv: list[str] | None = None) -> int:
         "native",
         help="the phase 3 gate: zoe serve through the native client against ZEO",
     )
-    native_cmds = native_cmd.add_subparsers(dest="native_command", required=True)
+    native_cmds = native_cmd.add_subparsers(dest="action", required=True)
     native_run = native_cmds.add_parser(
-        "run", help="run the gate, write one result and print the report"
+        "run",
+        parents=[family],
+        help="run the gate, write one result and print the report",
     )
     native_run.add_argument(
         "--cell",
@@ -184,33 +195,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=native.SCENARIOS,
         help="run only these scenarios (default: all 5)",
     )
-    native_run.add_argument(
-        "--machine",
-        help="the machine name in the result "
-        "(default: $ZOE_BENCH_MACHINE, else the CPU model)",
-    )
-    native_run.add_argument(
-        "--workdir",
-        type=Path,
-        default=Path("target/bench/work"),
-        help="where the servers write their stores; each cell runs on fresh "
-        "stores that the gate removes when the cell ends (default: %(default)s)",
-    )
-    native_run.add_argument(
-        "--output",
-        type=Path,
-        help="the result file (default: target/bench/native/<started>.json)",
-    )
     native_report = native_cmds.add_parser(
         "report", help="print the rows of a result and the verdict"
     )
     native_report.add_argument("result", type=Path)
 
     args = parser.parse_args(argv)
-    if args.command == "client":
-        return _client(args, parser)
-    if args.command == "native":
-        return _native(args)
+    if args.command in FAMILIES:
+        return _family(args, parser)
     if args.command == "index":
         try:
             print(write_index(args.root))
@@ -256,79 +248,62 @@ def _write(result: dict, root: Path, schema: dict) -> None:
     """Validate a result, write it under root and print its rows."""
     jsonschema.validate(result, schema)
     path = result_path(root, result)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result, indent=2) + "\n")
+    files.write_json(path, result)
     print(f"== {result['storage']}", flush=True)
     _summary(result)
     print(path, flush=True)
 
 
-def _client(args, parser) -> int:
-    """Run the client benchmark, or report on a result of it."""
-    if args.client_command == "report":
-        result = json.loads(args.result.read_text())
-        try:
-            jsonschema.validate(result, json.loads(client.SCHEMA.read_text()))
-        except jsonschema.ValidationError as error:
-            print(
-                f"{args.result} is not a result of the client benchmark: "
-                f"{error.message}",
-                file=sys.stderr,
-            )
-            return 2
-        return client.report(result, sys.stdout)
-    if args.rounds < client.ROUNDS:
-        parser.error(f"--rounds must be at least {client.ROUNDS}")
-    result = client.run(
-        objects=args.objects,
-        servers=tuple(args.server),
-        workdir=args.workdir,
-        machine=args.machine,
-        rounds=args.rounds,
-        commits=args.commits,
-    )
-    jsonschema.validate(result, json.loads(client.SCHEMA.read_text()))
-    output = args.output
-    if output is None:
-        stamp = result["run"]["started"].replace("-", "").replace(":", "")
-        output = Path("target/bench/client") / f"{stamp}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2) + "\n")
-    # The verdict of a run is the work of the report, not of the run.
-    client.report(result, sys.stdout)
-    print(output, flush=True)
-    return 0
-
-
-def _native(args) -> int:
-    """Run the native gate, or report on a result of it."""
-    schema = json.loads(native.SCHEMA.read_text())
-    if args.native_command == "report":
+def _family(args, parser) -> int:
+    """Run the client benchmark or the native gate, or report on a result
+    of it."""
+    family = args.command
+    module = client if family == "client" else native
+    schema = json.loads((publish.SCHEMAS / publish.SCHEMA_OF[family]).read_text())
+    if args.action == "report":
         result = json.loads(args.result.read_text())
         try:
             jsonschema.validate(result, schema)
         except jsonschema.ValidationError as error:
             print(
-                f"{args.result} is not a result of the native gate: {error.message}",
+                f"{args.result} is not a result of {FAMILIES[family]}: {error.message}",
                 file=sys.stderr,
             )
             return 2
-        return native.report(result, sys.stdout)
-    result = native.run(
-        cells=args.cell or native.CELLS,
-        scenarios=args.scenario or native.SCENARIOS,
-        workdir=args.workdir,
-        machine=args.machine,
-    )
+        return module.report(result, sys.stdout)
+    if family == "client":
+        if args.rounds < client.ROUNDS:
+            parser.error(f"--rounds must be at least {client.ROUNDS}")
+        result = client.run(
+            objects=args.objects,
+            servers=tuple(args.server),
+            workdir=args.workdir,
+            machine=args.machine,
+            rounds=args.rounds,
+            commits=args.commits,
+        )
+    else:
+        result = native.run(
+            cells=args.cell or native.CELLS,
+            scenarios=args.scenario or native.SCENARIOS,
+            workdir=args.workdir,
+            machine=args.machine,
+        )
     jsonschema.validate(result, schema)
     output = args.output
     if output is None:
         stamp = result["run"]["started"].replace("-", "").replace(":", "")
-        output = Path("target/bench/native") / f"{stamp}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2) + "\n")
+        output = Path("target/bench") / family / f"{stamp}.json"
+    # A run that stops in the write leaves no part of the result.
+    files.write_json(output, result)
+    if family == "native":
+        print(output, flush=True)
+        return native.report(result, sys.stdout)
+    # The verdict of a run of the client benchmark is the work of the
+    # report, not of the run.
+    client.report(result, sys.stdout)
     print(output, flush=True)
-    return native.report(result, sys.stdout)
+    return 0
 
 
 def _native_cell(text: str) -> native.Cell:

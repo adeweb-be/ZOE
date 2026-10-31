@@ -516,6 +516,11 @@ version = "4.5+zoe.1"
 source = { git = "https://github.com/adeweb-be/zodbpickle?rev=84029ffb1d5e636b2fa20f44c65272832519263f#84029ffb1d5e636b2fa20f44c65272832519263f" }
 
 [[package]]
+name = "zoe-bench-common"
+version = "0.0.0"
+source = { editable = "../common" }
+
+[[package]]
 name = "zoe-replay"
 version = "0.0.0"
 source = { editable = "." }
@@ -527,6 +532,7 @@ dependencies = [
     { name = "zeo" },
     { name = "zodb" },
     { name = "zodbpickle" },
+    { name = "zoe-bench-common" },
     { name = "zoedb" },
 ]
 
@@ -544,6 +550,7 @@ requires-dist = [
     { name = "zeo", specifier = ">=6" },
     { name = "zodb", specifier = ">=6" },
     { name = "zodbpickle", git = "https://github.com/adeweb-be/zodbpickle?rev=84029ffb1d5e636b2fa20f44c65272832519263f" },
+    { name = "zoe-bench-common", editable = "../common" },
     { name = "zoedb", editable = "../../python/zoedb" },
 ]
 

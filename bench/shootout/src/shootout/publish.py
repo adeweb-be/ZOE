@@ -25,11 +25,11 @@ import contextlib
 import json
 import os
 import secrets
-import subprocess
 import sys
 from pathlib import Path
 
 import jsonschema
+from benchcommon import provenance
 
 from shootout import layout
 
@@ -60,7 +60,8 @@ def publish(sources: list[str], checkout: str, main: str = MAIN) -> int:
         if not root.is_dir():
             raise UsageError(f"{checkout} is not a directory")
         documents = _documents(sources)
-        if _git("rev-parse", "--verify", "--quiet", f"{main}^{{commit}}") is None:
+        found = provenance.git("rev-parse", "--verify", "--quiet", f"{main}^{{commit}}")
+        if found is None:
             raise UsageError(f"{main} is not a commit of the ZOE repository")
     except UsageError as error:
         print(f"publish: {error}", file=sys.stderr)
@@ -191,7 +192,7 @@ def _page_changes() -> list[tuple[str, bool]]:
         return []
     repository = DASHBOARD.parents[1]
     base = DASHBOARD.relative_to(repository).as_posix()
-    listed = _git(
+    listed = provenance.git(
         "status",
         "--porcelain",
         "-z",
@@ -246,7 +247,7 @@ def _dashboard(root: Path, checkout: str):
     # bench/dashboard of the repository of the harness.
     repository = DASHBOARD.parents[1]
     base = DASHBOARD.relative_to(repository).as_posix()
-    listed = _git("ls-files", "-z", "--", base, cwd=repository)
+    listed = provenance.git("ls-files", "-z", "--", base, cwd=repository)
     if listed is None:
         return [], [(base, "git cannot list the files of the page")]
     pages, problems = [], []
@@ -315,7 +316,7 @@ def _check(
     else:
         if commit not in on_main:
             on_main[commit] = (
-                _git("merge-base", "--is-ancestor", commit, main) is not None
+                provenance.git("merge-base", "--is-ancestor", commit, main) is not None
             )
         if not on_main[commit]:
             reasons.append(f"commit {commit[:12]} is not on {main}")
@@ -335,19 +336,3 @@ def _check(
     if target is None:
         reasons.append("its path in the layout holds a part that is not a name")
     return target, reasons, document
-
-
-def _git(*args: str, cwd: Path = REPOSITORY) -> str | None:
-    """Run git in the ZOE repository. Return its output, or None when it
-    fails."""
-    try:
-        done = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    return done.stdout if done.returncode == 0 else None

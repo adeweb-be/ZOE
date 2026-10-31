@@ -6,7 +6,7 @@
 # The tests run in this environment, with plain classes of persistent and
 # BTrees. A replay of a Plone store runs in the interpreter of a Plone
 # instance, so that the resolver of ZODB has the classes of the site:
-# `just bench replay` puts src/ on its PYTHONPATH.
+# `just bench replay` puts src/ and bench/common/src on its PYTHONPATH.
 [build-system]
 requires = ["uv_build>=0.12,<0.13"]
 build-backend = "uv_build"
@@ -30,6 +30,9 @@ dependencies = [
     "persistent",
     "zodbpickle",
     "BTrees",
+    # The server lifecycle and the provenance of every harness. A replay
+    # in the interpreter of a Plone instance finds it on PYTHONPATH.
+    "zoe-bench-common",
 ]
 
 [dependency-groups]
@@ -40,6 +43,8 @@ dev = [
 [tool.uv.sources]
 # The source is editable, so the replay runs the Python code of the tree.
 zoedb = { path = "../../python/zoedb", editable = true }
+# Editable, so that the package finds the repository from its own path.
+zoe-bench-common = { path = "../common", editable = true }
 # The forks that the workspace in python/ uses.
 persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c54959112f49ef563267f0ed2cb96228c21a" }
 zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
