@@ -1170,7 +1170,7 @@ mod tests {
 
     /// The oids of the strong references of a record, as Loupe reads them.
     fn oids(record: &[u8]) -> Vec<Oid> {
-        crate::strong_references(record).unwrap()
+        crate::snapshot::strong_references(record).unwrap()
     }
 
     #[test]
