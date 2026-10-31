@@ -1,6 +1,6 @@
 [package]
 name = "zoe-mcp"
-description = "The MCP server for ops and content agents."
+description = "The MCP server for ops agents."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
