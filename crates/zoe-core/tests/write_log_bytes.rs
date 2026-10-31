@@ -35,8 +35,8 @@ const WARMUP: usize = 20;
 /// the fold.
 const COMMITS: usize = 60;
 /// The most bytes of an entry beyond its record frames: the header of the
-/// entry, the transaction row with its op, 13 bytes of op for each record
-/// and the zeros of the alignment, with room to spare.
+/// entry (56 bytes), the transaction row with its op, 13 bytes of op for
+/// each record and the zeros of the alignment, with room to spare.
 fn entry_overhead(records: usize) -> u64 {
     16 * records as u64 + 256
 }
@@ -72,10 +72,15 @@ fn frames(store: &Store, oids: &[Oid], tid: Tid) -> u64 {
         .sum()
 }
 
+/// Open a store with zstd at level 3. No fold starts by age, so the folds
+/// of a run are those that it asks for.
 fn open(metered: &MeteredVfs, write_log: WriteLog) -> Store {
     let options = Options {
         compression: Compression::Zstd { level: 3 },
-        write_log,
+        write_log: WriteLog {
+            fold_age: std::time::Duration::from_secs(3600),
+            ..write_log
+        },
         ..Options::default()
     };
     Store::open_full(metered.clone(), SystemClock, options).unwrap()

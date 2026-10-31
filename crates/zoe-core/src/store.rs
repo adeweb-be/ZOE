@@ -218,6 +218,10 @@ pub struct WriteLog {
     /// The backlog at which the fold starts: the bytes of the commits that
     /// the log holds and the tables do not. The default is 16 MiB.
     pub fold_bytes: u64,
+    /// The age of the oldest commit of the backlog at which the fold
+    /// starts, on the monotonic time of the store clock. It bounds the time
+    /// that a commit stays in the log alone. The default is 5 s.
+    pub fold_age: Duration,
     /// The most bytes of log entries that one backend write of the fold
     /// takes. A slice takes at least one commit. The default is 4 MiB.
     pub slice_bytes: u64,
@@ -240,6 +244,7 @@ impl Default for WriteLog {
             enabled: true,
             segment_bytes: 64 << 20,
             fold_bytes: 16 << 20,
+            fold_age: Duration::from_secs(5),
             slice_bytes: 4 << 20,
             backlog_bytes: 256 << 20,
             large_record: 64 << 10,
@@ -733,6 +738,16 @@ impl Store {
     /// the tables do not, as the bound `WriteLog::backlog_bytes` counts
     /// them (ADR 0056). The call reads no file.
     pub fn backlog_bytes(&self) -> u64 {
+        unimplemented!("the write-ahead log of ADR 0056")
+    }
+
+    /// Return the tids of the log entry that the open cut while its header
+    /// passed and its body did not: the previous tid and the last tid of
+    /// the entry (ADR 0056, section 12). The commits of that entry are lost:
+    /// a crash stopped their finish, or a damage of the disk destroyed
+    /// them after their sync. The open cannot tell which. `None` when the
+    /// open cut no such entry.
+    pub fn cut_at_open(&self) -> Option<(Tid, Tid)> {
         unimplemented!("the write-ahead log of ADR 0056")
     }
 

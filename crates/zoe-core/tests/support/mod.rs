@@ -83,9 +83,10 @@ impl Rng {
     }
 }
 
-/// A `MemVfs` that counts the bytes and the syncs of the store files, can
-/// hold each sync of the database file at a gate, and can fail each write
-/// of the database file. The clones share the files and the counts.
+/// A `MemVfs` that counts the bytes and the syncs of the store files. It
+/// can hold the syncs of the database file or of the log at a gate, fail
+/// each write of the database file, and fail each read of the log. The
+/// clones share the files, the counts and the switches.
 ///
 /// A file is the database file (`zoe.redb`), a file of the write-ahead log
 /// (a name under `wal/`), or another file. Only the first two count.
@@ -95,18 +96,59 @@ pub struct MeteredVfs {
     pub meter: Arc<Meter>,
 }
 
-/// The counts of a `MeteredVfs`, its gate and its fault.
+/// A gate that holds the syncs of one kind of file.
+#[derive(Default)]
+pub struct Gate {
+    held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+    /// The syncs that wait at the gate now.
+    waiting: AtomicUsize,
+}
+
+impl Gate {
+    fn set(&self, held: bool) {
+        *self.held.lock().unwrap() = held;
+        self.released.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut held = self.held.lock().unwrap();
+        if *held {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            while *held {
+                held = self.released.wait(held).unwrap();
+            }
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Return the syncs that wait at the gate now.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
+    }
+}
+
+/// The counts of a `MeteredVfs`, its gates and its switches.
 #[derive(Default)]
 pub struct Meter {
     pub database_bytes: std::sync::atomic::AtomicU64,
     pub database_syncs: std::sync::atomic::AtomicU64,
     pub log_bytes: std::sync::atomic::AtomicU64,
     pub log_syncs: std::sync::atomic::AtomicU64,
-    /// True while the syncs of the database file wait.
-    held: std::sync::Mutex<bool>,
-    released: std::sync::Condvar,
+    /// The gate of the syncs of the database file.
+    pub database_gate: Gate,
+    /// The gate of the syncs of the files of the log.
+    pub log_gate: Gate,
     /// True while each write of the database file fails.
     pub fail_database_writes: std::sync::atomic::AtomicBool,
+    /// True while each read of a file of the log fails.
+    pub fail_log_reads: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for Meter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Meter")
+    }
 }
 
 impl Meter {
@@ -138,22 +180,27 @@ impl Meter {
         self.log_syncs.load(Ordering::SeqCst)
     }
 
-    /// Make each later sync of the database file wait until `release`.
-    pub fn hold_database_syncs(&self) {
-        *self.held.lock().unwrap() = true;
+    /// Hold the syncs of the database file until the returned guard drops.
+    /// A test that fails while a thread waits at the gate then still ends.
+    pub fn hold(&self) -> Held<'_> {
+        self.database_gate.set(true);
+        Held(&self.database_gate)
     }
 
-    /// Let the syncs of the database file go on.
-    pub fn release_database_syncs(&self) {
-        *self.held.lock().unwrap() = false;
-        self.released.notify_all();
+    /// Hold the syncs of the files of the log until the returned guard
+    /// drops.
+    pub fn hold_log(&self) -> Held<'_> {
+        self.log_gate.set(true);
+        Held(&self.log_gate)
     }
+}
 
-    fn wait_for_release(&self) {
-        let mut held = self.held.lock().unwrap();
-        while *held {
-            held = self.released.wait(held).unwrap();
-        }
+/// A held gate. Its drop lets the syncs go on.
+pub struct Held<'m>(&'m Gate);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 
@@ -183,18 +230,15 @@ pub struct MeteredFile {
     meter: Arc<Meter>,
 }
 
-impl std::fmt::Debug for Meter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Meter")
-    }
-}
-
 impl redb::StorageBackend for MeteredFile {
     fn len(&self) -> std::io::Result<u64> {
         self.file.len()
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        if self.kind == FileKind::Log && self.meter.fail_log_reads.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("an injected read failure"));
+        }
         self.file.read(offset, out)
     }
 
@@ -205,10 +249,11 @@ impl redb::StorageBackend for MeteredFile {
     fn sync_data(&self) -> std::io::Result<()> {
         match self.kind {
             FileKind::Database => {
-                self.meter.wait_for_release();
+                self.meter.database_gate.pass();
                 self.meter.database_syncs.fetch_add(1, Ordering::SeqCst);
             }
             FileKind::Log => {
+                self.meter.log_gate.pass();
                 self.meter.log_syncs.fetch_add(1, Ordering::SeqCst);
             }
             FileKind::Other => {}
@@ -264,13 +309,39 @@ impl std::io::Write for MeteredWriter {
 impl zoe_core::vfs::WriteFile for MeteredWriter {
     fn sync(&mut self) -> std::io::Result<()> {
         if self.kind == FileKind::Log {
+            self.meter.log_gate.pass();
             self.meter.log_syncs.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.sync()
     }
 }
 
+/// A sequential reader of a `MeteredVfs` that fails while the reads of the
+/// log fail.
+struct MeteredReader {
+    inner: Box<dyn std::io::Read + Send>,
+    kind: FileKind,
+    meter: Arc<Meter>,
+}
+
+impl std::io::Read for MeteredReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.kind == FileKind::Log && self.meter.fail_log_reads.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("an injected read failure"));
+        }
+        self.inner.read(buf)
+    }
+}
+
 impl MeteredVfs {
+    /// Return a metered view of `vfs`, with a meter of its own.
+    pub fn over(vfs: zoe_core::vfs::MemVfs) -> Self {
+        Self {
+            vfs,
+            meter: Arc::default(),
+        }
+    }
+
     fn metered(&self, name: &str, file: zoe_core::vfs::MemFile) -> MeteredFile {
         MeteredFile {
             file,
@@ -336,7 +407,11 @@ impl zoe_core::vfs::Vfs for MeteredVfs {
     }
 
     fn read_file(&self, name: &str) -> std::io::Result<Box<dyn std::io::Read + Send>> {
-        self.vfs.read_file(name)
+        Ok(Box::new(MeteredReader {
+            inner: self.vfs.read_file(name)?,
+            kind: kind_of(name),
+            meter: Arc::clone(&self.meter),
+        }))
     }
 
     fn sync_file(&self, name: &str) -> std::io::Result<()> {
@@ -364,10 +439,11 @@ pub mod wal {
     use zoe_core::Tid;
     use zoe_core::vfs::{MemVfs, Vfs};
 
-    /// The length of the header of a segment.
+    /// The length of the header of a segment, and the offset of the first
+    /// entry of a use.
     pub const SEGMENT_HEADER: u64 = 32;
     /// The length of the header of an entry.
-    pub const ENTRY_HEADER: u64 = 48;
+    pub const ENTRY_HEADER: u64 = 56;
     /// The magic number of a segment.
     pub const SEGMENT_MAGIC: &[u8; 8] = b"ZOE-WAL\0";
     /// The magic number of an entry.
@@ -392,6 +468,7 @@ pub mod wal {
         pub offset: u64,
         pub ops: u32,
         pub body_len: u64,
+        pub epoch: u64,
         pub previous: Tid,
         pub last: Tid,
     }
@@ -409,12 +486,13 @@ pub mod wal {
         }
     }
 
-    /// Return the names of the files of `wal/`, with the directory part,
-    /// in order.
+    /// Return the names of the segment files of `wal/` (`.wal`), with the
+    /// directory part, in order.
     pub fn files(vfs: &MemVfs) -> Vec<String> {
         match vfs.list_files("wal") {
             Ok(names) => names
                 .into_iter()
+                .filter(|name| name.ends_with(".wal"))
                 .map(|name| format!("wal/{name}"))
                 .collect(),
             Err(_) => Vec::new(),
@@ -453,32 +531,42 @@ pub mod wal {
         })
     }
 
-    /// Return the entries of the segment `name` that pass their checksums,
-    /// from the first one to the first that does not.
-    pub fn entries(vfs: &MemVfs, name: &str) -> Vec<Entry> {
-        let Some(segment) = segment(vfs, name) else {
-            return Vec::new();
+    /// Return the entry at `offset` of the segment `name` when its header
+    /// and its body pass their checksums.
+    pub fn entry_at(vfs: &MemVfs, name: &str, offset: u64) -> Option<Entry> {
+        let header = read(vfs, name, offset, ENTRY_HEADER)?;
+        if &header[..4] != ENTRY_MAGIC || xxh3_64(&header[..48]) != u64_at(&header, 48) {
+            return None;
+        }
+        let entry = Entry {
+            offset,
+            ops: u32_at(&header, 4),
+            body_len: u64_at(&header, 8),
+            epoch: u64_at(&header, 16),
+            previous: Tid(u64_at(&header, 24)),
+            last: Tid(u64_at(&header, 32)),
         };
-        let salt = segment.epoch.to_le_bytes();
+        let body = read(vfs, name, entry.body(), entry.body_len)?;
+        let checked = [&header[..40], &body[..]].concat();
+        (xxh3_64(&checked) == u64_at(&header, 40)).then_some(entry)
+    }
+
+    /// Return the entries of the use of the segment `name`, from the first
+    /// one to the first that does not pass. The epoch of the use comes from
+    /// the header, or from the first entry when the header does not pass.
+    pub fn entries(vfs: &MemVfs, name: &str) -> Vec<Entry> {
+        let epoch = match segment(vfs, name) {
+            Some(segment) if segment.state == IN_USE => segment.epoch,
+            Some(_) => return Vec::new(),
+            None => match entry_at(vfs, name, SEGMENT_HEADER) {
+                Some(first) => first.epoch,
+                None => return Vec::new(),
+            },
+        };
         let mut entries = Vec::new();
         let mut offset = SEGMENT_HEADER;
-        while let Some(header) = read(vfs, name, offset, ENTRY_HEADER) {
-            let checked = [&salt[..], &header[..40]].concat();
-            if &header[..4] != ENTRY_MAGIC || xxh3_64(&checked) != u64_at(&header, 40) {
-                break;
-            }
-            let entry = Entry {
-                offset,
-                ops: u32_at(&header, 4),
-                body_len: u64_at(&header, 8),
-                previous: Tid(u64_at(&header, 16)),
-                last: Tid(u64_at(&header, 24)),
-            };
-            let Some(body) = read(vfs, name, entry.body(), entry.body_len) else {
-                break;
-            };
-            let checked = [&salt[..], &header[..32], &body[..]].concat();
-            if xxh3_64(&checked) != u64_at(&header, 32) {
+        while let Some(entry) = entry_at(vfs, name, offset) {
+            if entry.epoch != epoch {
                 break;
             }
             entries.push(entry);
@@ -507,23 +595,5 @@ pub mod wal {
         let mut byte = [0];
         file.read(offset, &mut byte).unwrap();
         file.write(offset, &[!byte[0]]).unwrap();
-    }
-}
-
-impl Meter {
-    /// Hold the syncs of the database file until the returned guard drops.
-    /// A test that fails while a thread waits at the gate then still ends.
-    pub fn hold(&self) -> Held<'_> {
-        self.hold_database_syncs();
-        Held(self)
-    }
-}
-
-/// The gate of `Meter::hold`. Its drop lets the syncs go on.
-pub struct Held<'m>(&'m Meter);
-
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        self.0.release_database_syncs();
     }
 }

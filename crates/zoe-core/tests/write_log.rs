@@ -7,10 +7,13 @@
 //! a load needs no second lookup. The fold writes the commits into the
 //! tables later, in slices. The backlog is bounded, and a finish that
 //! meets the bound waits for the fold. An open replays the log after the
-//! folded tid, and refuses a log that lost an acknowledged commit. A
-//! batch of large records, a batch larger than half of the backlog and a
-//! batch of deferred restores go into the tables directly. The format of
-//! such a store is `ZOE format 3`.
+//! folded tid, refuses a log that lost an acknowledged commit, reads a use
+//! whose header is damaged from its first entry and never reuses its file,
+//! reports an entry that it cuts, and fails on an I/O error. A reader sees
+//! a prefix of the commits, also while the fold runs. A batch of large
+//! records, a batch larger than half of the backlog and a batch of deferred
+//! restores go into the tables directly. An idle store folds by age. The
+//! format of such a store is `ZOE format 3`.
 //!
 //! The crash images are in `write_log_crash.rs`, the bytes of a commit in
 //! `write_log_bytes.rs`, and the read-only opens in
@@ -22,20 +25,23 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use support::{MeteredVfs, Rng, wal};
+use support::{CountingClock, MeteredVfs, Rng, wal};
 use zoe_core::testing::{self, ManualClock, commit, commit_all, commit_as, new_oid, try_commit};
 use zoe_core::vfs::{MemVfs, Vfs};
 use zoe_core::{
-    Flavour, Observer, Oid, Options, PackReport, Store, SystemClock, Tid, WriteLog, ZoeError,
+    DurableRow, Flavour, Observer, Oid, Options, PackReport, Store, SystemClock, Tid, WriteLog,
+    ZoeError, timestamp,
 };
+use zoe_pickle::python::{Heap, Value};
 
-/// Settings under which no fold starts by itself: only `Store::fold`, a
-/// pack and a close fold.
+/// Settings under which no fold starts by itself, by size or by age: only
+/// `Store::fold`, a pack and a close fold.
 fn held() -> WriteLog {
     WriteLog {
         fold_bytes: 1 << 40,
+        fold_age: HOUR,
         backlog_bytes: 1 << 41,
         ..WriteLog::default()
     }
@@ -155,7 +161,8 @@ fn a_finish_syncs_its_log_entry_and_writes_no_byte_of_the_tables() {
         "the finish wrote the tables"
     );
     assert_eq!(metered.meter.database_syncs(), 0);
-    assert_eq!(metered.meter.log_syncs(), 1);
+    // The fold thread can also sync the segment that it grows.
+    assert!(metered.meter.log_syncs() >= 1);
     assert!(metered.meter.log_bytes() >= 100 * 1024);
     assert!(store.backlog_bytes() >= 100 * 1024);
     for &oid in &oids {
@@ -196,6 +203,7 @@ fn the_log_entry_of_a_finish_has_the_layout_of_the_format() {
     let segment = wal::segment(&vfs, &name).unwrap();
     assert_eq!(segment.version, 1);
     assert_eq!(segment.state, wal::IN_USE);
+    assert_eq!(entry.epoch, segment.epoch);
     let (_, entry_one) = wal::find(&vfs, first).unwrap();
     assert_eq!(entry_one.previous, Tid::ZERO);
     assert_eq!(entry.previous, first);
@@ -859,6 +867,8 @@ fn a_damaged_last_entry_is_cut_as_a_torn_tail() {
         Err(ZoeError::NotFound { .. })
     ));
     assert_eq!(store.last_transaction(), commits[0].1);
+    // The header of the cut entry passed: the open reports its tids.
+    assert_eq!(store.cut_at_open(), Some((commits[0].1, commits[1].1)));
     let after = commit_new(&store, 1, 100);
     assert!(after[0].1 > commits[0].1);
 }
@@ -964,5 +974,591 @@ fn readers_see_each_acknowledged_commit_while_the_fold_moves_it() {
     for (i, &oid) in oids.iter().enumerate() {
         let tids = acknowledged[i].lock().unwrap();
         assert_eq!(store.history(oid, COMMITS).unwrap().len(), tids.len());
+    }
+}
+
+#[test]
+fn a_damaged_header_of_the_current_use_loses_no_commit_and_the_file_is_not_reused() {
+    let vfs = MemVfs::new();
+    let (image, commits) = killed_after(&vfs, held(), 3, 100);
+    let (name, _) = wal::find(&image, commits[2].1).unwrap();
+    // A byte of the epoch: the header no longer passes its checksum.
+    wal::flip(&image, &name, 20);
+    assert_eq!(wal::segment(&image, &name), None);
+
+    let store = open(&image, held());
+    for &(oid, tid) in &commits {
+        assert_eq!(store.load(oid).unwrap().1, tid);
+    }
+    let after = commit_new(&store, 2, 100);
+    for &(_, tid) in &after {
+        let (segment, _) = wal::find(&image, tid).unwrap();
+        assert_ne!(segment, name, "a new use of a file whose header failed");
+    }
+    store.fold().unwrap();
+    assert!(
+        !wal::files(&image).contains(&name),
+        "the fold kept a file whose header failed"
+    );
+    drop(store);
+
+    let reopened = open(&image, held());
+    for &(oid, tid) in commits.iter().chain(&after) {
+        assert_eq!(reopened.load(oid).unwrap().1, tid);
+    }
+}
+
+#[test]
+fn a_damaged_header_and_first_entry_fail_the_open_when_later_entries_hold_commits() {
+    let vfs = MemVfs::new();
+    let (image, commits) = killed_after(&vfs, held(), 3, 100);
+    let (name, first) = wal::find(&image, commits[0].1).unwrap();
+    assert_eq!(first.offset, wal::SEGMENT_HEADER);
+    wal::flip(&image, &name, 20);
+    // A byte of the previous tid of the first entry.
+    wal::flip(&image, &name, first.offset + 26);
+    // The two later entries are evidence of synced commits: no silent loss.
+    match refused(image, held()) {
+        ZoeError::CorruptTxn { tid } => assert_eq!(tid, commits[0].1),
+        other => panic!("{other}"),
+    }
+}
+
+#[test]
+fn a_damaged_entry_header_in_the_middle_of_a_segment_fails_the_open() {
+    let vfs = MemVfs::new();
+    let (image, commits) = killed_after(&vfs, held(), 3, 100);
+    let (name, middle) = wal::find(&image, commits[1].1).unwrap();
+    // A byte of the previous tid: the header of the entry fails.
+    wal::flip(&image, &name, middle.offset + 26);
+    match refused(image, held()) {
+        ZoeError::CorruptTxn { tid } => assert_eq!(tid, commits[1].1),
+        other => panic!("{other}"),
+    }
+}
+
+#[test]
+fn a_damaged_last_entry_of_a_segment_that_is_not_the_last_fails_the_open() {
+    let vfs = MemVfs::new();
+    let write_log = WriteLog {
+        segment_bytes: 4096,
+        ..held()
+    };
+    let (image, commits) = killed_after(&vfs, write_log.clone(), 2, 3000);
+    let (segment_one, entry) = wal::find(&image, commits[0].1).unwrap();
+    assert_ne!(wal::find(&image, commits[1].1).unwrap().0, segment_one);
+    wal::flip(&image, &segment_one, entry.body() + 3);
+    // The next segment names the cut entry as the one before it.
+    match refused(image, write_log) {
+        ZoeError::CorruptTxn { tid } => assert_eq!(tid, commits[0].1),
+        other => panic!("{other}"),
+    }
+}
+
+#[test]
+fn an_io_error_on_a_read_of_the_log_fails_the_open() {
+    let vfs = MemVfs::new();
+    let (image, _) = killed_after(&vfs, held(), 2, 100);
+    let metered = MeteredVfs::over(image);
+    metered.meter.fail_log_reads.store(true, Ordering::SeqCst);
+    match Store::open_full(metered.clone(), SystemClock, options(held())) {
+        Err(ZoeError::Io(_)) => {}
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("the open read a failed read as a torn tail"),
+    }
+}
+
+/// Load each version of `oid` that `versions` gives, oldest first, through
+/// `load`, `load_before` and `history`.
+fn check_versions(store: &Store, oid: Oid, versions: &[(Tid, Vec<u8>)]) {
+    let (last_tid, last_data) = versions.last().unwrap();
+    assert_eq!(store.load(oid).unwrap(), (last_data.clone(), *last_tid));
+    for (k, (tid, data)) in versions.iter().enumerate() {
+        let read = store.load_before(oid, Tid(tid.0 + 1)).unwrap().unwrap();
+        assert_eq!((&read.data, read.serial), (data, *tid), "version {k}");
+        assert_eq!(
+            read.next,
+            versions.get(k + 1).map(|(t, _)| *t),
+            "version {k}"
+        );
+    }
+    let history: Vec<Tid> = store
+        .history(oid, 100)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.tid)
+        .collect();
+    let expected: Vec<Tid> = versions.iter().rev().map(|(tid, _)| *tid).collect();
+    assert_eq!(history, expected);
+}
+
+/// Commit `data` for `oid` over its last version in `versions`, and add the
+/// new version.
+fn update(store: &Store, oid: Oid, versions: &mut Vec<(Tid, Vec<u8>)>, data: Vec<u8>) {
+    let serial = versions.last().map_or(Tid::ZERO, |(tid, _)| *tid);
+    let tid = commit(store, oid, serial, &data);
+    versions.push((tid, data));
+}
+
+#[test]
+fn one_oid_written_through_the_log_and_through_direct_batches_reads_in_order() {
+    let vfs = MemVfs::new();
+    let write_log = WriteLog {
+        backlog_bytes: 1 << 20,
+        fold_bytes: 1 << 20,
+        fold_age: HOUR,
+        ..WriteLog::default()
+    };
+    let store = open(&vfs, write_log.clone());
+    let x = new_oid(&store);
+    let mut versions = Vec::new();
+
+    // Through the log.
+    update(&store, x, &mut versions, b"log 1".to_vec());
+    // A deferred restore: a direct batch, after the fold of the backlog.
+    let restored = timestamp(SystemTime::now() + HOUR);
+    let mut txn = store
+        .tpc_begin_restore_deferred(restored, b"", b"", b"")
+        .unwrap();
+    txn.restore(x, Some(b"deferred restore")).unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    versions.push((restored, b"deferred restore".to_vec()));
+    assert_eq!(store.backlog_bytes(), 0);
+    // After it, a direct batch with a sync.
+    update(&store, x, &mut versions, b"after the restore".to_vec());
+    // y fills the backlog, then a batch larger than half of the bound,
+    // with x, waits for an empty backlog.
+    commit_new(&store, 1, 10);
+    assert!(store.backlog_bytes() > 0);
+    let serial = versions.last().unwrap().0;
+    let mut writes = vec![(x, serial, b"oversized".to_vec())];
+    writes.extend((0..600).map(|_| (new_oid(&store), Tid::ZERO, vec![1; 1024])));
+    versions.push((commit_all(&store, &writes), b"oversized".to_vec()));
+    assert_eq!(store.backlog_bytes(), 0);
+    // Through the log, then a large record that finds that backlog.
+    update(&store, x, &mut versions, b"log 2".to_vec());
+    update(&store, x, &mut versions, vec![2; 100 << 10]);
+    store.fold().unwrap();
+    // A large record on an empty backlog: a direct batch.
+    update(&store, x, &mut versions, vec![3; 100 << 10]);
+    update(&store, x, &mut versions, b"log 3".to_vec());
+    check_versions(&store, x, &versions);
+
+    // A kill, then an open with the log off: the open replays the log, and
+    // the next batch waits for its fold.
+    let image = vfs.crash_now(|pending| pending);
+    drop(store);
+    let off = WriteLog {
+        enabled: false,
+        ..write_log
+    };
+    let store = open(&image, off);
+    check_versions(&store, x, &versions);
+    update(&store, x, &mut versions, b"with the log off".to_vec());
+    assert_eq!(store.backlog_bytes(), 0);
+    check_versions(&store, x, &versions);
+}
+
+/// Return the number that the first 8 bytes of `data` give.
+fn number(data: &[u8]) -> u64 {
+    u64::from_be_bytes(data[..8].try_into().unwrap())
+}
+
+#[test]
+fn readers_never_see_half_of_a_commit() {
+    const COMMITS: u64 = 300;
+    let vfs = MemVfs::new();
+    let write_log = WriteLog {
+        fold_bytes: 32 << 10,
+        slice_bytes: 16 << 10,
+        fold_age: Duration::from_millis(50),
+        ..WriteLog::default()
+    };
+    let store = open(&vfs, write_log);
+    let (a, b) = (new_oid(&store), new_oid(&store));
+    let value = |n: u64| n.to_be_bytes().repeat(64);
+    let mut serial = commit_all(
+        &store,
+        &[(a, Tid::ZERO, value(0)), (b, Tid::ZERO, value(0))],
+    );
+    let done = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for n in 1..=COMMITS {
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.store(a, serial, &value(n)).unwrap();
+                txn.store(b, serial, &value(n)).unwrap();
+                for key in [b"k1", b"k2"] {
+                    txn.kv_set(Flavour::Durable, REGISTRY, key, &n.to_be_bytes(), None)
+                        .unwrap();
+                }
+                txn.vote().unwrap();
+                serial = txn.finish().unwrap();
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        for _ in 0..4 {
+            scope.spawn(|| {
+                loop {
+                    let finished = done.load(Ordering::SeqCst);
+                    // a is read first: once a shows commit n, b shows n or later.
+                    let first = number(&store.load(a).unwrap().0);
+                    let second = number(&store.load(b).unwrap().0);
+                    assert!(second >= first, "a at {first}, b at {second}");
+                    let get = |key: &[u8]| {
+                        store
+                            .kv_get(Flavour::Durable, REGISTRY, key)
+                            .unwrap()
+                            .map_or(0, |value| number(&value))
+                    };
+                    let (k1, k2) = (get(b"k1"), get(b"k2"));
+                    assert!(k2 >= k1, "k1 at {k1}, k2 at {k2}");
+                    let pairs = store
+                        .kv_scan(Flavour::Durable, REGISTRY, None, None, 10)
+                        .unwrap();
+                    if pairs.len() == 2 {
+                        assert_eq!(pairs[0].1, pairs[1].1, "a scan saw half of a commit");
+                    }
+                    let tid = store.last_transaction();
+                    let at = Tid(tid.0 + 1);
+                    let (ra, rb) = (
+                        store.load_before(a, at).unwrap().unwrap(),
+                        store.load_before(b, at).unwrap().unwrap(),
+                    );
+                    assert_eq!((ra.serial, &ra.data), (rb.serial, &rb.data));
+                    if finished {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The acknowledged commits of a writer: their tids, their oids and their
+/// namespace keys.
+type Acknowledged = (Vec<Tid>, Vec<Oid>, Vec<Vec<u8>>);
+
+#[test]
+fn scans_during_folds_give_no_duplicate_no_gap_and_no_error() {
+    const COMMITS: usize = 150;
+    const RECORDS: usize = 3;
+    let vfs = MemVfs::new();
+    let write_log = WriteLog {
+        fold_bytes: 16 << 10,
+        slice_bytes: 8 << 10,
+        fold_age: Duration::from_millis(20),
+        ..WriteLog::default()
+    };
+    let store = open(&vfs, write_log);
+    // The acknowledged commits, their oids and their namespace keys.
+    let acknowledged: Mutex<Acknowledged> = Mutex::default();
+    let done = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for n in 0..COMMITS {
+                let oids: Vec<Oid> = (0..RECORDS).map(|_| new_oid(&store)).collect();
+                let key = format!("key{n:05}").into_bytes();
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                for &oid in &oids {
+                    txn.store(oid, Tid::ZERO, &[n as u8; 512]).unwrap();
+                }
+                txn.kv_set(Flavour::Durable, REGISTRY, &key, b"v", None)
+                    .unwrap();
+                txn.vote().unwrap();
+                let tid = txn.finish().unwrap();
+                let mut seen = acknowledged.lock().unwrap();
+                seen.0.push(tid);
+                seen.1.extend(oids);
+                seen.2.push(key);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        for seed in 1..=2 {
+            let (store, acknowledged, done) = (&store, &acknowledged, &done);
+            scope.spawn(move || {
+                let mut rng = Rng::new(seed);
+                loop {
+                    let finished = done.load(Ordering::SeqCst);
+                    let (tids, oids, keys) = acknowledged.lock().unwrap().clone();
+
+                    let found: Vec<Tid> = store
+                        .iterator(None, None)
+                        .unwrap()
+                        .map(|txn| {
+                            let txn = txn.unwrap();
+                            assert_eq!(txn.records.len(), RECORDS, "{:?}", txn.tid);
+                            txn.tid
+                        })
+                        .collect();
+                    assert!(found.windows(2).all(|w| w[0] < w[1]), "the iterator");
+                    assert!(tids.iter().all(|tid| found.contains(tid)), "a gap");
+                    if !tids.is_empty() {
+                        let tid = tids[rng.below(tids.len())];
+                        let one: Vec<_> = store.iterator(Some(tid), Some(tid)).unwrap().collect();
+                        assert_eq!(one.len(), 1);
+                        assert_eq!(one[0].as_ref().unwrap().records.len(), RECORDS);
+                    }
+
+                    let mut walked = Vec::new();
+                    let mut next = None;
+                    while let Some(current) = store.record_iternext(next).unwrap() {
+                        walked.push(current.oid);
+                        match current.next {
+                            Some(oid) => next = Some(oid),
+                            None => break,
+                        }
+                    }
+                    assert!(walked.windows(2).all(|w| w[0] < w[1]), "record_iternext");
+                    assert!(oids.iter().all(|oid| walked.contains(oid)), "a gap");
+
+                    let keys_found = store.record_keys(Oid(0), 1 << 20).unwrap();
+                    assert!(keys_found.windows(2).all(|w| w[0] < w[1]), "record_keys");
+                    assert!(
+                        oids.iter()
+                            .all(|oid| keys_found.iter().any(|(o, _)| o == oid))
+                    );
+
+                    let log: Vec<Tid> = store
+                        .undo_log(Tid::MAX, 10_000)
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| row.tid)
+                        .collect();
+                    assert!(log.windows(2).all(|w| w[0] > w[1]), "undo_log");
+                    assert!(tids.iter().all(|tid| log.contains(tid)), "a gap");
+
+                    let pairs = store
+                        .kv_scan(Flavour::Durable, REGISTRY, None, None, 1000)
+                        .unwrap();
+                    assert!(pairs.windows(2).all(|w| w[0].0 < w[1].0), "kv_scan");
+                    assert!(keys.iter().all(|key| pairs.iter().any(|(k, _)| k == key)));
+                    if finished {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Return the record of a `BTrees.Length.Length` of `value`.
+fn length(value: i128) -> Vec<u8> {
+    let mut heap = Heap::new();
+    let class = heap.new_class("BTrees.Length", "Length");
+    testing::record(&heap, class, Value::Int(value))
+}
+
+#[test]
+fn the_object_count_does_not_count_a_record_merged_onto_a_commit_in_flight() {
+    let clock = CountingClock::default();
+    let metered = MeteredVfs::default();
+    let store = Store::open_full(metered.clone(), clock.clone(), options(held())).unwrap();
+    let oid = new_oid(&store);
+    let read = commit(&store, oid, Tid::ZERO, &length(0));
+    commit_new(&store, 2, 10);
+    let count = store.object_count();
+    assert_eq!(count, Some(3));
+    let mut first = store.tpc_begin(b"", b"", b"").unwrap();
+    first.store(oid, read, &length(1)).unwrap();
+    first.vote().unwrap();
+
+    let (one, two) = thread::scope(|scope| {
+        let waits = clock.waits.load(Ordering::SeqCst);
+        let second = scope.spawn(|| {
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(oid, read, &length(1)).unwrap();
+            txn.vote().map(|()| txn)
+        });
+        // The second vote waits for the lock of the first transaction.
+        testing::wait_until(|| clock.waits.load(Ordering::SeqCst) > waits);
+        thread::sleep(Duration::from_millis(200));
+        // `Store::sync` holds the commit sequencer at the gate of the
+        // database sync, so the first commit stays in flight.
+        let held = metered.meter.hold();
+        let sync = scope.spawn(|| store.sync().unwrap());
+        testing::wait_until(|| metered.meter.database_gate.waiting() == 1);
+        let one = scope.spawn(move || first.finish().unwrap());
+        // The finish hands the lock off, and the vote merges onto the
+        // record of the commit in flight: its serial is a placeholder.
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(second.natively_resolved(), [oid]);
+        let two = scope.spawn(move || second.finish().unwrap());
+        thread::sleep(Duration::from_millis(50));
+        drop(held);
+        sync.join().unwrap();
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert!(two > one);
+    assert_eq!(store.load(oid).unwrap(), (length(2), two));
+    assert_eq!(store.load_before(oid, two).unwrap().unwrap().serial, one);
+    assert_eq!(
+        store.object_count(),
+        count,
+        "a merged record counted as new"
+    );
+    store.fold().unwrap();
+    assert_eq!(store.object_count(), count);
+}
+
+#[test]
+fn a_pack_that_removes_an_oid_that_a_log_commit_writes_counts_it_after_the_fold() {
+    let vfs = MemVfs::new();
+    let store = open(&vfs, held());
+    let root = Oid(0);
+    let z = new_oid(&store);
+    // No record refers to z, so a pack removes it.
+    let t1 = commit_all(
+        &store,
+        &[
+            (root, Tid::ZERO, item("root", &[])),
+            (z, Tid::ZERO, item("z1", &[])),
+        ],
+    );
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(z, t1, &item("z2", &[])).unwrap();
+    txn.vote().unwrap();
+    store.pack(store.last_transaction()).unwrap();
+    assert!(matches!(
+        store.load_serial(z, t1),
+        Err(ZoeError::NotFound { .. })
+    ));
+    let t2 = txn.finish().unwrap();
+    assert_eq!(store.load(z).unwrap(), (item("z2", &[]), t2));
+
+    let mut oids: Vec<Oid> = store
+        .record_keys(Oid(0), 1000)
+        .unwrap()
+        .into_iter()
+        .map(|(oid, _)| oid)
+        .collect();
+    oids.dedup();
+    let exact = oids.len() as u64;
+    assert_eq!(exact, 2);
+    // Until the slice that folds the commit, the count can be one lower
+    // (ADR 0056, section 19).
+    let count = store.object_count().unwrap();
+    assert!(count == exact || count + 1 == exact, "{count} for {exact}");
+    store.fold().unwrap();
+    assert_eq!(store.object_count(), Some(exact));
+}
+
+#[test]
+fn a_batch_of_namespace_writes_only_goes_to_the_log_on_an_empty_backlog() {
+    let metered = MeteredVfs::default();
+    let store = Store::open_full(metered.clone(), SystemClock, options(held())).unwrap();
+    assert_eq!(store.backlog_bytes(), 0);
+    metered.meter.reset();
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.kv_set(Flavour::Durable, REGISTRY, b"key", b"value", None)
+        .unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    // No large record: no direct batch.
+    assert!(metered.meter.log_bytes() > 0);
+    assert_eq!(metered.meter.database_syncs(), 0);
+    assert!(store.backlog_bytes() > 0);
+    let value = store.kv_get(Flavour::Durable, REGISTRY, b"key").unwrap();
+    assert_eq!(value.as_deref(), Some(&b"value"[..]));
+}
+
+#[test]
+fn a_restore_of_durable_rows_lands_over_the_log_and_beside_a_writer() {
+    let vfs = MemVfs::new();
+    let store = open(&vfs, held());
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.kv_set(Flavour::Durable, REGISTRY, b"k", b"logged", None)
+        .unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    assert!(store.backlog_bytes() > 0);
+
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            for n in 0..50 {
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                let key = format!("w{n:02}").into_bytes();
+                txn.kv_set(Flavour::Durable, REGISTRY, &key, b"w", None)
+                    .unwrap();
+                txn.vote().unwrap();
+                txn.finish().unwrap();
+            }
+        });
+        let row = DurableRow {
+            name: REGISTRY.to_owned(),
+            key: b"k".to_vec(),
+            payload: b"restored".to_vec(),
+        };
+        store.kv_restore_durable(&[row]).unwrap();
+        writer.join().unwrap();
+    });
+    let check = |store: &Store| {
+        let value = store.kv_get(Flavour::Durable, REGISTRY, b"k").unwrap();
+        assert_eq!(value.as_deref(), Some(&b"restored"[..]));
+        for n in 0..50 {
+            let key = format!("w{n:02}").into_bytes();
+            assert!(
+                store
+                    .kv_get(Flavour::Durable, REGISTRY, &key)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    };
+    check(&store);
+    store.fold().unwrap();
+    check(&store);
+    drop(store);
+    check(&open(&vfs, held()));
+}
+
+#[test]
+fn an_ephemeral_row_in_the_log_alone_reads_absent_after_its_expiry() {
+    let clock = ManualClock::new();
+    let vfs = MemVfs::new();
+    let store = Store::open_full(vfs.clone(), clock.clone(), options(held())).unwrap();
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.kv_set(
+        Flavour::Ephemeral,
+        SESSIONS,
+        b"s1",
+        b"data",
+        Some(Duration::from_secs(60)),
+    )
+    .unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    assert!(store.backlog_bytes() > 0);
+    let value = store.kv_get(Flavour::Ephemeral, SESSIONS, b"s1").unwrap();
+    assert_eq!(value.as_deref(), Some(&b"data"[..]));
+
+    clock.advance(Duration::from_secs(120));
+    assert_eq!(
+        store.kv_get(Flavour::Ephemeral, SESSIONS, b"s1").unwrap(),
+        None
+    );
+    let pairs = store
+        .kv_scan(Flavour::Ephemeral, SESSIONS, None, None, 10)
+        .unwrap();
+    assert!(pairs.is_empty(), "{pairs:?}");
+    assert!(store.backlog_bytes() > 0, "the row left the log");
+}
+
+#[test]
+fn an_idle_store_folds_by_age() {
+    let vfs = MemVfs::new();
+    let write_log = WriteLog {
+        fold_age: Duration::from_millis(100),
+        ..WriteLog::default()
+    };
+    let store = open(&vfs, write_log);
+    let commits = commit_new(&store, 3, 100);
+    // Far below `fold_bytes`: only the age starts the fold.
+    testing::wait_until(|| store.backlog_bytes() == 0);
+    for &(oid, tid) in &commits {
+        assert_eq!(store.load(oid).unwrap().1, tid);
     }
 }
