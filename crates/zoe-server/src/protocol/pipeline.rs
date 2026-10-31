@@ -756,19 +756,20 @@ impl Calls {
                 let Ticket {
                     slot: _slot, room, ..
                 } = ticket;
+                // The call and its reply log in one span, with the peer:
+                // the connection has no storage and no label yet.
+                let _entered = tracing::info_span!("connection", client = &*peer).entered();
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
                         let session = Session::new(storage, outbox.clone(), stopping)
                             .read_only_client(read_only);
-                        let _entered = tracing::info_span!("connection", client = &*peer).entered();
                         let _request = session.request(&call).entered();
                         let outcome = session.call(&call, &mut reply);
                         (outcome, Some(session).filter(Session::is_registered))
                     }
                     Err(outcome) => (outcome, None),
                 };
-                let _entered = tracing::info_span!("connection", client = &*peer).entered();
                 if !reply.send(&call, outcome, &outbox) {
                     ended.end();
                 }

@@ -541,21 +541,26 @@ impl Transaction {
     /// a shared lock on `oid`, and a stale serial fails the vote with
     /// `ReadConflictError`.
     fn check_current_serial(&mut self, args: Args<'_>) -> Result<Value, Fault> {
-        let [oid, serial, id] = args.exactly::<3>()?;
-        self.current(id)?.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), serial_of(serial)?);
-            Ok(txn.check_current_serial(oid, serial)?)
-        });
-        Ok(Value::Nil)
+        self.stage_serial(args, Txn::check_current_serial)
     }
 
     /// Stage a deletion of `oid`. The vote checks `serial` as it does for
     /// `storea`.
     fn delete_object(&mut self, args: Args<'_>) -> Result<Value, Fault> {
+        self.stage_serial(args, Txn::delete)
+    }
+
+    /// Run `step` with the oid and the serial of `args`, `[oid, serial,
+    /// id]`, on the open transaction `id`, as `Open::stage` runs a step.
+    fn stage_serial(
+        &mut self,
+        args: Args<'_>,
+        step: impl FnOnce(&mut Txn<Arc<Store>>, Oid, Tid) -> Result<(), ZoeError>,
+    ) -> Result<Value, Fault> {
         let [oid, serial, id] = args.exactly::<3>()?;
         self.current(id)?.stage(|txn| {
             let (oid, serial) = (Oid(u64_of(oid)?), serial_of(serial)?);
-            Ok(txn.delete(oid, serial)?)
+            Ok(step(txn, oid, serial)?)
         });
         Ok(Value::Nil)
     }
