@@ -1,8 +1,8 @@
 """Acceptance test of the cache of the native client.
 
 Loads of the native client hit a cache in the client process, with the
-semantics of `ZEO.cache.ClientCache`. The argument `cache_size` bounds it,
-and leaves `zoe.zeo._NOT_BUILT`. `just test` runs this module.
+semantics of `ZEO.cache.ClientCache`. The argument `cache_size` bounds it.
+`just test` runs this module.
 
 The test counts the loads that reach the server. `zoe serve --admin-listen`
 gives `zoe_loads_total`, the number of `loadBefore` calls of a storage, on
@@ -353,9 +353,6 @@ def test_a_record_larger_than_half_of_the_cache_is_never_cached(server):
 
 
 def test_cache_size_is_built(server):
-    import zoe.zeo
-
-    assert "cache_size" not in zoe.zeo._NOT_BUILT
     storage = native(server.address, cache_size=CACHE_SIZE)
     try:
         assert callable(storage._cache.clear)

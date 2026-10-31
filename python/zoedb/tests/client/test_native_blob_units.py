@@ -71,12 +71,6 @@ def server(tmp_path):
         yield server
 
 
-def test_the_blob_arguments_are_built():
-    for name in ("blob_dir", "shared_blob_dir", "blob_cache_size"):
-        assert name not in zoe.zeo._NOT_BUILT
-    assert "blob_cache_size_check" not in zoe.zeo._NOT_BUILT
-
-
 def test_the_client_provides_iblobstorage(server, tmp_path):
     storage = native(server, tmp_path / "cache")
     try:

@@ -46,11 +46,6 @@ def test_a_cache_object_is_refused():
         zoe.zeo._native_cache_path(object(), None, "c", "1")
 
 
-def test_client_var_and_cache_are_built():
-    for key in ("client", "var", "cache"):
-        assert key not in zoe.zeo._NOT_BUILT
-
-
 def test_the_file_of_zeo_stays_as_it_is(tmp_path):
     zec = tmp_path / "c-1.zec"
     zec.write_bytes(b"ZEC3" + bytes(8))

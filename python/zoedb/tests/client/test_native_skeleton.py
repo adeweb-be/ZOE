@@ -27,10 +27,6 @@ starts.
 - Against a stock ZEO 6 server, the client opens, commits and loads, and
   uses no extension.
 - When the server stops, a load raises `ClientDisconnected`.
-- `zoe.zeo._NOT_BUILT` names the arguments of `ZEO.ClientStorage` whose
-  feature the native client does not have yet. Each of them fails the open
-  with an error that names it; none is ignored. The list shrinks as the
-  features come, and is empty when the client is complete.
 
 Each test imports ZEO itself, so that the module collects without it.
 """
@@ -366,22 +362,4 @@ def test_a_load_after_the_server_stops_raises_client_disconnected(tmp_path):
             with pytest.raises(ClientDisconnected):
                 storage.load(oid)
         finally:
-            storage.close()
-
-
-def test_an_argument_whose_feature_is_not_built_fails_the_open(server, tmp_path):
-    import zoe.zeo
-
-    native_client = zoe.testing.native_client
-    # The open refuses a name of the list before it reads its value.
-    not_built = zoe.zeo._NOT_BUILT
-    assert all(isinstance(name, str) for name in not_built)
-    for name in not_built:
-        with pytest.raises(Exception, match=name):
-            storage = native_client(
-                server.address,
-                storage="1",
-                wait_timeout=TIMEOUT,
-                **{name: str(tmp_path / name)},
-            )
             storage.close()

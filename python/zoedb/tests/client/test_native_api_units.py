@@ -67,11 +67,6 @@ def test_load_current_comes_from_the_cache_without_the_server(tmp_path):
             storage.close()
 
 
-def test_the_label_and_the_server_sync_are_built():
-    assert "client_label" not in zoe.zeo._NOT_BUILT
-    assert "server_sync" not in zoe.zeo._NOT_BUILT
-
-
 def test_the_serial_of_a_store_takes_the_str_of_zeo_tests():
     assert zoe.zeo._serial(None) == z64
     assert zoe.zeo._serial(b"") == z64

@@ -30,9 +30,7 @@ builder never changes it: a test that fails is a bug, and a test that
 cannot pass is a question for the human.
 
 The gate also checks that the native inside is the default of
-`zoe.zeo.ClientStorage` and of `<zoeclient>`, and that `zoe.zeo._NOT_BUILT`,
-the list of the arguments of `ZEO.ClientStorage` whose feature the native
-client does not have, is empty.
+`zoe.zeo.ClientStorage` and of `<zoeclient>`.
 """
 
 import threading
@@ -64,7 +62,7 @@ OUT_MODULES = {
 TLS_FILES = (
     "it gives an ssl context, or the self-signed server.pem of ZEO's tests; "
     "the native client takes TLS only from the files of the <ssl> section, "
-    "and its certificates must chain to a CA (follow-up #338); "
+    "and its certificates must chain to a CA; "
     "test_native_transports.py covers TLS"
 )
 POOL = (
@@ -275,12 +273,6 @@ def test_the_named_tests_and_the_out_modules_are_in_the_suites():
     assert NAMED_CLASSES <= classes, f"the run misses {NAMED_CLASSES - classes}"
     assert NAMED_DOCTESTS <= names, f"the run misses {NAMED_DOCTESTS - names}"
     assert set(OUT) <= names | classes, f"OUT names no test: {set(OUT) - names}"
-
-
-def test_every_argument_of_zeo_client_storage_is_built():
-    import zoe.zeo
-
-    assert not list(zoe.zeo._NOT_BUILT), zoe.zeo._NOT_BUILT
 
 
 def test_the_native_inside_is_the_default(tmp_path):
