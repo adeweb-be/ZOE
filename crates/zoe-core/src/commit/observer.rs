@@ -44,6 +44,23 @@ pub trait Observer: Send + Sync {
     fn intent_locks_acquired(&self, locks: usize, wait: Duration) {
         let _ = (locks, wait);
     }
+
+    /// One slice of the fold wrote `commits` commits of the log, `bytes`
+    /// bytes of log entries, into the tables in one backend write, which
+    /// took `duration` on the monotonic time of the store clock (ADR 0056).
+    /// The thread of the fold calls it after the backend commit of the
+    /// slice.
+    fn slice_folded(&self, commits: usize, bytes: u64, duration: Duration) {
+        let _ = (commits, bytes, duration);
+    }
+
+    /// The leader of a commit batch waited `wait` for the fold, on the
+    /// monotonic time of the store clock: the backlog was full, or the
+    /// batch goes into the tables and waited for an empty backlog (ADR
+    /// 0056). The leader calls it after the wait.
+    fn backlog_waited(&self, wait: Duration) {
+        let _ = wait;
+    }
 }
 
 impl Store {

@@ -186,10 +186,66 @@ pub struct Options {
     /// mode of their classes, and the rules of ADR 0042. The default is
     /// tier 1 on for every class, and the rules off.
     pub structural_merges: StructuralMerges,
+    /// The write-ahead log of the store (ADR 0056). The skins do not
+    /// expose these settings: tests and benchmarks set them.
+    pub write_log: WriteLog,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
     pub _more: (),
+}
+
+/// The settings of the write-ahead log of a store (ADR 0056).
+///
+/// A finish appends its commit batch to the log and syncs the log. The
+/// fold writes the commits of the log into the tables later, in slices.
+/// The open checks the settings: an open with settings that do not hold
+/// together fails with an `InvalidInput` I/O error.
+///
+/// Build it from the defaults, for example
+/// `WriteLog { fold_bytes, ..WriteLog::default() }`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteLog {
+    /// True, the default, sends commit batches to the log. False writes
+    /// each batch into the tables, as a direct batch. The open replays a
+    /// log that exists, also when this is false.
+    pub enabled: bool,
+    /// The size at which a segment file stops to grow and the next batch
+    /// goes into another segment. A segment holds at least one entry, so
+    /// a larger entry makes its segment larger. At least 4,096. The
+    /// default is 64 MiB.
+    pub segment_bytes: u64,
+    /// The backlog at which the fold starts: the bytes of the commits that
+    /// the log holds and the tables do not. The default is 16 MiB.
+    pub fold_bytes: u64,
+    /// The most bytes of log entries that one backend write of the fold
+    /// takes. A slice takes at least one commit. The default is 4 MiB.
+    pub slice_bytes: u64,
+    /// The bound of the backlog. A finish that would go past it waits for
+    /// the fold. At least `fold_bytes`. The default is 256 MiB.
+    pub backlog_bytes: u64,
+    /// The pickle size from which a record is large. A batch whose large
+    /// records hold at least half of its pickle bytes goes into the tables
+    /// directly when the backlog is empty. The default is 64 KiB.
+    pub large_record: u64,
+    /// Not an option. This field makes `..WriteLog::default()` necessary
+    /// when a caller sets every option.
+    #[doc(hidden)]
+    pub _more: (),
+}
+
+impl Default for WriteLog {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            segment_bytes: 64 << 20,
+            fold_bytes: 16 << 20,
+            slice_bytes: 4 << 20,
+            backlog_bytes: 256 << 20,
+            large_record: 64 << 10,
+            _more: (),
+        }
+    }
 }
 
 impl Default for Options {
@@ -207,6 +263,7 @@ impl Default for Options {
             cache_size: None,
             pack_gc: true,
             structural_merges: StructuralMerges::default(),
+            write_log: WriteLog::default(),
             _more: (),
         }
     }
@@ -659,6 +716,24 @@ impl Store {
         *sequencer = Some(last);
         self.blobs().release_kept();
         Ok(())
+    }
+
+    /// Fold every commit that the log holds into the tables, and wait for
+    /// the end of that fold (ADR 0056). The commits after the call can
+    /// stay in the log.
+    ///
+    /// A store with nothing to fold, a read-only store included, returns
+    /// at once. A store that halted, or whose fold failed, fails with
+    /// `Halted`.
+    pub fn fold(&self) -> Result<()> {
+        unimplemented!("the write-ahead log of ADR 0056")
+    }
+
+    /// Return the bytes of the backlog: the commits that the log holds and
+    /// the tables do not, as the bound `WriteLog::backlog_bytes` counts
+    /// them (ADR 0056). The call reads no file.
+    pub fn backlog_bytes(&self) -> u64 {
+        unimplemented!("the write-ahead log of ADR 0056")
     }
 
     /// Return the current pickle of `oid` and its serial.
