@@ -17,6 +17,7 @@ use super::pipeline::Pool;
 use super::resolution::ResolutionLog;
 use super::session;
 use super::status::{self, Stats};
+use crate::defaults;
 
 /// The bounds of the queues of a storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,9 +39,9 @@ impl Queues {
     /// The bounds of a server that gets no option: 100,000 transactions,
     /// no invalidation age and 1,000 messages.
     pub(crate) const DEFAULT: Self = Self {
-        invalidations: 100_000,
+        invalidations: defaults::INVALIDATION_QUEUE_SIZE,
         invalidation_age: Duration::ZERO,
-        client: 1_000,
+        client: defaults::CLIENT_QUEUE_SIZE,
     };
 }
 
