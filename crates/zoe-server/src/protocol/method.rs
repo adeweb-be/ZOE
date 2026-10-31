@@ -91,15 +91,15 @@ pub(crate) enum Op {
 }
 
 /// One method of the protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Method {
     /// The name of the method on the wire.
     pub(crate) name: &'static str,
     pub(crate) op: Op,
     pub(crate) lane: Lane,
     /// False for a call that a stock client sends without waiting for a
-    /// reply. The server takes the flag of each call from its message: the
-    /// tests send each call with the flag of this field.
+    /// reply (`docs/spikes/zeo-wire.md`). The server takes the flag of each
+    /// call from its message, so only the tests read this field.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) replies: bool,
     /// The extension that adds the method, or `None` for a method of ZEO.
@@ -241,5 +241,33 @@ mod tests {
         for method in ["set_client_label", "sendBlob", "pack"] {
             assert!(!on_read_pool(method), "{method}");
         }
+    }
+
+    #[test]
+    fn the_calls_without_a_reply_are_the_asynchronous_calls_of_a_stock_client() {
+        let asynchronous: Vec<&str> = METHODS
+            .iter()
+            .filter(|m| !m.replies)
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(
+            asynchronous,
+            [
+                "set_client_label",
+                "iterator_gc",
+                "tpc_begin",
+                "storea",
+                "restorea",
+                "checkCurrentSerialInTransaction",
+                "deleteObject",
+                "kv_set",
+                "kv_delete",
+                "undoa",
+                "storeBlobStart",
+                "storeBlobChunk",
+                "storeBlobEnd",
+                "storeBlobShared",
+            ]
+        );
     }
 }

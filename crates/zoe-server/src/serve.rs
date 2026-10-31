@@ -1222,12 +1222,7 @@ impl Drop for Running {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-serve-lib-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
+    use crate::protocol::testing::{fresh_dir, read_frame};
 
     #[test]
     fn stop_closes_the_store_also_in_an_async_context() {
@@ -1369,14 +1364,6 @@ mod tests {
     fn ruok_gives_the_status_as_json_and_closes() {
         use std::io::{Read, Write};
         use std::net::TcpStream;
-
-        fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
-            let mut len = [0u8; 4];
-            stream.read_exact(&mut len).unwrap();
-            let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
-            stream.read_exact(&mut payload).unwrap();
-            payload
-        }
 
         let server = Server::start(ServeOptions::new(fresh_dir("ruok"))).unwrap();
         let mut stream = TcpStream::connect(server.addr()).unwrap();

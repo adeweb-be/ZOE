@@ -40,6 +40,8 @@ pub(crate) mod sweep;
 /// The entry of the fuzz targets.
 #[cfg(any(test, feature = "fuzz"))]
 pub mod fuzz;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::fs;
 use std::future::Future;
@@ -880,24 +882,11 @@ mod tests {
     use zoe_core::Tid;
 
     use super::invalidation::{Commit, Others};
+    use super::testing::{
+        call_bytes, fresh_dir, never_stops, read_frame, register, registered, registered_as, send,
+        write_frame,
+    };
     use super::*;
-
-    fn read_frame(client: &mut Client) -> Vec<u8> {
-        let mut len = [0u8; 4];
-        client.read_exact(&mut len).unwrap();
-        let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
-        client.read_exact(&mut payload).unwrap();
-        payload
-    }
-
-    fn write_frame(client: &mut Client, payload: &[u8]) {
-        client.write_all(&frame::encode(payload).unwrap()).unwrap();
-    }
-
-    /// Return a signal that never tells a stop: its sender is gone.
-    fn never_stops() -> Stopping {
-        Stopping::new().1
-    }
 
     #[test]
     fn a_client_on_a_unix_domain_socket_is_the_path_and_its_process_id() {
@@ -910,8 +899,7 @@ mod tests {
 
     #[test]
     fn a_connection_that_the_hub_closes_ends_with_its_session() {
-        let dir = std::env::temp_dir().join(format!("zoe-protocol-close-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("close");
         let store = Arc::new(Store::open(&dir).unwrap());
         let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
         let storages = Arc::new(Storages::new(
@@ -1032,9 +1020,7 @@ mod tests {
     /// counted load to the reply of the last one. It prints the mean.
     #[test]
     fn a_load_of_1_kb_takes_three_handoffs() {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-handoffs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("handoffs");
         let store = Arc::new(Store::open(&dir).unwrap());
         let record = vec![7u8; 1024];
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
@@ -1172,9 +1158,7 @@ mod tests {
     /// the socket whole.
     #[test]
     fn the_bytes_of_a_record_of_100_kb_reach_the_socket_without_a_copy() {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-uncopied-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("uncopied");
         let store = Arc::new(Store::open(&dir).unwrap());
         // Bytes that do not compress, so the store keeps them as they are.
         let mut state: u64 = 0x2545_f491_4f6c_dd1d;
@@ -1259,49 +1243,6 @@ mod tests {
         drop(runtime);
     }
 
-    /// Send a call. The id 0 is a call without a reply.
-    fn send(client: &mut Client, id: i64, method: &str, args: Vec<Value>) {
-        let call = Value::Array(vec![
-            Value::from(id),
-            Value::Boolean(id == 0),
-            Value::from(method),
-            Value::Array(args),
-        ]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &call).unwrap();
-        write_frame(client, &bytes);
-    }
-
-    /// Connect to `addr`, answer the protocol and register.
-    fn registered(addr: std::net::SocketAddr) -> Client {
-        registered_as(addr, "1")
-    }
-
-    /// Connect to `addr`, answer the protocol and register with the
-    /// storage `name`.
-    fn registered_as(addr: std::net::SocketAddr, name: &str) -> Client {
-        let mut client = Client::connect(addr).unwrap();
-        register(&mut client, name);
-        client
-    }
-
-    /// Answer the protocol on `client` and register with the storage
-    /// `name`.
-    fn register(client: &mut Client, name: &str) {
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        assert_eq!(read_frame(client), PROTOCOL);
-        write_frame(client, PROTOCOL);
-        send(
-            client,
-            1,
-            "register",
-            vec![Value::from(name), Value::Boolean(false)],
-        );
-        read_frame(client);
-    }
-
     /// Begin the transaction 7 and store `oid` as a new object.
     fn begin_and_store(client: &mut Client, oid: u64) {
         let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
@@ -1309,19 +1250,6 @@ mod tests {
         let data = Value::Binary(b"pickle".to_vec());
         let store = vec![zoe_wire::p64(oid), zoe_wire::p64(0), data, Value::from(7)];
         send(client, 0, "storea", store);
-    }
-
-    /// Encode a call. The id 0 is a call without a reply.
-    fn call_bytes(id: i64, method: &str, args: Vec<Value>) -> Vec<u8> {
-        let call = Value::Array(vec![
-            Value::from(id),
-            Value::Boolean(id == 0),
-            Value::from(method),
-            Value::Array(args),
-        ]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &call).unwrap();
-        bytes
     }
 
     /// Send `first`, then 10 heartbeats, one each 5 ms, as a client that
@@ -1414,8 +1342,7 @@ mod tests {
 
     #[test]
     fn a_stop_of_the_server_removes_the_upload_files() {
-        let dir = std::env::temp_dir().join(format!("zoe-protocol-stop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("stop");
         let server = crate::serve::Server::start(crate::serve::ServeOptions::new(&dir)).unwrap();
         let chunk = || vec![Value::Binary(vec![7; 1_000])];
         // One client has an open upload. The other ended its upload, so the
@@ -1476,9 +1403,7 @@ mod tests {
 
     #[test]
     fn a_stop_answers_a_finish_that_it_received_and_aborts_the_other_transactions() {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-stop-finish-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("stop-finish");
         let server = crate::serve::Server::start(crate::serve::ServeOptions::new(&dir)).unwrap();
         // One client voted on the oid 1, so it holds the lock of the oid.
         let mut holder = registered(server.addr());
@@ -1619,9 +1544,7 @@ mod tests {
     fn a_session_past_the_shutdown_timeout_keeps_only_the_store_of_its_storage() {
         use crate::serve::{ServeOptions, Server, StorageOptions};
 
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-stop-two-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("stop-two");
         let options = ServeOptions::with_storages([
             StorageOptions::new("a", dir.join("a")),
             StorageOptions::new("b", dir.join("b")),
@@ -1668,8 +1591,7 @@ mod tests {
     fn the_idle_time_does_not_count_while_the_calls_of_the_connection_wait() {
         use crate::serve::{ServeOptions, Server};
 
-        let dir = std::env::temp_dir().join(format!("zoe-protocol-idle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("idle");
         let options = ServeOptions::new(&dir)
             .lock_timeout(Duration::from_secs(60))
             .idle_timeout(Duration::from_millis(600));
@@ -1716,9 +1638,7 @@ mod tests {
     fn an_idle_close_aborts_the_transaction_of_a_client_that_reads_nothing() {
         use crate::serve::{ServeOptions, Server};
 
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-idle-unread-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("idle-unread");
         let options = ServeOptions::new(&dir).idle_timeout(Duration::from_millis(600));
         let mut kept = None;
         let server = Server::start_with(options, |_, path, options| {
@@ -1892,9 +1812,7 @@ mod tests {
 
     #[test]
     fn the_server_releases_intent_locks_held_past_the_bound_and_warns() {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-intent-hold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("intent-hold");
         let store = Arc::new(Store::open(&dir).unwrap());
         let hold = Duration::from_millis(200);
         let storage = NamedStorage::new("1", &dir, Arc::clone(&store), Queues::DEFAULT)
@@ -1958,9 +1876,7 @@ mod tests {
 
     #[test]
     fn the_end_of_a_connection_ends_its_lock_intent_that_waits() {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-protocol-intent-wait-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fresh_dir("intent-wait");
         let options = zoe_core::Options {
             lock_timeout: Duration::from_secs(120),
             ..zoe_core::Options::default()
