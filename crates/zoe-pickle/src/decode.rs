@@ -804,17 +804,25 @@ impl<'a> Decoder<'a> {
 
     /// Reads the index of a put or a get.
     fn index(&mut self, opcode: u8) -> Result<(u32, MemoForm), Error> {
-        match opcode {
-            BINPUT | BINGET => Ok((u32::from(self.u8()?), MemoForm::Short)),
-            LONG_BINPUT | LONG_BINGET => Ok((u32::from_le_bytes(self.array()?), MemoForm::Long)),
-            _ => {
-                let at = self.pos;
-                let line = self.line()?;
-                let index = text::index(line)
-                    .ok_or_else(|| self.error_at(at, "the memo index is not a decimal number"))?;
-                Ok((index, MemoForm::Text))
+        let at = self.pos;
+        let form = match opcode {
+            BINPUT | BINGET => {
+                self.take(1)?;
+                MemoForm::Short
             }
-        }
+            LONG_BINPUT | LONG_BINGET => {
+                self.take(4)?;
+                MemoForm::Long
+            }
+            _ => {
+                self.line()?;
+                MemoForm::Text
+            }
+        };
+        // Only a text index can fail to read here.
+        let index = memo_index(opcode, &self.bytes[at..self.pos])
+            .ok_or_else(|| self.error_at(at, "the memo index is not a decimal number"))?;
+        Ok((index, form))
     }
 
     /// Reads up to the next newline. Returns the bytes before it.
