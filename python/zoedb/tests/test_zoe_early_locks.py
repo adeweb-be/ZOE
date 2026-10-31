@@ -550,7 +550,7 @@ def test_an_owner_whose_first_lock_fails_gives_its_connection_back(
 
     # Two connections commit at once: the holder takes one, the owner whose
     # lock fails takes the other until the failure.
-    monkeypatch.setattr(zoe.zeo, "_POOL_BOUND", 2)
+    monkeypatch.setattr(zoe.zeo._native, "_POOL_BOUND", 2)
     with ZoeServer(str(tmp_path / "store"), args=["--lock-timeout", "1"]) as server:
         s = zoe.zeo.ClientStorage(server.address, wait_timeout=30)
         db = ZODB.DB(s)
