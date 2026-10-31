@@ -6,6 +6,7 @@ shared fixtures are in `conftest.py`.
 """
 
 import contextlib
+import io
 import pickle
 import socket
 import subprocess
@@ -23,6 +24,25 @@ def record(value):
     """Return a ZODB record of a persistent mapping that holds value."""
     meta = (("persistent.mapping", "PersistentMapping"), None)
     return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
+
+
+def counter(value):
+    """A record of ZODB's PCounter, whose _p_resolveConflict adds."""
+    meta = (("ZODB.tests.ConflictResolution", "PCounter"), None)
+    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
+
+
+def strict(value):
+    """A record of ZODB's PCounter2, whose _p_resolveConflict refuses."""
+    meta = (("ZODB.tests.ConflictResolution", "PCounter2"), None)
+    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
+
+
+def value_of(data):
+    """Return the `_value` of the state of a counter record."""
+    unpickler = pickle.Unpickler(io.BytesIO(data))
+    unpickler.load()
+    return unpickler.load()["_value"]
 
 
 def _begin(storage, user, description, extension, tid):
@@ -133,11 +153,15 @@ def native(server, storage="1", **kw):
 @contextlib.contextmanager
 def serving(path, environment=None):
     """Run `zoe serve` on the store in `path`, with the `ZOE_*` variables of
-    `environment`. Yield its address. Kill the server at the end."""
+    `environment`. Yield its address. Kill the server at the end. A server
+    that does not listen within `TIMEOUT` seconds fails the start."""
     from zoe.testing import ZoeServer
 
-    with ZoeServer(str(path), env=environment) as server:
+    server = ZoeServer(str(path), env=environment).start(TIMEOUT)
+    try:
         yield server.address
+    finally:
+        server.kill()
 
 
 def metrics(server):

@@ -14,53 +14,13 @@ A failed handshake closes that connection only. The test makes its own
 certificates with the `openssl` command, so the repository holds no key.
 """
 
-import pickle
 import ssl
-import subprocess
 
 import pytest
+import support
+from support import ZERO, commit, make_ca, make_cert, record
 
 from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def openssl(*args, cwd):
-    subprocess.run(["openssl", *args], cwd=cwd, check=True, capture_output=True)
-
-
-def make_ca(directory, name):
-    openssl(
-        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
-        "-subj", f"/CN={name}", "-keyout", f"{name}.key", "-out", f"{name}.pem",
-        "-addext", "keyUsage = critical, keyCertSign, cRLSign",
-        cwd=directory,
-    )  # fmt: skip
-
-
-def make_cert(directory, name, ca, server=False):
-    openssl(
-        "req", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={name}",
-        "-keyout", f"{name}.key", "-out", f"{name}.csr",
-        cwd=directory,
-    )  # fmt: skip
-    extensions = directory / f"{name}.ext"
-    if server:
-        extensions.write_text("subjectAltName = DNS:localhost, IP:127.0.0.1\n")
-    else:
-        extensions.write_text("extendedKeyUsage = clientAuth\n")
-    openssl(
-        "x509", "-req", "-in", f"{name}.csr", "-CA", f"{ca}.pem",
-        "-CAkey", f"{ca}.key", "-CAcreateserial", "-days", "2",
-        "-extfile", f"{name}.ext", "-out", f"{name}.pem",
-        cwd=directory,
-    )  # fmt: skip
 
 
 @pytest.fixture(scope="module")
@@ -85,24 +45,11 @@ def context(certs, client=None):
 
 
 def client(server, ctx=None, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
+    """Open a stock client, over TLS with the context `ctx`."""
     if ctx is not None:
         kw["ssl"] = ctx
         kw["ssl_server_hostname"] = "localhost"
-    return ClientStorage(server.address, storage="1", **kw)
-
-
-def commit(storage, stores):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
+    return support.client(server, **kw)
 
 
 def tls_args(certs, *extra):

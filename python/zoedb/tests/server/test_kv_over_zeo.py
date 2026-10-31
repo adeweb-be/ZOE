@@ -1,22 +1,24 @@
 """Unit tests of the extension `kv` over the protocol (ADR 0043): the calls
 of `zoe.zeo.ClientStorage` with the native client and with the asyncio
-client of ZEO, `zoe.kv` on a database of such a client, the expiry of an
-ephemeral key, a restart, and a stock client that sees nothing new."""
+client of ZEO, a bad write, `zoe.kv` on a database of such a client,
+`kv_supported` while the server is away, a stock client that sees nothing
+new, and a server without `kv`. `acceptance/test_kv_namespaces.py` covers
+the expiry of an ephemeral key and a restart."""
 
 import time
 
 import pytest
 import transaction
 import ZODB
+from support import TIMEOUT
+from support import client as stock_client
+from support import commit_kv as commit
 from ZEO.Exceptions import ServerException
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import Unsupported
 from ZODB.utils import z64
 
 import zoe.kv
-from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 
 
 def zoe_client(address, native=True, **kw):
@@ -24,31 +26,6 @@ def zoe_client(address, native=True, **kw):
 
     kw.setdefault("wait_timeout", TIMEOUT)
     return zoe.zeo.ClientStorage(address, storage="1", native=native, **kw)
-
-
-def stock_client(address, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(address, storage="1", **kw)
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
-
-
-def commit(storage, *writes):
-    meta = TransactionMetaData()
-    storage.tpc_begin(meta)
-    for write in writes:
-        if write[0] == "delete":
-            storage.kv_delete(*write[1:], meta)
-        else:
-            storage.kv_set(*write, meta)
-    storage.tpc_vote(meta)
-    return storage.tpc_finish(meta)
 
 
 @pytest.mark.parametrize("native", [True, False])
@@ -70,18 +47,6 @@ def test_the_calls_of_the_namespaces(server, native):
         assert storage.kv_scan("ephemeral", "sessions") == [(b"s1", b"data")]
         commit(storage, ("delete", "durable", "registry", b"title"))
         assert storage.kv_get("durable", "registry", b"title") is None
-    finally:
-        storage.close()
-
-
-@pytest.mark.parametrize("native", [True, False])
-def test_an_ephemeral_key_expires(server, native):
-    storage = zoe_client(server.address, native=native)
-    try:
-        commit(storage, ("ephemeral", "sessions", b"s1", b"data", 0.2))
-        assert storage.kv_get("ephemeral", "sessions", b"s1") == b"data"
-        time.sleep(0.3)
-        assert storage.kv_get("ephemeral", "sessions", b"s1") is None
     finally:
         storage.close()
 
@@ -140,21 +105,6 @@ def test_kv_supported_keeps_its_answer_while_the_server_is_away(server, native):
     finally:
         storage.close()
         server.start()
-
-
-def test_a_durable_key_survives_a_restart(server):
-    storage = zoe_client(server.address)
-    try:
-        commit(storage, ("durable", "registry", b"title", b"site", None))
-    finally:
-        storage.close()
-    server.kill()
-    server.start()
-    storage = zoe_client(server.address)
-    try:
-        assert storage.kv_get("durable", "registry", b"title") == b"site"
-    finally:
-        storage.close()
 
 
 def test_a_stock_client_sees_nothing_new(server):

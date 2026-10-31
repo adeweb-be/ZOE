@@ -21,54 +21,18 @@ The test makes its certificates with the `openssl` command, as
 `server/test_tls.py` does, so the repository holds no key.
 """
 
-import socket
-import subprocess
 import threading
-import time
 
 import pytest
+from support import TIMEOUT, ZERO, free_address, make_ca, make_cert, wait_for
 from ZEO.Exceptions import ClientDisconnected
 
 import zoe
 import zoe.testing
 from zoe.testing import ZoeServer
 
-ZERO = bytes(8)
-TIMEOUT = 30
 # The open wait of a client that must fail.
 REFUSED = 2
-
-
-def openssl(*args, cwd):
-    subprocess.run(["openssl", *args], cwd=cwd, check=True, capture_output=True)
-
-
-def make_ca(directory, name):
-    openssl(
-        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
-        "-subj", f"/CN={name}", "-keyout", f"{name}.key", "-out", f"{name}.pem",
-        "-addext", "keyUsage = critical, keyCertSign, cRLSign",
-        cwd=directory,
-    )  # fmt: skip
-
-
-def make_cert(directory, name, ca, server=False):
-    openssl(
-        "req", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={name}",
-        "-keyout", f"{name}.key", "-out", f"{name}.csr",
-        cwd=directory,
-    )  # fmt: skip
-    extensions = directory / f"{name}.ext"
-    if server:
-        extensions.write_text("subjectAltName = DNS:localhost, IP:127.0.0.1\n")
-    else:
-        extensions.write_text("extendedKeyUsage = clientAuth\n")
-    openssl(
-        "x509", "-req", "-in", f"{name}.csr", "-CA", f"{ca}.pem",
-        "-CAkey", f"{ca}.key", "-CAcreateserial", "-days", "2",
-        "-extfile", f"{name}.ext", "-out", f"{name}.pem",
-        cwd=directory,
-    )  # fmt: skip
 
 
 @pytest.fixture(scope="module")
@@ -120,21 +84,6 @@ def zoeclient(address, ssl, wait_timeout=TIMEOUT):
           {ssl}
         </zoeclient>
         """
-
-
-def free_address():
-    """Return a TCP address where nothing listens."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()
-
-
-def wait_for(condition):
-    """Wait until condition() is true. Fail after TIMEOUT."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        assert time.monotonic() < deadline, "timed out"
-        time.sleep(0.01)
 
 
 def assert_native():

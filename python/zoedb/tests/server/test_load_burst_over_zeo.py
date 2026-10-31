@@ -10,16 +10,17 @@ the last invalidation each object shows its last commit. A next serial can
 be past that transaction: its invalidation came before the reply.
 """
 
+import functools
 import pickle
 import threading
 import time
 
-import pytest
+import support
+from support import TIMEOUT, ZERO, client
 
-from zoe.testing import ZoeServer
+# The transactions of the test have this user and this description.
+commit = functools.partial(support.commit, user=b"user", description=b"burst")
 
-ZERO = bytes(8)
-TIMEOUT = 30
 OBJECTS = 20
 COMMITS = 40
 
@@ -27,29 +28,6 @@ COMMITS = 40
 def record(oid, n):
     meta = (("persistent.mapping", "PersistentMapping"), None)
     return pickle.dumps(meta, 3) + pickle.dumps({"data": {"oid": oid, "n": n}}, 3)
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT, **kw)
-
-
-def commit(storage, stores):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData(b"user", b"burst")
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 def test_bursts_of_prefetched_loads_keep_the_order_of_the_invalidations(server):

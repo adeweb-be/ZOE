@@ -32,16 +32,14 @@ adds the defaults, so a read writes nothing (`install` patches
 `zoe.plone:uninstall` gives each value back as a dict and removes the mark
 (`restore_properties`).
 
-Only `install`, `uninstall`, the sheets of a site and the import step
-import Plone.
+Only `install`, the sheets of a site and the import step import Plone.
 """
 
 import copy
-import sys
-from collections.abc import MutableMapping
 
 import transaction
-from persistent import Persistent
+
+from zoe.plone._bases import EntryMapping
 
 __all__ = [
     "BATCH",
@@ -50,13 +48,11 @@ __all__ = [
     "PrincipalProperties",
     "import_properties",
     "install",
-    "installed",
     "move",
     "move_properties",
     "policy",
     "restore",
     "restore_properties",
-    "uninstall",
 ]
 
 #: The entry of `PrincipalProperties` in the merge policy.
@@ -79,55 +75,16 @@ MARK = "_zoe_principal_properties"
 RETIRED = 0
 
 
-class PrincipalProperties(Persistent, MutableMapping):
+class PrincipalProperties(EntryMapping):
     """A mapping of property name to value, for one member or one group.
 
-    Its state is the mapping itself. `__setstate__` interns the keys, as
-    `Persistent.__setstate__` does, so the record of a client that loads
-    the properties and writes them again is the record of the store. A
-    change of an item marks the object as changed.
+    Its state is the mapping itself (`EntryMapping`): each property is a
+    field of the record.
     """
-
-    def __init__(self, items=()):
-        self._entries = dict(items)
-
-    def __getstate__(self):
-        return dict(self._entries)
-
-    def __setstate__(self, state):
-        entries = {
-            (sys.intern(key) if type(key) is str else key): value
-            for key, value in state.items()
-        }
-        self.__dict__.clear()
-        self.__dict__["_entries"] = entries
-
-    def __getitem__(self, key):
-        return self._entries[key]
-
-    def __setitem__(self, key, value):
-        self._entries[key] = value
-        self._p_changed = True
-
-    def __delitem__(self, key):
-        del self._entries[key]
-        self._p_changed = True
-
-    def __iter__(self):
-        return iter(self._entries)
-
-    def __len__(self):
-        return len(self._entries)
-
-    def __contains__(self, key):
-        return key in self._entries
 
     def copy(self):
         """Return a dict with the same items."""
         return dict(self._entries)
-
-    def __repr__(self):
-        return f"<{type(self).__name__} of {sorted(map(repr, self._entries))}>"
 
 
 def policy():
@@ -253,11 +210,6 @@ def import_properties(context):
 _stock = {}
 
 
-def installed():
-    """Tell if the patch of the sheet is installed."""
-    return bool(_stock)
-
-
 def install():
     """Patch the mutable property sheet of PlonePAS: a read copies the
     stored properties, and a write on a marked sheet stores a
@@ -294,13 +246,3 @@ def install():
     ):
         method.__doc__ = _stock[name].__doc__
         setattr(ZODBMutablePropertyProvider, name, method)
-
-
-def uninstall():
-    """Put the stock methods back."""
-    if not _stock:
-        return
-    from Products.PlonePAS.plugins.property import ZODBMutablePropertyProvider
-
-    for name in ("getPropertiesForUser", "setPropertiesForUser"):
-        setattr(ZODBMutablePropertyProvider, name, _stock.pop(name))

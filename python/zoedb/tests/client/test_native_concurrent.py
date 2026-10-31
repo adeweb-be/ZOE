@@ -35,24 +35,15 @@ registered. Each test imports ZEO and ZODB's test modules itself.
 """
 
 import json
-import pickle
 import socket
 import struct
 import threading
 import time
 
-import pytest
+from support import TIMEOUT, ZERO, commit, native, record, wait_for
 
-import zoe.testing
-from zoe.testing import ZoeServer
-
-# The longest time that a test waits for the server or for one step of a
-# thread.
-TIMEOUT = 30
 # The longest time that a test waits for all its threads to end.
 RUN_TIMEOUT = 300
-# The serial of an object that has no record yet.
-ZERO = bytes(8)
 # The writers of the model test, and the commits of each.
 WRITERS = 16
 COMMITS = 200
@@ -67,48 +58,6 @@ HOLDERS = 8
 LEAST_BOUND = 64
 # The time that a test waits to see that a thread stays blocked.
 BLOCKED = 0.5
-
-
-def native(address, **kw):
-    """Open the native client on the storage 1 of address."""
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return zoe.testing.native_client(address, storage="1", **kw)
-
-
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def commit(storage, stores, f=None):
-    """Commit (oid, serial, data) items through storage. Return the tid.
-
-    `f` is the callback of `tpc_finish`.
-    """
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        if f is None:
-            return storage.tpc_finish(txn)
-        return storage.tpc_finish(txn, f)
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-
-
-def wait_for(condition, what):
-    """Poll condition until it is true. Fail after TIMEOUT seconds."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(f"{what} did not happen in {TIMEOUT} seconds")
-        time.sleep(0.01)
 
 
 def start(target, errors, *args):
@@ -149,12 +98,6 @@ def connections(address):
         sock.sendall(struct.pack(">I", 4) + b"ruok")
         assert read_frame() == b"M5"
         return json.loads(read_frame().decode("ascii"))["1"]["connections"]
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 def test_a_transaction_commits_while_another_holds_its_vote(server):
@@ -411,7 +354,7 @@ def check_the_contract(address):
                 oid = client.new_oid()
                 serial = ZERO
                 for round_ in range(ROUNDS):
-                    serial = commit(client, [(oid, serial, record(round_))], f)
+                    serial = commit(client, [(oid, serial, record(round_))], f=f)
                     tids.append(serial)
 
             threads = [

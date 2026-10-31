@@ -7,13 +7,12 @@ The `zoedb` wheel gives the package `zoe`. The extension module `zoe._zoe` holds
 | `zoe` | `Storage`, `WrongThread`, `__version__` |
 | `zoe.storage` | the module of `zoe.Storage` and `zoe.WrongThread` |
 | `zoe.zeo` | `ClientStorage`, `Sequence`, `EXTENSIONS` |
-| `zoe.kv` | `Namespace` |
+| `zoe.kv` | `Namespace`, `scan_all`, `SCAN_LIMIT`, `MAX_KEY`, `MAX_TTL` |
 | `zoe.policy` | `MergePolicy`, `validate`, `install`, `read`, and the constants of a merge policy |
 | `zoe.zodb` | `LockingConnection`, `hot_classes`, `install` |
 | `zoe.config` | the ZConfig data types of `<zoe>` and `<zoeclient>`, and `resolve_uri` of the `zoe://` URI (see [zope.conf sections](zope-conf.md)) |
 | `zoe.serve` | `main`, the entry point of `python -m zoe.serve -C FILE` |
 | `zoe.testing` | the test layers and `ZoeServer` |
-| `zoe.asyncio` | no public name yet |
 | `zoe.plone` | the Plone integration, with the extra `zoedb[plone]` |
 
 `import zoe` does not import ZODB. `zoe.Storage` and `zoe.WrongThread` import `zoe.storage`, and so ZODB, at their first use.

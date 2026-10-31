@@ -16,29 +16,15 @@ Through an unmodified `ZEO.ClientStorage`:
   reach.
 """
 
+import functools
+
 import pytest
+import support
+from support import ZERO, client
 
-from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-def client(server):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
-
-
-def commit(storage, stores, user=b"user", description=b"description", extension=None):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData(user, description, extension)
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
+# The transactions of the test have this user and this description, unless
+# a call gives others.
+commit = functools.partial(support.commit, user=b"user", description=b"description")
 
 
 def transactions(storage, start=None, stop=None):
@@ -48,12 +34,6 @@ def transactions(storage, start=None, stop=None):
         records = [(r.oid, r.tid, r.data) for r in txn]
         result.append((txn.tid, txn.user, txn.description, txn.extension, records))
     return result
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 @pytest.fixture

@@ -18,19 +18,13 @@ import tomllib
 
 import pytest
 import ZConfig
+from support import TIMEOUT
 
+import zoe.testing
 from zoe import serve
 from zoe.testing import ZoeServer
 
-TIMEOUT = 30
-
-
-@pytest.fixture(autouse=True)
-def no_zoe_environment(monkeypatch):
-    """Remove each ZOE_* variable, so that only the test sets them."""
-    for name in list(os.environ):
-        if name.startswith("ZOE_"):
-            monkeypatch.delenv(name)
+pytestmark = pytest.mark.usefixtures("no_zoe_environment")
 
 
 def write(tmp_path, *lines):
@@ -294,7 +288,7 @@ def test_the_process_becomes_zoe_serve_without_the_settings_in_its_arguments(
         "listen 127.0.0.1:0",
         f"path {store}",
     )
-    process = subprocess.Popen(
+    process = zoe.testing._spawn(
         [sys.executable, "-m", "zoe.serve", "-C", str(conf)],
         stdout=subprocess.PIPE,
         text=True,

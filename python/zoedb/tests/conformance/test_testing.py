@@ -9,7 +9,9 @@ import pytest
 import transaction
 import ZODB
 import ZODB.MappingStorage
-from test_zodb_suites import FULL, walk
+from suite_support import cases_and_layers
+from support import ZERO, commit_one
+from test_zodb_suites import FULL
 from ZODB.POSException import ReadOnlyError, StorageError
 from ZODB.tests.MinPO import MinPO
 from ZODB.tests.StorageTestBase import zodb_unpickle
@@ -72,7 +74,7 @@ def bindings(value):
             if item is value:
                 yield f"{module.__name__}.{key}"
         if hasattr(module, "test_suite"):
-            for test, _ in walk(module.test_suite()):
+            for test, _ in cases_and_layers(module.test_suite()):
                 globs = getattr(getattr(test, "_dt_test", None), "globs", {})
                 for key, item in globs.items():
                     if item is value:
@@ -124,14 +126,8 @@ def zeo_config(**options):
 
 def commit(storage, data):
     """Store `data` as a new object of `storage`. Return its oid and tid."""
-    from ZODB.Connection import TransactionMetaData
-
     oid = storage.new_oid()
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    storage.store(oid, bytes(8), data, "", txn)
-    storage.tpc_vote(txn)
-    return oid, storage.tpc_finish(txn)
+    return oid, commit_one(storage, oid, ZERO, data)
 
 
 @pytest.fixture

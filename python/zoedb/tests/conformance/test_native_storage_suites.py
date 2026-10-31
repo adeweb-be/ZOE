@@ -22,8 +22,9 @@ ZEO's tests open through it, is the native client. A test passes, or is in
 inside of `ZEO.ClientStorage`, which the native client does not have.
 """
 
-import doctest
 import unittest
+
+from suite_support import defining_class, name_of
 
 import zoe.testing
 
@@ -89,21 +90,6 @@ INSIDE = {
 }
 
 
-def defining_class(test):
-    """Return the class that defines the method of test."""
-    method = getattr(test, "_testMethodName", "runTest")
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return cls
-    raise AssertionError(f"no class defines {test.id()}")
-
-
-def name_of(test):
-    if isinstance(test, doctest.DocTestCase):
-        return test.id().rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-    return f"{defining_class(test).__name__}.{test._testMethodName}"
-
-
 def _tests_of(case):
     """Return the tests of case, with both prefixes of ZODB's mixins."""
     tests = []
@@ -141,7 +127,7 @@ def run(tests, layers):
             layer.setUp()
             started.append(layer)
         for test in tests:
-            name = name_of(test)
+            name = name_of(test, strict=True)
             if name in OUT or name in INSIDE:
                 left_out += 1
                 continue
@@ -170,7 +156,7 @@ def test_the_storage_tests_of_zeo_pass_with_the_native_client():
         (defining_class(t).__module__, defining_class(t).__name__) for t in tests
     }
     assert MIXINS <= defined, f"the run misses {MIXINS - defined}"
-    names = {name_of(test) for test in tests}
+    names = {name_of(test, strict=True) for test in tests}
     assert set(OUT) <= names, f"OUT names no test: {set(OUT) - names}"
     assert set(INSIDE) <= names, f"INSIDE names no test: {set(INSIDE) - names}"
 

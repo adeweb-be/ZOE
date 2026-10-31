@@ -37,27 +37,16 @@ gives `zoe_loads_total`, the number of `loadBefore` calls of a storage, on
 The tests open the native client with `zoe.testing.native_client`.
 """
 
-import http.client
-import os
-import subprocess
 import sysconfig
 import threading
-import time
 
 import pytest
+from client_support import AdminServer
+from support import TIMEOUT, ZERO, commit, native, wait_for
 from ZODB.utils import p64, u64
 
-import zoe.testing
-from zoe.testing import ZoeServer
-
-# The longest time that a test waits for the server or a thread.
-TIMEOUT = 30
-# The serial of an object that has no record yet.
-ZERO = bytes(8)
 KB = 1024
 FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
-# The sample of the loadBefore calls of the storage 1.
-LOADS = 'zoe_loads_total{storage="1"} '
 # The size of the cache, and the number of records, of the size test.
 CACHE_SIZE = 100 * KB
 RECORDS = 1000
@@ -71,126 +60,11 @@ HOT_OBJECTS = 4
 HOT_COMMITS = 200
 
 
-class AdminServer:
-    """A `zoe serve` process with its admin port, for a test.
-
-    It runs `zoe serve --path path --listen 127.0.0.1:0 --admin-listen
-    127.0.0.1:0`. The server writes `admin <address>` and then
-    `listening <address>` to stdout. `address` is the ZEO address, `admin`
-    the admin address. As a context manager, it starts the server and kills
-    it at the end. The server dies with the thread that started it, as with
-    `ZoeServer`.
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self.address = None
-        self.admin = None
-        self._process = None
-
-    def __enter__(self):
-        command = [
-            ZoeServer.binary(),
-            "serve",
-            "--path",
-            str(self.path),
-            "--listen",
-            "127.0.0.1:0",
-            "--admin-listen",
-            "127.0.0.1:0",
-        ]
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        self._process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-            preexec_fn=zoe.testing._die_with_parent(),
-        )
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, self._process.kill)
-        timer.start()
-        try:
-            for line in self._process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word not in ("admin", "listening"):
-                    continue
-                host, port = value.rsplit(":", 1)
-                address = (host.strip("[]"), int(port))
-                if word == "admin":
-                    self.admin = address
-                else:
-                    self.address = address
-                    break
-        finally:
-            timer.cancel()
-            timer.join()
-        if self.address is None or self.admin is None:
-            self.__exit__()
-            raise RuntimeError("zoe serve did not write its two addresses")
-        return self
-
-    def __exit__(self, *exc_info):
-        process, self._process = self._process, None
-        if process is not None:
-            process.kill()
-            process.wait()
-            process.stdout.close()
-
-
-def loads(server):
-    """Return the number of loadBefore calls of the storage 1 of server."""
-    connection = http.client.HTTPConnection(*server.admin, timeout=TIMEOUT)
-    try:
-        connection.request("GET", "/metrics")
-        reply = connection.getresponse()
-        text = reply.read().decode()
-    finally:
-        connection.close()
-    assert reply.status == 200, text
-    for line in text.splitlines():
-        if line.startswith(LOADS):
-            return int(float(line[len(LOADS) :]))
-    raise AssertionError(f"no zoe_loads_total of the storage 1 in:\n{text}")
-
-
 def counted(server, action):
     """Run action. Return its result and its loads that reached the server."""
-    before = loads(server)
+    before = server.loads()
     result = action()
-    return result, loads(server) - before
-
-
-def native(address, **kw):
-    """Open the native client on the storage 1 of address."""
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return zoe.testing.native_client(address, storage="1", **kw)
-
-
-def commit(storage, stores):
-    """Commit (oid, serial, data) items through storage. Return the tid."""
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        return storage.tpc_finish(txn)
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-
-
-def wait_for(condition, what):
-    """Poll condition until it is true. Fail after TIMEOUT seconds."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(f"{what} did not happen in {TIMEOUT} seconds")
-        time.sleep(0.01)
+    return result, server.loads() - before
 
 
 def seen(storage, tid):

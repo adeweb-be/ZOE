@@ -7,26 +7,11 @@ The acceptance test is `test_native_blobs.py`.
 import os
 
 import pytest
+from client_support import blob_native as native
+from support import TIMEOUT
 from ZODB.interfaces import IBlobStorage
 from ZODB.POSException import POSKeyError
 from ZODB.utils import p64, u64, z64
-
-import zoe.testing
-import zoe.zeo
-from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-
-
-def native(server, blob_dir, **kw):
-    """Open a native client of the storage 1 of `server`."""
-    return zoe.testing.native_client(
-        server.address,
-        storage="1",
-        wait_timeout=TIMEOUT,
-        blob_dir=str(blob_dir),
-        **kw,
-    )
 
 
 def blob_file(directory, data):
@@ -63,12 +48,6 @@ def blob_files(directory):
             if name != ".lock" and name != ".layout":
                 found.append(os.path.relpath(os.path.join(base, name), directory))
     return sorted(found)
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 def test_the_client_provides_iblobstorage(server, tmp_path):

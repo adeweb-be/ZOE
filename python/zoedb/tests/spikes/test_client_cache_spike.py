@@ -29,6 +29,8 @@ lock of the writers, the invalidations and a process that lags.
 import re
 from pathlib import Path
 
+from spike_findings import section
+
 ROOT = Path(__file__).resolve().parents[4]
 FINDING = ROOT / "docs" / "spikes" / "client-cache.md"
 ADR_NAME = "the-client-cache-file.md"
@@ -54,12 +56,6 @@ CARD_FIELDS = [
     "Budget:",
     "Done when:",
 ]
-
-
-def section(text, heading):
-    """Return the body of the section `heading`, up to the next section."""
-    assert heading in text, f"no section {heading!r}"
-    return text.split(heading, 1)[1].split("\n## ", 1)[0]
 
 
 def test_the_finding_has_every_section():

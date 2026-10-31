@@ -30,13 +30,12 @@ client inside. `just test` runs it.
 """
 
 import dataclasses
-import os
 import random
-import subprocess
 import threading
-import urllib.request
 
 import pytest
+from support import TIMEOUT, metrics, native
+from support import client as zeo_client
 
 import zoe
 import zoe.testing
@@ -44,8 +43,6 @@ from zoe.testing import ZoeServer
 
 # The largest tid. loadBefore(oid, MAX_TID) loads the current record.
 MAX_TID = (2**63 - 1).to_bytes(8, "big")
-# The longest time that a test waits for the server.
-TIMEOUT = 30
 # The seed of the generator of the cases.
 SEED = 4203
 # The cases of each family and each kind of object.
@@ -317,63 +314,18 @@ def run(storage, cases, calls):
         db.close()
 
 
-class Server:
-    """A `zoe serve` process with an admin port, to read `/metrics`.
-
-    `zoe.testing.ZoeServer` keeps only the line `listening ADDRESS` of the
-    server. This class also keeps the line `admin ADDRESS` before it.
-    """
+class Server(ZoeServer):
+    """A `zoe serve` process with an admin port, to read `/metrics`."""
 
     def __init__(self, path):
-        self.path = path
-        self.address = None
-        self.admin = None
-        self._process = None
+        super().__init__(str(path), args=["--admin-listen", "127.0.0.1:0"])
 
     def __enter__(self):
-        command = [
-            ZoeServer.binary(), "serve", "--path", str(self.path),
-            "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0",
-        ]  # fmt: skip
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-        )
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        code = process.wait()
-        process.stdout.close()
-        raise RuntimeError(f"zoe serve stopped with {code} before it listened")
-
-    def __exit__(self, *exc_info):
-        process, self._process = self._process, None
-        if process is not None:
-            process.kill()
-            process.wait()
-            process.stdout.close()
+        return self.start(TIMEOUT)
 
     def native_merges(self):
         """Return `zoe_conflicts_resolved_total{path="native"}`."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
+        text = metrics(self)
         prefix = 'zoe_conflicts_resolved_total{storage="1",path="native"} '
         for line in text.splitlines():
             if line.startswith(prefix):
@@ -384,10 +336,8 @@ class Server:
 def client(mode, server):
     """Open a client of mode on server."""
     if mode == "zeo-client":
-        from ZEO.ClientStorage import ClientStorage
-
-        return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
-    return zoe.testing.native_client(server.address, storage="1", wait_timeout=TIMEOUT)
+        return zeo_client(server)
+    return native(server)
 
 
 def run_on_zoe(mode, path, cases, calls):

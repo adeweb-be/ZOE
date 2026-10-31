@@ -21,138 +21,20 @@ resolved, so the DB loads their state again.
 - A conflict that the class does not resolve raises `ConflictError` with
   its oid and its serials. The client drops its cache entry of the oid,
   so the next load of the oid reaches the server.
-- After a resolved commit, a load of the oid gives the resolved state, not
-  the state that the client stored.
+
+`test_conflict_resolution_over_zeo.py` checks, for the native client and
+for a stock client, that after a resolved commit a load of the oid gives
+the resolved state, not the state that the client stored.
 
 The test counts the loads that reach the server with `zoe_loads_total` of
 `GET /metrics` on the admin port of `zoe serve`.
 """
 
-import io
-import os
-import pickle
-import subprocess
-import threading
-import time
-import urllib.request
-
 import pytest
+from client_support import AdminServer
+from support import ZERO, native, strict, wait_for
+from support import commit_resolving as commit
 from ZODB.POSException import ConflictError
-
-import zoe.testing
-from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-class Server:
-    """A `zoe serve` process with an admin port.
-
-    `zoe.testing.ZoeServer` keeps only the line `listening ADDRESS` of the
-    server. This class also keeps the line `admin ADDRESS` before it, so
-    the test reads `/metrics`.
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self.address = None
-        self.admin = None
-        self._process = None
-
-    def start(self):
-        command = [
-            ZoeServer.binary(), "serve", "--path", str(self.path),
-            "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0",
-        ]  # fmt: skip
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-        )
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        code = process.wait()
-        process.stdout.close()
-        raise RuntimeError(f"zoe serve stopped with {code} before it listened")
-
-    def kill(self):
-        process, self._process = self._process, None
-        if process is not None:
-            process.kill()
-            process.wait()
-            process.stdout.close()
-
-    def loads(self):
-        """Return the number of `loadBefore` calls that reached the server."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
-        for line in text.splitlines():
-            if line.startswith('zoe_loads_total{storage="1"} '):
-                return int(line.split()[-1])
-        raise AssertionError(f"/metrics has no zoe_loads_total:\n{text}")
-
-
-def counter(value):
-    """A record of ZODB's PCounter, whose _p_resolveConflict adds."""
-    meta = (("ZODB.tests.ConflictResolution", "PCounter"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
-
-
-def strict(value):
-    """A record of ZODB's PCounter2, whose _p_resolveConflict refuses."""
-    meta = (("ZODB.tests.ConflictResolution", "PCounter2"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
-
-
-def value_of(data):
-    unpickler = pickle.Unpickler(io.BytesIO(data))
-    unpickler.load()
-    return unpickler.load()["_value"]
-
-
-def commit(storage, stores):
-    """Commit the stores. Return the tid and the result of the vote.
-
-    A failed step aborts the transaction and raises.
-    """
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        resolved = storage.tpc_vote(txn)
-        return storage.tpc_finish(txn), resolved
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-
-
-def wait_for(condition):
-    """Wait until condition() is true. Fail after TIMEOUT."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        assert time.monotonic() < deadline, "timed out"
-        time.sleep(0.01)
 
 
 def snapshot(conn, manager):
@@ -163,9 +45,8 @@ def snapshot(conn, manager):
 
 @pytest.fixture
 def server(tmp_path):
-    server = Server(tmp_path / "store").start()
-    yield server
-    server.kill()
+    with AdminServer(tmp_path / "store") as server:
+        yield server
 
 
 @pytest.fixture
@@ -176,10 +57,7 @@ def dbs(server):
     opened = []
     try:
         for _ in range(2):
-            storage = zoe.testing.native_client(
-                server.address, storage="1", wait_timeout=TIMEOUT
-            )
-            opened.append(ZODB.DB(storage))
+            opened.append(ZODB.DB(native(server)))
         yield opened
     finally:
         for db in opened:
@@ -269,26 +147,3 @@ def test_an_unresolvable_conflict_raises_and_drops_the_cache_entry(server, dbs):
     loads = server.loads()
     assert b.load(oid) == (strict(2), committed)
     assert server.loads() == loads + 1
-
-
-def test_a_load_after_a_resolved_commit_gives_the_resolved_state(dbs):
-    a, b = (db.storage for db in dbs)
-    oid = a.new_oid()
-    base, _ = commit(a, [(oid, ZERO, counter(1))])
-    wait_for(lambda: b.lastTransaction() == base)
-    assert b.load(oid) == (counter(1), base)
-    commit(a, [(oid, base, counter(2))])
-
-    # b read the base and adds 4. The resolved state adds both increments.
-    tid, resolved = commit(b, [(oid, base, counter(5))])
-    assert oid in (resolved or [])
-
-    # The cache of b holds the resolved state, or nothing, but never the
-    # state that b stored.
-    data, serial = b.load(oid)
-    assert serial == tid
-    assert value_of(data) == 6
-    wait_for(lambda: a.lastTransaction() == tid)
-    data, serial = a.load(oid)
-    assert serial == tid
-    assert value_of(data) == 6

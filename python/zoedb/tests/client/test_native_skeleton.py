@@ -18,9 +18,6 @@ starts.
 - `loadBefore` at the tid of the second revision gives the first revision
   and its tid range.
 - `new_oid` gives distinct oids.
-- A store with a stale serial raises `ConflictError` with the oid.
-- `tpc_abort` after a vote releases the locks, so another client commits
-  the oid.
 - `sequence("a").next()` increases.
 - On a free-threaded build, the GIL stays off after the import, the open, a
   commit and a load.
@@ -28,27 +25,25 @@ starts.
   uses no extension.
 - When the server stops, a load raises `ClientDisconnected`.
 
+`server/test_commit_over_zeo.py` checks a stale serial and an abort after
+the vote through the native client and through a stock client.
+
 Each test imports ZEO itself, so that the module collects without it.
 """
 
 import json
 import os
-import pickle
 import subprocess
 import sys
 import sysconfig
 import threading
-import time
 
 import pytest
+from support import TIMEOUT, ZERO, commit, native, record, wait_for
 
 import zoe.testing
 from zoe.testing import ZoeServer
 
-# The longest time that a test waits for the server or a thread.
-TIMEOUT = 30
-# The serial of an object that has no record yet.
-ZERO = bytes(8)
 FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 # The end of the name of the network thread of ZEO's asyncio client.
 NETWORK_THREAD = "zeo client networking thread"
@@ -87,43 +82,6 @@ print(json.dumps(states))
 """
 
 
-def native(address, **kw):
-    """Open the native client on the storage 1 of address."""
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return zoe.testing.native_client(address, storage="1", **kw)
-
-
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def commit(storage, stores):
-    """Commit (oid, serial, data) items through storage. Return the tid."""
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        return storage.tpc_finish(txn)
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-
-
-def wait_for(condition, what):
-    """Poll condition until it is true. Fail after TIMEOUT seconds."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(f"{what} did not happen in {TIMEOUT} seconds")
-        time.sleep(0.01)
-
-
 def network_threads(address):
     """Return the names of the threads of ZEO's client for address."""
     port = str(address[1])
@@ -132,12 +90,6 @@ def network_threads(address):
         for thread in threading.enumerate()
         if thread.name.endswith(NETWORK_THREAD) and port in thread.name
     ]
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 def test_the_client_is_a_zeo_client_storage_without_zeo_threads(server):
@@ -232,56 +184,6 @@ def test_new_oid_gives_distinct_oids(server):
         first.close()
     assert all(isinstance(oid, bytes) and len(oid) == 8 for oid in oids)
     assert len(set(oids)) == len(oids)
-
-
-def test_a_store_with_a_stale_serial_raises_conflict_error(server):
-    from ZODB.Connection import TransactionMetaData
-    from ZODB.POSException import ConflictError
-
-    storage = native(server.address)
-    try:
-        oid = storage.new_oid()
-        first = commit(storage, [(oid, ZERO, record(1))])
-        commit(storage, [(oid, first, record(2))])
-        txn = TransactionMetaData()
-        storage.tpc_begin(txn)
-        try:
-            # The client raises at the store or at the vote.
-            with pytest.raises(ConflictError) as raised:
-                storage.store(oid, first, record(3), "", txn)
-                storage.tpc_vote(txn)
-        finally:
-            storage.tpc_abort(txn)
-        assert raised.value.oid == oid
-    finally:
-        storage.close()
-
-
-def test_an_abort_after_the_vote_releases_the_locks(server):
-    from ZODB.Connection import TransactionMetaData
-
-    first = native(server.address)
-    try:
-        second = native(server.address)
-        try:
-            oid = first.new_oid()
-            tid = commit(first, [(oid, ZERO, record(1))])
-            txn = TransactionMetaData()
-            first.tpc_begin(txn)
-            try:
-                first.store(oid, tid, record(2), "", txn)
-                first.tpc_vote(txn)
-            finally:
-                first.tpc_abort(txn)
-            # With the locks still held, the vote of the second client
-            # fails after the lock timeout of the server.
-            committed = commit(second, [(oid, tid, record(3))])
-            assert committed > tid
-            assert tuple(second.load(oid)) == (record(3), committed)
-        finally:
-            second.close()
-    finally:
-        first.close()
 
 
 def test_a_sequence_increases(server):

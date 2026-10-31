@@ -13,17 +13,18 @@ The forms come from ZEO 6's own server, so ZEO's doctests of these methods
 pass against `zoe serve`.
 """
 
+import functools
 import json
-import pickle
 import socket
 import struct
 
 import pytest
+import support
+from support import TIMEOUT, ZERO, client, record
 
-from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
+# The transactions of the test have this user and this description, unless
+# a call gives others.
+commit = functools.partial(support.commit, user=b"user", description=b"description")
 
 # The keys of `server_status` of ZEO 6's server, and of each storage in a
 # `ruok` reply.
@@ -42,34 +43,6 @@ STATUS_KEYS = {
     "timeout-thread-is-alive",
     "waiting",
 }
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT, **kw)
-
-
-def commit(storage, stores, user=b"user", description=b"description"):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData(user, description)
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 @pytest.fixture

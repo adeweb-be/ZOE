@@ -36,6 +36,8 @@ The gate also checks that the native inside is the default of
 import threading
 import unittest
 
+from suite_support import cases_and_layers, class_of, name_of
+
 import zoe.testing
 from zoe.testing import ZoeServer
 
@@ -200,7 +202,7 @@ def phase_2():
     """Return the module of the gate of phase 2, test_zeo_suites.py.
 
     It is in the directory of this module, and gives MODULES, OUT,
-    OUT_MODULES and the code that walks a suite.
+    OUT_MODULES and `suite_of`.
     """
     import test_zeo_suites
 
@@ -220,9 +222,9 @@ def run(module_name, layers, out):
     result = unittest.TestResult()
     started, ran = [], 0
     try:
-        for test, test_layers in suites.walk(suites.suite_of(module_name), layers):
-            name = suites.name_of(test)
-            if name in out or suites.class_of(test) in out:
+        for test, test_layers in cases_and_layers(suites.suite_of(module_name), layers):
+            name = name_of(test)
+            if name in out or class_of(test) in out:
                 continue
             for layer in test_layers:
                 if layer not in started:
@@ -267,9 +269,9 @@ def test_the_named_tests_and_the_out_modules_are_in_the_suites():
 
     classes, names = set(), set()
     for module_name in modules():
-        for test, _ in suites.walk(suites.suite_of(module_name)):
+        for test, _ in cases_and_layers(suites.suite_of(module_name)):
             classes.update(cls.__name__ for cls in type(test).__mro__)
-            names.add(suites.name_of(test))
+            names.add(name_of(test))
     assert NAMED_CLASSES <= classes, f"the run misses {NAMED_CLASSES - classes}"
     assert NAMED_DOCTESTS <= names, f"the run misses {NAMED_DOCTESTS - names}"
     assert set(OUT) <= names | classes, f"OUT names no test: {set(OUT) - names}"

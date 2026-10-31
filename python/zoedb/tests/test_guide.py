@@ -22,7 +22,7 @@ there. The pages give fixed ports. The test replaces each port of a listen
 address with 0, so the server takes free ports and runs beside other
 servers, and gives the client the ports that the server writes on stdout.
 The server gets no `ZOE_*` variable of the caller. On Linux, it ends when
-the test process ends (`_die_with_parent`).
+the test process ends (`zoe.testing._spawn`).
 """
 
 import io
@@ -39,7 +39,7 @@ from pathlib import Path
 import pytest
 from ZConfig.loader import ConfigLoader
 
-from zoe.testing import ZoeServer, _die_with_parent
+from zoe.testing import ZoeServer, _spawn
 
 ROOT = Path(__file__).resolve().parents[3]
 GUIDE = ROOT / "docs" / "guide"
@@ -109,14 +109,13 @@ class Server:
     """A server that a block of the guide starts, in the directory `cwd`."""
 
     def __init__(self, args, cwd):
-        self.process = subprocess.Popen(
+        self.process = _spawn(
             args,
             cwd=cwd,
             env=environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             text=True,
-            preexec_fn=_die_with_parent(),
         )
         self.admin = self.listening = None
         # The kill closes stdout, so the read below ends.

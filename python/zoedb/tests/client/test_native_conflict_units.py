@@ -4,61 +4,17 @@
 `test_native_conflicts.py`.
 """
 
-import io
-import pickle
 import threading
 
 import pytest
+from support import commit_resolving as commit
+from support import counter, native, value_of
 from ZODB.utils import z64
-
-import zoe.testing
-from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-
-
-def counter(value):
-    """A record of ZODB's PCounter, whose _p_resolveConflict adds."""
-    meta = (("ZODB.tests.ConflictResolution", "PCounter"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
-
-
-def value_of(data):
-    unpickler = pickle.Unpickler(io.BytesIO(data))
-    unpickler.load()
-    return unpickler.load()["_value"]
-
-
-def commit(storage, stores):
-    """Commit the stores. Return the tid and the result of the vote.
-
-    A failed step aborts the transaction and raises.
-    """
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        resolved = storage.tpc_vote(txn)
-        return storage.tpc_finish(txn), resolved
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 @pytest.fixture
 def storage(server):
-    storage = zoe.testing.native_client(
-        server.address, storage="1", wait_timeout=TIMEOUT
-    )
+    storage = native(server)
     yield storage
     storage.close()
 

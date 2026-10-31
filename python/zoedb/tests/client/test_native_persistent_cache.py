@@ -30,17 +30,14 @@ import os
 import subprocess
 import sys
 import threading
-import urllib.request
 
 import pytest
+import support
+from client_support import AdminServer
+from support import TIMEOUT, ZERO, client
 from ZODB.Connection import TransactionMetaData
 from ZODB.utils import p64
 
-import zoe.testing
-from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-ZERO = bytes(8)
 CLIENT = "c"
 # The size of each record, and the number of records of most tests.
 RECORD = 1024
@@ -53,6 +50,7 @@ HEADER = 64 * 1024
 # "loaded" after the first pass.
 LOADER = """\
 import sys
+import threading
 
 from ZODB.utils import p64
 
@@ -79,6 +77,7 @@ while True:
 # A client process that holds the cache file open until its stdin closes.
 HOLDER = """\
 import sys
+import threading
 
 import zoe.testing
 
@@ -92,72 +91,9 @@ storage.close()
 """
 
 
-class AdminServer(ZoeServer):
-    """`zoe serve` with an admin port on 127.0.0.1.
-
-    The server writes the line `admin ADDRESS` before the line `listening
-    ADDRESS`. `ZoeServer.start` reads past the first line, so this class
-    starts the process itself. `admin` is the address of the admin port.
-    """
-
-    def __init__(self, path, args=()):
-        super().__init__(path, args=["--admin-listen", "127.0.0.1:0", *args])
-        self.admin = None
-
-    def start(self, timeout=TIMEOUT):
-        command = [self.binary(), "serve", "--path", str(self.path)]
-        command += ["--listen", "127.0.0.1:0", *self.args]
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-            # On Linux, the kernel kills the server when this thread ends,
-            # as for ZoeServer.
-            preexec_fn=zoe.testing._die_with_parent(),
-        )
-        timer = threading.Timer(timeout, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        process.wait()
-        process.stdout.close()
-        raise RuntimeError("zoe serve stopped before it listened")
-
-    def loads(self):
-        """Return the number of `loadBefore` calls of the storage 1."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
-        prefix = 'zoe_loads_total{storage="1"} '
-        for line in text.splitlines():
-            if line.startswith(prefix):
-                return int(float(line[len(prefix) :]))
-        raise AssertionError("/metrics has no zoe_loads_total for the storage 1")
-
-
 def native(server, var, **kw):
     """Open a native client with the persistent cache of `CLIENT` in `var`."""
-    return zoe.testing.native_client(
-        server.address,
-        storage="1",
-        wait_timeout=TIMEOUT,
-        client=CLIENT,
-        var=str(var),
-        **kw,
-    )
+    return support.native(server, client=CLIENT, var=str(var), **kw)
 
 
 def records(count=COUNT):
@@ -170,9 +106,7 @@ def commit(server, changes, serials):
 
     `serials` gives the current serial of each oid, and gets the new ones.
     """
-    from ZEO.ClientStorage import ClientStorage
-
-    writer = ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
+    writer = client(server)
     try:
         txn = TransactionMetaData()
         writer.tpc_begin(txn)

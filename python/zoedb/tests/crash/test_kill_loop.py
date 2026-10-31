@@ -23,28 +23,22 @@ import threading
 import time
 from pathlib import Path
 
+import support
+from support import TIMEOUT, ZERO, record
+
 from zoe.testing import ZoeServer
 
-ZERO = bytes(8)
-TIMEOUT = 30
 RUNS = int(os.environ.get("ZOE_KILL_LOOP_RUNS", "20"))
 SEED = int(os.environ.get("ZOE_KILL_LOOP_SEED", "1"))
 WRITERS = 4
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
 
 
 BLOB_RECORD = pickle.dumps((("ZODB.blob", "Blob"), None), 3) + pickle.dumps(None, 3)
 
 
 def client(server, cache, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", blob_dir=str(cache), **kw)
+    """Open a stock client with a blob cache in `cache`."""
+    return support.client(server, blob_dir=str(cache), **kw)
 
 
 def writer(server, cache, rng_seed, done, out):

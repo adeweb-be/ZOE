@@ -10,23 +10,13 @@ The test then connects a stock client to the path and commits.
 
 import unittest
 
+from suite_support import cases_and_layers
+
 import zoe.testing
 
 ZEO_TESTS = [
     "ZEO.tests.testZEO.unix_domain_sockets",
 ]
-
-
-def cases_and_layers(suite, layers=()):
-    """Yield each test of suite with the layers of the suites around it."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from cases_and_layers(item, layers)
-    else:
-        yield suite, layers
 
 
 def test_the_doctest_unix_domain_sockets_passes(tmp_path, monkeypatch):

@@ -23,18 +23,14 @@ the module collects before they are installed.
 """
 
 import contextlib
-import pickle
 import threading
 import time
 
 import pytest
+from support import TIMEOUT, ZERO, record
 
 from zoe.testing import ZoeServer
 
-# The serial of an object that has no record yet.
-ZERO = bytes(8)
-# The longest time that a test waits for the server or a thread.
-TIMEOUT = 30
 # The name of the extension in `register` and in `get_info`. The
 # specification names it.
 EXTENSION = "lock_intent"
@@ -47,12 +43,6 @@ LONG = 20
 PROMPT = 5
 # The time that a waiter must stay blocked before the holder ends.
 BLOCKED = 0.5
-
-
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
 
 
 def lock_order():

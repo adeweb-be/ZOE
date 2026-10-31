@@ -20,14 +20,19 @@ import subprocess
 import time
 
 import pytest
+from support import TIMEOUT, client, commit
 
+import zoe.testing
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 
 
 class Serve:
-    """A `zoe serve` process with its stdout and stderr in files."""
+    """A `zoe serve` process with its stdout and stderr in files.
+
+    The tests read its exit code and its stderr, so they do not use
+    `ZoeServer`. The process dies with the test, as the process of
+    `ZoeServer` does.
+    """
 
     def __init__(self, tmp_path, args, env=None, cwd=None):
         environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
@@ -35,7 +40,7 @@ class Serve:
         self.stderr_path = tmp_path / "serve.stderr"
         with open(tmp_path / "serve.stdout", "w") as out:
             with open(self.stderr_path, "w") as err:
-                self.process = subprocess.Popen(
+                self.process = zoe.testing._spawn(
                     [ZoeServer.binary(), "serve", *map(str, args)],
                     stdin=subprocess.DEVNULL,
                     stdout=out,
@@ -76,24 +81,11 @@ def wait_until_it_accepts(server, path):
         time.sleep(0.05)
 
 
-def client(address, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(address, storage="1", **kw)
-
-
 def commit_and_load(address):
-    from ZODB.Connection import TransactionMetaData
-
     storage = client(address)
     try:
         oid = storage.new_oid()
-        txn = TransactionMetaData()
-        storage.tpc_begin(txn)
-        storage.store(oid, bytes(8), b"unix", "", txn)
-        storage.tpc_vote(txn)
-        tid = storage.tpc_finish(txn)
+        tid = commit(storage, [(oid, bytes(8), b"unix")])
         assert storage.load(oid) == (b"unix", tid)
     finally:
         storage.close()
