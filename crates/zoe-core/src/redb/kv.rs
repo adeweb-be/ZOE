@@ -122,6 +122,19 @@ pub(super) fn put(
     Ok(())
 }
 
+/// Stage the row `row` of the namespaces of `flavour` in `txn` with
+/// `frame`, a frame that is ready, as it is.
+pub(super) fn put_frame(
+    txn: &WriteTransaction,
+    flavour: Flavour,
+    row: &[u8],
+    frame: &[u8],
+) -> Result<()> {
+    let mut table = txn.open_table(table(flavour)).map_err(backend)?;
+    table.insert(row, frame).map_err(backend)?;
+    Ok(())
+}
+
 /// Stage the removal of the row `row` of the namespaces of `flavour` in
 /// `txn`.
 pub(super) fn remove(txn: &WriteTransaction, flavour: Flavour, row: &[u8]) -> Result<()> {

@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use redb::ReadableTable;
 
@@ -11,7 +11,9 @@ use super::{
     RedbBackend, SEQUENCES, TXN_OIDS, TXNS, backend, decode_object_count, has_records,
     has_records_from, kv, refused,
 };
-use crate::backend::{BlobRecord, NewPayload, NewRecord, Payload, TxnMeta, TxnStatus, WriteTxn};
+use crate::backend::{
+    BlobRecord, Framed, NewPayload, NewRecord, Payload, TxnMeta, TxnStatus, WriteTxn,
+};
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
 use crate::kv::{Flavour, Swept};
@@ -30,7 +32,12 @@ pub(super) struct RedbWrite<'a> {
     txn: redb::WriteTransaction,
     last_tid: &'a AtomicU64,
     object_count: &'a AtomicU64,
+    unsynced: &'a AtomicBool,
     compression: Compression,
+    /// The records of the write that the write-ahead log counted already
+    /// as new oids: the frames with the previous serial `Tid::ZERO` that
+    /// `put_frame` stores.
+    counted: u64,
     written_tid: Option<Tid>,
     max_oid: Option<Oid>,
     pack_watermark: Option<Tid>,
@@ -58,7 +65,9 @@ impl<'a> RedbWrite<'a> {
             txn,
             last_tid: &backend.last_tid,
             object_count: &backend.object_count,
+            unsynced: &backend.unsynced,
             compression: backend.compression,
+            counted: 0,
             written_tid: None,
             max_oid: None,
             pack_watermark: None,
@@ -117,6 +126,93 @@ impl<'a> RedbWrite<'a> {
             self.fresh = value.and_then(|v| format::decode_u64(v.value())).map(Oid);
         }
         Ok(self.fresh)
+    }
+
+    /// Stage the frame `frame` of the record of `oid` at `tid` as it is,
+    /// with its key in the transaction index. The previous serial comes
+    /// from the frame.
+    fn put_record_frame(&mut self, oid: Oid, tid: Tid, frame: &[u8]) -> Result<()> {
+        let fresh = self.fresh()?;
+        let prev = format::frame_prev(frame);
+        let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
+        Self::touch_put(&mut self.touched, &records, oid, prev, fresh, false)?;
+        records
+            .insert(&format::record_key(oid, tid), frame)
+            .map_err(backend)?;
+        let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
+        index
+            .insert(&format::txn_oid_key(tid, oid), ())
+            .map_err(backend)?;
+        self.max_oid = self.max_oid.max(Some(oid));
+        if prev == Tid::ZERO {
+            self.counted += 1;
+        }
+        Ok(())
+    }
+
+    /// Commit the staged writes, with a sync unless `deferred`.
+    fn finish(mut self: Box<Self>, deferred: bool) -> Result<()> {
+        if deferred {
+            // redb does not sync a commit without durability. The next
+            // durable commit makes it durable.
+            self.txn
+                .set_durability(redb::Durability::None)
+                .map_err(backend)?;
+        }
+        // A write that changes no record writes no count: a sequence
+        // reservation, a sweep step and the barrier of `sync`.
+        let counts = if self.touched.is_empty() {
+            None
+        } else {
+            let stored = {
+                let meta = self.txn.open_table(META).map_err(backend)?;
+                let value = meta.get(META_OBJECT_COUNT).map_err(backend)?;
+                decode_object_count(value.as_ref().map(|v| v.value()))?
+            };
+            Some((stored, self.count_after(stored)?))
+        };
+        {
+            let mut meta = self.txn.open_table(META).map_err(backend)?;
+            if let Some((_, count)) = counts {
+                meta.insert(META_OBJECT_COUNT, &format::encode_u64(count)[..])
+                    .map_err(backend)?;
+            }
+            if let Some(tid) = self.pack_watermark {
+                meta.insert(META_PACK_WATERMARK, &format::encode_u64(tid.0)[..])
+                    .map_err(backend)?;
+            }
+            if let Some(tid) = self.written_tid {
+                meta.insert(META_LAST_TID, &format::encode_u64(tid.0)[..])
+                    .map_err(backend)?;
+            }
+            if let Some(oid) = self.max_oid {
+                let stored = meta
+                    .get(META_NEXT_OID)
+                    .map_err(backend)?
+                    .and_then(|v| format::decode_u64(v.value()))
+                    .unwrap_or(1);
+                let next = stored.max(oid.0 + 1);
+                meta.insert(META_NEXT_OID, &format::encode_u64(next)[..])
+                    .map_err(backend)?;
+            }
+        }
+        self.txn.commit().map_err(backend)?;
+        if deferred {
+            self.unsynced.store(true, Ordering::Release);
+        } else {
+            self.unsynced.store(false, Ordering::Release);
+        }
+        if let Some((stored, count)) = counts {
+            // The writes that change records commit one at a time, since
+            // redb has one writer, but their additions can come in any
+            // order. The sum is the same.
+            let change = count.wrapping_sub(stored).wrapping_sub(self.counted);
+            self.object_count.fetch_add(change, Ordering::AcqRel);
+        }
+        if let Some(tid) = self.written_tid {
+            self.last_tid.fetch_max(tid.0, Ordering::AcqRel);
+        }
+        Ok(())
     }
 
     /// Return the object count after this write: the stored count, plus
@@ -196,6 +292,30 @@ impl WriteTxn for RedbWrite<'_> {
         blobs.insert(&key, frame.as_slice()).map_err(backend)?;
         self.max_oid = self.max_oid.max(Some(oid));
         Ok(())
+    }
+
+    /// Store the frame as it is. Only the fold of the write-ahead log calls
+    /// it, so a record with the previous serial `Tid::ZERO` is a new oid
+    /// that the log counted already: the commit leaves it out of its
+    /// change of the count in memory.
+    fn put_frame(&mut self, row: Framed<'_>) -> Result<()> {
+        match row {
+            Framed::Record(oid, tid, frame) => self.put_record_frame(oid, tid, frame),
+            Framed::Blob(oid, tid, frame) => {
+                let key = format::record_key(oid, tid);
+                let mut blobs = self.txn.open_table(BLOBS).map_err(backend)?;
+                blobs.insert(&key, frame).map_err(backend)?;
+                self.max_oid = self.max_oid.max(Some(oid));
+                Ok(())
+            }
+            Framed::Txn(tid, frame) => {
+                let mut txns = self.txn.open_table(TXNS).map_err(backend)?;
+                txns.insert(&format::txn_key(tid), frame).map_err(backend)?;
+                self.written_tid = Some(tid);
+                Ok(())
+            }
+            Framed::Kv(flavour, row, frame) => kv::put_frame(&self.txn, flavour, row, frame),
+        }
     }
 
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()> {
@@ -304,59 +424,10 @@ impl WriteTxn for RedbWrite<'_> {
     }
 
     fn commit(self: Box<Self>) -> Result<()> {
-        // A write that changes no record writes no count: a sequence
-        // reservation, a sweep step and the barrier of `sync`.
-        let object_count = if self.touched.is_empty() {
-            None
-        } else {
-            let stored = {
-                let meta = self.txn.open_table(META).map_err(backend)?;
-                let value = meta.get(META_OBJECT_COUNT).map_err(backend)?;
-                decode_object_count(value.as_ref().map(|v| v.value()))?
-            };
-            Some(self.count_after(stored)?)
-        };
-        {
-            let mut meta = self.txn.open_table(META).map_err(backend)?;
-            if let Some(count) = object_count {
-                meta.insert(META_OBJECT_COUNT, &format::encode_u64(count)[..])
-                    .map_err(backend)?;
-            }
-            if let Some(tid) = self.pack_watermark {
-                meta.insert(META_PACK_WATERMARK, &format::encode_u64(tid.0)[..])
-                    .map_err(backend)?;
-            }
-            if let Some(tid) = self.written_tid {
-                meta.insert(META_LAST_TID, &format::encode_u64(tid.0)[..])
-                    .map_err(backend)?;
-            }
-            if let Some(oid) = self.max_oid {
-                let stored = meta
-                    .get(META_NEXT_OID)
-                    .map_err(backend)?
-                    .and_then(|v| format::decode_u64(v.value()))
-                    .unwrap_or(1);
-                let next = stored.max(oid.0 + 1);
-                meta.insert(META_NEXT_OID, &format::encode_u64(next)[..])
-                    .map_err(backend)?;
-            }
-        }
-        self.txn.commit().map_err(backend)?;
-        if let Some(count) = object_count {
-            self.object_count.store(count, Ordering::Release);
-        }
-        if let Some(tid) = self.written_tid {
-            self.last_tid.store(tid.0, Ordering::Release);
-        }
-        Ok(())
+        self.finish(false)
     }
 
-    fn commit_deferred(mut self: Box<Self>) -> Result<()> {
-        // redb does not sync a commit without durability. The next
-        // durable commit makes it durable.
-        self.txn
-            .set_durability(redb::Durability::None)
-            .map_err(backend)?;
-        self.commit()
+    fn commit_deferred(self: Box<Self>) -> Result<()> {
+        self.finish(true)
     }
 }

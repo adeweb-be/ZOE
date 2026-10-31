@@ -372,7 +372,12 @@ impl Backend for RedbBackend {
         // An empty write transaction with the default durability syncs
         // the file. So the commits without durability before it become
         // durable too.
-        db.begin_write().map_err(backend)?.commit().map_err(backend)
+        db.begin_write()
+            .map_err(backend)?
+            .commit()
+            .map_err(backend)?;
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
     }
 
     #[cfg(feature = "testing")]

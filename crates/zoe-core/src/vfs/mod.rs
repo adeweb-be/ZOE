@@ -45,6 +45,14 @@ pub trait Vfs: Send + Sync + 'static {
     /// opens the target of a link.
     fn create_new(&self, name: &str) -> io::Result<Self::File>;
 
+    /// Open the segment file `name` of the write-ahead log (ADR 0056).
+    /// Create it empty when it does not exist. The file makes each write at
+    /// once and holds no copy of the bytes, and a growth through `set_len`
+    /// gets zeros. The default is `open`.
+    fn open_log(&self, name: &str) -> io::Result<Self::File> {
+        self.open(name)
+    }
+
     /// Rename the file `from` to `to`, and replace `to` if it exists.
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
 
@@ -122,6 +130,10 @@ impl<V: Vfs> Vfs for Arc<V> {
         (**self).create_new(name)
     }
 
+    fn open_log(&self, name: &str) -> io::Result<Self::File> {
+        (**self).open_log(name)
+    }
+
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         (**self).rename(from, to)
     }
@@ -185,6 +197,7 @@ impl<V: Vfs> Vfs for Arc<V> {
 pub(crate) trait Dir: Send + Sync {
     fn exists(&self, name: &str) -> io::Result<bool>;
     fn create_new(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>>;
+    fn open_log(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>>;
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
     fn hard_link(&self, from: &str, to: &str) -> io::Result<()>;
     fn remove(&self, name: &str) -> io::Result<()>;
@@ -207,6 +220,10 @@ impl<V: Vfs> Dir for V {
 
     fn create_new(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>> {
         Ok(Box::new(Vfs::create_new(self, name)?))
+    }
+
+    fn open_log(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>> {
+        Ok(Box::new(Vfs::open_log(self, name)?))
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
