@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from shootout import KB, check_cold_loads, environment, gil
+from shootout import KB, check_cold_loads, environment, gil, publish
 from shootout.nativeworker import main as worker_main
 from shootout.storages import (
     STORAGES,
@@ -53,7 +53,7 @@ from shootout.storages import (
 )
 
 SCHEMA_VERSION = 1
-SCHEMA = Path(__file__).resolve().parents[3] / "schema" / "native.schema.json"
+SCHEMA = publish.SCHEMAS / publish.SCHEMA_OF["native"]
 BASELINE = "zeo"
 STORAGE = "zoe-native"
 PAIR = (BASELINE, STORAGE)
@@ -198,18 +198,12 @@ def run(
         for cell in cells
     ]
     shutil.rmtree(root)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "machine": environment.machine(workdir, machine),
-        "python": environment.python(),
-        "software": environment.software(SOFTWARE)
-        | server_versions(STORAGES[STORAGE], None),
-        "run": {
-            "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "commit": environment.commit(),
-            "dirty": environment.dirty(),
-            "seconds": round(time.monotonic() - clock, 3),
-        },
+    versions = environment.software(SOFTWARE) | server_versions(STORAGES[STORAGE], None)
+    seconds = round(time.monotonic() - clock, 3)
+    head = environment.header(
+        SCHEMA_VERSION, workdir, machine, versions, started, seconds=seconds
+    )
+    return head | {
         "rule": {
             "min_pairs": MIN_PAIRS,
             "max_pairs": MAX_PAIRS,

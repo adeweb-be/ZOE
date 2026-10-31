@@ -95,6 +95,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import start
 
 from plonebench import corpus, fixture, stack
 
@@ -148,13 +149,8 @@ def showcase():
     return importlib.import_module("plonebench.showcase")
 
 
-@pytest.fixture(autouse=True)
-def lock(tmp_path, monkeypatch):
-    """Give each test a lock file of its own, so that no test waits for a
-    benchmark of the machine."""
-    path = tmp_path / "bench.lock"
-    monkeypatch.setenv("ZOE_BENCH_LOCK", str(path))
-    return path
+# Each test has a lock file of its own.
+pytestmark = pytest.mark.usefixtures("lock")
 
 
 def held(path):
@@ -215,12 +211,6 @@ def plan(capsys, *options, directory=None):
     out = capsys.readouterr().out
     assert code == 0, out
     return json.loads(out)
-
-
-def start(directory, execute, *options):
-    """Start or resume the showcase in `directory`, with a fake runner."""
-    argv = ["--dir", str(directory), "--max-load", "1000", *options]
-    return showcase().main(argv, execute=execute)
 
 
 def todo(document):

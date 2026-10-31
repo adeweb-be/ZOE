@@ -1,8 +1,8 @@
 """`just plone zeoclient check` stops `zoe serve` also when it fails.
 
 Each test makes the check fail at one step, then looks for a `zoe serve`
-process that the recipe left. Run them inside `devenv shell`: `uv run
---directory python pytest ../plone/tests`. The first build needs the
+process that the recipe left. Run them inside `devenv shell`: `just plone
+test plone/tests/test_zeoclient_stop.py`. The first build needs the
 network.
 """
 
@@ -15,26 +15,16 @@ import subprocess
 import threading
 from pathlib import Path
 
+from conftest import zoe_serve_processes
+
 REPO = Path(__file__).resolve().parents[2]
 STORE = REPO / "target" / "plone" / "zeoclient" / "var" / "zoe"
 ZEO_ADDRESS = ("127.0.0.1", 8100)
 
 
-def zoe_serve_processes():
-    """Return the pids of the `zoe serve` processes on the store of the
-    scenario.
-
-    The pattern names the store, so the servers of other worktrees and of
-    other tests do not match.
-    """
-    pattern = f"zoe serve --path {re.escape(str(STORE))}( |$)"
-    result = subprocess.run(
-        ["pgrep", "-u", str(os.getuid()), "-f", pattern],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return {int(pid) for pid in result.stdout.split()}
+# The `zoe serve` processes on the store of the scenario. It names the store,
+# so the servers of other worktrees and of other tests do not match.
+SERVERS = f"zoe serve --path {re.escape(str(STORE))}( |$)"
 
 
 def check(env=None):
@@ -58,7 +48,7 @@ def test_a_busy_zeo_port_fails_the_check_and_leaves_no_server():
         result = check()
     assert result.returncode != 0, result.stdout[-5000:]
     assert "zoe serve does not listen" in result.stderr
-    assert not zoe_serve_processes()
+    assert not zoe_serve_processes(SERVERS)
 
 
 def test_a_failed_read_of_the_site_stops_the_server():
@@ -78,4 +68,4 @@ def test_a_failed_read_of_the_site_stops_the_server():
     assert result.returncode != 0, result.stdout[-5000:]
     assert "gives the status 404" in result.stderr
     assert (STORE / "zoe.redb").exists()
-    assert not zoe_serve_processes()
+    assert not zoe_serve_processes(SERVERS)

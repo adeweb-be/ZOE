@@ -213,21 +213,17 @@ def _document(
         software += environment.RELSTORAGE_SOFTWARE
     elif store.name in ("zoe", "zoe-native"):
         software += environment.ZOE_SOFTWARE
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "storage": store.name,
-        "machine": environment.machine(workdir, machine),
-        "python": environment.python(),
-        "software": environment.software(software) | server_versions(store, dsn),
-        "run": {
-            "quick": kind == "quick",
-            "set": kind,
-            "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "commit": environment.commit(),
-            "dirty": environment.dirty(),
-        },
-        "scenarios": scenarios,
-    }
+    versions = environment.software(software) | server_versions(store, dsn)
+    head = environment.header(
+        SCHEMA_VERSION,
+        workdir,
+        machine,
+        versions,
+        started,
+        quick=kind == "quick",
+        set=kind,
+    )
+    return head | {"storage": store.name, "scenarios": scenarios}
 
 
 def _run_cell(

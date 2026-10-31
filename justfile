@@ -12,7 +12,9 @@ default:
 
 # Check the format and run clippy and the Python lints. The fuzz targets of
 # zoe serve are a workspace of their own: check their format, and that their
-# Cargo.lock needs no change, so `just fuzz` builds with --locked.
+# Cargo.lock needs no change, so `just fuzz` builds with --locked. The
+# harnesses of bench/ that build zoedb must pin the forks of persistent,
+# zodbpickle and BTrees that python/ pins.
 check:
     cargo fmt --all --check
     cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
@@ -20,6 +22,7 @@ check:
     cargo clippy --workspace --all-targets --locked -- -D warnings
     ruff check python ci/src deploy
     ruff format --check python ci/src deploy
+    PYTHONPATH=bench/common/src python3.13 -m benchcommon.pins
 
 # Run the Rust tests, then the Python tests on every interpreter, then the
 # checks of the deployment files.
@@ -30,12 +33,29 @@ test:
     # counts.
     cargo test --release --locked -p zoe-core --test bit_flip_harness -- --show-output
     # The tests of the server run the `zoe` binary that cargo test built.
-    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
-    for py in {{ pythons }}; do \
-        echo "== CPython $py"; \
-        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
-    done
+    ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe" just _pytest "{{ pythons }}"
     just deploy check
+
+# Run pytest in the uv workspace of python/ on each interpreter of `only`,
+# with the pytest arguments that follow.
+_pytest only *args:
+    for py in {{ only }}; do \
+        echo "== CPython $py"; \
+        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q {{ args }}; \
+    done
+
+# Build the `zoe` binary in the profile `debug` or `release`, and print its
+# absolute path. The recipes export it as ZOE_BINARY.
+_zoe profile:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ profile }}" in
+        debug) flags=() ;;
+        release) flags=(--release) ;;
+        *) echo "just _zoe: the profile is debug or release." >&2; exit 2 ;;
+    esac
+    cargo build "${flags[@]}" --locked -p zoe-server --bin zoe >&2
+    echo "$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/{{ profile }}/zoe"
 
 # Run tests and the race canary under ThreadSanitizer. `just tsan` runs the
 # tests of zoe-core, and `just tsan zoe-core FILTER` only those whose name
@@ -179,12 +199,9 @@ fuzz seconds="60" *targets="frame handshake merge fields":
 # and pytest arguments, for example
 # `just conformance 3.13 zoedb/tests/conformance/test_zeo_suites.py`.
 conformance only=pythons *tests="zoedb/tests/conformance":
-    cargo build --locked -p zoe-server --bin zoe
-    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
-    for py in {{ only }}; do \
-        echo "== CPython $py"; \
-        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q {{ tests }}; \
-    done
+    ZOE_BINARY="$(just _zoe debug)"; \
+    export ZOE_BINARY; \
+    just _pytest "{{ only }}" {{ tests }}
 
 # Run the process kill loop against `zoe serve` for `runs` rounds, on
 # CPython 3.13, then the kill loop under the simulator for `seeds` seeds.
@@ -211,8 +228,8 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
         seed=$(( (RANDOM << 15) | RANDOM ))
     fi
     # The server is the `zoe` binary of this build.
-    cargo build --locked -p zoe-server --bin zoe
-    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+    ZOE_BINARY="$(just _zoe debug)"
+    export ZOE_BINARY
     export ZOE_KILL_LOOP_RUNS="{{ runs }}" ZOE_KILL_LOOP_SEED="$seed"
     echo "just crash: {{ runs }} rounds, seed $seed"
     status=0
@@ -272,6 +289,9 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
 # admin user as user:password. Without it, the recipe makes a random
 # password once, in target/plone/admin. The instance listens on 127.0.0.1,
 # on the port ZOE_PLONE_PORT or 8080.
+# `just plone test` runs the tests of plone/tests, which run these
+# recipes, on CPython 3.13; `just plone test FILE...` runs the pytest
+# arguments that follow, with paths of the repository.
 [positional-arguments]
 plone scenario="zoe" command="start" *args:
     #!/usr/bin/env bash
@@ -279,6 +299,16 @@ plone scenario="zoe" command="start" *args:
     # just gives the arguments of the recipe as positional arguments, each
     # unchanged: the scenario, the command, then the arguments that follow.
     args=("${@:3}")
+    if [ "{{ scenario }}" = test ]; then
+        # The arguments of pytest start at the command, which is start
+        # when no argument follows test.
+        tests=("${@:2}")
+        if [ "${tests[*]}" = start ]; then
+            tests=(plone/tests)
+        fi
+        export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/python/.venv-3.13"
+        exec uv run --locked --project python --python 3.13 pytest -q "${tests[@]}"
+    fi
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
         echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient, zoeclient or zeoclient-mount." >&2
         exit 2
@@ -286,6 +316,9 @@ plone scenario="zoe" command="start" *args:
     target="{{ justfile_directory() }}/target/plone"
     instance="$target/{{ scenario }}/bin/instance"
     port="${ZOE_PLONE_PORT:-8080}"
+    # The address of the server of a ZEO client instance: the zeo-address
+    # of zeoclient.cfg, which templates/zoeclient.conf.in also gives.
+    zeo_address=127.0.0.1:8100
     # The interpreters of the shell know only the C locales. Zope sets the
     # locale of the environment when it starts.
     export LC_ALL=C.UTF-8
@@ -395,8 +428,7 @@ plone scenario="zoe" command="start" *args:
     serve() {
         local log="$1" tries=0
         shift
-        cargo build --locked -p zoe-server --bin zoe
-        zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+        zoe="$(just _zoe debug)"
         # The server gets no ZOE_* variable of the caller, so only the
         # options here apply. The admin password does not go to the
         # server.
@@ -457,11 +489,9 @@ plone scenario="zoe" command="start" *args:
                     ;;
             esac
             if [ "${#stores[@]}" -gt 0 ]; then
-                # The instance is a ZEO client of zoe serve. The server
-                # listens on the zeo-address of zeoclient.cfg, which
-                # templates/zoeclient.conf.in also gives.
+                # The instance is a ZEO client of zoe serve.
                 serve "$target/{{ scenario }}/var/log/zoe-serve.log" \
-                    "${stores[@]}" --listen 127.0.0.1:8100
+                    "${stores[@]}" --listen "$zeo_address"
             fi
             "$instance" run plone/set_admin.py
             "$instance" run plone/create_site.py "$mark" ${folder:+"$folder"}
@@ -498,68 +528,46 @@ plone scenario="zoe" command="start" *args:
             # ZOE_PLONE_BACKENDS names. The tests that start `zoe serve`
             # run the `zoe` binary of this build.
             set -- "${args[@]}"
-            cargo build --locked -p zoe-server --bin zoe
-            ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe" \
-                ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
+            zoe="$(just _zoe debug)"
+            ZOE_BINARY="$zoe" ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
                 -s plone.locking -s zoe.plone "$@"
             ;;
-        creators)
-            # The creators script runs in the instance with the storage of
-            # the scenario, after a new site. The instance must not run.
+        creators | history)
+            # The script runs in the instance with the storage of the
+            # scenario, after a new site. The instance must not run.
+            # history.py checks the merge policy of zoe.plone and its
+            # append-only workflow history.
             set -- "${args[@]}"
-            if [ "$#" -ne 3 ]; then
-                echo "just plone: use just plone {{ scenario }} creators THREADS ITEMS SEED." >&2
+            if [ "{{ command }}" = creators ]; then
+                usage="THREADS ITEMS SEED" count=3 clients=" zeoclient zoeclient "
+                refusal="the creators run on zoe, zeoclient or zoeclient"
+            else
+                usage=THREADS count=1 clients=" zoeclient "
+                refusal="the history check runs on zoe or zoeclient"
+            fi
+            if [ "$#" -ne "$count" ]; then
+                echo "just plone: use just plone {{ scenario }} {{ command }} $usage." >&2
                 exit 2
             fi
-            case "{{ scenario }}" in
-                zoe)
-                    ;;
-                zeoclient | zoeclient)
-                    # A new store for each run, on the address of the
-                    # configuration of the instance.
-                    store="$target/{{ scenario }}/var/creators"
-                    rm -rf "$store"
-                    serve "$target/{{ scenario }}/var/log/zoe-serve-creators.log" \
-                        --path "$store" --listen 127.0.0.1:8100
-                    ;;
-                *)
-                    echo "just plone: the creators run on zoe, zeoclient or zoeclient." >&2
-                    exit 2
-                    ;;
-            esac
-            "$instance" run plone/set_admin.py
-            "$instance" run plone/create_site.py "creators-$RANDOM$RANDOM"
-            # The last line of stdout is the JSON report of the script.
-            "$instance" run plone/creators.py "$@"
-            ;;
-        history)
-            # The history script runs in the instance with the storage of
-            # the scenario, after a new site: the merge policy of zoe.plone
-            # and its append-only workflow history. The instance must not
-            # run.
-            set -- "${args[@]}"
-            if [ "$#" -ne 1 ]; then
-                echo "just plone: use just plone {{ scenario }} history THREADS." >&2
-                exit 2
+            if [ "{{ scenario }}" != zoe ]; then
+                case "$clients" in
+                    *" {{ scenario }} "*) ;;
+                    *)
+                        echo "just plone: $refusal." >&2
+                        exit 2
+                        ;;
+                esac
+                # A new store for each run, on the address of the
+                # configuration of the instance.
+                store="$target/{{ scenario }}/var/{{ command }}"
+                rm -rf "$store"
+                serve "$target/{{ scenario }}/var/log/zoe-serve-{{ command }}.log" \
+                    --path "$store" --listen "$zeo_address"
             fi
-            case "{{ scenario }}" in
-                zoe)
-                    ;;
-                zoeclient)
-                    store="$target/zoeclient/var/history"
-                    rm -rf "$store"
-                    serve "$target/zoeclient/var/log/zoe-serve-history.log" \
-                        --path "$store" --listen 127.0.0.1:8100
-                    ;;
-                *)
-                    echo "just plone: the history check runs on zoe or zoeclient." >&2
-                    exit 2
-                    ;;
-            esac
             "$instance" run plone/set_admin.py
-            "$instance" run plone/create_site.py "history-$RANDOM$RANDOM"
+            "$instance" run plone/create_site.py "{{ command }}-$RANDOM$RANDOM"
             # The last line of stdout is the JSON report of the script.
-            "$instance" run plone/history.py "$@"
+            "$instance" run "plone/{{ command }}.py" "$@"
             ;;
         *)
             echo "just plone: unknown command {{ command }}. Use start, build, check, suites, creators or history." >&2
@@ -584,7 +592,8 @@ plone scenario="zoe" command="start" *args:
 # needs. Each result records the GIL of each worker process. `run`, `test`
 # and `native` build `zoe` in release for the storages zoe-server and
 # zoe-native, unless ZOE_BINARY names a binary.
-# `just bench test FILE...` runs only the tests of those files.
+# `just bench test` runs the tests of bench/shootout and of bench/common,
+# and `just bench test FILE...` runs only the tests of those files.
 # `just bench index DIR` rewrites index.json of version 2 of a results
 # tree, and `just bench publish [--main REF] SRC... CHECKOUT` copies the
 # result documents of every family into a checkout of the results
@@ -595,12 +604,12 @@ plone scenario="zoe" command="start" *args:
 # server. It writes target/bench/client/<started>.json and prints the
 # rows, and builds `zoe` in release first. `just bench client report FILE`
 # prints the rows of a result and its verdict, and builds nothing.
-# `just bench load` and `just bench saturate` build `zoe` and `zoe-bench` in release, start
-# `zoe serve` on a new store in target/bench/work/zoe-bench, run
+# `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
+# in release, start `zoe serve` on a new store in
+# target/bench/work/zoe-bench, with no `ZOE_*` variable of the caller, run
 # `zoe-bench load` or `zoe-bench saturate` with its default settings and the
 # options that follow, and write the JSON result to stdout and to
-# target/bench/zoe-bench/<command>-<started>.json. The criterion benchmarks
-# are not built yet.
+# target/bench/zoe-bench/<command>-<started>.json.
 # `just bench plone COMMAND` runs the Plone end-to-end benchmark of
 # bench/plone: Locust against a synthetic Plone site on ZEO and on zoe
 # serve (`prepare`, `run`, `campaign`, `report`, `serve`, `fixtures`), and
@@ -626,6 +635,14 @@ plone scenario="zoe" command="start" *args:
 # resumes a directory that `--dir` gives. `--plan` prints the runs and
 # their estimates and runs nothing. It builds nothing before it starts:
 # the builds are the first runs of the set.
+# Each benchmark holds the bench lock, an exclusive flock(2) on
+# ZOE_BENCH_LOCK (target/bench/bench.lock by default), from before its
+# build to its end, so one benchmark runs at a time: `run`, `native`,
+# `client`, `load`, `saturate`, `plone prepare`, `plone run`,
+# `plone campaign` and `replay RUN`. The showcase takes it for each of its
+# runs. A child command of a holder takes it through the open file that
+# ZOE_BENCH_LOCK_FD names, so it does not wait for its parent. The tests,
+# the reports, `gate`, `index` and `publish` take no lock.
 [positional-arguments]
 bench *args="run":
     #!/usr/bin/env bash
@@ -633,133 +650,150 @@ bench *args="run":
     # just gives the arguments of the recipe as positional arguments, each
     # unchanged, such as `--zope-cpus "1;3"` or a path with a space.
     # `just bench showcase OPTIONS` stands for `just bench plone showcase
+    # OPTIONS`, `just bench client OPTIONS` for `just bench client run
+    # OPTIONS`, and `just bench native OPTIONS` for `just bench native run
     # OPTIONS`.
     if [ "${1:-}" = showcase ]; then
         set -- plone "$@"
     fi
-    if [ "${1:-}" = plone ]; then
-        shift
-        export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/plone/venv"
-        # Locust loads greenlet, which links libstdc++.so.6. On Linux the
-        # shell gives its directory in ZOE_CXX_LIBS.
-        if [ -n "${ZOE_CXX_LIBS:-}" ]; then
-            export LD_LIBRARY_PATH="$ZOE_CXX_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        fi
-        plonebench=(uv run --locked --python 3.13 --project bench/plone)
-        if [ "${1:-}" = test ]; then
-            shift
-            exec "${plonebench[@]}" pytest -q "${@:-bench/plone/tests}"
-        fi
-        case "${1:-}" in
-            prepare | run | campaign | serve)
-                if [ -z "${ZOE_BINARY:-}" ]; then
-                    cargo build --release --locked -p zoe-server --bin zoe
-                fi
-                ;;
-        esac
-        exec "${plonebench[@]}" python -m plonebench "$@"
-    fi
-    if [ "${1:-}" = replay ]; then
-        shift
-        export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/replay/venv"
-        replay=(uv run --locked --python 3.13 --project bench/replay)
-        if [ "${1:-}" = report ]; then
-            shift
-            exec "${replay[@]}" python -m replay report "$@"
-        fi
-        if [ "${1:-}" != test ]; then
-            run="${1:?just bench replay: give the directory of a B5 run that kept its store}"
-            store="$run/store/filestorage/Data.fs"
-            [ -f "$store" ] || { echo "just bench replay: $run kept no FileStorage: run B5 on zeo with --keep-store" >&2; exit 1; }
-            ls "$run"/probe/instance*.jsonl >/dev/null 2>&1 || { echo "just bench replay: $run has no probe records in probe/" >&2; exit 1; }
-            # The interpreter of the instance has the eggs of the site, so
-            # the resolver of ZODB has the classes of Plone. It runs the
-            # package zoe of the last `just plone zoeclient build`.
-            interpreter="target/plone/zoeclient/parts/instance/bin/interpreter"
-            [ -x "$interpreter" ] || { echo "just bench replay: run just plone zoeclient build first" >&2; exit 1; }
-        fi
-        if [ -z "${ZOE_BINARY:-}" ]; then
-            cargo build --release --locked -p zoe-server --bin zoe
-            ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
-            export ZOE_BINARY
-        fi
-        if [ "${1:-}" = test ]; then
-            shift
-            exec "${replay[@]}" pytest -q "${@:-bench/replay/tests}"
-        fi
-        shift
-        out="target/bench/replay/$(date -u +%Y%m%dT%H%M%SZ).json"
-        work="target/bench/work/replay"
-        rm -rf "$work"
-        export PYTHONPATH="{{ justfile_directory() }}/bench/replay/src"
-        # The interpreter warns that pkg_resources is deprecated.
-        export PYTHONWARNINGS="ignore::UserWarning"
-        exec "$interpreter" -m replay run --store "$store" --probes "$run/probe" \
-            --workdir "$work" --out "$out" "$@"
-    fi
-    # `just bench client OPTIONS` stands for `just bench client run OPTIONS`,
-    # and `just bench native OPTIONS` for `just bench native run OPTIONS`.
     if { [ "${1:-}" = client ] || [ "${1:-}" = native ]; } && [ "${2:-}" != run ] && [ "${2:-}" != report ]; then
         command="$1"
         shift
         set -- "$command" run "$@"
     fi
-    if [ "${1:-}" = load ] || [ "${1:-}" = saturate ]; then
-        command="$1"
-        shift
-        cargo build --release --locked -p zoe-server --bin zoe -p zoe-bench --bin zoe-bench
-        bin="${CARGO_TARGET_DIR:-target}/release"
-        work="target/bench/work/zoe-bench"
-        out="target/bench/zoe-bench"
-        rm -rf "$work"
-        mkdir -p "$work" "$out"
-        # `zoe serve` writes `listening <address>` once it accepts
-        # connections. The port 0 takes a free port.
-        "$bin/zoe" serve --path "$work/store" --listen 127.0.0.1:0 >"$work/serve.out" 2>"$work/serve.log" &
-        pid=$!
-        trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
-        for _ in $(seq 100); do
-            grep -q '^listening ' "$work/serve.out" && break
-            kill -0 "$pid" 2>/dev/null || { cat "$work/serve.log" >&2; exit 1; }
-            sleep 0.1
-        done
-        addr="$(sed -n 's/^listening //p' "$work/serve.out")"
-        [ -n "$addr" ] || { echo "just bench: zoe serve does not listen" >&2; exit 1; }
-        result="$out/$command-$(date -u +%Y%m%dT%H%M%SZ).json"
-        # Write to a temporary file, and move it on success only. So a
-        # failed run leaves no result.
-        partial="$(mktemp "$out/.$command.XXXXXX")"
-        trap 'rm -f "$partial"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
-        ZOE_BENCH_COMMIT="${ZOE_BENCH_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}" \
-            "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$partial"
-        # mktemp creates the file with the mode 0600.
-        chmod 0644 "$partial"
-        mv "$partial" "$result"
-        cat "$result"
-        exit 0
-    fi
-    export UV_PYTHON="${UV_PYTHON:-3.13}"
-    export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/venv-$UV_PYTHON"
-    # The RelStorage wheel links libstdc++, which the Nix interpreters do not
-    # find on their own. The compiler of the shell knows where it is.
-    if command -v cc >/dev/null; then
-        libstdcxx="$(dirname "$(cc -print-file-name=libstdc++.so.6)")"
-        export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    fi
-    shootout=(uv run --locked --project bench/shootout)
-    builds=false
-    case "${1:-} ${2:-}" in
-        "client report" | "native report") ;;
-        run\ * | test\ * | client\ * | native\ *) builds=true ;;
+    case "${1:-}" in
+        plone | replay)
+            family="$1"
+            shift
+            ;;
+        load | saturate) family=zoe-bench ;;
+        *) family=shootout ;;
     esac
-    if [ "$builds" = true ] && [ -z "${ZOE_BINARY:-}" ]; then
-        cargo build --release --locked -p zoe-server --bin zoe
-        ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
-        export ZOE_BINARY
+    case "$family ${1:-} ${2:-}" in
+        "shootout run "* | "shootout client run" | "shootout native run" | zoe-bench\ *) lock=true ;;
+        "plone prepare "* | "plone run "* | "plone campaign "*) lock=true ;;
+        "replay test "* | "replay report "*) lock=false ;;
+        replay\ *) lock=true ;;
+        *) lock=false ;;
+    esac
+    if [ "$lock" = true ]; then
+        # The shell holds the lock through its open file 9 until the
+        # benchmark ends. A parent that holds it gives its open file.
+        if [ -z "${ZOE_BENCH_LOCK_FD:-}" ]; then
+            lockfile="${ZOE_BENCH_LOCK:-target/bench/bench.lock}"
+            mkdir -p "$(dirname "$lockfile")"
+            exec 9>>"$lockfile"
+            export ZOE_BENCH_LOCK_FD=9
+        fi
+        PYTHONPATH=bench/common/src python3.13 -m benchcommon.lock
     fi
+    exec "{{ just_executable() }}" "_bench-$family" "$@"
+
+# The Plone end-to-end benchmark of bench/plone, and its showcase.
+[positional-arguments]
+_bench-plone *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/plone/venv"
+    # Locust loads greenlet, which links libstdc++.so.6. On Linux the
+    # shell gives its directory in ZOE_CXX_LIBS.
+    if [ -n "${ZOE_CXX_LIBS:-}" ]; then
+        export LD_LIBRARY_PATH="$ZOE_CXX_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    plonebench=(uv run --locked --python 3.13 --project bench/plone)
     if [ "${1:-}" = test ]; then
         shift
-        exec "${shootout[@]}" pytest -q "${@:-bench/shootout/tests}"
+        exec "${plonebench[@]}" pytest -q "${@:-bench/plone/tests}"
+    fi
+    case "${1:-}" in
+        prepare | run | campaign | serve)
+            ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
+            export ZOE_BINARY
+            ;;
+    esac
+    exec "${plonebench[@]}" python -m plonebench "$@"
+
+# The log replay of bench/replay (B6).
+[positional-arguments]
+_bench-replay *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/replay/venv"
+    replay=(uv run --locked --python 3.13 --project bench/replay)
+    if [ "${1:-}" = report ]; then
+        shift
+        exec "${replay[@]}" python -m replay report "$@"
+    fi
+    if [ "${1:-}" != test ]; then
+        run="${1:?just bench replay: give the directory of a B5 run that kept its store}"
+        store="$run/store/filestorage/Data.fs"
+        [ -f "$store" ] || { echo "just bench replay: $run kept no FileStorage: run B5 on zeo with --keep-store" >&2; exit 1; }
+        ls "$run"/probe/instance*.jsonl >/dev/null 2>&1 || { echo "just bench replay: $run has no probe records in probe/" >&2; exit 1; }
+        # The interpreter of the instance has the eggs of the site, so
+        # the resolver of ZODB has the classes of Plone. It runs the
+        # package zoe of the last `just plone zoeclient build`.
+        interpreter="target/plone/zoeclient/parts/instance/bin/interpreter"
+        [ -x "$interpreter" ] || { echo "just bench replay: run just plone zoeclient build first" >&2; exit 1; }
+    fi
+    ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
+    export ZOE_BINARY
+    if [ "${1:-}" = test ]; then
+        shift
+        exec "${replay[@]}" pytest -q "${@:-bench/replay/tests}"
+    fi
+    shift
+    out="target/bench/replay/$(date -u +%Y%m%dT%H%M%SZ).json"
+    work="target/bench/work/replay"
+    rm -rf "$work"
+    # The interpreter of the instance finds the replay and bench/common
+    # on PYTHONPATH.
+    export PYTHONPATH="{{ justfile_directory() }}/bench/replay/src:{{ justfile_directory() }}/bench/common/src"
+    # The interpreter warns that pkg_resources is deprecated.
+    export PYTHONWARNINGS="ignore::UserWarning"
+    exec "$interpreter" -m replay run --store "$store" --probes "$run/probe" \
+        --workdir "$work" --out "$out" "$@"
+
+# `zoe-bench load` and `zoe-bench saturate` against `zoe serve` on a new
+# store.
+[positional-arguments]
+_bench-zoe-bench command *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
+    export ZOE_BINARY
+    cargo build --release --locked -p zoe-bench --bin zoe-bench
+    zoe_bench="${CARGO_TARGET_DIR:-target}/release/zoe-bench"
+    PYTHONPATH=bench/common/src exec python3.13 -m benchcommon.zoebench \
+        "$zoe_bench" target/bench/work/zoe-bench target/bench/zoe-bench "$@"
+
+# The zodbshootout baseline, the gate, the native gate, the client
+# benchmark, and the results trees of bench/shootout.
+[positional-arguments]
+_bench-shootout *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export UV_PYTHON="${UV_PYTHON:-3.13}"
+    export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/venv-$UV_PYTHON"
+    # The RelStorage wheel links libstdc++.so.6, which the interpreters of
+    # the shell do not find. On Linux the shell gives its directory in
+    # ZOE_CXX_LIBS.
+    if [ -n "${ZOE_CXX_LIBS:-}" ]; then
+        export LD_LIBRARY_PATH="$ZOE_CXX_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    shootout=(uv run --locked --project bench/shootout)
+    case "${1:-} ${2:-}" in
+        "client report" | "native report") ;;
+        run\ * | test\ * | client\ * | native\ *)
+            ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
+            export ZOE_BINARY
+            ;;
+    esac
+    if [ "${1:-}" = test ]; then
+        shift
+        if [ "$#" -eq 0 ]; then
+            set -- bench/shootout/tests bench/common/tests
+        fi
+        exec "${shootout[@]}" pytest -q "$@"
     fi
     exec "${shootout[@]}" python -m shootout "$@"
 
@@ -846,8 +880,7 @@ ci *functions="check test docs":
 # runs it. `just release wheel DIR VERSION...` builds the zoedb wheel in the
 # shell into DIR, one wheel for each CPython version, 3.13 by default, as
 # `just plone` builds it. `just release test` runs the tests of the Dagger
-# functions against the Dagger engine. The version bump, the wheels of the
-# Dagger function release and the Helm chart are not built yet.
+# functions against the Dagger engine.
 release command="dist" dir="target/dist" *versions="3.13":
     #!/usr/bin/env bash
     set -euo pipefail

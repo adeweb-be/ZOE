@@ -35,8 +35,8 @@ The scenarios:
 - zeoclient: stock Plone with the stock ZEO client against `zoe serve`,
   without zoedb. It shows that the load meets these conflicts.
 
-Run it inside `devenv shell`: `uv run --directory python pytest
-../plone/tests/test_id_allocation.py`. The first build needs the network.
+Run it inside `devenv shell`: `just plone test plone/tests/test_id_allocation.py`.
+The first build needs the network.
 """
 
 import json

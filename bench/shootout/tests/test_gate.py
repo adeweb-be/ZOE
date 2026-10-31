@@ -1,36 +1,10 @@
 """Unit tests of the gate report: the left-out rows and the summary line."""
 
 import io
-import json
+
+from conftest import write_gate_result
 
 from shootout import gate
-
-
-def write(root, storage, ops):
-    """Write a result of storage with ops[name] in one cell of each name."""
-    result = {
-        "storage": storage,
-        "machine": {"name": "reference"},
-        "python": {
-            "implementation": "cpython",
-            "version": "3.13.0",
-            "free_threaded": False,
-        },
-        "run": {"quick": False, "started": "2026-01-01T00:00:00+00:00", "commit": None},
-        "scenarios": [
-            {
-                "name": name,
-                "mode": "threads",
-                "concurrency": 16,
-                "object_size": 1024,
-                "ops_per_second": value,
-            }
-            for name, value in ops.items()
-        ],
-    }
-    path = root / "results" / "reference" / "cp313" / storage / "run.json"
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(result))
 
 
 def report(root, ratio=1.0):
@@ -45,8 +19,10 @@ def test_read_hot_in_every_size_is_the_only_cell_left_out():
 
 
 def test_the_summary_counts_the_cells_left_out(tmp_path):
-    write(tmp_path, "zeo", {"add": 1000.0, "read_hot": 1000.0})
-    write(tmp_path, "zoe-server", {"add": 1000.0, "read_hot": 500.0})
+    write_gate_result(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0})
+    write_gate_result(
+        tmp_path, "zoe-server", "cp313", {"add": 1000.0, "read_hot": 500.0}
+    )
     code, lines = report(tmp_path)
     assert code == 0
     hot = next(line for line in lines if line.startswith("read_hot "))
@@ -56,8 +32,8 @@ def test_the_summary_counts_the_cells_left_out(tmp_path):
 
 
 def test_a_left_out_cell_without_a_counterpart_has_no_ratio(tmp_path):
-    write(tmp_path, "zeo", {"add": 1000.0, "read_hot": 1000.0})
-    write(tmp_path, "zoe-server", {"add": 1000.0})
+    write_gate_result(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0})
+    write_gate_result(tmp_path, "zoe-server", "cp313", {"add": 1000.0})
     code, lines = report(tmp_path)
     assert code == 0
     hot = next(line for line in lines if line.startswith("read_hot "))
@@ -65,8 +41,15 @@ def test_a_left_out_cell_without_a_counterpart_has_no_ratio(tmp_path):
 
 
 def test_an_explicit_ratio_sets_every_cell_that_counts(tmp_path):
-    write(tmp_path, "zeo", {"add": 1000.0, "update": 1000.0, "read_hot": 1000.0})
-    write(tmp_path, "zoe-server", {"add": 3000.0, "update": 2900.0, "read_hot": 0.1})
+    write_gate_result(
+        tmp_path, "zeo", "cp313", {"add": 1000.0, "update": 1000.0, "read_hot": 1000.0}
+    )
+    write_gate_result(
+        tmp_path,
+        "zoe-server",
+        "cp313",
+        {"add": 3000.0, "update": 2900.0, "read_hot": 0.1},
+    )
     code, lines = report(tmp_path, ratio=3.0)
     assert code == 1
     assert [line.split()[0] for line in lines if "FAIL" in line] == ["update"]
