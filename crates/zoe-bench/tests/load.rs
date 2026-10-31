@@ -17,18 +17,15 @@
 //! The results describe the machine, as the zodbshootout results do, and
 //! hold no host name, user name or path. The corpus is synthetic.
 
+mod support;
+
 use std::process::Command;
 
 use zoe_server::serve::{ServeOptions, Server};
 
-const BENCH: &str = env!("CARGO_BIN_EXE_zoe-bench");
+use support::fresh_dir;
 
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-bench-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const BENCH: &str = env!("CARGO_BIN_EXE_zoe-bench");
 
 fn run(args: &[&str]) -> serde_json::Value {
     let output = Command::new(BENCH).args(args).output().unwrap();
