@@ -17,15 +17,11 @@ from pathlib import Path
 
 from benchcommon import lock
 from benchcommon import servers as common
-from benchcommon.provenance import commit as commit_of
-from benchcommon.provenance import dirty as dirty_of
 
 from plonebench import fixture, stack
 
 # The interval between two reads of the load average, in seconds.
 LOAD_POLL = 15.0
-
-__all__ = ["commit_of", "dirty_of"]
 
 
 class Log:

@@ -52,14 +52,17 @@ from pathlib import Path
 
 from benchcommon import files
 
+# The commit of the showcase and whether the tree differs from it, as every
+# harness records them.
+from benchcommon.provenance import commit as commit_of
+from benchcommon.provenance import dirty as dirty_of
+
 from plonebench.showcase.execute import Execute, child_environment
 from plonebench.showcase.host import (
     PROVENANCE,
     Log,
     bench_lock,
     check_provenance,
-    commit_of,
-    dirty_of,
     keep_awake,
     provenance,
     record_of,
