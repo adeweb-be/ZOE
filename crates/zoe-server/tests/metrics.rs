@@ -27,9 +27,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, MAX, Server, Value, ZOE, begin, commit, fresh_dir, load, new_oids, p64, record, s,
 };
 
@@ -217,7 +217,7 @@ fn values_of<'a>(value: &'a serde_json::Value, key: &str, out: &mut Vec<&'a serd
 fn a_long_lock_is_logged_with_its_oid_and_its_client() {
     let dir = fresh_dir("lock-warn");
     let log = dir.join("stderr.log");
-    let (mut child, mut stdout) = wire::spawn_until_output(
+    let (mut child, mut stdout) = common::spawn_until_output(
         Command::new(ZOE)
             .args([
                 "serve",

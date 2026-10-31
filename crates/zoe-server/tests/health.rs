@@ -11,9 +11,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Server, commit, fresh_dir, new_oids, record, s};
+use common::{Server, commit, fresh_dir, new_oids, record, s};
 
 /// Send `GET path` to the admin port and return the status and the body.
 fn get(addr: SocketAddr, path: &str) -> (u16, String) {
@@ -43,8 +43,8 @@ fn get(addr: SocketAddr, path: &str) -> (u16, String) {
 #[test]
 fn the_help_names_the_admin_option_and_its_twin() {
     let output = {
-        let _spawn = wire::spawn_lock();
-        std::process::Command::new(wire::ZOE)
+        let _spawn = common::spawn_lock();
+        std::process::Command::new(common::ZOE)
             .args(["serve", "--help"])
             .output()
             .unwrap()

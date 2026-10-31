@@ -13,9 +13,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, MAX, Server, TIMEOUT, Value, bytes_of, commit, fresh_dir, items, load, new_oids, p64,
     u64_of,
 };

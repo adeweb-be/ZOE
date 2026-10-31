@@ -7,9 +7,9 @@
 //! 100 KB, and above the size of the socket buffers. A load never shows a
 //! large record of a transaction that did not finish.
 
-mod wire;
+mod common;
 
-use wire::{Conn, MAX, Server, Value, begin, commit, fresh_dir, items, new_oids, p64, u64_of};
+use common::{Conn, MAX, Server, Value, begin, commit, fresh_dir, items, new_oids, p64, u64_of};
 
 /// The sizes of the records: around 255 and 65,535 bytes, the limits of
 /// bin 8 and bin 16, then 100 KB, 1 MiB and 4 MiB.
@@ -132,7 +132,7 @@ fn a_load_never_shows_a_large_record_of_a_transaction_that_did_not_finish() {
     let old = pickle(1, 100_000);
     let first = commit(&mut writer, 1, &[(oid, 0, old.clone())]).unwrap();
     reader
-        .wait_for("invalidateTransaction", wire::TIMEOUT)
+        .wait_for("invalidateTransaction", common::TIMEOUT)
         .unwrap();
 
     begin(&mut writer, 2);
@@ -155,7 +155,7 @@ fn a_load_never_shows_a_large_record_of_a_transaction_that_did_not_finish() {
 
     let tid = u64_of(&writer.call("tpc_finish", vec![Value::from(2)]).unwrap());
     let invalidation = reader
-        .wait_for("invalidateTransaction", wire::TIMEOUT)
+        .wait_for("invalidateTransaction", common::TIMEOUT)
         .unwrap();
     assert_eq!(u64_of(&items(&invalidation)[0]), tid);
     let (id, frame) = raw_load(&mut reader, oid, Value::Binary(MAX.to_vec()));

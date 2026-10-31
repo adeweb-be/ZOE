@@ -22,15 +22,14 @@
 //! `0x000000000000002a`, or as ZODB's `oid_repr` does, `0x2a`. The test
 //! takes both forms.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Output;
 
 use zoe_core::{Flavour, Oid, Store, Tid};
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::{assert_exit, fresh_dir, s, zoe};
 
 /// The prefix of the namespace of a moved registry.
 const PREFIX: &str = "zoe.plone.registry:";
@@ -54,55 +53,12 @@ type Row<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
 /// the variables.
 type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zoe-convert-registry-{name}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-/// Run `zoe` with the arguments `args` and the variables `env`. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    common::output(&mut command)
-}
-
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-/// Check the exit code, and show the output if it is not the one expected.
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        stdout(output),
-        stderr(output)
-    );
 }
 
 /// Tell if `text` names `oid` in one of the two forms of the module
@@ -160,7 +116,7 @@ fn records(registries: &[Oid]) -> Vec<(Oid, Vec<u8>)> {
 /// Make a store in `dir` with the registries of two sites, both moved: the
 /// rows of a field and a value, and the marker, in the namespace of each.
 fn store_with_moved_registries(dir: &Path) {
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     let (first, second) = (
         format!("{PREFIX}{FIRST_ID}"),
         format!("{PREFIX}{SECOND_ID}"),
@@ -320,13 +276,13 @@ fn a_store_without_a_moved_registry_converts_as_before() {
 
     // A store with no namespace.
     let plain = dir.join("plain");
-    commit(&common::open(&plain), &records(&[FIRST]), &[]);
+    commit(&common::open_store(&plain), &records(&[FIRST]), &[]);
 
     // A store whose only durable namespace is not a registry, with a key
     // `m` too.
     let other = dir.join("other");
     commit(
-        &common::open(&other),
+        &common::open_store(&other),
         &records(&[FIRST]),
         &[("app.settings", MARKER, Some(b"1"))],
     );
@@ -335,7 +291,7 @@ fn a_store_without_a_moved_registry_converts_as_before() {
     // deletes each row, the marker too, and leaves the generation row.
     let back = dir.join("back");
     {
-        let store = common::open(&back);
+        let store = common::open_store(&back);
         commit(
             &store,
             &records(&[FIRST]),

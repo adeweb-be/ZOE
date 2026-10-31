@@ -7,28 +7,23 @@ use std::net::SocketAddr;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{Conn, MAX, Server, Value, begin, commit, fresh_dir, new_oids, p64, record, s};
+use common::{Conn, MAX, Server, Value, begin, commit, fresh_dir, new_oids, p64, record, s};
 
 /// Start `zoe serve` with `args` on a free port of 127.0.0.1. No `ZOE_*`
 /// variable reaches it. Return the process, its address, and its stdout,
 /// which must stay open while it runs.
 fn spawn(args: &[&str]) -> (Child, SocketAddr, BufReader<ChildStdout>) {
-    let mut command = Command::new(wire::ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
+    let mut command = Command::new(common::ZOE);
+    common::clear_zoe_env(&mut command)
         .arg("serve")
         .args(args)
         .args(["--listen", "127.0.0.1:0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let (child, mut stdout) = wire::spawn_until_output(&mut command);
+    let (child, mut stdout) = common::spawn_until_output(&mut command);
     loop {
         let mut line = String::new();
         assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "zoe serve stopped");
@@ -75,7 +70,7 @@ fn sigint_stops_the_server_as_sigterm_does() {
 
     let started = Instant::now();
     let sent = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         Command::new("kill")
             .args(["-INT", &child.id().to_string()])
             .status()
@@ -88,7 +83,7 @@ fn sigint_stops_the_server_as_sigterm_does() {
     assert!(took < Duration::from_secs(5), "the stop took {took:?}");
     assert!(staged.closed_within(Duration::from_secs(5)));
     // The store closed cleanly, and the staged record is not in it.
-    let _spawn = wire::spawn_lock();
+    let _spawn = common::spawn_lock();
     let store = zoe_core::Store::open_read_only(&path).unwrap();
     assert!(store.load(zoe_core::Oid(oid)).is_err());
 }
@@ -115,6 +110,6 @@ fn the_twin_bounds_a_stop_that_a_client_that_does_not_read_holds() {
     assert!(took < Duration::from_secs(3), "the stop took {took:?}");
     // The close of the slow connection ended its session before the
     // stores closed. So the store closed cleanly.
-    let _spawn = wire::spawn_lock();
+    let _spawn = common::spawn_lock();
     zoe_core::Store::open_read_only(&path).unwrap();
 }
