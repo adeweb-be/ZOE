@@ -28,7 +28,7 @@ class AdminServer(ZoeServer):
 
     def __init__(self, path, args=(), **kw):
         args = ["--admin-listen", "127.0.0.1:0", *args]
-        super().__init__(str(path), args=args, **kw)
+        super().__init__(path, args=args, **kw)
 
     def start(self, timeout=TIMEOUT):
         return super().start(timeout)
