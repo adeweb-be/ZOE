@@ -17,8 +17,8 @@ Its last line of stdout is a JSON report.
 The scenarios: zoe (`zoe.Storage` in the instance) and zoeclient
 (`zoe.zeo.ClientStorage` against `zoe serve`).
 
-Run it inside `devenv shell`: `uv run --directory python pytest
-../plone/tests/test_history.py`. The first build needs the network.
+Run it inside `devenv shell`: `just plone test plone/tests/test_history.py`.
+The first build needs the network.
 """
 
 import json

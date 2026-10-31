@@ -64,9 +64,8 @@ TINY = Profile(
 )
 
 
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(native.SCHEMA.read_text())
+# The schema of the `schema` fixture.
+SCHEMA_PATH = native.SCHEMA
 
 
 def spread(ratio, n):
