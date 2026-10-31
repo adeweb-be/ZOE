@@ -18,12 +18,9 @@ object that provides `ITTWLockable` and whose storage has KV namespaces:
   the locks.
 
 Every other object, and an object whose storage has no namespace, keeps the
-stock behaviour. `uninstall()` puts the stock methods back. The locks that
-the namespace holds then stop counting; each one expires with its TTL. The
-backend does not carry locks over: the locks that an object kept itself
-before `install()` do not count while it is installed, and the locks of the
-namespace do not count after `uninstall()`. A lock lives for minutes, so
-this ends with the next edit.
+stock behaviour. The backend does not carry locks over: the locks that an
+object kept itself before `install()` do not count while it is installed.
+A lock lives for minutes, so this ends with the next edit.
 
 One row holds all the locks of one object: a pickle of the WebDAV locks and
 of the types. A transaction decodes the row once, and its reads and its
@@ -57,19 +54,17 @@ import time
 import weakref
 from collections.abc import MutableMapping
 
-import transaction.interfaces
-import zope.interface
-
 import zoe.kv
+from zoe.plone._bases import Observer, has_namespaces
 
-__all__ = ["NAMESPACE", "install", "installed", "uninstall"]
+__all__ = ["NAMESPACE", "install", "installed"]
 
 # The name of the namespace of the locks.
 NAMESPACE = "zoe.plone.locks"
 
 # The longest TTL that the core takes, in seconds: the longest timeout of a
 # WebDAV lock.
-MAX_TTL = 2**32 - 1
+MAX_TTL = zoe.kv.MAX_TTL
 
 # The stock methods while the backend is installed.
 _stock = {}
@@ -118,17 +113,6 @@ def install():
     TTWLockable._locks = _locks
 
 
-def uninstall():
-    """Put the stock methods back."""
-    if not _stock:
-        return
-    from OFS.Lockable import LockableItem
-    from plone.locking.lockable import TTWLockable
-
-    LockableItem.wl_lockmapping = _stock.pop("wl_lockmapping")
-    TTWLockable._locks = _stock.pop("_locks")
-
-
 def _row_of(obj):
     """Return the row of the locks of `obj` for the current transaction of
     its connection, or None when `obj` keeps its locks itself."""
@@ -140,7 +124,7 @@ def _row_of(obj):
         return None
     jar = getattr(base, "_p_jar", None)
     oid = getattr(base, "_p_oid", None)
-    if jar is None or oid is None or not zoe.kv._supported(jar):
+    if jar is None or oid is None or not has_namespaces(jar):
         return None
     txn = jar.transaction_manager.get()
     rows = _rows.get(jar)
@@ -152,75 +136,38 @@ def _row_of(obj):
     return row
 
 
-@zope.interface.implementer(transaction.interfaces.IDataManager)
-class _Rows(dict):
+class _Rows(Observer, dict):
     """The rows that one transaction of one connection decoded, by oid.
 
-    It joins the transaction as a data manager that writes nothing itself,
-    so that a rollback to a savepoint drops the rows. The writes of the
-    namespace stage the rows before each of their savepoints, so the
-    savepoint keeps a `LockItem` that changed in place, whatever the order
-    in which the two joined.
+    It joins the transaction as an `Observer`, so that a rollback to a
+    savepoint drops the rows: the next read decodes them from the writes
+    that the rollback gave back. The writes of the namespace stage the rows
+    before each of their savepoints, so the savepoint keeps a `LockItem`
+    that changed in place, whatever the order in which the two joined. A
+    transaction that is not active takes no data manager: its reads decode
+    the rows, and a write fails as any write after the commit does.
     """
 
+    sort_prefix = "zoe.plone.locking"
+
     def __init__(self, jar, txn):
-        super().__init__()
-        self.transaction_manager = jar.transaction_manager
-        self.transaction = txn
-        self._jar = jar
-        txn.join(self)
-        writes = zoe.kv.Namespace(jar, "ephemeral", NAMESPACE)._staged(create=True)
-        writes.flush_before_savepoint(self.write_back)
-        txn.addBeforeCommitHook(self.write_back)
+        super().__init__(jar, txn)
+        if self.joined:
+            self.flush_before_savepoint(zoe.kv.Namespace(jar, "ephemeral", NAMESPACE))
+            txn.addBeforeCommitHook(self.write_back)
 
     def write_back(self):
         """Stage each row that changed: a `LockItem` can change in place."""
         for row in self.values():
             row.write()
 
-    def _end(self):
+    def rollback(self):
+        self.clear()
+
+    def end(self):
         self.clear()
         if _rows.get(self._jar) is self:
             del _rows[self._jar]
-
-    # IDataManager
-
-    def abort(self, txn):
-        self._end()
-
-    def tpc_begin(self, txn):
-        pass
-
-    def commit(self, txn):
-        pass
-
-    def tpc_vote(self, txn):
-        pass
-
-    def tpc_finish(self, txn):
-        self._end()
-
-    def tpc_abort(self, txn):
-        self._end()
-
-    def sortKey(self):
-        return f"zoe.plone.locking:{id(self)}"
-
-    def savepoint(self):
-        self.write_back()
-        return _RowsSavepoint(self)
-
-
-@zope.interface.implementer(transaction.interfaces.IDataManagerSavepoint)
-class _RowsSavepoint:
-    """A savepoint of the rows: its rollback drops the decoded rows, so the
-    next read decodes them from the writes that the rollback gave back."""
-
-    def __init__(self, rows):
-        self._rows = rows
-
-    def rollback(self):
-        self._rows.clear()
 
 
 class _Row:

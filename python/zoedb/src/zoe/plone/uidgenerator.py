@@ -49,10 +49,11 @@ Only `install()` imports Plone.
 
 import threading
 
-import transaction
 from BTrees.Length import Length
 from ZODB.POSException import ConflictError, Unsupported
 from ZODB.utils import z64
+
+from zoe.plone._bases import private_connection
 
 __all__ = [
     "BLOCK",
@@ -126,55 +127,43 @@ def _reserve(tool, sequence, value, seen):
     shows no range. The reservation reads the tool on a new connection, in
     a transaction of its own, and commits there.
     """
-    with _reservation:
-        db = tool._p_jar.db()
-        manager = transaction.TransactionManager()
-        connection = db.open(transaction_manager=manager)
-        try:
-            for _ in range(RETRIES):
-                manager.begin()
-                fresh = connection.get(tool._p_oid)
-                counter = _counter(fresh)
-                state = _state(fresh)
-                base, floor, mark, end = state or (0, 0, 0, 0)
-                uid = base + value
-                if (
-                    state is not None
-                    and value > seen
-                    and counter == end
-                    and uid > floor
-                ):
-                    if uid <= end:
-                        # Another reservation made the id valid.
-                        manager.abort()
-                        return uid
-                    # The id is above the range: raise the end.
-                    mark = max(mark, value)
-                    end = uid + BLOCK - 1
-                else:
-                    # Start a new range above every id of the site: above
-                    # the stock counter and above the end of the old range.
-                    uid = max(counter, end) + 1
-                    last = value
-                    for _ in range(BLOCK):
-                        last = sequence.next()
-                    base, floor, mark = uid - value, uid, last
-                    end = base + last + BLOCK
-                fresh._uid_counter = end
-                setattr(fresh, STATE, (base, floor, mark, end))
-                manager.get().note(NOTE)
-                try:
-                    manager.commit()
-                except ConflictError:
+    with _reservation, private_connection(tool._p_jar.db()) as (connection, manager):
+        for _ in range(RETRIES):
+            manager.begin()
+            fresh = connection.get(tool._p_oid)
+            counter = _counter(fresh)
+            state = _state(fresh)
+            base, floor, mark, end = state or (0, 0, 0, 0)
+            uid = base + value
+            if state is not None and value > seen and counter == end and uid > floor:
+                if uid <= end:
+                    # Another reservation made the id valid.
                     manager.abort()
-                    continue
-                return uid
-            raise ConflictError(
-                f"no reservation of portal_uidgenerator after {RETRIES} tries"
-            )
-        finally:
-            manager.abort()
-            connection.close()
+                    return uid
+                # The id is above the range: raise the end.
+                mark = max(mark, value)
+                end = uid + BLOCK - 1
+            else:
+                # Start a new range above every id of the site: above
+                # the stock counter and above the end of the old range.
+                uid = max(counter, end) + 1
+                last = value
+                for _ in range(BLOCK):
+                    last = sequence.next()
+                base, floor, mark = uid - value, uid, last
+                end = base + last + BLOCK
+            fresh._uid_counter = end
+            setattr(fresh, STATE, (base, floor, mark, end))
+            manager.get().note(NOTE)
+            try:
+                manager.commit()
+            except ConflictError:
+                manager.abort()
+                continue
+            return uid
+        raise ConflictError(
+            f"no reservation of portal_uidgenerator after {RETRIES} tries"
+        )
 
 
 def next_id(tool):

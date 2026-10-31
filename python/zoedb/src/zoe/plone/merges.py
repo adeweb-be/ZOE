@@ -293,21 +293,25 @@ def apply_overrides(policy, overrides, derived=frozenset(), blocked=frozenset())
             removed.add(name)
             continue
         removed.discard(name)
-        fields = {**merged.get("fields", {}), **entry.get("fields", {})}
-        coupled = _groups(merged.get("coupled"), entry.get("coupled"))
-        merged.update(
-            {
-                key: value
-                for key, value in entry.items()
-                if key not in ("fields", "coupled")
-            }
-        )
-        if fields:
-            merged["fields"] = fields
-        if coupled:
-            merged["coupled"] = coupled
-        result["classes"][name] = merged
+        result["classes"][name] = _merge_entry(merged, entry)
     return merge_policy.validate(result), removed
+
+
+def _merge_entry(base, entry):
+    """Return a copy of the entry `base` with the entry `entry` over it.
+    The fields of both merge, and so do their coupled groups. Each other
+    key of `entry` replaces the key of `base`."""
+    merged = dict(base)
+    merged.update(
+        {key: value for key, value in entry.items() if key not in ("fields", "coupled")}
+    )
+    fields = {**base.get("fields", {}), **entry.get("fields", {})}
+    if fields:
+        merged["fields"] = fields
+    coupled = _groups(base.get("coupled"), entry.get("coupled"))
+    if coupled:
+        merged["coupled"] = coupled
+    return merged
 
 
 def compose(stored, new):
@@ -328,20 +332,7 @@ def compose(stored, new):
         if old is None or entry is None:
             result["classes"][name] = dict(old if entry is None else entry)
             continue
-        merged = dict(old)
-        merged.update(
-            {
-                key: value
-                for key, value in entry.items()
-                if key not in ("fields", "coupled")
-            }
-        )
-        fields = {**old.get("fields", {}), **entry.get("fields", {})}
-        if fields:
-            merged["fields"] = fields
-        coupled = _groups(old.get("coupled"), entry.get("coupled"))
-        if coupled:
-            merged["coupled"] = coupled
+        merged = _merge_entry(old, entry)
         if old.get("blocked") or entry.get("blocked"):
             merged.update(blocked_entry())
         result["classes"][name] = merged

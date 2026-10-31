@@ -24,41 +24,27 @@ they are installed.
 """
 
 import os
-import pickle
 import random
 import threading
 import time
 
 import pytest
+from support import TIMEOUT, ZERO, client, record
 
 import zoe
 from zoe.testing import ZoeServer
 
-# The tid and the serial of an object that has no record yet.
-ZERO = bytes(8)
-# The longest time that a test waits for the server or a thread.
-TIMEOUT = 30
 # The rounds of the kill loop and the seed of their timing.
 KILL_RUNS = int(os.environ.get("ZOE_KILL_LOOP_RUNS", "5"))
 KILL_SEED = int(os.environ.get("ZOE_KILL_LOOP_SEED", "1"))
 
 
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def client(server, **kw):
-    """Return a stock ClientStorage connected to the storage 1 of server."""
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", **kw)
-
-
 def commit(storage, stores):
-    """Commit (oid, serial, data) items through storage. Return the tid."""
+    """Commit (oid, serial, data) items through storage. Return the tid.
+
+    A failed step does not abort the transaction: the kill loop commits
+    while the server dies.
+    """
     from ZODB.Connection import TransactionMetaData
 
     txn = TransactionMetaData(b"user", b"description")

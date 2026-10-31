@@ -1,69 +1,9 @@
-"""The ZOE client: `zoe.zeo.ClientStorage`, a drop-in for `ZEO.ClientStorage`.
+"""The native client inside `zoe.zeo.ClientStorage`.
 
-`ClientStorage` is a subclass of `ZEO.ClientStorage.ClientStorage`, with the
-same arguments. Each connection declares the extensions of `EXTENSIONS` in a
-third argument of `register`. A ZOE server accepts the names that it serves
-and gives them back under the key `extensions` of `get_info`. A stock ZEO
-server takes two arguments only: it refuses the third with `TypeError`, and
-the connection registers again with two arguments. The client then works as
-`ZEO.ClientStorage` does.
-
-`sequence(name).next()` gives the next value of the sequence `name` of the
-store, an `int`, as `zoe.Storage` does: unique and strictly increasing per
-store and per name, not part of a transaction. It needs a server that
-accepted `sequences` on the connection. Without it, `next()` raises
-`ZODB.POSException.Unsupported`.
-
-`kv_get`, `kv_scan`, `kv_generation`, `kv_set` and `kv_delete` give the
-KV namespaces of the store, as `zoe.Storage` does (ADR 0043). They need a
-server that accepted `kv` on the connection: `kv_supported()` tells. Without
-it, each raises `ZODB.POSException.Unsupported`. `zoe.kv.Namespace` gives a
-namespace to a connection of a database.
-
-When the package `opentelemetry` is installed, each connection also declares
-`trace_context`. When the server accepts it, each call that the client makes
-inside a span carries the W3C traceparent of that span: a fifth element of
-the message, a map with the key `traceparent`. The span of the call on the
-server then joins the trace of the client. A call outside a span has four
-elements. The client exports no span: the application configures
-OpenTelemetry.
-
-`%import zoe` gives the ZConfig section `<zoeclient>`, which opens this class.
-Its `<ssl>` section gives the files of TLS: the client builds its TLS from
-them, as ZEO's `<clientstorage>` does.
-
-`ClientStorage` runs on the native client of `zoe._zoe`, built on the Rust
-crate `zoe-client`, and not on the asyncio client of ZEO. This is the
-default. `native=False` keeps the asyncio client of ZEO inside. A subclass
-of `ClientStorage` keeps the asyncio client of ZEO, because it can change
-its methods. The native client is still an instance of
-`ZEO.ClientStorage.ClientStorage`, and no thread of ZEO starts. It connects
-as ZEO does: to a `(host, port)` address, to the path of a unix domain
-socket, or to the first server of a list that opens, with TLS from the
-`<ssl>` section of `<zoeclient>`. It checks the server against the CA
-certificates of `authenticate`, a file or a directory, else against those
-of the system, as ZEO does. It takes no `ssl` context: TLS runs in
-Rust, and a context does not give back the files of its certificate and
-key. It runs several transactions at once, each on its own connection of a
-pool, with one more connection that orders the invalidations (ADR 0036). It
-keeps a client cache of `cache_size` bytes, with the semantics of the cache
-of ZEO (ADR 0034): in memory, or in a file with `client` and `var`, or
-`cache`. It has blobs in both modes of ZEO: a blob cache in `blob_dir`, or
-a blob directory that it shares with the server (`shared_blob_dir`). It
-resolves in the client the conflicts that a vote lists, as
-`ZEO.ClientStorage` does. When it loses its server, it connects again in
-the background and verifies its cache, as ZEO does. It declares
-`sequences` and `kv`, and `trace_context` when the package `opentelemetry`
-is installed. It sends the traceparent as the client of ZEO does. It has the
-rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
-`record_iternext`, `pack`, `undoInfo` and `undoLog`, `server_status`,
-`deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
-`new_addr` and `client_label`. It speaks only the msgpack protocol `M5`: a
-stock ZEO server needs `msgpack true`. When the caller gives no `native`
-and the open with `wait` finds a stock ZEO server that speaks only the
-pickle protocol `Z5`, the instance takes the asyncio client of ZEO inside
-and logs a warning. `_NOT_BUILT` names the arguments whose feature it does
-not have yet. It is empty.
+`_NativeClientStorage` runs on `zoe._zoe.Client`, the binding of the Rust
+crate `zoe-client`, and not on the asyncio client of ZEO. It is still an
+instance of `ZEO.ClientStorage.ClientStorage`, and no thread of ZEO starts.
+The package `zoe.zeo` tells what it does.
 """
 
 import concurrent.futures
@@ -79,8 +19,6 @@ import ZODB.blob
 import ZODB.event
 import ZODB.interfaces
 import zope.interface
-from ZEO.asyncio.client import ClientIO, ClientThread, Fallback, Protocol
-from ZEO.asyncio.futures import run_coroutine_threadsafe
 from ZEO.ClientStorage import BlobCacheLayout, _lock_blob
 from ZEO.ClientStorage import ClientStorage as ZEOClientStorage
 from ZEO.Exceptions import ClientDisconnected
@@ -92,398 +30,26 @@ from ZODB.POSException import (
 )
 from ZODB.utils import z64
 
-try:
-    from opentelemetry.trace import get_current_span
-    from opentelemetry.trace.propagation.tracecontext import (
-        TraceContextTextMapPropagator,
-    )
-except ImportError:
-    _PROPAGATOR = None
-else:
-    _PROPAGATOR = TraceContextTextMapPropagator()
+from zoe import zodb
+from zoe.zeo._asyncio import (
+    _KV,
+    _LOCK_INTENT,
+    EXTENSIONS,
+    ClientStorage,
+    _traceparent,
+)
 
-__all__ = ["EXTENSIONS", "ClientStorage", "Sequence"]
-
-logger = logging.getLogger(__name__)
+# The native client logs under the name of the package, as the tests
+# and the filters of the logs expect.
+logger = logging.getLogger("zoe.zeo")
 
 # The native client logs the events of its connection under the logger of
 # `ZEO.ClientStorage`, with the words of ZEO, so a filter of the logs of
 # ZEO keeps them.
 _zeo_logger = logging.getLogger("ZEO.ClientStorage")
 
-# The extension that lets a call carry the trace context of the client.
-_TRACE_CONTEXT = "trace_context"
-
-# The extension of the KV namespaces.
-_KV = "kv"
-
-# The extensions that each connection declares in `register`. Without
-# OpenTelemetry, the client has no trace context to send.
-_TRACES = () if _PROPAGATOR is None else (_TRACE_CONTEXT,)
-# The extension of the early write-intent locks (ADR 0045).
-_LOCK_INTENT = "lock_intent"
-EXTENSIONS = ("sequences", _LOCK_INTENT, _KV, *_TRACES)
-
-# The flavours of the KV namespaces.
-_FLAVOURS = ("ephemeral", "durable")
-
-
-def _check_flavour(flavour):
-    """Raise `ValueError` when `flavour` is not a flavour of a namespace."""
-    if flavour not in _FLAVOURS:
-        raise ValueError(
-            f'the flavour of a namespace is "ephemeral" or "durable", not {flavour!r}'
-        )
-
-
-def _traceparent():
-    """Return the W3C traceparent of the current span, or None.
-
-    Without a valid current span, or without OpenTelemetry, return None.
-    """
-    if _PROPAGATOR is None:
-        return None
-    # Without a valid span, build no carrier.
-    if not get_current_span().get_span_context().is_valid:
-        return None
-    carrier = {}
-    _PROPAGATOR.inject(carrier)
-    return carrier.get("traceparent")
-
-
-class _InContext:
-    """A coroutine that runs each of its steps in the context of its caller.
-
-    The network thread runs the coroutine. ZEO runs the steps of a coroutine
-    without a context of their own, so a step sees the context that the
-    network thread has at that time. This wrapper runs each step in a copy
-    of the context of the thread that made the coroutine. So the current
-    span of OpenTelemetry in a step is the span of the caller.
-    """
-
-    __slots__ = ("_coro", "_context")
-
-    def __init__(self, coro):
-        self._coro = coro
-        self._context = contextvars.copy_context()
-
-    def send(self, value):
-        return self._context.run(self._coro.send, value)
-
-    def throw(self, error):
-        return self._context.run(self._coro.throw, error)
-
-    def close(self):
-        return self._coro.close()
-
-
-class _Protocol(Protocol):
-    """A connection to one server. It declares `EXTENSIONS` in `register`.
-
-    When the server accepted `trace_context`, each call carries the
-    traceparent of the current span.
-    """
-
-    # The connection sends the declaration until a server refuses it.
-    declares = True
-    # True when the server accepted `trace_context` on the connection.
-    # `ClientStorage.notify_connected` sets it.
-    traces = False
-
-    def finish_connection(self, protocol_version):
-        super().finish_connection(protocol_version)
-        # A connection without a protocol in common has no encoder.
-        self._encode = getattr(self, "encode", None)
-        if self._encode is not None:
-            self.encode = self._encode_call
-
-    def _encode_call(self, message_id, async_, method, args):
-        """Encode a call, with the traceparent of the current span when the
-        connection traces."""
-        traceparent = _traceparent() if self.traces else None
-        return self._encode_traced(message_id, async_, method, args, traceparent)
-
-    def _encode_traced(self, message_id, async_, method, args, traceparent):
-        """Encode a call. With a `traceparent`, add the trace context."""
-        if traceparent is None:
-            return self._encode(message_id, async_, method, args)
-        context = {"traceparent": traceparent}
-        return self._encode(message_id, async_, method, args, context)
-
-    def call_async_iter(self, it):
-        # This is `call_async_iter` of ZEO, with the traceparent of now. The
-        # socket can take the messages after this call ends, in another
-        # context.
-        traceparent = _traceparent() if self.traces else None
-        self.write_message_iter(
-            self._encode_traced(0, True, method, args, traceparent)
-            for method, args in it
-        )
-
-    async def _register(self, read_only):
-        if self.declares:
-            try:
-                return await self.server_call(
-                    "register", self.storage_key, read_only, list(EXTENSIONS)
-                )
-            except TypeError:
-                # A stock server takes two arguments. Its connection stays
-                # open and unregistered, so the client registers again.
-                self.declares = False
-        return await self.server_call("register", self.storage_key, read_only)
-
-    async def verify_connection(self):
-        # This is `Protocol.verify_connection` of ZEO, with `_register`.
-        async with self.client.register_lock:
-            try:
-                try:
-                    server_tid = await self._register(
-                        False if self.read_only is Fallback else self.read_only
-                    )
-                except ReadOnlyError:
-                    if self.read_only is not Fallback:
-                        raise
-                    self.read_only = True
-                    server_tid = await self._register(True)
-                else:
-                    if self.read_only is Fallback:
-                        self.read_only = False
-            except Exception as exc:
-                self.client.register_failed(self, exc)
-            else:
-                await self.client.register(self, server_tid)
-
-
-class _ClientIO(ClientIO):
-    """The client in the network thread. Its connections are `_Protocol`."""
-
-    def try_connecting(self):
-        # This is `ClientIO.try_connecting` of ZEO, with `_Protocol`.
-        if not self.closed:
-            self.protocols = [
-                _Protocol(
-                    self.loop,
-                    addr,
-                    self,
-                    self.storage_key,
-                    self.read_only,
-                    self.connect_poll,
-                    ssl=self.ssl,
-                    ssl_server_hostname=self.ssl_server_hostname,
-                )
-                for addr in self.addrs
-            ]
-
-
-class _ClientThread(ClientThread):
-    """The network thread. It runs a `_ClientIO`."""
-
-    def set_options(
-        self,
-        addrs,
-        wrapper,
-        cache,
-        storage_key,
-        read_only,
-        timeout=30,
-        disconnect_poll=1,
-        **kwargs,
-    ):
-        super().set_options(
-            addrs,
-            wrapper,
-            cache,
-            storage_key,
-            read_only,
-            timeout,
-            disconnect_poll,
-            **kwargs,
-        )
-        self._io_args = (addrs, wrapper, cache, storage_key, read_only, disconnect_poll)
-        self._io_kwargs = kwargs
-
-    def setup_delegation(self, loop):
-        # This is `ClientRunner.setup_delegation` of ZEO, with `_ClientIO`,
-        # and an `io_call` that runs its coroutine in the context of its
-        # caller. The asynchronous calls need no change: the event loop
-        # runs a callback of `call_soon_threadsafe` in the context of its
-        # caller.
-        self.loop = loop
-        self.client = client = _ClientIO(loop, *self._io_args, **self._io_kwargs)
-        self.call_sync_co = client.call_sync_co
-        self.load_before_co = client.load_before_co
-
-        def io_call(coro, wait=True):
-            if _PROPAGATOR is not None:
-                # The call sees the current span of its caller.
-                coro = _InContext(coro)
-            future = run_coroutine_threadsafe(coro, loop)
-            try:
-                return future.result() if wait else future
-            finally:
-                del future
-
-        self.io_call = io_call
-
-
-class Sequence:
-    """A named counter of the store of a `ClientStorage`.
-
-    `next()` gives values that are unique and strictly increasing per store
-    and per name, from 1.
-    """
-
-    def __init__(self, storage, name):
-        self._storage = storage
-        self._name = name
-
-    def next(self):
-        """Return the next value of the sequence.
-
-        The value is not part of a transaction: an abort does not give it
-        back. Each restart of the server can skip up to 100 values. Raise
-        `Unsupported` when the server did not accept `sequences`.
-        """
-        return self._storage._sequence_next(self._name)
-
-
-class ClientStorage(ZEOClientStorage):
-    """`ZEO.ClientStorage` with the ZOE extensions that the server accepts.
-
-    By default, the instance is a `_NativeClientStorage`: the native client
-    runs inside. With `native=False`, the asyncio client of ZEO runs
-    inside. A subclass runs the asyncio client of ZEO by default, and
-    `native=True` on it raises `TypeError`.
-
-    Without `native`, a server that speaks only the pickle protocol `Z5`
-    at the open with `wait` gives the asyncio client of ZEO inside: the
-    instance becomes a `ClientStorage` with `native=False`. With
-    `native=True`, such a server is a failed connection.
-    """
-
-    def __new__(cls, *args, native=None, **kw):
-        fall_back = native is None and cls is ClientStorage
-        if native is None:
-            native = issubclass(cls, _NativeClientStorage) or cls is ClientStorage
-        if native and cls is ClientStorage:
-            cls = _NativeClientStorage
-        elif native and not issubclass(cls, _NativeClientStorage):
-            raise TypeError(
-                f"{cls.__name__} runs the client of ZEO: native=True needs"
-                " zoe.zeo.ClientStorage itself"
-            )
-        instance = super().__new__(cls)
-        if fall_back:
-            # `_NativeClientStorage.__init__` reads and removes the mark.
-            instance._fall_back = True
-        return instance
-
-    def __init__(
-        self,
-        *args,
-        native=None,
-        early_locks=False,
-        early_lock_classes=None,
-        _client_factory=_ClientThread,
-        _ssl_section=None,
-        **kw,
-    ):
-        # The asyncio client of ZEO has one session and one commit lock for
-        # every thread of the process, so it takes no early locks.
-        if early_locks:
-            raise ValueError("early-locks on needs the native client: native true")
-        self.early_lock_classes = None
-        # `_ssl_section` is the `<ssl>` section of `<zoeclient>`. ZEO's
-        # client takes the context that it gives.
-        if _ssl_section is not None:
-            from ZEO.zconfig import client_ssl
-
-            kw["ssl"], server_hostname = client_ssl(_ssl_section)
-            if kw.get("ssl_server_hostname") is None:
-                kw["ssl_server_hostname"] = server_hostname
-        super().__init__(*args, _client_factory=_client_factory, **kw)
-
-    def notify_connected(self, conn, info):
-        # The calls of the connection carry the trace context only when the
-        # server accepted `trace_context`.
-        conn.protocol.traces = _TRACE_CONTEXT in info.get("extensions", ())
-        super().notify_connected(conn, info)
-        # A server that got no declaration gives no key `extensions`. Then
-        # remove the key of an earlier connection. The key stays during the
-        # update, so a call of `next()` meanwhile does not fail.
-        if "extensions" not in info:
-            self._info.pop("extensions", None)
-
-    def sequence(self, name):
-        """Return the sequence `name` of the store."""
-        if not isinstance(name, str):
-            raise TypeError(
-                f"the name of a sequence is a str, not {type(name).__name__}"
-            )
-        return Sequence(self, name)
-
-    def _sequence_next(self, name):
-        if "sequences" not in self._info.get("extensions", ()):
-            raise Unsupported("the server does not serve the extension sequences")
-        return self._call("sequence_next", name)
-
-    # The KV namespaces.
-
-    def kv_supported(self):
-        """Tell if the server accepted `kv` on the connection."""
-        return _KV in self._info.get("extensions", ())
-
-    def _check_kv(self, flavour=None):
-        if not self.kv_supported():
-            raise Unsupported("the server does not serve the extension kv")
-        if flavour is not None:
-            _check_flavour(flavour)
-
-    def kv_get(self, flavour, name, key):
-        """Return the value of `key` in the namespace `name` of `flavour`,
-        `"ephemeral"` or `"durable"`, as bytes, or None when the key has no
-        value or is expired. The read gives the last committed value."""
-        self._check_kv(flavour)
-        return self._call("kv_get", flavour, name, key)
-
-    def kv_scan(self, flavour, name, start=None, stop=None, limit=1000):
-        """Return the pairs `(key, value)` of the namespace `name` of
-        `flavour`, in the byte order of the keys, from `start` (included)
-        to `stop` (excluded), at most `limit` and at most 1,000."""
-        self._check_kv(flavour)
-        pairs = self._call("kv_scan", flavour, name, start, stop, limit)
-        return [(key, value) for key, value in pairs]
-
-    def kv_generation(self, name):
-        """Return the generation of the durable namespace `name`, the 8
-        bytes of the tid of the last commit that wrote it."""
-        self._check_kv()
-        return self._call("kv_generation", name)
-
-    def kv_set(self, flavour, name, key, value, ttl, transaction):
-        """Stage a write of `value` for `key` in the namespace `name` of
-        `flavour` in `transaction`, with the rules of `store`. An ephemeral
-        key needs `ttl`, in seconds; a durable key takes None. The server
-        reports an error of the write at the vote."""
-        self._check_kv(flavour)
-        self._check_trans(transaction, "kv_set")
-        self._async("kv_set", flavour, name, key, value, ttl)
-
-    def kv_delete(self, flavour, name, key, transaction):
-        """Stage a delete of `key` in the namespace `name` of `flavour` in
-        `transaction`, with the rules of `kv_set`."""
-        self._check_kv(flavour)
-        self._check_trans(transaction, "kv_delete")
-        self._async("kv_delete", flavour, name, key)
-
-
 # The size of the cache of ZEO when the caller gives none.
 _MB = 1024**2
-
-# The arguments of `ZEO.ClientStorage` whose feature the native client does
-# not have yet, each with the value that leaves its feature off. Any other
-# value fails the open with an error that names the argument.
-_NOT_BUILT = {}
 
 # The extensions that the native client declares: those of the client of
 # ZEO, and `server_writes` (ADR 0049). With it, the vote of the server can
@@ -766,13 +332,12 @@ def _dropping_of(storage):
     return dropping
 
 
-class _NativeClientStorage(ClientStorage):
+class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
     """`zoe.zeo.ClientStorage` with the native client inside.
 
     It takes the arguments of `ZEO.ClientStorage`. It ignores the arguments
-    that ZEO 6 ignores too. Each argument of `_NOT_BUILT` must keep the
-    value that leaves its feature off. `native` must stay true. `ssl` must
-    stay None: the TLS comes from the `<ssl>` section of `<zoeclient>`.
+    that ZEO 6 ignores too. `native` must stay true. `ssl` must stay None:
+    the TLS comes from the `<ssl>` section of `<zoeclient>`.
 
     With several addresses, the client connects to all of them and keeps
     one server: with `read_only_fallback`, a writable server before a
@@ -904,19 +469,10 @@ class _NativeClientStorage(ClientStorage):
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
-        from zoe import zodb
-
         # A bad list of hot classes raises before the client connects.
         self._early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
         given = dict(locals())
-        given.pop("zodb")
         fall_back = self.__dict__.pop("_fall_back", False) and wait
-        # Refuse a feature that is not built before any other step.
-        for key, off in _NOT_BUILT.items():
-            if given[key] != off:
-                raise Unsupported(
-                    f"the native client does not have {key} yet: leave {key} out"
-                )
         cache_path = _native_cache_path(cache, var, client, storage)
         if ssl is not None:
             raise Unsupported(
@@ -1008,8 +564,7 @@ class _NativeClientStorage(ClientStorage):
             return
         self._cache = _NativeCache(self._native, cache_size, cache_path)
         self._native_ready.set()
-        self._default_intents = self._native.intents()
-        self._bound_intents = threading.local()
+        self._init_intents()
         if self._early_lock_classes:
             zodb.install()
         try:
@@ -1320,9 +875,6 @@ class _NativeClientStorage(ClientStorage):
     def _async(self, method, *args):
         self._check_process()
         self._native.call_async(method, args)
-
-    def _async_iter(self, it):
-        raise Unsupported("the native client does not upload blobs yet")
 
     def new_addr(self, addr):
         self._check_process()
@@ -1697,39 +1249,24 @@ class _NativeClientStorage(ClientStorage):
     def kv_delete(self, flavour, name, key, transaction):
         self._check_trans(transaction, "kv_delete").kv_delete(flavour, name, key)
 
-    # The early write-intent locks (ADR 0045).
+    # The owners of the early write-intent locks of `zodb._IntentOwners`
+    # (ADR 0045). The first lock of an owner leases a connection of the
+    # pool, which it keeps until `unlock_intent` or the `tpc_begin` that
+    # adopts its locks. A server that did not accept the extension
+    # `lock_intent` gives `Unsupported`.
 
-    def new_intent_owner(self):
-        """Return a new owner of early write-intent locks. Its first lock
-        leases a connection of the pool, which it keeps until `unlock_intent`
-        or the `tpc_begin` that adopts its locks."""
+    def _new_owner(self):
         return self._native.intents()
 
-    def lock_intent(self, oids, owner=None):
-        """Take the early write-intent lock of each oid of `oids`, in
-        ascending order, and return the current serial of each one.
-
-        Without `owner`, the locks belong to the default owner of the client,
-        and the next `tpc_begin` adopts them. An oid at or below an oid that
-        the owner holds raises `StorageTransactionError` and takes nothing.
-        A wait past the lock timeout of the server raises `ConflictError`.
-        """
+    def _take_intents(self, owner, oids):
         self._check_process()
         if _LOCK_INTENT not in self._info.get("extensions", ()):
             raise Unsupported("the server does not serve the extension lock_intent")
-        owner = self._default_intents if owner is None else owner
-        return self._with_server(lambda: self._native.lock_intent(owner, list(oids)))
+        return self._with_server(lambda: self._native.lock_intent(owner, oids))
 
-    def unlock_intent(self, owner=None):
-        """Release every early write-intent lock of the owner."""
+    def _release_intents(self, owner):
         self._check_process()
-        self._native.unlock_intent(self._default_intents if owner is None else owner)
-
-    def bind_intent_owner(self, owner):
-        """Make `owner` the owner of the intent locks that the next
-        `tpc_begin` of the calling thread adopts, or the default owner again
-        when `owner` is None."""
-        self._bound_intents.owner = owner
+        self._native.unlock_intent(owner)
 
     # The two-phase commit.
 
@@ -1763,7 +1300,7 @@ class _NativeClientStorage(ClientStorage):
                 status = status.decode("ascii")
             # The transaction adopts the intent locks of the owner that the
             # thread bound, or of the default owner.
-            owner = getattr(self._bound_intents, "owner", None) or self._default_intents
+            owner = self._begin_owner()
             native = self._native.begin(
                 _as_bytes(txn.user),
                 _as_bytes(txn.description),

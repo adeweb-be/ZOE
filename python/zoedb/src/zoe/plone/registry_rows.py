@@ -24,6 +24,7 @@ commits.
 """
 
 import collections
+import functools
 import io
 import pickle
 import secrets
@@ -33,6 +34,8 @@ import weakref
 import persistent
 from ZODB.broken import PersistentBroken, find_global, rebuild
 from ZODB.POSException import ConflictError
+
+import zoe.kv
 
 __all__ = [
     "LAYOUT",
@@ -63,16 +66,13 @@ FIELD = b"f"
 VALUE = b"v"
 
 # The longest key of a namespace, in bytes.
-MAX_KEY = 1024
+MAX_KEY = zoe.kv.MAX_KEY
 
 # The number of namespaces that the cache keeps for each storage.
 BOUND = 16
 
 # The number of scans of a namespace before a `ConflictError`.
 SCAN_TRIES = 3
-
-# The most pairs that one call of `kv_scan` gives.
-_PAGE = 1000
 
 
 def new_id():
@@ -178,16 +178,10 @@ def scan_rows(storage, name, tries=SCAN_TRIES):
     When a commit wrote the namespace in between, it scans again. After
     `tries` scans, it raises `ConflictError`.
     """
+    scan = functools.partial(storage.kv_scan, "durable", name)
     for _ in range(tries):
         before = storage.kv_generation(name)
-        rows = {}
-        cursor = None
-        while True:
-            page = storage.kv_scan("durable", name, cursor, None, _PAGE)
-            if not page:
-                break
-            rows.update((bytes(key), bytes(value)) for key, value in page)
-            cursor = bytes(page[-1][0]) + b"\x00"
+        rows = {bytes(key): bytes(value) for key, value in zoe.kv.scan_all(scan)}
         if storage.kv_generation(name) == before:
             marker = decode_marker(rows.get(MARKER))
             return rows, 0 if marker is None else marker[1]

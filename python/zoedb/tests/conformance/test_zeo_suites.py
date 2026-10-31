@@ -19,9 +19,10 @@ against a run of the harness. The builder never changes it: a test that
 fails is a bug, and a test that cannot pass is a question for the human.
 """
 
-import doctest
 import importlib
 import unittest
+
+from suite_support import cases_and_layers, class_of, name_of
 
 import zoe.testing
 
@@ -111,31 +112,6 @@ OUT = {
 }
 
 
-def name_of(test):
-    if isinstance(test, doctest.DocTestCase):
-        return test.id().rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-    method = getattr(test, "_testMethodName", "runTest")
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return f"{cls.__name__}.{method}"
-    return test.id()
-
-
-def class_of(test):
-    return type(test).__name__
-
-
-def walk(suite, layers=()):
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from walk(item, layers)
-    else:
-        yield suite, layers
-
-
 def suite_of(module_name):
     module = importlib.import_module(module_name)
     if hasattr(module, "test_suite"):
@@ -147,7 +123,9 @@ def run(module_name):
     result = unittest.TestResult()
     started, ran = [], 0
     try:
-        for test, layers in walk(suite_of(module_name), (zoe.testing.ZEO_LAYER,)):
+        for test, layers in cases_and_layers(
+            suite_of(module_name), (zoe.testing.ZEO_LAYER,)
+        ):
             name = name_of(test)
             if name in OUT or class_of(test) in OUT:
                 continue

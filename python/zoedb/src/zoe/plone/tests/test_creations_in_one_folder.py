@@ -71,8 +71,6 @@ scenario runs it. `just plone zoe backends` runs it, and `just plone zoe
 backends -t test_creations_in_one_folder` runs only this module.
 """
 
-import shutil
-import tempfile
 import threading
 import unittest
 
@@ -89,16 +87,11 @@ from plone.app.testing import (
 )
 from plone.folder.default import DefaultOrdering
 from Testing.makerequest import makerequest
-from ZODB.DB import DB
 from ZODB.POSException import ConflictError
-from zope.component.hooks import getSite, setSite
-from zope.globalrequest import clearRequest, getRequest, setRequest
+from zope.component.hooks import setSite
+from zope.globalrequest import clearRequest, setRequest
 
-from zoe.plone.tests.test_concurrent_creations import (
-    copy_records,
-    describe,
-    wire_ids,
-)
+from zoe.plone.tests import helpers
 from zoe.plone.tests.test_queued_indexing import drain, path_of, switch_on
 
 # The transactions of a round, each in a thread of its own.
@@ -216,7 +209,7 @@ class TestCreationsInOneFolder(unittest.TestCase):
         portal = self.layer["portal"]
         setRoles(portal, TEST_USER_ID, ["Manager"])
         switch_on(self)
-        wire_ids(self)
+        helpers.wire_ids(self)
         portal.portal_workflow.setChainForPortalTypes(
             ("Folder", "Document"), (WORKFLOW,)
         )
@@ -233,30 +226,9 @@ class TestCreationsInOneFolder(unittest.TestCase):
         """Copy the site of the layer to a new `zoe.Storage`, opened with
         the keyword arguments `options`. Return the site on that store, on
         a connection of this thread, until the end of the test."""
-        import zoe
-
-        directory = tempfile.mkdtemp(prefix="zoe-one-folder-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe", **options)
-        try:
-            copy_records(self.layer["zodbDB"].storage, storage)
-        except BaseException:
-            storage.close()
-            raise
-        self.db = DB(storage, pool_size=CREATORS + 2)
-        self.addCleanup(self.db.close)
-        connection = self.db.open()
-        self.addCleanup(connection.close)
-        self.addCleanup(setRequest, getRequest())
-        self.addCleanup(setSite, getSite())
-        self.addCleanup(transaction.abort)
-        app = makerequest(connection.root()["Application"])
-        setRequest(app.REQUEST)
-        portal = app[PLONE_SITE_ID]
-        setSite(portal)
-        login(portal, TEST_USER_NAME)
-        self.portal = portal
-        return portal
+        return helpers.open_site(
+            self, options, "zoe-one-folder-", CREATORS + 2, user=TEST_USER_NAME
+        )
 
     def in_connection(self, work):
         """Call `work(site)` with the site on a new connection, in a thread
@@ -295,59 +267,17 @@ class TestCreationsInOneFolder(unittest.TestCase):
         Then they commit, one after the other, in the order of their turns.
         Return the error of each turn that raised, by turn.
         """
-        db = self.db
-        changed = threading.Barrier(CREATORS, timeout=TIMEOUT)
-        done = [threading.Event() for _ in range(CREATORS)]
-        errors = {}
-
-        def creator(turn):
-            connection = db.open()
-            try:
-                app = makerequest(connection.root()["Application"])
-                setRequest(app.REQUEST)
-                site = app[PLONE_SITE_ID]
-                setSite(site)
-                login(site, TEST_USER_NAME)
-                create(site[FOLDER], number, turn)
-                # Each creator changes the site from the snapshot of its
-                # connection. Then the creators commit.
-                changed.wait()
-                if turn:
-                    done[turn - 1].wait(TIMEOUT)
-                transaction.commit()
-            except BaseException as error:
-                errors[turn] = error
-            finally:
-                done[turn].set()
-                transaction.abort()
-                logout()
-                setSite(None)
-                clearRequest()
-                connection.close()
-
-        threads = [
-            threading.Thread(target=creator, args=(turn,)) for turn in range(CREATORS)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(TIMEOUT)
-            self.assertFalse(thread.is_alive())
-        # The connection of this thread sees the commits of the round.
-        transaction.begin()
-        return errors
+        return helpers.run_round(
+            self,
+            CREATORS,
+            lambda site, turn: create(site[FOLDER], number, turn),
+            TIMEOUT,
+        )
 
     def create_rounds(self):
         """Run each round. Return the errors of each round that had one, as
         text, by round and turn."""
-        failed = {}
-        for number in range(ROUNDS):
-            errors = self.create_round(number)
-            if errors:
-                failed[number] = {
-                    turn: describe(error) for turn, error in sorted(errors.items())
-                }
-        return failed
+        return helpers.round_errors(self.create_round, ROUNDS)
 
     def new_ids(self):
         """Return the ids of the Documents of the rounds, by round."""
@@ -432,7 +362,7 @@ class TestCreationsInOneFolder(unittest.TestCase):
             if isinstance(error, ConflictError)
         }
         others = {
-            turn: describe(error)
+            turn: helpers.describe(error)
             for turn, error in errors.items()
             if not isinstance(error, ConflictError)
         }

@@ -9,17 +9,26 @@ import subprocess
 import sysconfig
 from pathlib import Path
 
+from support import TIMEOUT
+
+import zoe.testing
+
 
 def test_the_console_script_refuses_to_serve(tmp_path):
     script = Path(sysconfig.get_path("scripts")) / "zoe"
     environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
     store = tmp_path / "store"
-    result = subprocess.run(
+    # A script that serves dies with the test.
+    process = zoe.testing._spawn(
         [str(script), "serve", "--path", str(store), "--listen", "127.0.0.1:0"],
         env=environ,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
+    )
+    stdout, stderr = process.communicate(timeout=TIMEOUT)
+    result = subprocess.CompletedProcess(
+        process.args, process.returncode, stdout, stderr
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert result.stdout == ""

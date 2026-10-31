@@ -14,8 +14,8 @@ from unittest import mock
 import transaction
 from plone.app.testing import PLONE_FUNCTIONAL_TESTING
 
-from zoe.plone import registry as backend
 from zoe.plone import registry_rows
+from zoe.plone.tests.helpers import RegistryBackend
 
 
 class Bound(str):
@@ -44,20 +44,8 @@ class Bound(str):
         return str.__ge__(self, other)
 
 
-class TestRegistryReadCost(unittest.TestCase):
+class TestRegistryReadCost(RegistryBackend, unittest.TestCase):
     layer = PLONE_FUNCTIONAL_TESTING
-
-    def setUp(self):
-        backend.install()
-        self.addCleanup(backend.uninstall)
-        self.portal = self.layer["portal"]
-        self.registry = self.portal.portal_registry
-
-    def moved(self):
-        """Move the registry of the site and commit. Return it."""
-        backend.move(self.registry)
-        transaction.commit()
-        return self.registry
 
     def test_keys_of_a_range_compare_a_number_of_names_that_grows_as_a_log(self):
         registry = self.moved()

@@ -10,6 +10,7 @@ import os
 import threading
 
 import pytest
+from support import ZERO, commit
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import (
     ReadOnlyError,
@@ -21,8 +22,6 @@ from ZODB.tests import IteratorStorage, RecoveryStorage, StorageTestBase
 
 import zoe
 import zoe.storage
-
-ZERO = bytes(8)
 
 
 class ZODBIterationTests(
@@ -76,16 +75,6 @@ def storage(tmp_path):
     opened = zoe.Storage(str(tmp_path / "store"))
     yield opened
     opened.close()
-
-
-def commit(storage, writes):
-    """Commit writes, a list of `(oid, serial, data)`, and return the tid."""
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    for oid, serial, data in writes:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
 
 
 def rows(iterator):

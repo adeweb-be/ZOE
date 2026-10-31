@@ -53,6 +53,7 @@ import importlib
 import unittest
 
 import pytest
+from suite_support import cases_and_layers
 from ZODB.tests.TransactionalUndoStorage import TransactionalUndoStorage
 
 import zoe
@@ -167,18 +168,6 @@ def name_of(test):
     raise AssertionError(f"no class defines {test.id()}")
 
 
-def walk(suite, layers=()):
-    """Yield each test of suite with its layers, the outer layer first."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from walk(item, layers)
-    else:
-        yield suite, layers
-
-
 def run(suite):
     """Run suite under STORAGE_LAYER and the layers of its tests.
 
@@ -189,7 +178,7 @@ def run(suite):
     started = []
     collected = 0
     try:
-        for test, layers in walk(suite, (zoe.testing.STORAGE_LAYER,)):
+        for test, layers in cases_and_layers(suite, (zoe.testing.STORAGE_LAYER,)):
             name = name_of(test)
             if name in OUT:
                 continue
@@ -312,7 +301,7 @@ def test_the_blob_suite_of_zodb_passes():
         test_packing=False,
         test_undo=True,
     )
-    names = {name_of(test) for test, _ in walk(suite)}
+    names = {name_of(test) for test, _ in cases_and_layers(suite)}
     assert "RecoveryBlobStorage.testSimpleBlobRecovery" in names
     assert "blob_transaction_txt" in names
 

@@ -89,8 +89,6 @@ logins run there. The merges of ZOE run in the core, so the in-process
 """
 
 import secrets
-import shutil
-import tempfile
 import threading
 import unittest
 
@@ -105,12 +103,11 @@ from plone.app.testing import (
     setRoles,
 )
 from Testing.makerequest import makerequest
-from ZODB.DB import DB
 from zope.component import getMultiAdapter
-from zope.component.hooks import getSite, setSite
-from zope.globalrequest import clearRequest, getRequest, setRequest
+from zope.component.hooks import setSite
+from zope.globalrequest import clearRequest, setRequest
 
-from zoe.plone.tests.test_concurrent_creations import copy_records, describe
+from zoe.plone.tests import helpers
 from zoe.plone.tests.test_profile_one_folder import PROFILE_FUNCTIONAL_TESTING
 
 # The two members of the test.
@@ -194,29 +191,7 @@ class TestConcurrentLogins(unittest.TestCase):
         """Copy the site of the layer to a new `zoe.Storage`, opened with
         the keyword arguments `options`. Return the site on that store, on
         a connection of this thread, until the end of the test."""
-        import zoe
-
-        directory = tempfile.mkdtemp(prefix="zoe-logins-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe", **options)
-        try:
-            copy_records(self.layer["zodbDB"].storage, storage)
-        except BaseException:
-            storage.close()
-            raise
-        self.db = DB(storage, pool_size=POOL_SIZE)
-        self.addCleanup(self.db.close)
-        connection = self.db.open()
-        self.addCleanup(connection.close)
-        self.addCleanup(setRequest, getRequest())
-        self.addCleanup(setSite, getSite())
-        self.addCleanup(transaction.abort)
-        app = makerequest(connection.root()["Application"])
-        setRequest(app.REQUEST)
-        portal = app[PLONE_SITE_ID]
-        setSite(portal)
-        self.portal = portal
-        return portal
+        return helpers.open_site(self, options, "zoe-logins-", POOL_SIZE)
 
     def login_round(self, accounts):
         """Run one round: one thread for each account of `accounts`, each
@@ -304,7 +279,8 @@ class TestConcurrentLogins(unittest.TestCase):
             errors, written = self.login_round(accounts)
             if errors:
                 failed[number] = {
-                    turn: describe(error) for turn, error in sorted(errors.items())
+                    turn: helpers.describe(error)
+                    for turn, error in sorted(errors.items())
                 }
             history.append((before, written, self.stored_times()))
         return failed, history

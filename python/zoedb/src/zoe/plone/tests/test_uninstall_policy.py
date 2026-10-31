@@ -19,6 +19,7 @@ import transaction
 from plone.app.testing import TEST_USER_ID, applyProfile, setRoles
 from zope.component.hooks import getSite, setSite
 
+from zoe.plone.tests import helpers
 from zoe.plone.tests import test_profile_one_folder as alone
 
 SWITCHES = ("folder_orders", "split_merges")
@@ -59,17 +60,9 @@ class TestUninstallPolicy(unittest.TestCase):
         transaction.commit()
 
     def add_site(self, site_id="other"):
-        from Products.CMFPlone.factory import addPloneSite
-
-        site = getSite()
-        try:
-            addPloneSite(
-                self.app, site_id, extension_ids=("plone.app.contenttypes:default",)
-            )
-        finally:
-            setSite(site)
-        transaction.commit()
-        return self.app[site_id]
+        return helpers.add_site(
+            self.app, site_id, extension_ids=("plone.app.contenttypes:default",)
+        )
 
     def test_an_uninstall_switches_off_what_the_profile_switched_on(self):
         from zoe.plone import merges

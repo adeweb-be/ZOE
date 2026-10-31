@@ -7,15 +7,15 @@ msgpack, of 100 KB and of 1 MiB, of bytes that compress and of bytes that
 do not, through `load`, `loadBefore` and `prefetch`.
 """
 
+import functools
 import pickle
 import random
 
-import pytest
+import support
+from support import ZERO, client
 
-from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
+# The transactions of the test have this user and this description.
+commit = functools.partial(support.commit, user=b"user", description=b"large")
 
 # Around 255 and 65,535 bytes, the limits of bin 8 and bin 16, then 100 KB
 # and 1 MiB.
@@ -31,29 +31,6 @@ def record(size, compressible, seed):
         body = random.Random(seed).randbytes(size)
     meta = (("persistent.mapping", "PersistentMapping"), None)
     return pickle.dumps(meta, 3) + pickle.dumps({"data": body}, 3)
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT, **kw)
-
-
-def commit(storage, stores):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData(b"user", b"large")
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 def test_a_stock_client_gets_the_bytes_of_each_large_record(server):

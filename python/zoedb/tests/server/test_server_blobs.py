@@ -13,25 +13,17 @@ it reads it.
 import os
 
 import pytest
+import support
 
 from zoe.testing import ZoeServer
 
-TIMEOUT = 30
 # Larger than many chunks of 64 KiB, and not a multiple of it.
 LARGE = 3 * 1024 * 1024 + 12345
 
 
 def client(server, blob_dir, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(
-        server.address,
-        storage="1",
-        wait_timeout=TIMEOUT,
-        blob_dir=str(blob_dir),
-        shared_blob_dir=False,
-        **kw,
-    )
+    """Open a stock client with a blob cache in `blob_dir`."""
+    return support.client(server, blob_dir=str(blob_dir), shared_blob_dir=False, **kw)
 
 
 @pytest.fixture

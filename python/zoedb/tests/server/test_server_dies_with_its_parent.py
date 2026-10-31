@@ -27,6 +27,8 @@ import time
 
 import pytest
 
+import zoe.testing
+
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
     reason="Linux only: the parent-death signal and /proc",
@@ -114,8 +116,9 @@ def name_of(pid):
 
 def start_child(script, *args, cwd):
     """Run `script` in a child Python process. Return the process and the
-    id of the `zoe serve` process that it started."""
-    child = subprocess.Popen(
+    id of the `zoe serve` process that it started. The child dies with the
+    test, so its server dies too."""
+    child = zoe.testing._spawn(
         [sys.executable, "-c", script, *args],
         cwd=cwd,
         stdin=subprocess.DEVNULL,

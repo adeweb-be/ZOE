@@ -52,21 +52,15 @@ import dataclasses
 import importlib
 import io
 import json
-import os
 import random
-import subprocess
-import threading
 
 import pytest
+from acceptance_support import current_record as record
 from persistent.mapping import PersistentMapping
+from support import TIMEOUT, serving
 
 import zoe.testing
-from zoe.testing import ZoeServer
 
-# The largest tid. loadBefore(oid, MAX_TID) loads the current record.
-MAX_TID = (2**63 - 1).to_bytes(8, "big")
-# The longest time that a test waits for the server.
-TIMEOUT = 30
 # The modes: in-process, and through zoe serve with each client.
 MODES = ("in-process", "zeo-client", "native-client")
 # The mapping classes that a policy names: Mapping, and the class of Zope.
@@ -159,42 +153,6 @@ def install(db, new_policy):
         zoe.policy.install(conn, new_policy)
     with db.transaction() as conn:
         return zoe.policy.read(conn)["version"]
-
-
-@contextlib.contextmanager
-def serving(path, environment):
-    """Run `zoe serve` on path with environment. Yield its address."""
-    command = [
-        ZoeServer.binary(), "serve", "--path", str(path), "--listen", "127.0.0.1:0"
-    ]  # fmt: skip
-    environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-    environ.update(environment)
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        env=environ,
-        text=True,
-    )
-    try:
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    break
-            else:
-                raise RuntimeError(f"zoe serve stopped with {process.wait()}")
-        finally:
-            timer.cancel()
-        yield (host.strip("[]"), int(port))
-    finally:
-        process.kill()
-        process.wait()
-        process.stdout.close()
 
 
 @contextlib.contextmanager
@@ -508,10 +466,6 @@ def generated_cases():
 
 def plain(obj):
     return dict(obj.__getstate__())
-
-
-def record(db, oid):
-    return db.storage.loadBefore(oid, MAX_TID)[0]
 
 
 @dataclasses.dataclass
