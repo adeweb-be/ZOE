@@ -9,16 +9,16 @@
 
 use std::collections::BTreeSet;
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     MAX, Server, Value, ZOE, begin, commit, fresh_dir, items, new_oids, p64, record, s, u64_of,
 };
 
 #[test]
 fn the_help_names_the_pool_option_and_its_twin() {
     let output = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         std::process::Command::new(ZOE)
             .args(["serve", "--help"])
             .output()
@@ -51,7 +51,7 @@ fn many_pipelined_loads_each_get_their_reply() {
     for (id, oid) in ids.iter().zip(&oids) {
         let reply = conn.reply_to(id).unwrap();
         let parts = items(&reply);
-        assert_eq!(wire::bytes_of(&parts[0]), record(&oid.to_be_bytes()));
+        assert_eq!(common::bytes_of(&parts[0]), record(&oid.to_be_bytes()));
         assert_eq!(u64_of(&parts[1]), tid);
         seen.insert(*oid);
     }
@@ -126,7 +126,7 @@ fn a_load_passes_a_waiting_vote(extra: &[&str]) {
 
 /// Check that a vote ended in a conflict on `oid`: an error reply, or a
 /// reply that lists the conflict of `oid` for the client to resolve.
-fn assert_conflict(outcome: Result<Value, wire::Fault>, oid: u64) {
+fn assert_conflict(outcome: Result<Value, common::Fault>, oid: u64) {
     match outcome {
         Err(fault) => assert_eq!(fault.class, "ZODB.POSException.ConflictError"),
         Ok(reply) => {

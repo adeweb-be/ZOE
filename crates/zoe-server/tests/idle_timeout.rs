@@ -12,9 +12,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, Server, TIMEOUT, Value, ZOE, begin, commit, fresh_dir, load, new_oids, p64, record, s,
     u64_of,
 };
@@ -29,7 +29,7 @@ const BEAT: Duration = Duration::from_millis(500);
 
 /// Wait at most `limit` for the reply to the call `id`, and send a
 /// heartbeat every `BEAT` meanwhile, as a stock client does every 60 s.
-fn reply_with_heartbeats(conn: &mut Conn, id: &Value, limit: Duration) -> wire::Message {
+fn reply_with_heartbeats(conn: &mut Conn, id: &Value, limit: Duration) -> common::Message {
     let started = Instant::now();
     conn.stream().set_read_timeout(Some(BEAT)).unwrap();
     loop {
@@ -56,7 +56,7 @@ fn reply_with_heartbeats(conn: &mut Conn, id: &Value, limit: Duration) -> wire::
 #[test]
 fn the_help_names_the_timeout_and_its_twin() {
     let output = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         std::process::Command::new(ZOE)
             .args(["serve", "--help"])
             .output()

@@ -1,56 +1,15 @@
 //! Tests of the `zoe` binary beside its acceptance test.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-cli-options-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// Return a command that runs `zoe` with `args` and the variables `env`.
-/// No other `ZOE_*` variable reaches it. Its stdout and stderr are pipes.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Command {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
-}
-
-fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
-    common::output(&mut zoe(args, env))
-}
-
-/// Check the exit code, and show the output if it is not the one expected.
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+use common::{assert_exit, fresh_dir, zoe, zoe_command};
 
 /// Make an empty store in `dir`.
 fn empty_store(dir: &Path) {
-    drop(common::open(dir));
+    drop(common::open_store(dir));
 }
 
 #[test]
@@ -60,7 +19,7 @@ fn dry_run_on_the_command_line_wins_over_its_twin() {
     empty_store(&store);
     let path = store.to_str().unwrap();
     let pack = |flag: &str, twin: &str| {
-        let output = run(
+        let output = zoe(
             &["pack", "--path", path, "--days", "7", flag],
             &[("ZOE_DRY_RUN", twin)],
         );
@@ -94,7 +53,7 @@ fn unlinked_store(dir: &Path) -> zoe_core::Oid {
     use zoe_core::{Oid, Tid};
 
     let (root, object) = (Oid(0), Oid(1));
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(root, Tid::ZERO, &record(&[object])).unwrap();
     txn.store(object, Tid::ZERO, &record(&[])).unwrap();
@@ -116,11 +75,11 @@ fn pack_gc_on_the_command_line_wins_over_its_twin() {
     let pack = |flags: &[&str], twin: &str| {
         let mut args = vec!["pack", "--path", path, "--days", "0"];
         args.extend_from_slice(flags);
-        let output = run(&args, &[("ZOE_PACK_GC", twin)]);
+        let output = zoe(&args, &[("ZOE_PACK_GC", twin)]);
         assert_exit(&output, 0, &format!("{flags:?} with ZOE_PACK_GC={twin}"));
         String::from_utf8(output.stdout).unwrap()
     };
-    let kept = || common::open(&store).load(object).is_ok();
+    let kept = || common::open_store(&store).load(object).is_ok();
 
     // A dry run reports the pack of its option, and removes nothing.
     let report = pack(&["--dry-run"], "false");
@@ -153,7 +112,12 @@ fn a_source_that_is_not_a_data_fs_creates_no_store() {
     std::fs::write(&not_data_fs, b"this is not a FileStorage file").unwrap();
     let short = dir.join("short");
     std::fs::write(&short, b"FS").unwrap();
-    for source in [&dir, &not_data_fs, &short, &dir.join("missing")] {
+    for source in [
+        &dir.to_path_buf(),
+        &not_data_fs,
+        &short,
+        &dir.join("missing"),
+    ] {
         let store = dir.join("zoe");
         let args = [
             "convert",
@@ -162,7 +126,7 @@ fn a_source_that_is_not_a_data_fs_creates_no_store() {
             "--path",
             store.to_str().unwrap(),
         ];
-        let output = run(&args, &[]);
+        let output = zoe(&args, &[]);
         assert_exit(&output, 1, &format!("convert {}", source.display()));
         assert!(!output.stderr.is_empty(), "the failure has no message");
         assert!(!store.exists(), "{} created a store", source.display());
@@ -174,7 +138,7 @@ fn a_source_that_is_not_a_data_fs_creates_no_store() {
 fn run_with_closed_stdout(args: &[&str]) -> Output {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    common::output(zoe(args, &[]).stdout(writer))
+    common::output(zoe_command(args, &[]).stdout(writer))
 }
 
 #[test]
@@ -195,7 +159,7 @@ fn a_reader_that_closes_stdout_does_not_fail_the_command() {
     ];
     let output = run_with_closed_stdout(&convert);
     assert_exit(&output, 0, "convert with a closed stdout");
-    let last = common::open(&store).last_transaction();
+    let last = common::open_store(&store).last_transaction();
     assert_ne!(last, zoe_core::Tid::ZERO, "the conversion copied nothing");
 
     let output = run_with_closed_stdout(&["pack", "--path", path, "--days", "7"]);
@@ -222,11 +186,11 @@ fn a_frame_limit_out_of_range_is_a_usage_error() {
             .iter()
             .map(|value| ("ZOE_MAX_FRAME_SIZE", *value))
             .collect();
-        let output = run(&args, &env);
+        let output = zoe(&args, &env);
         assert_exit(&output, 2, &format!("{option:?} {twin:?}"));
         assert!(!store.exists(), "a usage error created the store");
     }
-    let help = run(&["serve", "--help"], &[]);
+    let help = zoe(&["serve", "--help"], &[]);
     assert_exit(&help, 0, "serve --help");
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("--max-frame-size"), "{help}");

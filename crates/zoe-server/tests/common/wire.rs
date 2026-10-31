@@ -13,20 +13,16 @@
 //! accepts connections. With `--admin-listen`, it writes `admin <address>`
 //! before that line.
 
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 pub use rmpv::Value;
 
-/// The binary under test.
-pub const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use super::{ZOE, clear_zoe_env, s, spawn_lock, spawn_until_output};
 
 /// The longest time that a test waits for the server.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,51 +35,6 @@ pub const ZERO: [u8; 8] = [0; 8];
 
 /// The tid that loads the current record.
 pub const MAX: [u8; 8] = [0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-
-/// A spawned child keeps a copy of each file descriptor of the test
-/// process until `exec` closes them in the child, the lock of a store too.
-/// `Command::spawn` can return before that: the kernel wakes the parent of
-/// a `vfork` before the child closes these copies. So each open of a store
-/// holds this mutex. Each spawn holds it until the child is past `exec`:
-/// until the child writes to its stdout (`spawn_until_output`), answers a
-/// request, or ends.
-static SPAWN: Mutex<()> = Mutex::new(());
-
-/// Take the mutex of the spawns.
-pub fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Spawn `command`, whose stdout is a pipe, and wait for its first output
-/// or its end, with the mutex of the spawns held. A child that writes has
-/// finished `exec`, so it holds no descriptor of the test process. Return
-/// the child and its stdout, with nothing read from it.
-pub fn spawn_until_output(command: &mut Command) -> (Child, BufReader<ChildStdout>) {
-    let _spawn = spawn_lock();
-    let mut child = command.spawn().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    stdout.fill_buf().unwrap();
-    (child, stdout)
-}
-
-/// Open the store in `dir` in the test process.
-pub fn open_store(dir: &Path) -> zoe_core::Store {
-    let _spawn = spawn_lock();
-    zoe_core::Store::open(dir).unwrap()
-}
-
-/// Return a new empty directory for the test `name`.
-pub fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-serve-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// Return the text of a path.
-pub fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
 
 /// A `zoe serve` process. Dropping it kills the process.
 pub struct Server {
@@ -171,12 +122,7 @@ impl Server {
 
     fn spawn(&mut self) {
         let mut command = Command::new(&self.binary);
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("ZOE_") {
-                command.env_remove(name);
-            }
-        }
-        command
+        clear_zoe_env(&mut command)
             .arg("serve")
             .args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -550,18 +496,6 @@ pub fn items(value: &Value) -> Vec<Value> {
         Value::Array(items) => items.clone(),
         other => panic!("not an array: {other:?}"),
     }
-}
-
-/// A ZODB record of a `PersistentMapping` whose state holds `value` under
-/// the key `v`.
-pub fn record(value: &[u8]) -> Vec<u8> {
-    assert!(value.len() < 256);
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
 }
 
 /// Begin the transaction `txn` as a stock client does: `tpc_begin` has no

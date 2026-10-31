@@ -7,9 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s, u64_of};
+use common::{Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s, u64_of};
 
 #[test]
 fn a_vote_that_waits_for_a_lock_releases_its_locks_when_its_client_disconnects() {
