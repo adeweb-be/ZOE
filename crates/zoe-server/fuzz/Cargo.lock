@@ -2371,6 +2371,7 @@ dependencies = [
  "zoe-convert",
  "zoe-core",
  "zoe-mcp",
+ "zoe-pickle",
  "zoe-wire",
 ]
 

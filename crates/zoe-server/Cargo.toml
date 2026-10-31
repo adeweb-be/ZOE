@@ -20,6 +20,7 @@ serve = [
     "dep:rmpv",
     "dep:toml",
     "dep:zoe-mcp",
+    "dep:zoe-pickle",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:opentelemetry",
@@ -32,7 +33,7 @@ serve = [
 fuzz = ["serve"]
 # The deterministic simulator `zoe_server::sim`. Only the dev-dependency
 # below turns it on, so only test builds have it.
-sim = ["serve", "dep:redb", "dep:zoe-client", "dep:zoe-pickle"]
+sim = ["serve", "dep:redb", "dep:zoe-client"]
 
 [[bin]]
 name = "zoe"
