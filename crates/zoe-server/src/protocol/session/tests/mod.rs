@@ -34,6 +34,7 @@ use crate::protocol::clock;
 use crate::protocol::invalidation::{Commit, Others};
 use crate::protocol::method::{self, Lane};
 use crate::protocol::outbox::{Inbox, Outbox};
+use crate::protocol::testing::never_stops;
 use crate::protocol::{NamedStorage, Queues, ResolutionLog, Stopping, Storages};
 
 /// A pickle of a `persistent.mapping.PersistentMapping` record, as ZODB
@@ -141,11 +142,6 @@ fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
         drop(outbox);
         connection.finish().await;
     });
-}
-
-/// Return a signal that never tells a stop: its sender is gone.
-fn never_stops() -> Stopping {
-    Stopping::new().1
 }
 
 /// Return an outbox whose frames go nowhere.

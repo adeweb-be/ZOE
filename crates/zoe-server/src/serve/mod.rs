@@ -28,7 +28,6 @@
 //! its client sends after the stop, so its close is not a reset. It closes
 //! when the client closes, or a short time after its last frame. Then the
 //! stores close.
-
 //!
 //! `options` holds the settings of a server, and `listener` the ZEO port:
 //! its socket, the accept loop and the count of the connections.

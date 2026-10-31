@@ -829,6 +829,7 @@ mod tests {
     use zoe_wire::p64;
 
     use super::*;
+    use crate::protocol::testing::never_stops;
     use crate::protocol::{NamedStorage, Queues};
     use crate::runtime::Tokio;
 
@@ -922,7 +923,7 @@ mod tests {
                 outbox,
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let limit = Duration::from_secs(30);
             // No call runs, so the connection is quiet at once.
@@ -960,7 +961,7 @@ mod tests {
             outbox,
             Arc::new(Tokio),
             "test".into(),
-            Stopping::new().1,
+            never_stops(),
         );
         let register = vec![Value::from("1"), Value::Boolean(false)];
         start(&mut connection, vec![call(1, "register", register)]).await;
@@ -1010,7 +1011,7 @@ mod tests {
                 outbox,
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let limit = Duration::from_secs(30);
             let ping = call(1, "ping", Vec::new());
@@ -1112,7 +1113,7 @@ mod tests {
                 outbox.clone(),
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let register = vec![Value::from("1"), Value::Boolean(false)];
             start(&mut connection, vec![call(1, "register", register)]).await;
@@ -1155,7 +1156,7 @@ mod tests {
                 outbox.clone(),
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let register = vec![Value::from("1"), Value::Boolean(false)];
             // The vote takes the lock of oid 1 and waits for oid 2, longer
@@ -1191,7 +1192,7 @@ mod tests {
                 outbox.clone(),
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let ended = connection.ended();
             let register = vec![Value::from("1"), Value::Boolean(false)];
