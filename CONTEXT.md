@@ -60,6 +60,54 @@ _Avoid_: checkpoint
 The key space that lists, for each tid, the oids that its transaction wrote; the iterator and the server read the oids of a transaction from it.
 _Avoid_: oid list, transaction log (that is the rows of the transactions)
 
+**Log**:
+The write-ahead log of a store: the segment files of `wal/`. A finish appends its commit batch to it and syncs it, and the fold writes it into the tables later (ADR 0056).
+_Avoid_: journal, transaction log (that is the rows of the transactions), WAL (in prose)
+
+**Tables**:
+The redb tables of a store, which hold its records, rows and keys; the log holds only the commits that the tables do not hold yet.
+_Avoid_: database (alone), main store
+
+**Segment**:
+One file of the log, `wal/<n>.wal`. A use of a segment starts with a write of its header in the state "in use" with a new epoch, and the entries of that epoch are the entries of the use.
+_Avoid_: log file, chunk
+
+**Spare**:
+A segment whose header passes its checksum and says "spare": it holds no entry that counts, and the next use takes it, so the log writes no zeros once it reaches its size. A header that fails its checksum is never a spare.
+_Avoid_: free segment, empty segment
+
+**Entry**:
+The record of one commit batch in a segment: a header with the epoch of its use, the previous tid and the last tid, then the ops of each commit, each frame as the tables store it.
+_Avoid_: log record, block
+
+**Fold**:
+The thread that writes the commits of the log into the tables, in slices, when the backlog reaches `fold_bytes`, when its oldest commit reaches `fold_age`, or on a request.
+_Avoid_: checkpoint (that is a snapshot), flush, compaction
+
+**Slice**:
+One backend write of the fold: the oldest commits of the backlog, whole commits, up to `slice_bytes`, committed with a sync.
+_Avoid_: batch (that is a commit batch or a pack batch)
+
+**Folded tid**:
+The last tid that the tables hold durably, F: `last_tid` in `meta`; only a slice and a direct batch move it.
+_Avoid_: checkpoint tid, flushed tid
+
+**Log published tid**:
+The last tid P whose commit the unfolded table holds whole; the leader stores it after the whole batch is in the table, and each read of the table ignores what is after it (ADR 0056).
+_Avoid_: published tid (alone, that is the tid of the last commit whose invalidations went out)
+
+**Backlog**:
+The commits after the folded tid: the log and the unfolded table hold them. `backlog_bytes` bounds it, and a finish that would pass the bound waits for the fold.
+_Avoid_: queue, lag
+
+**Unfolded table**:
+The index in memory of the records and the namespace writes of the backlog; every read reads it before the tables, so a load makes one lookup.
+_Avoid_: memtable, cache
+
+**Direct batch**:
+A commit batch that the leader writes into the tables, not into the log: a batch of deferred restores, the batch after a deferred commit that no sync covered, a batch of mostly large records on an empty backlog, a batch larger than half of the bound of the backlog, and each batch when the log is off.
+_Avoid_: bypass, large commit
+
 ## Commit and conflicts
 
 **Two-phase commit**:

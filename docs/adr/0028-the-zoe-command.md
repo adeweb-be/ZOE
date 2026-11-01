@@ -75,6 +75,7 @@ These commands only read, and use the repairing open of the next section: `zoe c
 - A repair reads every page, shows no progress and cannot stop. It needs write access to `zoe.redb`.
 - The kill loop runs `zoe verify`, which repairs, so it does not prove a clean stop. The tests with `Store::open_read_only` prove it.
 - The scratch copy of `zoe verify --backup` uses the strict open, because the command closes it itself.
+- The repair of the open of the tools also folds the write-ahead log into `zoe.redb` when it holds a commit after the folded tid, slice by slice, and still writes only `zoe.redb`; on a damaged log it fails with `CorruptTxn` and folds nothing. The strict read-only open refuses a store whose log holds a commit after the folded tid with `NotClosedCleanly` (ADR 0056, section 14).
 
 ## Alternatives
 

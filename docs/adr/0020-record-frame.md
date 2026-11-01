@@ -72,6 +72,7 @@ The rules of a valid zstd payload: specification, "Storage core", "Record framin
 - A feature that uses the format room needs no migration. Each record costs 32 bytes on top of its pickle.
 - A new store is as large as its records. N14's target, a Plone store at least 3× smaller than `Data.fs`, holds only with `compression zstd`.
 - The tests of zstd behaviour open their stores with zstd.
+- The write-ahead log carries the frames as the tables store them, byte for byte, and the fold copies them into the tables as they are (ADR 0056). A frame of the log passes its checksum under its key space and its key before a read or the fold uses it.
 
 ## Alternatives
 

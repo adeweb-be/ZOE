@@ -1,6 +1,6 @@
 # 0056. A write-ahead log with a background fold: ZOE format 3
 
-Status: proposed. Card ZOE-272. The decision to build the log, the name `ZOE format 3` and the refusal of a store of format 2 are settled. This record gives the design, revised after an independent review. It changes the on-disk format and pack, two red zones. It changes no wire message and no public Python API.
+Status: accepted. Card ZOE-272. The decision to build the log, the name `ZOE format 3` and the refusal of a store of format 2 are settled. This record gives the design, revised after an independent review. It changes the on-disk format and pack, two red zones. It changes no wire message and no public Python API.
 
 ## Context
 
