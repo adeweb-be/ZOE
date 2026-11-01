@@ -1,10 +1,11 @@
 """The publishable set of the benchmarks, in one command.
 
-    python -m plonebench showcase --plan [--json] [OPTIONS]
-    python -m plonebench showcase [--dir DIR] [OPTIONS]
+    python -m plonebench showcase --plan [--json] [--set NAME] [OPTIONS]
+    python -m plonebench showcase [--dir DIR] [--set NAME] [OPTIONS]
 
 `just bench showcase OPTIONS` runs it in the environment of bench/plone.
-The set, in the order of its runs:
+`--set` chooses the set: `default` (also without the option) or
+`capacity`. The default set, in the order of its runs:
 
 1. the builds: the release `zoe` binary, and the Plone instances `zeo` and
    `zoeclient`;
@@ -14,6 +15,10 @@ The set, in the order of its runs:
    ADR 0054);
 3. the native gate and the client benchmark, each on CPython 3.13 and on
    3.14t.
+
+The capacity set has the builds, then the same three steps for the
+fixture `xlarge` (or `xlarge-mini`), with 4 instances of 2 threads, and
+no native gate and no client benchmark.
 
 Before the instances of a run of `zoe-native-qi-kv` start, a client of
 the run imports the profile `zoe.plone:default` into the copy of the
@@ -57,6 +62,7 @@ from benchcommon import files
 from benchcommon.provenance import commit as commit_of
 from benchcommon.provenance import dirty as dirty_of
 
+from plonebench import stack
 from plonebench.showcase.execute import Execute, child_environment
 from plonebench.showcase.host import (
     PROVENANCE,
@@ -71,21 +77,19 @@ from plonebench.showcase.host import (
 )
 from plonebench.showcase.plan import (
     CLIENT_OBJECTS,
-    LOCUST_CPUS,
     MAX_LOAD,
     ROOT,
-    SERVER_CPUS,
-    SET,
+    SETS,
     STEP_SECONDS,
     TRIM,
     WARMUP,
-    ZOPE_CPUS,
     SetOptions,
     describe,
     done,
     duration,
     entries,
     estimate,
+    fixtures_of,
     plan,
     print_plan,
     refusal,
@@ -131,10 +135,19 @@ def parser() -> argparse.ArgumentParser:
         "target/bench/showcase/<started>)",
     )
     parser.add_argument(
+        "--set",
+        choices=tuple(SETS),
+        default="default",
+        help="the set: default (small and medium, the native gate and the "
+        "client benchmark) or capacity (xlarge with 4 instances); each set "
+        "gives the defaults of --fixtures, --instances, --threads and the "
+        "CPU lists (default: %(default)s)",
+    )
+    parser.add_argument(
         "--fixtures",
-        type=_fixtures,
-        default=tuple(SET),
-        help="the fixtures of the set, separated by ',' (default: small,medium)",
+        type=_names,
+        help="the fixtures of the set, separated by ',' (default: small,medium "
+        "for the set default, xlarge for the set capacity)",
     )
     parser.add_argument(
         "--step-seconds",
@@ -160,13 +173,26 @@ def parser() -> argparse.ArgumentParser:
         default=CLIENT_OBJECTS,
         help="the --objects of the client benchmark (default: %(default)s)",
     )
-    parser.add_argument("--server-cpus", default=SERVER_CPUS)
+    parser.add_argument(
+        "--instances",
+        type=_positive,
+        help="the Zope instances of each B5 run (default: 2, 4 for capacity)",
+    )
+    parser.add_argument(
+        "--threads",
+        type=_positive,
+        help="the threads of each instance (default: 2)",
+    )
+    parser.add_argument("--server-cpus", help="the CPU list of the server (default: 0)")
     parser.add_argument(
         "--zope-cpus",
-        default=ZOPE_CPUS,
-        help="the CPU list of each instance, separated by ';' (default: 1;3)",
+        help="the CPU list of each instance, separated by ';', one for each "
+        "instance (default: 1;3, 1;3;6;8 for capacity)",
     )
-    parser.add_argument("--locust-cpus", default=LOCUST_CPUS)
+    parser.add_argument(
+        "--locust-cpus",
+        help="the CPU list of Locust (default: 6, 12,13 for capacity)",
+    )
     parser.add_argument(
         "--max-load",
         type=float,
@@ -183,14 +209,11 @@ def parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _fixtures(text: str) -> tuple[str, ...]:
-    names = [name for name in text.split(",") if name]
-    unknown = sorted(set(names) - set(SET))
-    if unknown or not names:
-        raise argparse.ArgumentTypeError(
-            f"the fixtures are some of {', '.join(SET)}: {text}"
-        )
-    return tuple(name for name in SET if name in names)
+def _names(text: str) -> tuple[str, ...]:
+    names = tuple(name for name in text.split(",") if name)
+    if not names:
+        raise argparse.ArgumentTypeError(f"no fixture: {text!r}")
+    return names
 
 
 def _seconds(positive: bool):
@@ -223,16 +246,33 @@ def main(
         command.error("--json goes with --plan")
     if args.trim >= args.step_seconds:
         command.error("--trim must be shorter than --step-seconds")
+    definition = SETS[args.set]
+    try:
+        fixtures = fixtures_of(args.set, args.fixtures)
+    except ValueError as error:
+        command.error(str(error))
+
+    def given(value, default):
+        return default if value is None else value
+
     options = SetOptions(
-        fixtures=args.fixtures,
+        fixtures=fixtures,
         step_seconds=args.step_seconds,
         warmup=args.warmup,
         trim=args.trim,
         client_objects=args.client_objects,
-        server_cpus=args.server_cpus,
-        zope_cpus=tuple(args.zope_cpus.split(";")),
-        locust_cpus=args.locust_cpus,
+        server_cpus=given(args.server_cpus, definition.server_cpus),
+        zope_cpus=tuple(given(args.zope_cpus, definition.zope_cpus).split(";")),
+        locust_cpus=given(args.locust_cpus, definition.locust_cpus),
+        set=args.set,
+        instances=given(args.instances, definition.instances),
+        threads=given(args.threads, definition.threads),
     )
+    # Each instance runs on a CPU list of its own: refuse a short list
+    # before the plan, and before anything is written.
+    short = stack.cpus_refusal(options.settings())
+    if short is not None:
+        command.error(short)
     commit = commit_of()
     dirty = dirty_of()
     directory = None if args.dir is None else args.dir.absolute()
@@ -407,6 +447,10 @@ def _told(run: dict, record: dict) -> str:
     parts = []
     if "verdict" in record:
         parts.append(f"verification {record['verdict']}")
+    if record.get("zope_clock_mhz") is not None:
+        parts.append(f"zope clock {round(record['zope_clock_mhz'])} MHz")
+    if record.get("zope_throttle_seconds") is not None:
+        parts.append(f"zope throttle {record['zope_throttle_seconds']:.1f} s")
     if "exit" in record:
         text = f"exit {record['exit']}"
         if run["kind"] == "native" and record["exit"] == 1:

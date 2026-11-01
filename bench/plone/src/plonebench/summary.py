@@ -38,6 +38,9 @@ STACK_SETTINGS = (
     "zoe_cache_size",
     "zoe_compression",
 )
+# The keys of `result.json` that give the clock and the throttle time of
+# the Zope CPUs of a run.
+ZOPE_CPUS_KEYS = ("zope_clock_mhz", "zope_throttle_seconds")
 # The options of a run that a campaign shares.
 RUN_SETTINGS = (
     "warmup_seconds",
@@ -93,7 +96,7 @@ def document(results: list[dict]) -> dict:
         "stacks": _stacks(results),
         "scenarios": _scenarios(results),
         "steps": _steps(results),
-        "runs": [_run(r) for r in results],
+        "runs": _runs(results),
     }
     jsonschema.validate(summary, json.loads(SCHEMA.read_text()))
     return summary
@@ -304,6 +307,15 @@ def _steps(results: list[dict]) -> list[dict]:
                 }
             )
     return steps
+
+
+def _runs(results: list[dict]) -> list[dict]:
+    """Return one entry for each run. A key of ZOPE_CPUS_KEYS is in each
+    entry when a run of the campaign records it, and null in the entry of
+    a run that does not. So the summary of runs that record none of them
+    stays as it is."""
+    keys = [key for key in ZOPE_CPUS_KEYS if any(key in r for r in results)]
+    return [_run(r) | {key: r.get(key) for key in keys} for r in results]
 
 
 def _run(result: dict) -> dict:

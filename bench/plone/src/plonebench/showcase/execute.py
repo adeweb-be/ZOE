@@ -17,6 +17,7 @@ from benchcommon import servers as common
 
 from plonebench import corpus, fixture, runner, stack
 from plonebench.showcase.plan import SetOptions
+from plonebench.summary import ZOPE_CPUS_KEYS
 
 
 def _stop_group(process: subprocess.Popen, timeout: float = 60.0) -> None:
@@ -172,7 +173,12 @@ class Execute:
         with self.inprocess(self.log(run, directory)):
             runner.run(options)
         result = json.loads((out / "result.json").read_text())
-        return {"verdict": result.get("verification", {}).get("verdict", "not run")}
+        record = {"verdict": result.get("verification", {}).get("verdict", "not run")}
+        # The clock and the throttle time of the Zope CPUs go to the log.
+        for key in ZOPE_CPUS_KEYS:
+            if key in result:
+                record[key] = result[key]
+        return record
 
     def summary(self, run: dict, directory: Path) -> None:
         from plonebench import __main__ as cli

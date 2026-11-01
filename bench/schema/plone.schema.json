@@ -89,7 +89,7 @@
       "required": ["name", "preset", "objects", "catalog_entries", "spec"],
       "properties": {
         "name": { "description": "The name of the fixture, used as a path segment in the results repository.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
-        "preset": { "description": "The preset whose SiteSpec equals the spec of the fixture, else custom.", "enum": ["small", "medium", "large", "custom"] },
+        "preset": { "description": "The preset whose SiteSpec equals the spec of the fixture, else custom.", "enum": ["small", "medium", "large", "xlarge", "xlarge-mini", "custom"] },
         "objects": { "description": "The content objects of the site, from the equivalence of its stores.", "type": "integer", "minimum": 0 },
         "catalog_entries": { "description": "The entries of the catalog, from the equivalence of its stores.", "type": "integer", "minimum": 0 },
         "spec": {
@@ -232,7 +232,9 @@
           "stack": { "type": "string" },
           "repetition": { "type": "integer", "minimum": 0 },
           "verification": { "description": "The verdict of the verification of the run, or not run.", "enum": ["pass", "fail", "not run"] },
-          "violations": { "description": "The violations that the verification found, or null when it did not run.", "type": ["integer", "null"], "minimum": 0 }
+          "violations": { "description": "The violations that the verification found, or null when it did not run.", "type": ["integer", "null"], "minimum": 0 },
+          "zope_clock_mhz": { "description": "The mean clock of the CPUs of the Zope instances over the samples of the steps, trim excluded, in MHz; null when the run did not record it.", "type": ["number", "null"], "minimum": 0 },
+          "zope_throttle_seconds": { "description": "The time that the physical cores of the CPUs of the Zope instances spent throttled during the steps, trim excluded, summed over the cores, in seconds; null when the run did not record it.", "type": ["number", "null"], "minimum": 0 }
         }
       }
     }

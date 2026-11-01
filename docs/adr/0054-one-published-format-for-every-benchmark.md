@@ -68,6 +68,7 @@ It runs `python -m shootout publish` in the environment of `bench/shootout`. A S
 - The runs share one fixture, commit, machine name, Python of the instances and settings. Else `report` prints the key and its values, exits with 2 and writes no FILE. It writes the Markdown report in every case.
 - The machine name is the name that the runs recorded, else `ZOE_BENCH_MACHINE` of the report, else a slug of the CPU model.
 - A number that its counter does not give is null, never 0. A run without step numbers is in `runs`, not in `steps`.
+- Each entry of `runs` holds `zope_clock_mhz`, the mean clock of the Zope CPUs during the steps, and `zope_throttle_seconds`, the throttle time of their cores during the steps, when a run of the campaign records them; each is null for a run that does not give it. They are optional keys, so a document of runs that record neither stays as it is.
 - The document holds no host name, user name, path or password.
 
 ### 7. A run without a record of its tree, a part of the gate, and the commit of main

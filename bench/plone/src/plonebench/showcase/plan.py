@@ -20,7 +20,8 @@ PROFILES = {"zeo": None, "zoe-native-qi-kv": "zoe.plone:default"}
 TWO = (4, 16)
 # The users of the curve of the dashboard.
 CURVE = (1, 4, 8, 16, 32)
-# The scenarios of each fixture, with the users of their steps.
+# The scenarios of each fixture of the default set, with the users of
+# their steps.
 SET = {
     "small": (
         ("browse", TWO),
@@ -40,6 +41,20 @@ SET = {
         ("mixed", TWO),
     ),
 }
+# The capacity set, a decision of the human: the users of the curve of the
+# dashboard, and of the other scenarios.
+CAPACITY_CURVE = (4, 8, 16, 32, 64)
+CAPACITY_TWO = (8, 32)
+CAPACITY = (
+    ("edit", CAPACITY_CURVE),
+    ("create-spread", CAPACITY_CURVE),
+    ("contention-folder", CAPACITY_TWO),
+    ("contention-fields", CAPACITY_TWO),
+    ("contention-same", CAPACITY_TWO),
+    ("browse", CAPACITY_TWO),
+    ("catalog", CAPACITY_TWO),
+    ("mixed", CAPACITY_TWO),
+)
 BUILDS = ("zoe", "plone-zeo", "plone-zoeclient")
 PYTHONS = ("3.13", "3.14t")
 KINDS = ("build", "prepare", "b5", "summary", "native", "client")
@@ -57,13 +72,64 @@ ZOPE_CPUS = "1;3"
 LOCUST_CPUS = "6"
 MAX_LOAD = 8.0
 
+
+@dataclasses.dataclass(frozen=True)
+class Set:
+    """One set of the showcase: the scenarios of each of its fixtures, and
+    the defaults of its options."""
+
+    fixtures: dict[str, tuple]
+    default_fixtures: tuple[str, ...]
+    # True when the set runs the native gate and the client benchmark.
+    shootout: bool
+    instances: int
+    threads: int
+    server_cpus: str
+    zope_cpus: str
+    locust_cpus: str
+
+
+SETS = {
+    "default": Set(
+        fixtures=SET,
+        default_fixtures=tuple(SET),
+        shootout=True,
+        instances=2,
+        threads=2,
+        server_cpus=SERVER_CPUS,
+        zope_cpus=ZOPE_CPUS,
+        locust_cpus=LOCUST_CPUS,
+    ),
+    # A decision of the human, for the reference machine: the server on
+    # core 0, each instance on a performance core of its own whose sibling
+    # CPU stays idle, Locust on efficiency cores, and core 5 (CPUs 10 and
+    # 11) free for the system. `xlarge-mini` is for the tests.
+    "capacity": Set(
+        fixtures={"xlarge": CAPACITY, "xlarge-mini": CAPACITY},
+        default_fixtures=("xlarge",),
+        shootout=False,
+        instances=4,
+        threads=2,
+        server_cpus="0",
+        zope_cpus="1;3;6;8",
+        locust_cpus="12,13",
+    ),
+}
+
 # The estimates in seconds, from runs on the reference machine.
 BUILD_SECONDS = {"zoe": 60, "plone-zeo": 35, "plone-zoeclient": 35}
-PREPARE_SECONDS = {"small": 90, "medium": 343}
+PREPARE_SECONDS = {"small": 90, "medium": 343, "xlarge-mini": 240, "xlarge": 23_400}
 # A B5 run takes its warmup and its steps, a fixed time (the copy of the
-# store, the start and the stop), and a time for each second of warmup and
-# steps (the drain of the queue and the verification of the operations).
-B5_SECONDS = {"small": 15, "medium": 45}
+# store and its sync, the start and the stop), and a time for each second
+# of warmup and steps (the drain of the queue and the verification of the
+# operations). The fixed time depends on the server of the stack: the ZOE
+# store of a fixture is larger than its FileStorage.
+B5_SECONDS = {
+    "small": {"zeo": 15, "zoe": 15},
+    "medium": {"zeo": 45, "zoe": 45},
+    "xlarge-mini": {"zeo": 10, "zoe": 10},
+    "xlarge": {"zeo": 120, "zoe": 180},
+}
 B5_SECONDS_PER_SECOND = 1.25
 SUMMARY_SECONDS = 5
 NATIVE_SECONDS = 300
@@ -84,6 +150,9 @@ class SetOptions:
     server_cpus: str
     zope_cpus: tuple[str, ...]
     locust_cpus: str
+    set: str = "default"
+    instances: int = 2
+    threads: int = 2
 
     def to_json(self) -> dict:
         return json.loads(json.dumps(dataclasses.asdict(self)))
@@ -100,6 +169,8 @@ class SetOptions:
         defaults = stack.Settings()
         return dataclasses.replace(
             defaults,
+            instances=self.instances,
+            threads=self.threads,
             server_cpus=self.server_cpus,
             zope_cpus=self.zope_cpus,
             locust_cpus=self.locust_cpus,
@@ -129,6 +200,7 @@ def switches(name: str, settings: stack.Settings) -> dict:
 def entries(options: SetOptions) -> list[dict]:
     """Return the entries of the set, in the order of their runs, without
     their state."""
+    definition = SETS[options.set]
     runs = [
         {"id": f"build-{target}", "kind": "build", "target": target}
         for target in BUILDS
@@ -140,7 +212,7 @@ def entries(options: SetOptions) -> list[dict]:
         prepare = {"id": f"prepare-{preset}", "kind": "prepare"}
         runs.append({**prepare, "fixture": name, "preset": preset})
         measured = []
-        for scenario, users in SET[preset]:
+        for scenario, users in definition.fixtures[preset]:
             # With one repetition, the stack that goes first changes from
             # one scenario to the next, so a drift of the machine does not
             # favour one stack.
@@ -159,6 +231,8 @@ def entries(options: SetOptions) -> list[dict]:
                         "step_seconds": options.step_seconds,
                         "warmup_seconds": options.warmup,
                         "trim_seconds": options.trim,
+                        "instances": options.instances,
+                        "threads": options.threads,
                         "pinning": options.pinning(),
                         "profile": PROFILES[name_of_stack],
                         "switches": switches(name_of_stack, settings),
@@ -174,6 +248,8 @@ def entries(options: SetOptions) -> list[dict]:
                 "runs": [run["id"] for run in measured],
             }
         )
+    if not definition.shootout:
+        return runs
     for kind in ("native", "client"):
         for python in PYTHONS:
             run = {"id": f"{kind}-{python}", "kind": kind, "python": python}
@@ -194,7 +270,8 @@ def estimate(run: dict) -> int:
         return PREPARE_SECONDS[run["preset"]]
     if kind == "b5":
         load = run["warmup_seconds"] + run["step_seconds"] * len(run["users"])
-        return round(B5_SECONDS[run["preset"]] + (1 + B5_SECONDS_PER_SECOND) * load)
+        fixed = B5_SECONDS[run["preset"]][stack.STACKS[run["stack"]].server]
+        return round(fixed + (1 + B5_SECONDS_PER_SECOND) * load)
     if kind == "summary":
         return SUMMARY_SECONDS
     if kind == "native":
@@ -279,6 +356,13 @@ def print_plan(document: dict) -> None:
         None: "no record of the tree",
     }[document["dirty"]]
     print(f"commit: {document['commit'] or 'unknown'} ({tree})")
+    options = document["options"]
+    print(
+        f"set: {options['set']}, {options['instances']} instances of "
+        f"{options['threads']} threads; server CPUs {options['server_cpus']}, "
+        f"Zope CPUs {';'.join(options['zope_cpus'])}, "
+        f"Locust CPUs {options['locust_cpus']}"
+    )
     runs = document["runs"]
     width = max(len(run["id"]) for run in runs)
     for run in runs:
@@ -291,6 +375,22 @@ def print_plan(document: dict) -> None:
         f"total: {len(todo)} of {len(runs)} runs to do, "
         f"about {duration(document['estimate_seconds'])}"
     )
+
+
+def fixtures_of(name: str, names: tuple[str, ...] | None) -> tuple[str, ...]:
+    """Return the fixtures `names` of the set `name` in the order of the
+    set, or its default fixtures when `names` is None. Raise ValueError for
+    a fixture that the set does not have."""
+    definition = SETS[name]
+    if names is None:
+        return definition.default_fixtures
+    unknown = sorted(set(names) - set(definition.fixtures))
+    if unknown:
+        raise ValueError(
+            f"the fixtures of the set {name} are some of "
+            f"{', '.join(definition.fixtures)}: {','.join(names)}"
+        )
+    return tuple(preset for preset in definition.fixtures if preset in names)
 
 
 def _option(key: str, value) -> str:

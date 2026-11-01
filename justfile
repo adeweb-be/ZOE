@@ -640,7 +640,9 @@ plone scenario="zoe" command="start" *args:
 # `just bench showcase` runs the publishable set on this machine: the
 # builds, the fixtures, the B5 runs of `small` and `medium` on `zeo` and
 # `zoe-native-qi-kv`, one B5 summary for each fixture, and the native gate
-# and the client benchmark on CPython 3.13 and 3.14t. It writes
+# and the client benchmark on CPython 3.13 and 3.14t. `--set capacity`
+# runs the capacity set instead: the builds, the fixture `xlarge`, its B5
+# runs with 4 Zope instances on 4 cores, and its B5 summary. It writes
 # target/bench/showcase/<started>/, which `just bench publish` takes, and
 # resumes a directory that `--dir` gives. `--plan` prints the runs and
 # their estimates and runs nothing. It builds nothing before it starts:

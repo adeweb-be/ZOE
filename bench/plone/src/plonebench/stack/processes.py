@@ -23,6 +23,8 @@ from plonebench.stack.config import (
     STACKS,
     Settings,
     StackConfig,
+    cpus_refusal,
+    instance_cpus,
     interpreter,
     pin,
     serve_options,
@@ -171,6 +173,9 @@ class Stack:
         return conf
 
     def start_instances(self, timeout: float = 300.0) -> None:
+        refusal = cpus_refusal(self.settings)
+        if refusal is not None:
+            raise ValueError(refusal)
         serve = zope_serve_script()
         for index in range(self.settings.instances):
             home = self.instance_home(index)
@@ -185,7 +190,7 @@ class Stack:
                     probe_out if self.settings.probe else None,
                 )
             )
-            cpus = self.settings.zope_cpus[index % len(self.settings.zope_cpus)]
+            cpus = instance_cpus(self.settings)[index]
             log = open(home / "log" / "stdout.log", "w")
             self.logs.append(log)
             env = clean_environment(PYTHONPATH=str(PROBE))

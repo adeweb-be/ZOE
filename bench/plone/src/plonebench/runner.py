@@ -207,7 +207,11 @@ def run(options: RunOptions) -> Path:
     result["restore"] = {}
     store = fixture.restore(fixture_dir, config, run_dir, result["restore"])
     st = stack.Stack(config, options.settings, run_dir, store)
-    sample = sampler.Sampler(run_dir / "samples.jsonl", sampler.disk_of(store))
+    sample = sampler.Sampler(
+        run_dir / "samples.jsonl",
+        sampler.disk_of(store),
+        zope_cpus=sampled_cpus(options.settings),
+    )
     error = None
     try:
         t0 = time.time()
@@ -477,6 +481,11 @@ def _analyse(result: dict, run_dir: Path, options: RunOptions) -> None:
     samples = sampler.load(run_dir / "samples.jsonl")
     for step, (start, end) in zip(result["steps_results"], windows, strict=True):
         step["resources"] = sampler.summarize(samples, start + options.trim, end)
+    # The clock and the throttle time of the Zope CPUs over the steps, trim
+    # excluded, so a throttled run shows.
+    result["zope_clock_mhz"], result["zope_throttle_seconds"] = sampler.zope_cpus(
+        samples, [(start + options.trim, end) for start, end in windows]
+    )
     result["resources"] = sampler.summarize(samples, measured["start"], measured["end"])
     result["logins"] = analysis.op_summary(
         [r for r in records if r.kind.startswith("login")], probes, 1.0
@@ -534,6 +543,7 @@ def _print_summary(result: dict) -> None:
             f"p95 {p95:6.0f} ms, failures {total['failure_rate'] or 0:.2%}, "
             f"conflicts {conflicts}"
         )
+    print("  " + zope_cpus_line(result))
     indexing = result.get("indexing")
     if indexing:
         after = indexing["drained_after_seconds"]
@@ -553,3 +563,26 @@ def _print_summary(result: dict) -> None:
                         f"{delays['count']} keys, delay p50 {delays['p50']:.3f} s, "
                         f"p95 {delays['p95']:.3f} s, max {delays['max']:.3f} s"
                     )
+
+
+def sampled_cpus(settings: stack.Settings) -> tuple[int, ...]:
+    """Return the CPUs whose clock and throttle time the sampler reads: the
+    CPUs of the lists that the instances run on. A longer list of Zope CPUs
+    leaves out its last lists, so their idle CPUs do not count."""
+    return sampler.cpu_numbers(stack.instance_cpus(settings))
+
+
+def zope_cpus_line(result: dict) -> str:
+    """Return the line of the log that gives the clock and the throttle time
+    of the Zope CPUs of a run."""
+    settings = result["stack"]["settings"]
+    cpus = ";".join(settings["zope_cpus"][: settings["instances"]])
+    clock = result.get("zope_clock_mhz")
+    throttle = result.get("zope_throttle_seconds")
+    return (
+        f"zope CPUs {cpus}: clock "
+        + ("unknown" if clock is None else f"mean {round(clock)} MHz")
+        + ", throttle "
+        + ("unknown" if throttle is None else f"{throttle:.1f} s")
+        + " during the steps"
+    )

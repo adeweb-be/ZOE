@@ -266,6 +266,25 @@ def split_merges_refusal(config: StackConfig, settings: Settings) -> str | None:
     return None
 
 
+def cpus_refusal(settings: Settings) -> str | None:
+    """Return why the instances of the settings cannot each run on a CPU
+    list of their own, or None when they can. A longer list is valid: the
+    instances take its first lists."""
+    lists = len(settings.zope_cpus)
+    if lists < settings.instances:
+        return (
+            f"--zope-cpus gives {lists} CPU lists for --instances "
+            f"{settings.instances}: give one list for each Zope instance"
+        )
+    return None
+
+
+def instance_cpus(settings: Settings) -> tuple[str, ...]:
+    """Return the CPU list of each instance: the first lists of
+    `zope_cpus`, one for each instance."""
+    return tuple(settings.zope_cpus[: settings.instances])
+
+
 def profile_refusal(config: StackConfig) -> str | None:
     """Return why a run of `config` cannot import a profile of `zoe.plone`
     into its store, or None when it can."""

@@ -238,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("fixtures", help="list the fixtures")
 
     args = parser.parse_args(argv)
+    if args.command in ("prepare", "run", "campaign", "serve"):
+        # Refuse the CPU lists before the command looks for a fixture.
+        refusal = stack.cpus_refusal(settings_of(args))
+        if refusal is not None:
+            parser.error(refusal)
     if args.command == "prepare":
         spec = corpus.PRESETS[args.preset]
         if args.spec:
