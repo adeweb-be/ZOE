@@ -12,8 +12,8 @@
 //!
 //! The fold never takes the commit sequencer, and holds no lock across a
 //! write, a sync or a wait. A failed slice, or a panic of the thread, marks
-//! the fold failed: the store halts. The observer is called outside the
-//! guard of that failure.
+//! the fold failed: the store halts. The observer gets each slice before
+//! the waiters wake, and a panic of the observer does not reach that guard.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -76,7 +76,7 @@ impl Drop for Failing<'_> {
 
 /// What the fold does next.
 enum Step {
-    Folded(Report),
+    Folded,
     Wait(Duration),
 }
 
@@ -98,14 +98,14 @@ fn body(core: Arc<Core>) {
                 core.fail(&error);
                 return;
             }
-            Ok(Step::Folded(report)) => observe(&core, &report),
+            Ok(Step::Folded) => {}
             Ok(Step::Wait(timeout)) => waiter.wait(timeout),
         }
     }
 }
 
-/// Give a slice to the observer. An observer that panics does not stop the
-/// fold.
+/// Give a slice to the observer. A panic of the observer stays here: it
+/// does not reach the guard of the fold and does not stop the fold.
 fn observe(core: &Core, report: &Report) {
     if let Some(observer) = core.observer.get() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -124,7 +124,7 @@ fn step(core: &Core, waiter: &dyn Waiter) -> Result<Step> {
     match due(core) {
         Some(timeout) => Ok(Step::Wait(timeout)),
         None => match slice(core, waiter)? {
-            Some(report) => Ok(Step::Folded(report)),
+            Some(_) => Ok(Step::Folded),
             None => Ok(Step::Wait(UNPUBLISHED)),
         },
     }
@@ -171,9 +171,15 @@ fn due(core: &Core) -> Option<Duration> {
 /// published tid, up to `slice_bytes`. Return `None` when no commit is
 /// published. `waiter` is the waiter of the fold, for the wait for the end
 /// of a log sync that runs.
+///
+/// The observer gets the slice before the slice ends and the waiters wake.
+/// So a caller of `Store::fold` sees the slice in the observer.
 pub(super) fn slice(core: &Core, waiter: &dyn Waiter) -> Result<Option<Report>> {
     core.slicing.store(true, Ordering::SeqCst);
     let folded = fold_slice(core, waiter);
+    if let Ok(Some(report)) = &folded {
+        observe(core, report);
+    }
     core.slicing.store(false, Ordering::SeqCst);
     if let Ok(Some(_)) = folded {
         core.wake_waiters();
