@@ -440,6 +440,26 @@ impl Table {
             .map(|commit| (self.entry(commit.entry), commit))
     }
 
+    /// Return the commits of the backlog from `from` to `to`, both
+    /// included, at or before `p`, in tid order, each with a reference to
+    /// its entry and its ops. The references keep the entries in memory, so
+    /// the caller can read them after the lock.
+    pub(super) fn commit_refs(&self, from: Tid, to: Tid, p: Tid) -> Vec<Picked> {
+        let start = self.backlog.partition_point(|commit| commit.tid < from);
+        let end = self
+            .backlog
+            .partition_point(|commit| commit.tid <= to.min(p));
+        self.backlog
+            .range(start..end.max(start))
+            .map(|commit| Picked {
+                tid: commit.tid,
+                entry: Arc::clone(&self.entries[(commit.entry - self.base) as usize].entry),
+                ops: commit.ops.clone(),
+                bytes: commit.bytes,
+            })
+            .collect()
+    }
+
     /// Return the last op at or before `p` on the row `row` of `flavour`:
     /// `Some(Some(frame))` for a write, `Some(None)` for a removal, `None`
     /// when the backlog has no such op.

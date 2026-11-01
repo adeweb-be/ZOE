@@ -24,7 +24,7 @@ use crate::format::{self, KeySpace};
 use crate::kv::Flavour;
 use crate::types::{Oid, Tid};
 
-use super::table::{LogEntry, Table};
+use super::table::{LogEntry, Picked, Table};
 use super::{Core, Logged};
 
 /// Decode the record frame `bytes` of `oid` at `tid`, and check it.
@@ -93,11 +93,13 @@ fn lower(a: Option<Tid>, b: Option<Tid>) -> Option<Tid> {
 }
 
 /// The transaction rows of the tables merged with those of the backlog, in
-/// tid order. The backlog rows are a copy of the backlog in the range: a
-/// row of the tables in their tids is the same commit, which a slice moved.
+/// tid order. The backlog rows are a copy of the backlog in the range,
+/// taken before the snapshot of the tables: a row of the tables in their
+/// tids is the same commit, which a slice moved. A row of the copy is
+/// decoded when the iterator gives it.
 struct Merged<'a> {
     tables: TxnIter<'a>,
-    backlog: VecDeque<(Tid, Result<TxnMeta>)>,
+    backlog: VecDeque<Picked>,
     first: Tid,
     last: Tid,
     /// A row of the tables after the backlog, held until the backlog rows
@@ -112,8 +114,8 @@ impl Iterator for Merged<'_> {
     fn next(&mut self) -> Option<Result<TxnMeta>> {
         loop {
             if self.held.is_some() || self.tables_done {
-                if let Some((_, row)) = self.backlog.pop_front() {
-                    return Some(row);
+                if let Some(commit) = self.backlog.pop_front() {
+                    return Some(txn_row(&commit.entry, &commit.ops, commit.tid));
                 }
                 if let Some(held) = self.held.take() {
                     return Some(held);
@@ -299,14 +301,14 @@ impl Backend for Logged {
 
     fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
         let core = &self.core;
-        let backlog: VecDeque<(Tid, Result<TxnMeta>)> = match core.view() {
+        let backlog: VecDeque<Picked> = match core.view() {
             None => VecDeque::new(),
-            Some((p, table)) => table
-                .commits(from, to, p)
-                .map(|(entry, commit)| (commit.tid, txn_row(entry, &commit.ops, commit.tid)))
-                .collect(),
+            Some((p, table)) => table.commit_refs(from, to, p).into(),
         };
-        let (Some(&(first, _)), Some(&(last, _))) = (backlog.front(), backlog.back()) else {
+        let (Some(first), Some(last)) = (
+            backlog.front().map(|commit| commit.tid),
+            backlog.back().map(|commit| commit.tid),
+        ) else {
             return core.redb.iter_txns(from, to);
         };
         Box::new(Merged {
