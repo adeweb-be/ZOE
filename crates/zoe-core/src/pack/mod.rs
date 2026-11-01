@@ -260,6 +260,10 @@ impl Store {
             (at.min(last), last, watermark)
         };
         let _noting = Noting(&self.packing);
+        // The tables hold each commit up to the last tid, and the table of
+        // the write-ahead log none of them, before the mark: the pack
+        // removes rows of the tables only (ADR 0056, section 15).
+        self.backend.fold(last)?;
         let mut pack = Pack::new(self, tid, (tid > watermark).then_some(tid));
         pack.mark_roots(last)?;
         loop {

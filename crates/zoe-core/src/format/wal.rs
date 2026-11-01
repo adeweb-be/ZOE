@@ -372,12 +372,6 @@ impl Entry {
         header[48..56].copy_from_slice(&sum.to_le_bytes());
         self.bytes.resize(aligned, 0);
     }
-
-    /// Return the length of the body.
-    pub(crate) fn body_len(&self) -> usize {
-        let header = EntryHeader::decode(&self.bytes);
-        header.map_or(0, |header| header.body_len as usize)
-    }
 }
 
 /// The builder of an entry. The frames go straight into the bytes of the
@@ -554,12 +548,6 @@ impl EntryBuilder {
         let commit = self.commits.last_mut().expect("an op follows a commit");
         commit.ops.end = self.ops.len();
         commit.bytes.end = self.bytes.len();
-    }
-
-    /// Return the number of bytes of the entry so far, without the zeros of
-    /// the alignment.
-    pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
     }
 
     /// Return the entry. `Entry::seal` writes its header.

@@ -1,7 +1,8 @@
 //! A test hook that reads and rewrites the stored bytes of a row, so that
 //! a test can damage a frame and check that every read detects it. It
 //! also writes and removes a row of `meta`, so that a test can make a
-//! store of an older format.
+//! store of an older format. Each hook that reads or changes stored bytes
+//! first folds the whole write-ahead log, then works on the tables.
 //!
 //! The module also holds the helpers that the tests of this crate share:
 //! the unit tests and the integration tests. `tests/support` holds the
@@ -50,6 +51,7 @@ pub enum Key {
 /// Return the bytes that `store` holds under `key`, as stored. A row that
 /// does not exist is a `Backend` error.
 pub fn read_frame(store: &Store, key: Key) -> Result<Vec<u8>> {
+    store.fold()?;
     store
         .backend
         .read_stored(key)?
@@ -59,6 +61,7 @@ pub fn read_frame(store: &Store, key: Key) -> Result<Vec<u8>> {
 /// Store `bytes` under `key` in `store`, in place of the row. The hook
 /// checks nothing and changes no other row.
 pub fn write_frame(store: &Store, key: Key, bytes: &[u8]) -> Result<()> {
+    store.fold()?;
     store.backend.write_stored(key, bytes)
 }
 
@@ -66,12 +69,14 @@ pub fn write_frame(store: &Store, key: Key, bytes: &[u8]) -> Result<()> {
 /// changes no other row. The open store keeps the state that it read at
 /// its open, so the change counts from the next open.
 pub fn write_meta(store: &Store, key: &str, bytes: &[u8]) -> Result<()> {
+    store.fold()?;
     store.backend.write_meta_stored(key, Some(bytes))
 }
 
 /// Remove the row `key` of `meta`, as `write_meta` changes it. A row that
 /// does not exist is a `Backend` error.
 pub fn remove_meta(store: &Store, key: &str) -> Result<()> {
+    store.fold()?;
     store.backend.write_meta_stored(key, None)
 }
 
@@ -90,6 +95,7 @@ pub fn kv_expiry_key(expiry: u64, row: &[u8]) -> Vec<u8> {
 /// Return the bytes that `store` holds for the row `row` of the namespaces
 /// of `flavour`, as stored. A row that does not exist is a `Backend` error.
 pub fn read_kv_frame(store: &Store, flavour: Flavour, row: &[u8]) -> Result<Vec<u8>> {
+    store.fold()?;
     store
         .backend
         .kv_row(flavour, row)?
@@ -105,12 +111,14 @@ pub fn write_kv_frame(
     row: &[u8],
     bytes: Option<&[u8]>,
 ) -> Result<()> {
+    store.fold()?;
     store.backend.write_kv_stored(Some(flavour), row, bytes)
 }
 
 /// Put `key` in the index of the expiries of `store`, or remove it for
 /// `false`. The hook checks nothing and changes no other row.
 pub fn write_kv_expiry_key(store: &Store, key: &[u8], present: bool) -> Result<()> {
+    store.fold()?;
     store
         .backend
         .write_kv_stored(None, key, present.then_some(&[][..]))
@@ -445,8 +453,8 @@ pub fn events() -> Vec<Captured> {
 /// The database file of a store.
 const DATABASE: &str = "zoe.redb";
 
-/// A `MemVfs` that counts the syncs of the database file. Its clones
-/// share the files and the count.
+/// A `MemVfs` that counts the syncs of the database file and of the files
+/// of the write-ahead log. Its clones share the files and the count.
 #[derive(Clone, Default)]
 pub struct CountingVfs {
     vfs: MemVfs,
@@ -457,18 +465,21 @@ pub struct CountingVfs {
 #[derive(Debug)]
 pub struct CountedFile {
     file: MemFile,
-    /// The count of the database file, `None` for another file.
+    /// The count of the database file and of the files of the log, `None`
+    /// for another file.
     syncs: Option<Arc<AtomicU64>>,
 }
 
 impl CountingVfs {
-    /// Return the number of syncs of the database file.
+    /// Return the number of syncs of the database file and of the files of
+    /// the write-ahead log.
     pub fn syncs(&self) -> u64 {
         self.syncs.load(Ordering::SeqCst)
     }
 
     fn counted(&self, name: &str, file: MemFile) -> CountedFile {
-        let syncs = (name == DATABASE).then(|| Arc::clone(&self.syncs));
+        let counted = name == DATABASE || name.starts_with("wal/");
+        let syncs = counted.then(|| Arc::clone(&self.syncs));
         CountedFile { file, syncs }
     }
 }

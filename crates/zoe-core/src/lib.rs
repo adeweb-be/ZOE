@@ -27,6 +27,7 @@ pub mod testing;
 mod types;
 mod undo;
 pub mod vfs;
+mod wal;
 
 pub use backend::{BlobRecord, Bytes, Record, RecordEncoding, TxnMeta, TxnStatus};
 pub use blob::{BlobFile, BlobReader};

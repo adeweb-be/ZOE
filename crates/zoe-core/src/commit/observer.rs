@@ -67,7 +67,12 @@ impl Store {
     /// Give the store its observer. Only the first call sets it. Return
     /// false when the store has an observer already.
     pub fn set_observer(&self, observer: Arc<dyn Observer>) -> bool {
-        self.group.observer.set(observer).is_ok()
+        if self.group.observer.set(Arc::clone(&observer)).is_err() {
+            return false;
+        }
+        // The fold of the log tells the observer of its slices.
+        self.backend.set_observer(observer);
+        true
     }
 
     /// Return the observer of the store, if it has one.
