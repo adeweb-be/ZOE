@@ -29,7 +29,7 @@ const OBJECTS: u64 = 20;
 /// The commits of the writer in the test of the order.
 const COMMITS: u64 = 60;
 
-/// The bursts of the reader, and the loads of each burst.
+/// The least count of bursts of the reader, and the loads of each burst.
 const BURSTS: usize = 40;
 const BURST: usize = 50;
 
@@ -106,7 +106,14 @@ fn the_replies_to_a_burst_of_loads_keep_the_order_of_the_invalidations() {
     let mut seen_commits = 0;
     // Each reply: the oid, the serial and the data.
     let mut replies = Vec::new();
-    for burst in 0..BURSTS {
+    // The reader sends at least `BURSTS` bursts, and the last one starts
+    // after the end of the writer. So the loads overlap the commits, also
+    // when the commits are slow.
+    let mut bursts = 0;
+    loop {
+        let writer_ended = committing.is_finished();
+        let burst = bursts;
+        bursts += 1;
         // The loads that wait for their reply, by message id.
         let mut pending: HashMap<i64, u64> = HashMap::new();
         for n in 0..BURST {
@@ -149,9 +156,12 @@ fn the_replies_to_a_burst_of_loads_keep_the_order_of_the_invalidations() {
                 other => panic!("an unexpected message: {other}"),
             }
         }
+        if writer_ended && bursts >= BURSTS {
+            break;
+        }
     }
     committing.join().unwrap();
-    assert_eq!(replies.len(), BURSTS * BURST);
+    assert_eq!(replies.len(), bursts * BURST);
     // Each reply holds the data that the writer committed at its serial.
     let written = written.lock().unwrap();
     for (oid, serial, data) in replies {

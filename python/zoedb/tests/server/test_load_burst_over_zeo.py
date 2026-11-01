@@ -16,7 +16,7 @@ import threading
 import time
 
 import support
-from support import TIMEOUT, ZERO, client
+from support import TIMEOUT, ZERO, client, wait_for
 
 # The transactions of the test have this user and this description.
 commit = functools.partial(support.commit, user=b"user", description=b"burst")
@@ -38,6 +38,12 @@ def test_bursts_of_prefetched_loads_keep_the_order_of_the_invalidations(server):
     try:
         oids = [writer.new_oid() for _ in range(OBJECTS)]
         first = commit(writer, [(oid, ZERO, record(oid, 0)) for oid in oids])
+        # The invalidation of the first commit reaches the reader after the
+        # commit returns. Before it, the last transaction of the reader is
+        # zero, and a load before tid 1 finds no data.
+        wait_for(
+            lambda: reader.lastTransaction() == first, "the first commit on the reader"
+        )
         written = {(oid, first): record(oid, 0) for oid in oids}
         serials = {oid: first for oid in oids}
         failures = []
