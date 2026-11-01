@@ -28,6 +28,7 @@ Findings: 0
   pickles          0
   unknown classes  0
   count mismatch   0
+  log              0
 Classes: 2
    1  ZODB.blob.Blob
   44  persistent.mapping.PersistentMapping
@@ -40,7 +41,8 @@ The command checks:
 - the references of each current record: each object that it refers to has a record (`references`);
 - each current record: the command reads its class and its references from the pickle (`pickles`);
 - the object count of the store (`count mismatch`);
-- with `--classes`, each class of the store against the classes of your application (`unknown classes`).
+- with `--classes`, each class of the store against the classes of your application (`unknown classes`);
+- the write-ahead log in `wal/` (`log`): a damaged log is a finding, and the command then checks the tables alone.
 
 Each problem is a finding. A finding fails the command with exit code 1. The report goes to stdout.
 

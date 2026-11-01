@@ -15,6 +15,11 @@
 //! The walk counts the oids that have at least one record, deletions
 //! included. The store keeps this count in `object_count`, and a count
 //! that differs is a finding. A store without a count gives no finding.
+//!
+//! A damaged write-ahead log fails the open of the tools with `CorruptTxn`
+//! (ADR 0056). `zoe verify` then reports the damage as the finding `log`
+//! ([`LogProblem`]), opens the tables alone with
+//! `Store::open_read_only_tables`, and checks them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -85,6 +90,32 @@ pub struct CountProblem {
     pub counted: u64,
 }
 
+/// A write-ahead log that the open of the tools refused: the log hides a
+/// commit, or its chain of entries breaks (ADR 0056).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogProblem {
+    /// The tid that the error names: a commit that the log cannot give.
+    pub tid: Tid,
+    /// The text of the error.
+    pub error: String,
+}
+
+impl LogProblem {
+    /// Return the finding of `error`, the error of a read-only open of a
+    /// store, when it tells of a damaged log: `CorruptTxn`. An open reads
+    /// no transaction row, so only the log gives this error there. Return
+    /// `None` for another error.
+    pub fn of(error: &ZoeError) -> Option<Self> {
+        match error {
+            ZoeError::CorruptTxn { tid } => Some(Self {
+                tid: *tid,
+                error: error.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// The findings and the counts of `verify`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verification {
@@ -126,6 +157,10 @@ pub struct Verification {
     /// The classes of `classes` that the list of known classes does not
     /// name. It is empty when `verify` gets no list.
     pub unknown_classes: Vec<String>,
+    /// The damage of the write-ahead log, when the open of the tools
+    /// refused the store and the check read the tables alone. `verify`
+    /// does not set it: the caller that opened the store does.
+    pub log: Option<LogProblem>,
 }
 
 /// The form of the oids and the tids in the JSON of a report.
@@ -146,12 +181,14 @@ impl Verification {
             + self.pickles.len()
             + self.unknown_classes.len()
             + usize::from(self.count.is_some())
+            + usize::from(self.log.is_some())
     }
 
     /// Return the findings as one JSON object: the lists `checksums`,
     /// `blobs`, `references` and `pickles`, each with its first `limit`
-    /// findings, then `classes` and `unknown_classes`. The oids and the
-    /// tids have the form `ids`. The caller adds its other keys.
+    /// findings, then `classes`, `unknown_classes`, and `log`, the damage
+    /// of the write-ahead log or null. The oids and the tids have the form
+    /// `ids`. The caller adds its other keys.
     pub fn to_json(&self, ids: IdForm, limit: usize) -> Value {
         let oid = |oid: Oid| match ids {
             IdForm::Number => json!(oid.0),
@@ -184,6 +221,10 @@ impl Verification {
             limit,
             |p| json!({"oid": oid(p.oid), "tid": tid(p.tid), "error": p.error}),
         );
+        let log = self
+            .log
+            .as_ref()
+            .map(|p| json!({"tid": tid(p.tid), "error": p.error}));
         json!({
             "checksums": checksums,
             "blobs": blobs,
@@ -191,6 +232,7 @@ impl Verification {
             "pickles": pickles,
             "classes": self.classes,
             "unknown_classes": self.unknown_classes,
+            "log": log,
         })
     }
 }
