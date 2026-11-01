@@ -474,6 +474,11 @@ fn every_crash_image_of_a_pack_that_waits_for_the_fold_while_finishes_run() {
 
     assert!(images.iter().any(|image| image.is_after("packed")));
     for image in &images {
+        // The record starts with the empty store: the images before the
+        // first two commits hold no root.
+        if !image.is_after("acknowledged 1") {
+            continue;
+        }
         let store = reopen(image, &held());
         assert_eq!(store.load(root).unwrap().0, item("root", &[x]), "{image:?}");
         let (data, serial) = store.load(x).unwrap();

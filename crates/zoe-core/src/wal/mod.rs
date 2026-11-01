@@ -674,9 +674,12 @@ impl WriteTxn for LogWrite<'_> {
         core.publish(LogEntry { bytes, ops }, &commits, self.new_oids);
         let after = core.backlog_bytes();
         let fold_bytes = core.settings.fold_bytes;
+        // A fold that saw an empty backlog waits with no limit. The first
+        // commit gives it an age to wait for, so the leader wakes it.
         if self.fold_after {
             core.request(last);
-        } else if hints.housekeeping || (before < fold_bytes && after >= fold_bytes) {
+        } else if hints.housekeeping || before == 0 || (before < fold_bytes && after >= fold_bytes)
+        {
             core.fold_waiter.wake();
         }
         Ok(())

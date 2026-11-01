@@ -1110,7 +1110,8 @@ mod tests {
         // The root links the object, so the pack keeps its record.
         let last = commit(&store, &[(ROOT, record(&[Oid(1)]))]);
         // The row of `tid` says that it keeps no record, but its record and
-        // its index key stay.
+        // its index key stay. The fold puts the row into the tables first.
+        store.fold().unwrap();
         let row = store.backend.iter_txns(tid, tid).next().unwrap().unwrap();
         let mut write = store.backend.begin_write().unwrap();
         write

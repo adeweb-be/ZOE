@@ -101,8 +101,11 @@ fn a_pack_between_the_vote_and_the_finish_keeps_the_count_exact() {
     // one that the voted transaction writes.
     store.pack(store.last_transaction()).unwrap();
     assert_eq!(store.object_count(), Some(1));
-    // The finish writes the first object again, as a new object.
+    // The finish writes the first object again, as a new object. The log
+    // counts no new oid for a record with a previous serial, so the count
+    // is exact again when the slice of that commit folds it.
     txn.finish().unwrap();
+    store.fold().unwrap();
     assert_eq!(store.object_count(), Some(2));
     assert_exact(&store);
 }
@@ -171,11 +174,11 @@ fn a_count_that_is_not_8_bytes_does_not_open() {
 fn another_format_name_does_not_open() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
-    testing::write_meta(&store, "format", b"ZOE format 3").unwrap();
+    testing::write_meta(&store, "format", b"ZOE format 4").unwrap();
     drop(store);
     let error = Store::open_vfs(vfs).err();
     assert!(
-        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 3"),
+        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 4"),
         "{error:?}"
     );
 }

@@ -129,7 +129,7 @@ The leader, under the commit sequencer:
 6. Writes the entry with one write, then syncs the segment file (`sync_data`). This sync makes each member durable. A mark "a log sync runs" covers the write and the sync; a guard clears it on each path out, an error and a panic included.
 7. Publishes the batch: under one write lock of the unfolded table, the records, the blob records, the transaction rows and the namespace writes of each member go into the table and the backlog, and the new oids into the object count (section 19). Then it stores the published tid P, the last tid of the batch, with release ordering, and then the last tid of the store.
 8. Removes the intent files, notes the oids for a running pack and gives the members their outcomes, as before. The observer gets `batch_synced`.
-9. Wakes the fold when the backlog reaches `fold_bytes`.
+9. Wakes the fold when the backlog was empty before the batch, so the fold waits for the age of its oldest commit, or when the backlog reaches `fold_bytes`.
 
 A failure in steps 3 to 6 fails each member and halts the store, as a failed backend write does. The table gets none of the members. Their outcome is unknown until the next open, which replays the entry when it is whole on the disk.
 

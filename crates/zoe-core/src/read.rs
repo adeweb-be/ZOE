@@ -1351,6 +1351,8 @@ mod tests {
     /// oid 1 at `tid`, with no pack. A damaged index of the database looks
     /// the same to a read.
     fn remove_outside_a_pack(store: &Store, tid: Tid, record: bool) {
+        // The fold puts the commits into the tables, where the removal works.
+        store.fold().unwrap();
         let mut write = store.backend.begin_write().unwrap();
         if record {
             write.remove_record(Oid(1), tid).unwrap();

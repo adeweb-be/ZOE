@@ -1218,6 +1218,9 @@ fn every_crash_image_keeps_the_index_and_the_records_together() {
     }
     txn.vote().unwrap();
     let committed = txn.finish().unwrap();
+    // The images open the tables alone, so the fold writes each commit
+    // into them before its mark.
+    store.fold().unwrap();
     vfs.mark("committed");
 
     // A restore of a new version, a deletion and a new object.
@@ -1230,6 +1233,7 @@ fn every_crash_image_keeps_the_index_and_the_records_together() {
     txn.restore(Oid(oids[2].0 + 1), Some(b"new")).unwrap();
     txn.vote().unwrap();
     txn.finish().unwrap();
+    store.fold().unwrap();
     vfs.mark("restored");
 
     // A crash does not close the store, so the images end here.

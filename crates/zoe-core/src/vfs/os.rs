@@ -474,7 +474,7 @@ impl redb::StorageBackend for OsFile {
         let old = self.backend.len()?;
         self.backend.set_len(len)?;
         let zeros = match self.mode {
-            Mode::Database => len - old <= ZERO_FILL_MAX,
+            Mode::Database => len.saturating_sub(old) <= ZERO_FILL_MAX,
             Mode::Log => true,
             Mode::Spill => false,
         };
