@@ -53,12 +53,17 @@
 //! A pool with a cache can also prefetch the references of each record
 //! that a load fetches from the server (`set_prefetch_references`).
 //!
+//! A load of an oid at a tid that a load in flight already asks for waits
+//! for the reply of that load, and sends nothing.
+//!
 //! `transaction` holds the transactions of the pool, their finishes and
 //! their turns, and the early write-intent locks of an owner. `dispatch`
 //! holds the dispatcher, `reconnect` the reconnect and its verification,
-//! and `references` the prefetch of the references of a record.
+//! `references` the prefetch of the references of a record, and `join`
+//! the loads in flight.
 
 mod dispatch;
+mod join;
 mod reconnect;
 mod references;
 mod transaction;
@@ -79,6 +84,7 @@ use crate::protocol;
 use crate::runtime::{BoxFuture, Runtime};
 use crate::{Error, lock};
 use dispatch::dispatch;
+use join::Flights;
 use reconnect::upgrade_forever;
 pub use references::{PREFETCH_REFERENCES, PREFETCH_SCAN_LIMIT};
 pub use transaction::{Finished, PoolIntents, PoolTransaction, Turn};
@@ -243,6 +249,9 @@ struct Shared {
     /// held only to pick or to change one. A writer takes `state` first.
     server: RwLock<Server>,
     next_load: AtomicUsize,
+    /// The loads in flight, by oid and tid. The lock is held only to add
+    /// or remove a load or a waiter.
+    flights: Mutex<Flights>,
     state: Mutex<State>,
     /// A new value tells each waiter that the state changed.
     changed: watch::Sender<u64>,
@@ -444,16 +453,6 @@ impl Shared {
             .ok_or(Error::Disconnected)
     }
 
-    /// Load as `Pool::load_before` does, without the prefetch of the
-    /// references of the record.
-    async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
-        let (record, position) = self.any_connection()?.load_before_at(oid, tid).await?;
-        if let (Some(cache), Some(record)) = (&self.cache, &record) {
-            cache.store(oid, record.tid, record.end, &record.data, position);
-        }
-        Ok((record, position))
-    }
-
     /// Prefetch as `Pool::prefetch` does, with at most `limit` loads: the
     /// first oids of `oids` that the cache does not hold for `tid`.
     fn prefetch(self: &Arc<Self>, oids: &[Oid], tid: Tid, limit: usize) -> Result<usize, Error> {
@@ -592,6 +591,7 @@ impl Pool {
             references: AtomicBool::new(false),
             server: RwLock::new(server),
             next_load: AtomicUsize::new(0),
+            flights: Mutex::new(Flights::default()),
             state: Mutex::new(state),
             changed: watch::channel(0).0,
             pushed: Mutex::new(None),
@@ -707,6 +707,13 @@ impl Pool {
     /// into another database. The loads of the prefetch do not prefetch
     /// the references of their records. A prefetch that fails changes
     /// nothing.
+    ///
+    /// When a load of `oid` at `tid` is in flight, a load of the pool or of
+    /// a prefetch, the call waits for its reply and sends nothing: it gets
+    /// a copy of the record or of the error. A load at another tid sends
+    /// its own request. A caller that drops its future does not stop the
+    /// load for the other waiters. Once the reply is in the cache and the
+    /// waiters have it, the next call sends a new request.
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
         let loaded = self.shared.load_before(oid, tid).await?;
         if let Some(record) = &loaded.0
@@ -720,7 +727,8 @@ impl Pool {
     /// Prefetch the records of `oids` before `tid` into the cache, as
     /// `prefetch` of `ZEO.ClientStorage` does. Each oid that the cache does
     /// not hold for `tid` gets one load, and all the loads run at once, as
-    /// tasks of the pool. Return the number of loads at once: the tasks
+    /// tasks of the pool. A load of an oid in flight at `tid` joins it, as
+    /// in `load_before`. Return the number of loads at once: the tasks
     /// wait for the replies, and store each one as `load_before` does. So a
     /// current record that an invalidation ended while its reply was on its
     /// way does not go in. A load that fails changes nothing. The loads
