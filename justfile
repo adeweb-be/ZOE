@@ -604,6 +604,16 @@ plone scenario="zoe" command="start" *args:
 # server. It writes target/bench/client/<started>.json and prints the
 # rows, and builds `zoe` in release first. `just bench client report FILE`
 # prints the rows of a result and its verdict, and builds nothing.
+# `just bench profile COMMAND` runs the load path profile of
+# bench/shootout/src/shootout/loadpath.py: `terms` times each layer of a
+# load through ZODB on the native client and on ZEO.ClientStorage, on a hit
+# and on a miss of the client cache; `loop` repeats one round for a
+# profiler (`--py-spy FILE` needs the profiling profile of the shell);
+# `frames FILE` prints the time per frame of a py-spy file; `scan FILE`
+# counts the references of the records of a FileStorage. It builds `zoe`
+# in release first. `just bench profile plone` runs plonebench.loadpath:
+# Plone requests in one Zope thread of the stack zoe-native, on a copy of
+# the small fixture (`--py-spy` samples them).
 # `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
 # in release, start `zoe serve` on a new store in
 # target/bench/work/zoe-bench, with no `ZOE_*` variable of the caller, run
@@ -666,12 +676,23 @@ bench *args="run":
             family="$1"
             shift
             ;;
+        profile)
+            # `just bench profile plone OPTIONS` runs plonebench.loadpath.
+            if [ "${2:-}" = plone ]; then
+                family=plone
+                shift 2
+                set -- loadpath "$@"
+            else
+                family=shootout
+            fi
+            ;;
         load | saturate) family=zoe-bench ;;
         *) family=shootout ;;
     esac
     case "$family ${1:-} ${2:-}" in
         "shootout run "* | "shootout client run" | "shootout native run" | zoe-bench\ *) lock=true ;;
-        "plone prepare "* | "plone run "* | "plone campaign "*) lock=true ;;
+        "shootout profile terms" | "shootout profile loop") lock=true ;;
+        "plone prepare "* | "plone run "* | "plone campaign "* | "plone loadpath "*) lock=true ;;
         "replay test "* | "replay report "*) lock=false ;;
         replay\ *) lock=true ;;
         *) lock=false ;;
@@ -706,11 +727,15 @@ _bench-plone *args:
         exec "${plonebench[@]}" pytest -q "${@:-bench/plone/tests}"
     fi
     case "${1:-}" in
-        prepare | run | campaign | serve)
+        prepare | run | campaign | serve | loadpath)
             ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
             export ZOE_BINARY
             ;;
     esac
+    if [ "${1:-}" = loadpath ]; then
+        shift
+        exec "${plonebench[@]}" python -m plonebench.loadpath "$@"
+    fi
     exec "${plonebench[@]}" python -m plonebench "$@"
 
 # The log replay of bench/replay (B6).
@@ -783,11 +808,15 @@ _bench-shootout *args:
     shootout=(uv run --locked --project bench/shootout)
     case "${1:-} ${2:-}" in
         "client report" | "native report") ;;
-        run\ * | test\ * | client\ * | native\ *)
+        run\ * | test\ * | client\ * | native\ * | "profile terms" | "profile loop")
             ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
             export ZOE_BINARY
             ;;
     esac
+    if [ "${1:-}" = profile ]; then
+        shift
+        exec "${shootout[@]}" python -m shootout.loadpath "$@"
+    fi
     if [ "${1:-}" = test ]; then
         shift
         if [ "$#" -eq 0 ]; then
