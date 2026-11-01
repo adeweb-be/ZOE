@@ -33,6 +33,7 @@
 //! its socket, the accept loop and the count of the connections.
 
 mod listener;
+mod mask;
 mod options;
 
 use std::fmt;
@@ -51,6 +52,7 @@ use crate::protocol::{self, NamedStorage, Pool, ResolutionLog, Stopping, Storage
 use crate::tls::Tls;
 pub use crate::tls::TlsOptions;
 use listener::{Listener, SocketFile, Tasks, accept, bind_tcp};
+pub(crate) use mask::block_stop_signals;
 pub use options::{
     Address, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, DEFAULT_SHUTDOWN_TIMEOUT, ServeOptions,
     StorageOptions,
@@ -155,10 +157,16 @@ impl Server {
     /// before the start creates anything on disk. A signal during the
     /// start does not stop the start: each store open ends, and the start
     /// ends or fails. Then [`Server::serve_until_signal`] stops at once.
+    ///
+    /// The caller blocks both signals with [`block_stop_signals`] before
+    /// it starts a thread, so no signal comes while the handlers are
+    /// installed. This call unblocks them in the calling thread after the
+    /// handlers exist.
     pub(crate) fn start_with_signals(options: ServeOptions) -> Result<Self, Error> {
         options.check_storages()?;
         let runtime = new_runtime()?;
         let signals = Signals::handle(&runtime).map_err(Error::Runtime)?;
+        mask::unblock_stop_signals().map_err(Error::Runtime)?;
         Self::start_on(runtime, Some(signals), options, |_, path, options| {
             open_writer(path, options)
         })

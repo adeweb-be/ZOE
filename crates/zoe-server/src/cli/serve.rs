@@ -674,6 +674,10 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
 
     use crate::serve::{Address, ServeOptions, Server, StorageOptions, TlsOptions};
 
+    // Each thread that the command starts from here on blocks SIGTERM and
+    // SIGINT, the thread of the OTLP exporter too, until the start
+    // installed the handlers.
+    crate::serve::block_stop_signals()?;
     let storages = args.storages.iter().map(|storage| {
         let options = StorageOptions::new(&storage.name, &storage.path)
             .read_only(storage.read_only)
