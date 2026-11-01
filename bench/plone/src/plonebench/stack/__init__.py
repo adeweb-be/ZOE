@@ -48,6 +48,7 @@ from plonebench.stack.processes import (
     copy_store,
     http_ok,
     port_open,
+    sync_files,
     wait_for,
 )
 from plonebench.stack.templates import storage_section, wsgi_ini, zeo_conf, zope_conf
@@ -84,6 +85,7 @@ __all__ = [
     "split_merges_refusal",
     "storage_section",
     "store_layout",
+    "sync_files",
     "wait_for",
     "wsgi_ini",
     "zeo_conf",

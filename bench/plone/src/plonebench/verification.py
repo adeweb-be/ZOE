@@ -3,7 +3,20 @@
 `request(records, manifest)` names what `inzope/observe.py` must read.
 `judge(records, manifest, observed)` checks it and returns one entry per
 check, with its counts and up to EXAMPLES violations. Both are pure, so
-the tests check the rules without Zope.
+the tests check the rules without Zope. `manifest` is a manifest in
+memory, or the targets file of the fixture (`workload.TargetsFile`), so
+the runner does not load the whole manifest.
+
+The reads are bounded by the run, not by the site. The observer reads the
+objects that the ledger names, the containers of the creations, a fixed
+sample of the manifest, and catalog entries only around what the run
+wrote: the items of the manifest next to an object of the ledger, the
+children of its container, and the entries next to its record id. The
+length of the catalog covers the rest of the site: a run that adds or
+loses an entry anywhere changes it. A run writes only these objects,
+these containers and the catalog buckets that hold their entries, so a
+defect that a run makes lies there. `prepare` checks the fixture itself
+once.
 
 A timed-out or cut write is `ambiguous`: it may have committed. The rules
 accept both of its results, and count them apart.
@@ -11,10 +24,11 @@ accept both of its results, and count them apart.
 
 from __future__ import annotations
 
+import random
 import re
 from collections import defaultdict
 
-from plonebench import corpus
+from plonebench import corpus, workload
 from plonebench.ledger import AMBIGUOUS, FAILED, OK, REJECTED, Record
 
 EXAMPLES = 10
@@ -26,6 +40,14 @@ WORKFLOW_KINDS = ("workflow",)
 TITLE_PATHS = (f"{corpus.BENCH}/{corpus.HOT}/", f"{corpus.BENCH}/{corpus.SHARED}/")
 MAX_TITLE_PATHS = 64
 MAX_TOKENS = 4000
+# The items of the manifest on each side of an object of the ledger whose
+# catalog entry the observer checks. The build gives consecutive record
+# ids in the order of the manifest, and a bucket of an IOBTree holds at
+# most 60 keys: so these items hold the entries of the buckets that a
+# write of the object rewrites.
+NEIGHBOURS = 64
+# The items of the fixed sample.
+SAMPLE = 100
 _TOKEN = re.compile(r"^(?:Edit|New|Patch|Import) ([a-z]+ [a-z]+ [a-z]+ [a-z]+)(?: |$)")
 
 
@@ -46,7 +68,51 @@ def _writes(records: list[Record]) -> list[Record]:
     return [r for r in records if r.kind in EDIT_KINDS + WORKFLOW_KINDS + CREATE_KINDS]
 
 
-def request(records: list[Record], manifest: dict) -> dict:
+def container_of(record: Record) -> str | None:
+    """Return the container of a creation: the folder that it names, else
+    its target when it did not succeed, else the parent of its target."""
+    folder = record.values.get("folder")
+    if folder:
+        return folder
+    if not record.target:
+        return None
+    return record.target if record.outcome != OK else record.target.rpartition("/")[0]
+
+
+def neighbour_ranges(indexes, count: int, width: int = NEIGHBOURS) -> list[list[int]]:
+    """Return the ranges `[start, stop)` of the items of a manifest of
+    `count` items that lie at most `width` items from one of `indexes`,
+    merged and in order."""
+    ranges: list[list[int]] = []
+    for index in sorted(set(indexes)):
+        start, stop = max(0, index - width), min(count, index + width + 1)
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], stop)
+        else:
+            ranges.append([start, stop])
+    return ranges
+
+
+def sample(manifest, size: int = SAMPLE) -> list[str]:
+    """Return the fixed sample of the manifest: `size` paths drawn with the
+    seed of the spec, in the order of the manifest. Each run of one
+    fixture gets the same sample."""
+    site = workload.view(manifest)
+    count = len(site)
+    rng = random.Random(f"{site.seed}:sample")
+    picks = sorted(rng.sample(range(count), min(size, count)))
+    paths: list[str] = []
+    for start, stop in neighbour_ranges(picks, count, 0):
+        paths.extend(site.paths(start, stop))
+    return paths
+
+
+def request(records: list[Record], manifest) -> dict:
+    """Return what the observer reads after the run of `records`. Its size
+    follows the ledger, not the site: the paths of the ledger, the
+    containers of the creations, the ranges of the manifest around the
+    objects of the ledger, and the fixed sample."""
+    site = workload.view(manifest)
     paths: set[str] = set()
     tokens: list[str] = []
     for record in _writes(records):
@@ -69,11 +135,28 @@ def request(records: list[Record], manifest: dict) -> dict:
             if token:
                 tokens.append(token)
     titles = sorted(p for p in paths if p.startswith(TITLE_PATHS))[:MAX_TITLE_PATHS]
+    containers = sorted(
+        {
+            container
+            for record in records
+            if record.kind in CREATE_KINDS
+            and (container := container_of(record)) is not None
+        }
+    )
+    # The objects of the ledger that the fixture holds: the objects that
+    # the run wrote and the containers of its creations.
+    indexes = [
+        index
+        for path in sorted(paths | set(containers))
+        if (index := site.index(path)) is not None
+    ]
     return {
         "paths": sorted(paths),
         "tokens": tokens[:MAX_TOKENS],
         "version_titles": titles,
-        "manifest_paths": [item["path"] for item in manifest["items"]],
+        "containers": containers,
+        "neighbours": neighbour_ranges(indexes, len(site)),
+        "sample": sample(site),
     }
 
 
@@ -142,9 +225,26 @@ def _allowed_multi(ops: list[Record], field: str) -> set[str] | None:
     return allowed
 
 
-def judge(records: list[Record], manifest: dict, observed: dict) -> dict:
-    items = {item["path"]: item for item in manifest["items"]}
+def _same_state(catalog_state, state) -> bool:
+    """True when the review_state of a catalog entry is the state `state`.
+    An object without a workflow has an empty review_state."""
+    return catalog_state == state or (catalog_state in (None, "") and state is None)
+
+
+def judge(records: list[Record], manifest, observed: dict) -> dict:
+    site = workload.view(manifest)
     objects = observed["objects"]
+    entries = observed.get("entries", {})
+    sampled = observed.get("sample", [])
+    # The targets of the writes and the containers of the creations, with
+    # any outcome: the run may have changed them, so the manifest does not
+    # give their values.
+    written = {r.target for r in _writes(records) if r.target} | {
+        container
+        for r in records
+        if r.kind in CREATE_KINDS and (container := container_of(r)) is not None
+    }
+    items = site.items_by_path(written | set(entries) | set(sampled))
     checks = {
         "created": Check("created", "each acknowledged creation exists with its title"),
         "failed_writes": Check(
@@ -181,6 +281,11 @@ def judge(records: list[Record], manifest: dict, observed: dict) -> dict:
             "search",
             "the token of the current title finds the object, a superseded "
             "token does not",
+        ),
+        "sample": Check(
+            "sample",
+            "each object of a fixed sample that the run did not write has the "
+            "title, state, versions and workflow history of the manifest",
         ),
     }
 
@@ -238,6 +343,9 @@ def judge(records: list[Record], manifest: dict, observed: dict) -> dict:
     duplicates = len(observed["duplicate_uids"]) + len(
         observed["duplicate_history_ids"]
     )
+    duplicates += len(site.duplicate_uids)
+    for uid in site.duplicate_uids[:EXAMPLES]:
+        checks["unique_ids"].fail(f"UID {uid}: more than one item of the manifest")
     for uid, paths in list(observed["duplicate_uids"].items())[:EXAMPLES]:
         checks["unique_ids"].fail(f"UID {uid}: {paths}")
     for hid, paths in list(observed["duplicate_history_ids"].items())[:EXAMPLES]:
@@ -379,6 +487,53 @@ def judge(records: list[Record], manifest: dict, observed: dict) -> dict:
         checks["catalog"].fail(
             f"{observed['catalog_duplicates']} duplicate catalog paths"
         )
+    # The length of the catalog: the entries of the fixture and of each new
+    # object. An entry that the catalog adds or loses anywhere changes it.
+    if site.catalog_size is not None and "catalog_entries" in observed:
+        expected = site.catalog_size + len(observed["extra"])
+        if observed["catalog_entries"] == expected:
+            checks["catalog"].ok()
+        else:
+            checks["catalog"].fail(
+                f"the catalog holds {observed['catalog_entries']} entries, "
+                f"not {expected}"
+            )
+    # The entries next to the writes of the run, against the manifest.
+    for path, entry in sorted(entries.items()):
+        item = items.get(path)
+        if item is None or path in written:
+            continue
+        problems = []
+        if "title" in item and entry["Title"] != item["title"]:
+            problems.append("Title")
+        if "state" in item and not _same_state(entry["review_state"], item["state"]):
+            problems.append("review_state")
+        if problems:
+            checks["catalog"].fail(f"{path}: {', '.join(problems)} of the manifest")
+        else:
+            checks["catalog"].ok()
+    # The fixed sample, against the manifest.
+    for path in sampled:
+        item = items.get(path)
+        if item is None or path in written:
+            continue
+        seen = objects.get(path)
+        if not seen or not seen["exists"]:
+            checks["sample"].fail(f"{path}: missing")
+            continue
+        compared = [("title", "title"), ("state", "state"), ("versions", "versions")]
+        # The build reads the workflow history of an item through
+        # acquisition. So the manifest gives an item without a workflow,
+        # such as a File, the history of its container.
+        if item.get("state") is not None:
+            compared.append(("workflow history", "workflow_history"))
+        problems = [
+            name for name, key in compared if key in item and seen[key] != item[key]
+        ]
+        if problems:
+            checks["sample"].fail(f"{path}: {', '.join(problems)} of the manifest")
+        else:
+            checks["sample"].ok()
 
     tokens = observed.get("tokens", {})
     owners = {}

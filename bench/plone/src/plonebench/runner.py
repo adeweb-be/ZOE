@@ -1,7 +1,9 @@
 """One run: a stack, a scenario, a fixture, from a fresh copy to a verdict.
 
-1. Check the prerequisites and record the environment.
-2. Restore the store of the stack from the fixture.
+1. Check the prerequisites and record the environment. Write the targets
+   file of the fixture when it does not have one (`workload.ensure_targets`).
+2. Restore the store of the stack from the fixture: a full copy, synced to
+   the disk before the server starts.
 3. Start the server and the instances, and wait until each serves the site.
 4. Warm up with the `warmup` scenario, unless the run is a cold start.
 5. Run the scenario, with the server counters read before and after. With
@@ -158,6 +160,9 @@ def run(options: RunOptions) -> Path:
         raise SystemExit(
             "plonebench: missing prerequisites:\n  " + "\n  ".join(missing)
         )
+    # Locust and the verification read the targets file, never the whole
+    # manifest. A fixture of an older build gets it here, once.
+    workload.ensure_targets(fixture_dir)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     run_id = f"{stamp}-{options.scenario}-{options.stack}-r{options.repetition}"
     run_dir = options.out or (stack.WORK / "runs" / run_id)
@@ -199,7 +204,8 @@ def run(options: RunOptions) -> Path:
         "operation, so a slower server lowers the offered rate",
         "exclusions": [],
     }
-    store = fixture.restore(fixture_dir, config, run_dir)
+    result["restore"] = {}
+    store = fixture.restore(fixture_dir, config, run_dir, result["restore"])
     st = stack.Stack(config, options.settings, run_dir, store)
     sample = sampler.Sampler(run_dir / "samples.jsonl", sampler.disk_of(store))
     error = None
@@ -376,6 +382,16 @@ def _status(url: str, site: str, password: str, since: float | None = None) -> d
         return json.loads(response.read())
 
 
+def _site(fixture_dir: Path) -> str:
+    """Return the id of the site of the fixture: from its targets file, which
+    a run writes before it starts, else from its manifest."""
+    path = fixture_dir / workload.TARGETS_FILE
+    if path.exists():
+        with workload.TargetsFile.open(path) as targets:
+            return targets.site
+    return json.loads((fixture_dir / "manifest.json").read_text())["site"]
+
+
 def _drain_queue(
     urls: list[str],
     fixture_dir: Path,
@@ -389,7 +405,7 @@ def _drain_queue(
     took to empty after the end of the measured steps, and the status of
     each instance: for the whole run, and for each step."""
     password = json.loads((fixture_dir / "credentials.json").read_text())["password"]
-    site = json.loads((fixture_dir / "manifest.json").read_text())["site"]
+    site = _site(fixture_dir)
     deadline = time.time() + timeout
     drained = None
     last: dict = {}
@@ -421,18 +437,28 @@ def _drain_queue(
 
 
 def _verify(st: stack.Stack, run_dir: Path, fixture_dir: Path) -> dict:
-    records = list(ledger.read([str(run_dir / "ledger" / "run.jsonl")]))
-    manifest = json.loads((fixture_dir / "manifest.json").read_text())
-    wanted = verification.request(records, manifest)
-    request_path = run_dir / "verify-request.json"
-    request_path.write_text(json.dumps(wanted))
-    observed_path = run_dir / "observed.json"
+    """Check the site of the stack against the ledger of the run. The
+    runner and the observer read the items of the fixture from its targets
+    file, so the cost follows the run, not the site."""
     started = time.time()
-    st.run_script("observe.py", str(request_path), str(observed_path), name="verifier")
-    observed = json.loads(observed_path.read_text())
-    verdict = verification.judge(records, manifest, observed)
+    records = list(ledger.read([str(run_dir / "ledger" / "run.jsonl")]))
+    targets_file = workload.ensure_targets(fixture_dir)
+    with workload.TargetsFile.open(targets_file) as targets:
+        wanted = verification.request(records, targets)
+        wanted["targets"] = str(targets_file)
+        request_path = run_dir / "verify-request.json"
+        request_path.write_text(json.dumps(wanted))
+        observed_path = run_dir / "observed.json"
+        st.run_script(
+            "observe.py", str(request_path), str(observed_path), name="verifier"
+        )
+        observed = json.loads(observed_path.read_text())
+        verdict = verification.judge(records, targets, observed)
     verdict["seconds"] = time.time() - started
     verdict["observed_paths"] = len(wanted["paths"])
+    verdict["sample"] = len(wanted["sample"])
+    verdict["entries_by_path"] = len(observed["entries"])
+    verdict["entries_by_record_id"] = observed["window_entries"]
     verdict["content_objects"] = observed["content_objects"]
     verdict["catalog_entries"] = observed["catalog_entries"]
     return verdict

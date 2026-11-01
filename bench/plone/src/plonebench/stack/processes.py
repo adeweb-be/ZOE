@@ -1,9 +1,10 @@
 """The processes of a run: the storage server, the Zope instances and the
-scripts of inzope/, and the copy of a store."""
+scripts of inzope/, and the copy of a store and its sync."""
 
 from __future__ import annotations
 
 import dataclasses
+import os
 import shutil
 import socket
 import subprocess
@@ -284,3 +285,16 @@ def copy_store(source: Path, destination: Path) -> None:
         if destination.exists():
             shutil.rmtree(destination)
         subprocess.run(["cp", "-a", str(source), str(destination)], check=True)
+
+
+def sync_files(path: Path) -> None:
+    """Write the dirty pages of the files under `path` to the disk, and
+    wait for the disk. On Linux, `sync -f` syncs the file system that holds
+    `path` (syncfs(2)): one flush for every file of a copy, where a sync of
+    each file would wait for the journal once per file. It also writes the
+    dirty pages of other files of that file system. On macOS, a copy of a
+    store is a clone that writes no data, and `os.sync` schedules the rest."""
+    if sys.platform == "darwin":
+        os.sync()
+        return
+    subprocess.run(["sync", "-f", str(path)], check=True)
