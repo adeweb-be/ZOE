@@ -18,7 +18,10 @@ folder of `warm-forms`. `gevent.sleep` returns at once.
 
 OUT_JSON gets the times, the peak memory of the process and a sha256 of
 the operations. The time of the start runs from the start of the script
-to the end of the import of the Locust file.
+to the end of the import of the Locust file. On Linux the peak is
+`VmHWM` of `/proc/self/status`: the peak of this process since its exec.
+`ru_maxrss` keeps the peak of the parent across the exec, and the parent
+is pytest. On macOS the peak is `ru_maxrss`.
 """
 
 import time
@@ -108,6 +111,19 @@ for user in made:
         user.work()
 work = time.perf_counter() - started
 
+
+def peak_bytes() -> int:
+    """The peak resident memory of this process, in bytes."""
+    if sys.platform == "darwin":
+        # ru_maxrss is in bytes on macOS.
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("no VmHWM in /proc/self/status")
+
+
 roles = {}
 for user in made:
     roles[user.role] = roles.get(user.role, 0) + 1
@@ -120,9 +136,7 @@ result = {
     "work_seconds": work,
     "work_calls": count * calls,
     "operations": len(records),
-    # ru_maxrss is in KB on Linux and in bytes on macOS.
-    "maxrss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    * (1 if sys.platform == "darwin" else 1024),
+    "maxrss_bytes": peak_bytes(),
     "digest": hashlib.sha256(json.dumps([accounts, records]).encode()).hexdigest(),
 }
 with open(out, "w") as file:
