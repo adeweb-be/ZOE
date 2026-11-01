@@ -166,9 +166,22 @@ class Storage(_zoe.Storage, zodb._IntentOwners, ConflictResolvingStorage):
     the storage, and the next `tpc_begin` adopts them. A connection names an
     owner of its own (`new_intent_owner`), and binds it to its thread for
     its `tpc_begin` (`bind_intent_owner`).
+
+    `native_reader` is the key `native-reader` of `<zoe>`: when it is true,
+    the default, `zoe.reader.install` and `zoe.plone` give the reader of ZOE
+    to the connections of a database on the storage (ADR 0057). The storage
+    keeps it as `native_reader` and does not read it otherwise.
     """
 
-    def __new__(cls, path, *, early_locks=False, early_lock_classes=None, **options):
+    def __new__(
+        cls,
+        path,
+        *,
+        early_locks=False,
+        early_lock_classes=None,
+        native_reader=True,
+        **options,
+    ):
         # A bad list of hot classes raises before the store opens.
         zodb.hot_classes(early_locks, early_lock_classes)
         return super().__new__(cls, path, **options)
@@ -180,8 +193,10 @@ class Storage(_zoe.Storage, zodb._IntentOwners, ConflictResolvingStorage):
         blob_dir=None,
         early_locks=False,
         early_lock_classes=None,
+        native_reader=True,
         **options,
     ):
+        self.native_reader = bool(native_reader)
         # The extension opens the store. Keep the blob directory for cleanup.
         self._blob_dir = None if blob_dir is None else os.path.abspath(blob_dir)
         # A read-only storage writes nothing, so it takes no early lock.

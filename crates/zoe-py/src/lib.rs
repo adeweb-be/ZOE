@@ -14,12 +14,16 @@
 //! `Client` is the native client of `zoe.zeo.ClientStorage` (`client`).
 //! Its tokio runtime starts when the first client opens, never at the
 //! import of the module.
+//!
+//! `Reader` is the base of `zoe.reader.Reader`, the reader of ZOE, which
+//! decodes a ZODB record in Rust (`reader`, ADR 0057).
 
 mod cli;
 mod client;
 mod errors;
 mod kv;
 mod publish;
+mod reader;
 mod sequence;
 mod signals;
 mod storage;
@@ -33,6 +37,8 @@ mod _zoe {
     use crate::cli::main;
     #[pymodule_export]
     use crate::client::{NativeClient, NativeIntents, NativeTransaction};
+    #[pymodule_export]
+    use crate::reader::{_reader_counts, Reader};
     #[pymodule_export]
     use crate::sequence::Sequence;
     #[pymodule_export]

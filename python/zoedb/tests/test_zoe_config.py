@@ -318,6 +318,38 @@ def test_the_structural_merges_take_their_twins(tmp_path, monkeypatch):
     assert options["resolution_log"] is None
 
 
+def test_native_reader_takes_its_key_its_twin_and_the_uri(tmp_path, monkeypatch):
+    storage = open_stanza(f"path {tmp_path / 'default'}")
+    try:
+        # True by default: zoe.reader.install gives the reader.
+        assert storage.native_reader is True
+    finally:
+        storage.close()
+    storage = open_stanza(f"path {tmp_path / 'key'}", "native-reader off")
+    try:
+        assert storage.native_reader is False
+    finally:
+        storage.close()
+    monkeypatch.setenv("ZOE_NATIVE_READER", "off")
+    storage = open_stanza(f"path {tmp_path / 'twin'}")
+    try:
+        assert storage.native_reader is False
+    finally:
+        storage.close()
+    # The key wins over its twin.
+    storage = open_stanza(f"path {tmp_path / 'both'}", "native-reader on")
+    try:
+        assert storage.native_reader is True
+    finally:
+        storage.close()
+    factory, _ = zodburi.resolve_uri(f"zoe://{tmp_path / 'uri'}?native-reader=no")
+    storage = factory()
+    try:
+        assert storage.native_reader is False
+    finally:
+        storage.close()
+
+
 @pytest.mark.parametrize(
     "line",
     [

@@ -39,12 +39,13 @@ Each key has an environment twin: `ZOE_` and the key in upper case, with `_` for
 | `structural-merge-class` | `ZOE_STRUCTURAL_MERGE_CLASSES` | none | The mode of one class of tier 1, as `CLASS MODE`, such as `BTrees.IOBTree.IOBucket shadow`. The key comes once for each class. The twin takes `CLASS=MODE` pairs separated by commas. |
 | `posting-dicts` | `ZOE_POSTING_DICTS` | `off` | The mode of the posting-dict rule and the first-key rule of ADR 0042: `on`, `shadow` or `off`. A shadow mode needs `resolution-log`. |
 | `resolution-log` | `ZOE_RESOLUTION_LOG` | none: no line | A file of JSON lines, one for each result of tier 1. The storage opens it in append mode and never syncs it. A leading `~` is the home directory. |
+| `native-reader` | `ZOE_NATIVE_READER` | `true` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, the connections of a database on the storage decode their records with the reader of ZOE, in Rust, in place of ZODB's `ObjectReader` (ADR 0057): `zoe.plone` gives the reader at the start of Zope, and `zoe.reader.install` outside Zope. If false, they keep ZODB's `ObjectReader`. |
 
 The keys `staging-memory`, `max-record-size`, `max-transaction-size` and `max-blob-size` are options of the core only. No key of `<zoe>` sets them.
 
 ## `<zoeclient>`
 
-A client of a ZOE server: `zoe.zeo.ClientStorage`, a subclass of `ZEO.ClientStorage` (see [Python API](python-api.md)). It extends `<zeoclient>` of ZODB, so it takes every key of `<zeoclient>` with the same values. It declares the ZOE extensions to the server (see [Protocol](protocol.md)), and works as a `<zeoclient>` against a stock ZEO server. Only `prefetch-references` has an environment twin, `ZOE_PREFETCH_REFERENCES`; the other keys have none, as `<zeoclient>` has none.
+A client of a ZOE server: `zoe.zeo.ClientStorage`, a subclass of `ZEO.ClientStorage` (see [Python API](python-api.md)). It extends `<zeoclient>` of ZODB, so it takes every key of `<zeoclient>` with the same values. It declares the ZOE extensions to the server (see [Protocol](protocol.md)), and works as a `<zeoclient>` against a stock ZEO server. Only `prefetch-references` has an environment twin, `ZOE_PREFETCH_REFERENCES`; the other keys have none, as `<zeoclient>` has none, `native-reader` included.
 
 The keys of `<zeoclient>`: `server` (one for each address), `storage`, `cache-size`, `name`, `client`, `var`, `min-disconnect-poll`, `max-disconnect-poll`, `wait`, `read-only`, `read-only-fallback`, `drop-cache-rather-verify`, `username`, `password`, `realm`, `blob-dir`, `shared-blob-dir`, `blob-cache-size`, `blob-cache-size-check` and `client-label`. The keys that `<zoeclient>` adds:
 
@@ -55,6 +56,7 @@ The keys of `<zeoclient>`: `server` (one for each address), `storage`, `cache-si
 | `early-locks` | `false` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, an object of a class of `early-lock-classes` takes its early write-intent lock on the server when its state loads (ADR 0044, part B). It needs the native client: with `native false`, the open raises an error. A server that does not accept the extension `lock_intent` gives no early lock and one warning. |
 | `early-lock-classes` | none | The hot classes of `early-locks`, each as `module.name`, separated by spaces or commas, as in `<zoe>`. |
 | `prefetch-references` | `ZOE_PREFETCH_REFERENCES`, else `true` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, a load that the server serves also prefetches into the client cache the objects of the same database that its record refers to, one level deep: at most 256 objects, for a record of at most 16 KiB. The record goes to the application first. Only the native client reads it. The twin gives the value when the key is not set; an empty twin counts as not set. |
+| `native-reader` | `true` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, the connections of a database on the client decode their records with the reader of ZOE, as with `native-reader` of `<zoe>`; the native client and the asyncio client of ZEO inside both take it. If false, they keep ZODB's `ObjectReader`. It has no twin. |
 
 ### `<ssl>`
 

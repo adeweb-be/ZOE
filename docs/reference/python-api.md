@@ -10,6 +10,7 @@ The `zoedb` wheel gives the package `zoe`. The extension module `zoe._zoe` holds
 | `zoe.kv` | `Namespace`, `scan_all`, `SCAN_LIMIT`, `MAX_KEY`, `MAX_TTL` |
 | `zoe.policy` | `MergePolicy`, `validate`, `install`, `read`, and the constants of a merge policy |
 | `zoe.zodb` | `LockingConnection`, `hot_classes`, `install` |
+| `zoe.reader` | `Reader`, `Connection`, `install`, `counts`: the reader of ZOE (ADR 0057) |
 | `zoe.config` | the ZConfig data types of `<zoe>` and `<zoeclient>`, and `resolve_uri` of the `zoe://` URI (see [zope.conf sections](zope-conf.md)) |
 | `zoe.serve` | `main`, the entry point of `python -m zoe.serve -C FILE` |
 | `zoe.testing` | the test layers and `ZoeServer` |
@@ -24,7 +25,7 @@ zoe.Storage(
     path, *, read_only=False, lock_timeout=None, blob_dir=None, pack_gc=True,
     compression=None, structural_merges=None, structural_merge_classes=None,
     posting_dicts=None, resolution_log=None, early_locks=False,
-    early_lock_classes=None,
+    early_lock_classes=None, native_reader=True,
 )
 ```
 
@@ -44,6 +45,7 @@ A ZODB storage in the directory `path`, in this process. The open creates the di
 | `resolution_log` | `None` | A file that gets one JSON line for each result of tier 1. A shadow mode without it raises `ValueError`. |
 | `early_locks` | `False` | Turn on the early write-intent locks of ADR 0044, part B, for the classes of `early_lock_classes`. |
 | `early_lock_classes` | `None` | The hot classes, each as `module.name`. Each must be a leaf record. A class of tier 1 raises `ValueError`. |
+| `native_reader` | `True` | With `True`, `zoe.reader.install` and `zoe.plone` give the reader of ZOE to the connections of a database on the storage; with `False`, they give nothing. The storage keeps it as the attribute `native_reader`. |
 
 It implements `IBlobStorageRestoreable`, `IStorageCurrentRecordIteration`, `IStorageIteration`, `IStorageUndoable` and `IExternalGC`, and the interfaces that they extend: `IStorage`, `IBlobStorage` and `IStorageRestoreable`. Its methods beyond these interfaces:
 
@@ -74,7 +76,7 @@ A subclass of `StorageTransactionError`. Only the thread that calls `tpc_begin` 
 
 | Name | What it is |
 | --- | --- |
-| `ClientStorage(*args, native=None, early_locks=False, early_lock_classes=None, **kw)` | A subclass of `ZEO.ClientStorage.ClientStorage`, with the same arguments. `<zoeclient>` opens it. By default, the native client of the Rust crate `zoe-client` runs inside. `native=False` keeps the asyncio client of ZEO. A subclass of `ClientStorage` keeps the asyncio client of ZEO, and `native=True` on it raises `TypeError`. `early_locks=True` needs the native client. |
+| `ClientStorage(*args, native=None, early_locks=False, early_lock_classes=None, **kw)` | A subclass of `ZEO.ClientStorage.ClientStorage`, with the same arguments. `<zoeclient>` opens it. By default, the native client of the Rust crate `zoe-client` runs inside. `native=False` keeps the asyncio client of ZEO. A subclass of `ClientStorage` keeps the asyncio client of ZEO, and `native=True` on it raises `TypeError`. `early_locks=True` needs the native client. The instance keeps the key `native-reader` of `<zoeclient>` as `native_reader`, `True` by default. |
 | `ClientStorage.sequence(name)` | The sequence `name` of the store, a `Sequence`. It needs a server that accepted the extension `sequences`. |
 | `ClientStorage.kv_supported()`, `kv_get`, `kv_scan`, `kv_generation`, `kv_set`, `kv_delete` | The KV namespaces of the store, as on `zoe.Storage`. They need a server that accepted the extension `kv`. Without it, each raises `ZODB.POSException.Unsupported`, and `kv_supported()` returns `False`. |
 | `Sequence(storage, name)` | A named counter of the store of a `ClientStorage`. `next()` returns the next value. Without the extension `sequences`, `next()` raises `Unsupported`. |
@@ -123,6 +125,17 @@ A policy is a dict with the key `classes` and, as switches, `structural_merges`,
 | `LockingConnection` | A ZODB `Connection` that takes the early write-intent locks of the hot classes of its storage. |
 | `hot_classes(early_locks, classes)` | Return the hot classes of a storage, as a frozenset of `module.name`, or `None` when `early_locks` is false. |
 | `install()` | Put the methods of `LockingConnection` on `ZODB.Connection.Connection`, once per process. A storage with early locks calls it at its open. |
+
+## `zoe.reader`
+
+The reader of ZOE decodes a ZODB record in Rust, in place of ZODB's `ObjectReader`, with the same state for every object (ADR 0057). A record that its Rust path does not decode goes to `ObjectReader` whole.
+
+| Name | What it is |
+| --- | --- |
+| `Reader(conn, cache, factory)` | ZODB's `ObjectReader` with `setGhostState` and `getState` in Rust. |
+| `Connection` | ZODB's `Connection` with a `Reader`. |
+| `install(db)` | Make each new connection of `db` a `Connection`, when `db.klass` is ZODB's `Connection`, and give a `Reader` to each connection that `db` already has. It gives nothing when `db.storage.native_reader` is false. `zoe.plone` calls it at the start of Zope for a main database on `zoe.Storage` or `zoe.zeo.ClientStorage`. |
+| `counts()` | Return the counts of the readers of the process: `decoded`, the records that the Rust path decoded; `fallback`, the records that went to `ObjectReader`, by reason; `opcodes`, the opcodes that sent a record there. |
 
 ## `zoe.testing`
 

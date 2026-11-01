@@ -7,8 +7,8 @@ as their storage. The `zoe` entry point of `zodburi.resolvers` names
 
 `<zoeclient>` opens a `zoe.zeo.ClientStorage`. It takes every key of
 `<zeoclient>`, with the same values, `wait-timeout`, `native`,
-`early-locks`, `early-lock-classes` and `prefetch-references`, and an
-`<ssl>` section with the keys of the `<ssl>` section of ZEO's
+`early-locks`, `early-lock-classes`, `prefetch-references` and
+`native-reader`, and an `<ssl>` section with the keys of the `<ssl>` section of ZEO's
 `<clientstorage>`. Only `prefetch-references` has an environment twin,
 `ZOE_PREFETCH_REFERENCES`, which `zoe.zeo.ClientStorage` reads too; the
 other keys have none, as `<zeoclient>` has none.
@@ -119,6 +119,7 @@ KEYS = {
     "structural-merge-class": class_modes,
     "posting-dicts": merge_mode,
     "resolution-log": stock_datatypes["string"],
+    "native-reader": stock_datatypes["boolean"],
 }
 
 # The keys that a section and a URI can give more than once. Their values
@@ -189,6 +190,7 @@ def open_storage(settings):
         structural_merge_classes=settings.get("structural-merge-class"),
         posting_dicts=settings.get("posting-dicts"),
         resolution_log=os.path.expanduser(resolution_log) if resolution_log else None,
+        native_reader=settings.get("native-reader", True),
     )
 
 
@@ -253,11 +255,11 @@ class ZoeClient(BaseConfig):
     It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
     `wait-timeout` as `wait_timeout`, `native` as `native`,
     `early-locks` and `early-lock-classes` as `early_locks` and
-    `early_lock_classes`, and `prefetch-references` as
-    `_prefetch_references`, None when the section does not set it. It gives
-    the
-    `<ssl>` section as it is: the native client reads its files, and ZEO's
-    client gets the context that ZEO's `<ssl>` section gives.
+    `early_lock_classes`, `prefetch-references` as `_prefetch_references`,
+    None when the section does not set it, and `native-reader` as
+    `_native_reader`. It gives the `<ssl>` section as it is: the native
+    client reads its files, and ZEO's client gets the context that ZEO's
+    `<ssl>` section gives.
     """
 
     def open(self):
@@ -299,5 +301,6 @@ class ZoeClient(BaseConfig):
             early_lock_classes=class_names(config.early_lock_classes or ""),
             _ssl_section=config.ssl,
             _prefetch_references=config.prefetch_references,
+            _native_reader=config.native_reader,
             **options,
         )

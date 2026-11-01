@@ -84,6 +84,7 @@
   - [0054. One published format for every benchmark](adr/0054-one-published-format-for-every-benchmark.md)
   - [0055. zoe-wire: the ZEO frame codec and the TLS certificate reader](adr/0055-zoe-wire.md)
   - [0056. A write-ahead log with a background fold: ZOE format 3](adr/0056-the-write-ahead-log.md)
+  - [0057. The reader of ZOE: a record decodes in Rust in place of ObjectReader](adr/0057-the-reader-of-zoe.md)
 
 # Reference
 

@@ -17,7 +17,10 @@ samples under each.
 Then it sends each path once more with `sys.setprofile` on, and counts the
 loads, the `persistent_load` callbacks and the Python calls under
 `Connection.setstate`, and the classes of the objects loaded, with whether
-their `__setstate__` is Python code. It writes the result as JSON to OUT.
+their `__setstate__` is Python code. It writes the result as JSON to OUT,
+with whether the connection has the reader of ZOE, which `zoe.plone` gives
+unless the storage has `native-reader off`, and the counts of the reader
+in the run.
 """
 
 import inspect
@@ -29,6 +32,7 @@ import urllib.request
 from collections import Counter
 from time import perf_counter
 
+import zoe.reader
 from ZODB.Connection import Connection
 from ZODB.serialize import ObjectReader
 from ZPublisher.WSGIPublisher import publish_module
@@ -37,6 +41,8 @@ out, admin, paths_file, requests = sys.argv[1:5]
 requests = int(requests)
 paths = json.loads(open(paths_file).read())
 db = app._p_jar.db()  # noqa: F821 - run.py gives app
+reader = isinstance(app._p_jar._reader, zoe.reader.Reader)  # noqa: F821
+reader_before = zoe.reader.counts()
 
 
 def server_loads():
@@ -187,7 +193,18 @@ for kind in sorted({row["kind"] for row in rows}):
                 },
             }
 loads = counts["loads"] or 1
+reader_after = zoe.reader.counts()
+reader_counts = {
+    "decoded": reader_after["decoded"] - reader_before["decoded"],
+    "fallback": {
+        reason: n - reader_before["fallback"].get(reason, 0)
+        for reason, n in reader_after["fallback"].items()
+        if n != reader_before["fallback"].get(reason, 0)
+    },
+}
 result = {
+    "reader": reader,
+    "reader_counts": reader_counts,
     "requests": rows,
     "groups": groups,
     "counted_requests": len(paths),

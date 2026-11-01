@@ -67,7 +67,14 @@ _ZEO_PROTOCOLS = (b"Z5",)
 
 # The arguments of an open that the fall back to the client of ZEO does not
 # pass on as they are.
-_NOT_FOR_ZEO = ("self", "native", "_ssl_section", "_prefetch_references", "__class__")
+_NOT_FOR_ZEO = (
+    "self",
+    "native",
+    "_ssl_section",
+    "_prefetch_references",
+    "_native_reader",
+    "__class__",
+)
 
 # The number of oids that the native client asks for at a time.
 _NEW_OIDS = 100
@@ -437,6 +444,11 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
     default, takes the value of `ZOE_PREFETCH_REFERENCES`, else true. The
     key `prefetch-references` of `<zoeclient>` gives it.
 
+    `_native_reader` is the key `native-reader` of `<zoeclient>`, kept as
+    `native_reader`: when it is true, the default, `zoe.reader.install`
+    and `zoe.plone` give the reader of ZOE to the connections of a database
+    on the client (ADR 0057).
+
     `sync()` with `server_sync` pings the listener, and returns when the
     DB got each commit that the server published before the reply. Each
     connection sends `client_label` to the server. `new_addr` gives the
@@ -482,6 +494,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         early_lock_classes=None,
         _ssl_section=None,
         _prefetch_references=None,
+        _native_reader=True,
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
@@ -509,6 +522,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         self._storage = storage
         self._read_only = bool(read_only)
         self._read_only_fallback = bool(read_only_fallback)
+        self.native_reader = bool(_native_reader)
         self._server_addr = None
         self._client_label = None
         self._info = {
@@ -636,7 +650,11 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         self.__dict__.clear()
         self.__class__ = ClientStorage
         ClientStorage.__init__(
-            self, native=False, _ssl_section=given["_ssl_section"], **args
+            self,
+            native=False,
+            _ssl_section=given["_ssl_section"],
+            _native_reader=given["_native_reader"],
+            **args,
         )
 
     @property

@@ -14,6 +14,14 @@
       handler=".uidgenerator.database_opened"
       />
 
+  <!-- When the main database is on a ZOE storage, its connections decode
+       their records with the reader of ZOE, unless the storage stanza has
+       native-reader off (ADR 0057). -->
+  <subscriber
+      for="zope.processlifetime.IDatabaseOpenedWithRoot"
+      handler=".reader.database_opened"
+      />
+
   <!-- The backends that ZOE_PLONE_BACKENDS names: locking, indexing,
        registry. They are opt-in. They install when the ZCML loads, so an
        instance, its scripts and bin/instance run see the same backends. -->

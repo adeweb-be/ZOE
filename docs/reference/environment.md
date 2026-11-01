@@ -27,6 +27,7 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_STRUCTURAL_MERGE_CLASSES` | `zoe serve`, `<zoe>` | `CLASS=MODE` pairs separated by commas |
 | `ZOE_POSTING_DICTS` | `zoe serve`, `<zoe>` | the mode of the rules of ADR 0042: `on`, `shadow` or `off` |
 | `ZOE_RESOLUTION_LOG` | `zoe serve`, `<zoe>` | the file of the resolution log |
+| `ZOE_NATIVE_READER` | `<zoe>` | a boolean: the connections of a database on the storage decode their records with the reader of ZOE (ADR 0057); `true` when not set |
 | `ZOE_FROM_DATA_FS` | `zoe convert` | the `Data.fs` to copy into the store |
 | `ZOE_TO_DATA_FS` | `zoe convert` | the `Data.fs` to copy the store into |
 | `ZOE_DATA_FS_BLOB_DIR` | `zoe convert` | the blob directory of the `Data.fs` |
@@ -88,6 +89,7 @@ The tests, the benchmarks and the recipes of the repository read these variables
 | `ZOE_FINISH_TXNS`, `ZOE_FINISH_SIZE`, `ZOE_FINISH_DIR`, `ZOE_FINISH_ATTACH` | the finish-time test of `zoe-core` | the transactions, the record size, the directory, and the encode before the finish |
 | `ZOE_EXIT_PATH_DIR` | the exit-path tests of `zoe convert` | a directory with a `Data.fs` to convert and back |
 | `ZOE_LOUPE_FIXTURE` | the tests of Loupe | a store to open |
+| `ZOE_TEST_READER` | `python/zoedb/tests/conftest.py`, `just conformance` | `on`: each ZODB `Connection` of the run has the reader of ZOE, also those that the tests of ZODB make (ADR 0057) |
 | `ZOE_PLONE_PORT`, `ZOE_PLONE_ADMIN`, `ZOE_PLONE_ADMIN_FILE`, `ZOE_PLONE_ZEO_ADDRESS` | the Plone scenarios of `plone/`, `just plone` | the HTTP port, the admin user, the file of the admin user, the address of the server of the suites |
 | `ZOE_BENCH_*` | the benchmarks of `bench/` and `zoe-bench`, `just bench` | the commit, the machine, the PostgreSQL database, the lock and the switches of the runs |
 | `ZOE_CXX_LIBS` | `devenv.nix`, the benchmarks of Plone | the directory of the C++ library of the shell |
