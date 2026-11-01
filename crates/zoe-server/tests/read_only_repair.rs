@@ -22,7 +22,7 @@
 //! test takes the write permission away from the files of the store: a
 //! read-only file system fails the open for writes in the same place.
 
-mod wire;
+mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use wire::{Conn, Server, ZOE, commit, fresh_dir, load, record, s};
+use common::{Conn, Server, ZOE, commit, fresh_dir, load, record, s};
 use zoe_core::{Oid, Store, ZoeError};
 
 /// The longest run of one command.
@@ -98,7 +98,7 @@ fn killed_store(root: &Path) -> (PathBuf, u64) {
     let last = commit(&mut conn, 2, &[(0, first, record(b"second"))]).unwrap();
     drop(conn);
     server.kill();
-    let _spawn = wire::spawn_lock();
+    let _spawn = common::spawn_lock();
     let strict = Store::open_read_only(&path);
     assert!(
         matches!(strict, Err(ZoeError::NotClosedCleanly)),
@@ -161,7 +161,8 @@ fn set_modes(dir: &Path, file: u32, directory: u32) {
 fn modes_apply() -> bool {
     static APPLY: OnceLock<bool> = OnceLock::new();
     *APPLY.get_or_init(|| {
-        let probe = fresh_dir("repair-modes").join("probe");
+        let dir = fresh_dir("repair-modes");
+        let probe = dir.join("probe");
         fs::write(&probe, b"").unwrap();
         fs::set_permissions(&probe, fs::Permissions::from_mode(0o444)).unwrap();
         let refused = fs::OpenOptions::new().write(true).open(&probe).is_err();
@@ -199,18 +200,13 @@ fn zoe_with_input(root: &Path, args: &[String], obey_modes: bool, input: &str) -
     } else {
         Command::new(ZOE)
     };
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
+    common::clear_zoe_env(&mut command)
         .args(args)
         .stdin(fs::File::open(&stdin).unwrap())
         .stdout(fs::File::create(&stdout).unwrap())
         .stderr(fs::File::create(&stderr).unwrap());
     // The mutex of the spawns stays held until the child ends.
-    let _spawn = wire::spawn_lock();
+    let _spawn = common::spawn_lock();
     let mut child = command
         .spawn()
         .unwrap_or_else(|e| panic!("zoe {args:?} does not start: {e}"));
@@ -257,18 +253,13 @@ impl ReadOnlyServer {
         let n = SERVERS.fetch_add(1, Ordering::Relaxed);
         let stderr = root.join(format!("serve-{n}.err"));
         let mut command = Command::new(ZOE);
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("ZOE_") {
-                command.env_remove(name);
-            }
-        }
-        command
+        common::clear_zoe_env(&mut command)
             .args(["serve", "--read-only", "--path", s(path)])
             .args(["--listen", "127.0.0.1:0"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&stderr).unwrap());
-        let (mut child, mut stdout) = wire::spawn_until_output(&mut command);
+        let (mut child, mut stdout) = common::spawn_until_output(&mut command);
         let addr = loop {
             let mut line = String::new();
             if stdout.read_line(&mut line).unwrap() == 0 {
@@ -294,7 +285,7 @@ impl ReadOnlyServer {
     /// stderr.
     fn stop(mut self) -> (ExitStatus, String) {
         let sent = {
-            let _spawn = wire::spawn_lock();
+            let _spawn = common::spawn_lock();
             Command::new("kill")
                 .args(["-TERM", &self.child.id().to_string()])
                 .status()
@@ -335,7 +326,7 @@ fn args(words: &[&str]) -> Vec<String> {
 fn dumps_of(root: &Path, killed: &Path) -> PathBuf {
     let source = root.join("source");
     copy_store(killed, &source);
-    drop(wire::open_store(&source));
+    drop(common::open_store(&source));
     let dumps = root.join("dumps");
     let run = zoe(
         root,
@@ -404,7 +395,7 @@ fn command(name: &str, path: &Path, out: &Path, dumps: &Path) -> Vec<String> {
 /// Check that the store in `path` was closed cleanly, and that its last
 /// commit is the one of `killed_store`.
 fn assert_clean(path: &Path, last: u64, after: &str) {
-    let _spawn = wire::spawn_lock();
+    let _spawn = common::spawn_lock();
     let store = Store::open_read_only(path)
         .unwrap_or_else(|e| panic!("after zoe {after}, the strict read-only open fails: {e}"));
     let (data, tid) = store.load(Oid(0)).unwrap();

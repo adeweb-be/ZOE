@@ -24,6 +24,7 @@
 //! on, so only test builds have this module.
 
 mod client;
+mod common;
 mod disk;
 mod net;
 mod pool;

@@ -35,8 +35,6 @@ client. `just test` runs it.
 """
 
 import contextlib
-import os
-import subprocess
 import threading
 import time
 
@@ -99,50 +97,14 @@ def through(server):
     )
 
 
-class Server:
+class Server(ZoeServer):
     """A `zoe serve` process with the lock timeout of the test."""
 
     def __init__(self, path):
-        self.path = path
-        self.address = None
-        self._process = None
+        super().__init__(str(path), args=["--lock-timeout", str(LOCK_TIMEOUT)])
 
     def __enter__(self):
-        command = [
-            ZoeServer.binary(), "serve", "--path", str(self.path),
-            "--listen", "127.0.0.1:0", "--lock-timeout", str(LOCK_TIMEOUT),
-        ]  # fmt: skip
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-        )
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        code = process.wait()
-        process.stdout.close()
-        raise RuntimeError(f"zoe serve stopped with {code} before it listened")
-
-    def __exit__(self, *exc_info):
-        process, self._process = self._process, None
-        if process is not None:
-            process.kill()
-            process.wait()
-            process.stdout.close()
+        return self.start(TIMEOUT)
 
 
 @contextlib.contextmanager

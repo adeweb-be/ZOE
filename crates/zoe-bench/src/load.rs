@@ -23,6 +23,7 @@ use serde::Serialize;
 use zoe_client::{Client, Error as ClientError};
 use zoe_core::{Oid, Tid};
 
+use crate::Error;
 use crate::machine::{Machine, Run};
 use crate::schedule::{Schedule, Zipf};
 
@@ -43,20 +44,6 @@ pub const MAX_ATTEMPTS: u64 = 1000;
 /// The user and the description of each transaction of a run.
 const USER: &[u8] = b"zoe-bench";
 const DESCRIPTION: &[u8] = b"zoe-bench";
-
-/// An error of a run.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A call of a client failed with an error that is not a conflict.
-    #[error(transparent)]
-    Client(#[from] ClientError),
-    /// A transaction met a conflict at each of its attempts.
-    #[error("a transaction met a conflict {MAX_ATTEMPTS} times")]
-    TooManyRetries,
-    /// An object of the store has no record at the snapshot of a read.
-    #[error("the object {0:?} has no record")]
-    Missing(Oid),
-}
 
 /// The workload of each client: what it reads and writes.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -178,12 +165,13 @@ pub struct Saturation {
     pub clients_under_ceiling: Option<usize>,
 }
 
-/// A report: one JSON document for one run.
+/// A report: one JSON document for one run of `load`, `saturate` or
+/// `hot`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Report<S, R> {
     /// `SCHEMA_VERSION`.
     pub schema_version: u32,
-    /// `load` or `saturate`.
+    /// `load`, `saturate` or `hot`.
     pub command: &'static str,
     /// The version of `zoe-bench`.
     pub version: &'static str,
@@ -199,7 +187,8 @@ pub struct Report<S, R> {
 }
 
 impl<S, R> Report<S, R> {
-    fn new(command: &'static str, run: Run, settings: S, result: R) -> Report<S, R> {
+    /// Return the report of a run of `command` that started at `run`.
+    pub(crate) fn new(command: &'static str, run: Run, settings: S, result: R) -> Report<S, R> {
         Report {
             schema_version: SCHEMA_VERSION,
             command,

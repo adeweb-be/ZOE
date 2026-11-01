@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 use std::time::{Duration, SystemTime};
 
 use zoe_convert::from_datafs;
@@ -22,8 +22,7 @@ use zoe_core::{Oid, Store, Tid, ZoeError, timestamp};
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::{assert_exit, fresh_dir, s, zoe};
 
 /// The subcommands that this test covers, as the naming table of the
 /// specification names them.
@@ -34,48 +33,8 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zoe-convert/tests/data-fs")
 }
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-cli-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-/// Run `zoe` with the arguments `args` and the variables `env`. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    common::output(&mut command)
-}
-
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-/// Check the exit code, and show the output if it is not the one expected.
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        stdout(output),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// One record of a store: the oid, the pickle and the blob.
@@ -87,7 +46,7 @@ type Txn = (Tid, Vec<u8>, Vec<u8>, Vec<u8>, Vec<Record>);
 
 /// Every transaction of the store in `dir`, with its records and blobs.
 fn contents(dir: &Path) -> Vec<Txn> {
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     store
         .iterator(None, None)
         .unwrap()
@@ -120,7 +79,7 @@ fn contents(dir: &Path) -> Vec<Txn> {
 /// What the library converter writes from the fixture.
 fn converted_fixture(dir: &Path) -> Vec<Txn> {
     {
-        let store = common::open(dir);
+        let store = common::open_store(dir);
         let report = from_datafs(
             &fixture().join("Data.fs"),
             Some(&fixture().join("blobs-bushy")),
@@ -253,7 +212,7 @@ fn convert_reads_a_data_fs_into_a_store_and_writes_it_back() {
     // The written Data.fs reads back into the same transactions.
     let again = dir.join("again");
     {
-        let store = common::open(&again);
+        let store = common::open_store(&again);
         let report = from_datafs(&data_fs, Some(&blobs), &store).unwrap();
         assert!(report.problems.is_empty(), "{report:?}");
     }
@@ -381,7 +340,7 @@ fn a_conversion_that_fails_or_does_not_verify_exits_with_1() {
     let fields: Vec<&str> = blob.split(' ').collect();
     let oid = Oid(u64::from_str_radix(fields[0], 16).unwrap());
     let tid = Tid(u64::from_str_radix(fields[1], 16).unwrap());
-    let path = common::open(&verified).blob_path(oid, tid).unwrap();
+    let path = common::open_store(&verified).blob_path(oid, tid).unwrap();
     std::fs::remove_file(path).unwrap();
     assert_exit(&zoe(&args, &[]), 1, "convert with a missing blob");
 
@@ -474,7 +433,7 @@ fn restore(store: &Store, tid: Tid, writes: &[(Oid, Vec<u8>)]) {
 /// A.
 fn aged_store(dir: &Path) -> [Tid; 3] {
     let tids = [days_ago(10), days_ago(9), days_ago(5)];
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     restore(
         &store,
         tids[0],
@@ -495,7 +454,7 @@ fn aged_store(dir: &Path) -> [Tid; 3] {
 
 /// The records of the aged store that are gone.
 fn removed(dir: &Path, tids: [Tid; 3]) -> BTreeSet<(Oid, Tid)> {
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     [(ROOT, 0), (ROOT, 1), (A, 0), (A, 1), (A, 2), (B, 0)]
         .into_iter()
         .map(|(oid, i)| (oid, tids[i]))
@@ -536,7 +495,7 @@ fn pack_packs_as_of_the_given_number_of_days_ago() {
     let mut expected = removed_at_7_days(tids);
     expected.insert((A, tids[1]));
     assert_eq!(removed(&store, tids), expected);
-    let store = common::open(&store);
+    let store = common::open_store(&store);
     assert_eq!(store.load(A).unwrap(), (document("a3"), tids[2]));
 }
 
@@ -556,7 +515,7 @@ fn a_dry_run_reports_by_class_and_removes_nothing() {
         assert!(report.contains(class), "{class} is not in:\n{report}");
     }
     assert_eq!(removed(&store, tids), BTreeSet::new());
-    assert_eq!(common::open(&store).last_transaction(), tids[2]);
+    assert_eq!(common::open_store(&store).last_transaction(), tids[2]);
 
     // The pack removes what the dry run reported.
     assert_exit(
@@ -620,7 +579,7 @@ fn pack_fails_with_1_on_a_missing_or_locked_store_and_changes_nothing() {
 
     let store = dir.join("zoe");
     let tids = aged_store(&store);
-    let running = common::open(&store);
+    let running = common::open_store(&store);
     let output = zoe(&["pack", "--path", s(&store), "--days", "7"], &[]);
     assert_exit(&output, 1, "pack a store that another process holds");
     drop(running);

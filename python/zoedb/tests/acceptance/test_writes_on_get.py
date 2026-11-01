@@ -24,19 +24,13 @@ these tests: `as_request` marks a transaction as the subscriber of
 """
 
 import contextlib
-import os
 import re
-import subprocess
-import threading
-import urllib.request
 
 import pytest
+from support import TIMEOUT, client, metrics, native
 
-import zoe.testing
 from zoe.testing import ZoeServer
 
-# The longest time that a test waits for the server.
-TIMEOUT = 30
 # The clients of zoe serve.
 MODES = ("zeo-client", "native-client")
 MAPPING = "persistent.mapping.PersistentMapping"
@@ -82,63 +76,18 @@ def counts(text):
     return found
 
 
-class Server:
-    """A `zoe serve` process with an admin port, to read `/metrics`.
-
-    `zoe.testing.ZoeServer` keeps only the line `listening ADDRESS` of the
-    server. This class also keeps the line `admin ADDRESS` before it.
-    """
+class Server(ZoeServer):
+    """A `zoe serve` process with an admin port, to read `/metrics`."""
 
     def __init__(self, path):
-        self.path = path
-        self.address = None
-        self.admin = None
-        self._process = None
+        super().__init__(str(path), args=["--admin-listen", "127.0.0.1:0"])
 
     def __enter__(self):
-        command = [
-            ZoeServer.binary(), "serve", "--path", str(self.path),
-            "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0",
-        ]  # fmt: skip
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-        )
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        code = process.wait()
-        process.stdout.close()
-        raise RuntimeError(f"zoe serve stopped with {code} before it listened")
-
-    def __exit__(self, *exc_info):
-        process, self._process = self._process, None
-        if process is not None:
-            process.kill()
-            process.wait()
-            process.stdout.close()
+        return self.start(TIMEOUT)
 
     def report(self):
         """Return the counts of the report, from `GET /metrics`."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            return counts(reply.read().decode())
+        return counts(metrics(self))
 
 
 @contextlib.contextmanager
@@ -147,14 +96,7 @@ def served(mode, tmp_path):
     import ZODB
 
     with Server(tmp_path / "store") as server:
-        if mode == "zeo-client":
-            from ZEO.ClientStorage import ClientStorage
-
-            storage = ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
-        else:
-            storage = zoe.testing.native_client(
-                server.address, storage="1", wait_timeout=TIMEOUT
-            )
+        storage = client(server) if mode == "zeo-client" else native(server)
         db = ZODB.DB(storage)
         try:
             yield server, db

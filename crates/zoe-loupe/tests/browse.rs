@@ -19,14 +19,7 @@ use serde_json::json;
 use zoe_core::{Oid, Store, ZoeError};
 use zoe_loupe::{Folder, Object};
 
-use common::{E2E_STORE, Fixture, class_name, files, fresh_dir, write_store};
-
-/// Open the fixture store in a new directory.
-fn open(name: &str) -> (Fixture, Folder) {
-    let dir = fresh_dir(name);
-    let fixture = write_store(&dir);
-    (fixture, Folder::open(&dir).unwrap())
-}
+use common::{E2E_STORE, class_name, files, fresh_dir, open, write_store};
 
 /// Every object that the references lead to from the root, by oid.
 fn reachable(folder: &Folder) -> BTreeMap<Oid, Object> {
@@ -66,9 +59,15 @@ fn follow(folder: &Folder, object: &Object, at: &str) -> Object {
 
 #[test]
 fn the_fixture_store_opens() {
+    // The end-to-end test of the window keeps its store in `E2E_STORE`.
+    // Another run gets a directory that the test removes at its end.
+    let temp;
     let dir = match std::env::var_os(E2E_STORE) {
         Some(dir) => PathBuf::from(dir),
-        None => fresh_dir("fixture"),
+        None => {
+            temp = fresh_dir("fixture");
+            temp.to_path_buf()
+        }
     };
     let fixture = write_store(&dir);
     let folder = Folder::open(&dir).unwrap();
@@ -119,7 +118,7 @@ fn a_folder_without_a_store_does_not_open_and_stays_as_it_was() {
 
 #[test]
 fn the_root_shows_its_class_oid_serial_size_state_and_references() {
-    let (fixture, folder) = open("root");
+    let (_dir, fixture, folder) = open("root");
     let root = folder.root().unwrap();
     let (serial, data) = fixture.revision(Oid(0), fixture.last_tid()).unwrap();
 
@@ -147,7 +146,7 @@ fn the_root_shows_its_class_oid_serial_size_state_and_references() {
 
 #[test]
 fn references_lead_from_the_root_to_every_live_object() {
-    let (fixture, folder) = open("references");
+    let (_dir, fixture, folder) = open("references");
     let reached = reachable(&folder);
 
     // The last transaction unlinked one document. Nothing else is garbage.
@@ -183,7 +182,7 @@ fn references_lead_from_the_root_to_every_live_object() {
 
 #[test]
 fn plone_paths_resolve_through_tree_and_annotations() {
-    let (fixture, folder) = open("paths");
+    let (_dir, fixture, folder) = open("paths");
     // The big folder has more items than one bucket holds, so its tree has
     // buckets of its own.
     let buckets = fixture
@@ -215,7 +214,7 @@ fn plone_paths_resolve_through_tree_and_annotations() {
 
 #[test]
 fn an_object_shows_its_decoded_state() {
-    let (fixture, folder) = open("state");
+    let (_dir, fixture, folder) = open("state");
 
     let doc = folder.resolve("/plone/folder/doc").unwrap();
     assert_eq!(doc.state["id"], json!("doc"));
@@ -257,7 +256,7 @@ fn an_object_shows_its_decoded_state() {
 
 #[test]
 fn an_unknown_oid_is_an_error() {
-    let (_, folder) = open("unknown");
+    let (_dir, _, folder) = open("unknown");
     assert!(folder.object(Oid(0xdead)).is_err());
 }
 

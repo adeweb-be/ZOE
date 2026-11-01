@@ -18,19 +18,15 @@ use std::path::{Path, PathBuf};
 use zoe_convert::{from_datafs, to_datafs};
 use zoe_core::{Oid, Store, Tid};
 
+mod support;
+use support::fresh_dir;
+
 /// The variable that names the input directory of the Python test.
 const EXIT_PATH_DIR: &str = "ZOE_EXIT_PATH_DIR";
 
 /// The fixture of the `Data.fs` reader.
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data-fs")
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-to-data-fs-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// One transaction of a `Data.fs`, as this test reads it.
@@ -147,18 +143,6 @@ fn read_data_fs(data: &[u8]) -> Vec<FsTxn> {
     txns
 }
 
-/// Return the name that ZODB gives to an oid or a tid in a blob path:
-/// `0x`, then the hex digits without leading zeros, in pairs.
-fn repr(n: u64) -> String {
-    let hex = format!("{n:x}");
-    let hex = if hex.len().is_multiple_of(2) {
-        hex
-    } else {
-        format!("0{hex}")
-    };
-    format!("0x{hex}")
-}
-
 /// Return the path of the blob file of `oid` at `tid` in `dir`, in the
 /// layout that the `.layout` file of `dir` names.
 fn blob_file(dir: &Path, oid: Oid, tid: Tid) -> PathBuf {
@@ -170,10 +154,10 @@ fn blob_file(dir: &Path, oid: Oid, tid: Tid) -> PathBuf {
                 path.push(format!("0x{byte:02x}"));
             }
         }
-        "lawn" => path.push(repr(oid.0)),
+        "lawn" => path.push(oid.repr()),
         other => panic!("unknown blob layout {other}"),
     }
-    path.push(format!("{}.blob", repr(tid.0)));
+    path.push(format!("{}.blob", tid.repr()));
     path
 }
 
@@ -238,16 +222,20 @@ fn assert_written(store: &Store, data_fs: &Path, blob_dir: &Path) {
 fn data_fs_round_trips_through_zoe() {
     // The Python exit-path test gives its own `Data.fs`. Without it, the
     // test converts the fixture of the reader.
+    let fresh;
     let (input, input_blobs, work) = match std::env::var_os(EXIT_PATH_DIR) {
         Some(dir) => {
             let dir = PathBuf::from(dir);
             (dir.join("Data.fs"), dir.join("blobs"), dir)
         }
-        None => (
-            fixture().join("Data.fs"),
-            fixture().join("blobs-bushy"),
-            fresh_dir("round-trip"),
-        ),
+        None => {
+            fresh = fresh_dir("round-trip");
+            (
+                fixture().join("Data.fs"),
+                fixture().join("blobs-bushy"),
+                fresh.to_path_buf(),
+            )
+        }
     };
     let first = Store::open(work.join("zoe")).unwrap();
     let read = from_datafs(&input, Some(&input_blobs), &first).unwrap();

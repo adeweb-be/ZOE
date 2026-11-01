@@ -162,7 +162,9 @@ class ZoeServer:
 
     `address` is `(host, port)`, or the path of a unix domain socket as a
     string. An address that is set before the start is the `--listen` of
-    the server.
+    the server. `admin` is the address of the admin port, from the line
+    `admin ADDRESS` of the server, or None: the server writes it when its
+    arguments hold `--admin-listen`. Each start reads it again.
 
     On Linux, the server never outlives the process that started it. The
     kernel sends SIGKILL to the server when its parent ends
@@ -179,6 +181,7 @@ class ZoeServer:
         self.env = dict(env or {})
         self.log = log
         self.address = None
+        self.admin = None
         self._process = None
 
     @staticmethod
@@ -240,10 +243,12 @@ class ZoeServer:
         timer = threading.Timer(timeout, expire) if timeout else None
         if timer is not None:
             timer.start()
-        address = None
+        address = admin = None
         try:
             for line in process.stdout:
-                if line.startswith("listening "):
+                if line.startswith("admin "):
+                    admin = line.removeprefix("admin ").strip()
+                elif line.startswith("listening "):
                     address = _listening(line.removeprefix("listening "))
                     break
         finally:
@@ -252,6 +257,7 @@ class ZoeServer:
                 timer.join()
         if address is not None and not expired.is_set():
             self.address = address
+            self.admin = admin
             self._process = process
             return self
         code = process.wait()
@@ -325,6 +331,18 @@ def _die_with_parent():
             raise RuntimeError("the process that started zoe serve ended")
 
     return die_with_parent
+
+
+def _spawn(args, **kw):
+    """Start the process `args` with the keyword arguments of
+    `subprocess.Popen`, and return it.
+
+    On Linux, the process dies with the thread that started it, as the
+    process of `ZoeServer` does. A test whose subject is the process of
+    `zoe serve` itself, its entry point or its exit code, starts the
+    process with this function.
+    """
+    return subprocess.Popen(args, preexec_fn=_die_with_parent(), **kw)
 
 
 def _no_option(what):

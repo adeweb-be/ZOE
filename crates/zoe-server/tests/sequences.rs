@@ -6,12 +6,12 @@
 //! `ValueError` for that call, outside and inside a transaction, and the
 //! connection stays open.
 
-mod wire;
+mod common;
 
-use wire::{Server, Value, begin, commit, fresh_dir, new_oids, p64, record};
+use common::{Server, Value, begin, commit, fresh_dir, new_oids, p64, record};
 
 /// Register `conn` with the storage `1` and the declaration `names`.
-fn declare(conn: &mut wire::Conn, read_only: bool, names: &[&str]) {
+fn declare(conn: &mut common::Conn, read_only: bool, names: &[&str]) {
     let names = names.iter().map(|name| Value::from(*name)).collect();
     conn.call(
         "register",
@@ -24,7 +24,7 @@ fn declare(conn: &mut wire::Conn, read_only: bool, names: &[&str]) {
     .unwrap();
 }
 
-fn next(conn: &mut wire::Conn, name: &str) -> Result<u64, wire::Fault> {
+fn next(conn: &mut common::Conn, name: &str) -> Result<u64, common::Fault> {
     conn.call("sequence_next", vec![Value::from(name)])
         .map(|value| value.as_u64().expect("sequence_next gives an int"))
 }
@@ -96,7 +96,7 @@ fn an_undeclared_call_in_a_transaction_is_refused_and_the_transaction_commits() 
     assert_eq!(fault.class, "builtins.ValueError");
     conn.call("vote", vec![id.clone()]).unwrap();
     conn.call("tpc_finish", vec![id]).unwrap();
-    assert_eq!(wire::load(&mut conn, oid).unwrap().0, record(b"a"));
+    assert_eq!(common::load(&mut conn, oid).unwrap().0, record(b"a"));
 }
 
 #[test]

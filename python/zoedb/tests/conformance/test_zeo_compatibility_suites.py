@@ -26,11 +26,9 @@ then run several times.
 """
 
 import sys
-import unittest
 
 import pytest
-
-import zoe.testing
+from suite_support import run_under_zeo_layer, select
 
 # Each id is `test.id()`.
 ZEO_TESTS = [
@@ -65,66 +63,11 @@ BAD_MESSAGE_TESTS = [
 RUNS = 5
 
 
-def cases_and_layers(suite, layers=()):
-    """Yield each test of suite with the layers of the suites around it."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from cases_and_layers(item, layers)
-    else:
-        yield suite, layers
-
-
-def select(suite, ids):
-    """Return the tests of suite with these ids, each with its layers."""
-    found = [
-        (test, layers) for test, layers in cases_and_layers(suite) if test.id() in ids
-    ]
-    assert sorted(test.id() for test, _ in found) == sorted(ids)
-    return found
-
-
-def run(selected):
-    """Run the tests under ZEO_LAYER and their own layers. Fail on a problem."""
-    result = unittest.TestResult()
-    started = []
-    try:
-        for test, layers in selected:
-            layers = (zoe.testing.ZEO_LAYER, *layers)
-            for layer in layers:
-                if layer not in started:
-                    layer.setUp()
-                    started.append(layer)
-            for layer in layers:
-                if hasattr(layer, "testSetUp"):
-                    layer.testSetUp()
-            try:
-                test.run(result)
-            finally:
-                for layer in reversed(layers):
-                    if hasattr(layer, "testTearDown"):
-                        layer.testTearDown()
-    finally:
-        for layer in reversed(started):
-            layer.tearDown()
-    problems = [
-        f"{test.id()}\n{trace}" for test, trace in result.failures + result.errors
-    ]
-    problems += [f"{test.id()}: skipped: {why}" for test, why in result.skipped]
-    problems += [
-        f"{test.id()}: unexpected success" for test in result.unexpectedSuccesses
-    ]
-    assert not problems, "\n\n".join(problems)
-    assert result.testsRun == len(selected)
-
-
 def test_the_thread_and_history_tests_of_testzeo_pass(tmp_path, monkeypatch):
     from ZEO.tests import testZEO
 
     monkeypatch.chdir(tmp_path)
-    run(select(testZEO.test_suite(), ZEO_TESTS))
+    run_under_zeo_layer(select(testZEO.test_suite(), ZEO_TESTS))
 
 
 def test_the_blob_transactions_of_a_client_without_a_shared_blob_directory_pass(
@@ -137,14 +80,14 @@ def test_the_blob_transactions_of_a_client_without_a_shared_blob_directory_pass(
     suite = testblob.storage_reusable_suite(
         "ClientStorageNonSharedBlobs", testZEO.ServerManagingClientStorage
     )
-    run(select(suite, NON_SHARED_BLOB_TESTS))
+    run_under_zeo_layer(select(suite, NON_SHARED_BLOB_TESTS))
 
 
 def test_the_iterator_gc_tests_pass_each_time(tmp_path, monkeypatch):
     from ZEO.tests import testZEO
 
     monkeypatch.chdir(tmp_path)
-    run(select(testZEO.test_suite(), ITERATOR_TESTS) * RUNS)
+    run_under_zeo_layer(select(testZEO.test_suite(), ITERATOR_TESTS) * RUNS)
 
 
 @pytest.mark.skipif(
@@ -159,4 +102,4 @@ def test_the_bad_message_tests_of_testconnection_pass_each_time(tmp_path, monkey
     from ZEO.tests import testConnection
 
     monkeypatch.chdir(tmp_path)
-    run(select(testConnection.test_suite(), BAD_MESSAGE_TESTS) * RUNS)
+    run_under_zeo_layer(select(testConnection.test_suite(), BAD_MESSAGE_TESTS) * RUNS)

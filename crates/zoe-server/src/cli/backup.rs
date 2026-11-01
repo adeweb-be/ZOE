@@ -14,7 +14,7 @@ use clap::Args;
 use zoe_convert::Backup;
 use zoe_core::Options;
 
-use super::{Failure, open_read_only};
+use super::{Failure, open_read_only, write_counts};
 
 /// The options of `zoe backup`.
 #[derive(Debug, Args)]
@@ -67,15 +67,21 @@ fn write_report(out: &mut dyn Write, path: &Path, to: &Path, report: &Backup) ->
         path.display(),
         to.display()
     )?;
-    writeln!(out, "  dump          {} ({kind})", dump.display())?;
-    writeln!(out, "  after tid     {}", report.after.hex())?;
-    writeln!(out, "  last tid      {}", report.last.hex())?;
-    writeln!(out, "  transactions  {}", report.transactions)?;
-    writeln!(out, "  records       {}", report.records)?;
     let (blobs, bytes) = (report.blobs, report.blob_bytes);
-    writeln!(out, "  blobs         {blobs} ({bytes} bytes)")?;
-    writeln!(out, "  sequences     {}", report.sequences)?;
-    writeln!(out, "  durable rows  {}", report.durable_rows)
+    write_counts(
+        out,
+        14,
+        &[
+            ("dump", &format!("{} ({kind})", dump.display())),
+            ("after tid", &report.after.hex()),
+            ("last tid", &report.last.hex()),
+            ("transactions", &report.transactions),
+            ("records", &report.records),
+            ("blobs", &format!("{blobs} ({bytes} bytes)")),
+            ("sequences", &report.sequences),
+            ("durable rows", &report.durable_rows),
+        ],
+    )
 }
 
 #[cfg(test)]

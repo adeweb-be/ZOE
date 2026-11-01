@@ -17,7 +17,10 @@ use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
 use zoe_convert::{BackupCheck, IdForm, Verification};
 
-use super::{Failure, closed_by_reader, open_with_blobs};
+use super::{Failure, closed_by_reader, open_with_blobs, write_counts};
+
+/// The width of the names of the counts of the report.
+const COUNTS: usize = 17;
 
 /// The format of the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -162,13 +165,19 @@ fn write_backup_text(
         dumps.display(),
         path.display()
     )?;
-    writeln!(out, "  dumps            {}", restored.dumps)?;
-    writeln!(out, "  last tid         {}", restored.last_tid.hex())?;
-    writeln!(out, "  transactions     {}", restored.transactions)?;
-    writeln!(out, "  records          {}", restored.records)?;
-    writeln!(out, "  blobs            {}", restored.blobs)?;
-    writeln!(out, "  sequences        {}", restored.sequences)?;
-    writeln!(out, "  durable rows     {}", restored.durable_rows)?;
+    write_counts(
+        out,
+        COUNTS,
+        &[
+            ("dumps", &restored.dumps),
+            ("last tid", &restored.last_tid.hex()),
+            ("transactions", &restored.transactions),
+            ("records", &restored.records),
+            ("blobs", &restored.blobs),
+            ("sequences", &restored.sequences),
+            ("durable rows", &restored.durable_rows),
+        ],
+    )?;
     writeln!(out, "Differences: {}", check.differences.len())?;
     for difference in &check.differences {
         writeln!(out, "  {difference}")?;
@@ -236,14 +245,20 @@ fn write_json(out: &mut dyn Write, report: &Verification) -> io::Result<()> {
 /// Write the report for a person.
 fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Result<()> {
     writeln!(out, "Verified the store {}", path.display())?;
-    writeln!(out, "  transactions     {}", report.transactions)?;
-    writeln!(out, "  sequences        {}", report.sequences)?;
-    writeln!(out, "  ephemeral keys   {}", report.ephemeral_keys)?;
-    writeln!(out, "  durable keys     {}", report.durable_keys)?;
-    writeln!(out, "  expired keys     {}", report.expired_keys)?;
-    writeln!(out, "  records          {}", report.records)?;
-    writeln!(out, "  objects          {}", report.objects)?;
-    writeln!(out, "  blobs            {}", report.blobs)?;
+    write_counts(
+        out,
+        COUNTS,
+        &[
+            ("transactions", &report.transactions),
+            ("sequences", &report.sequences),
+            ("ephemeral keys", &report.ephemeral_keys),
+            ("durable keys", &report.durable_keys),
+            ("expired keys", &report.expired_keys),
+            ("records", &report.records),
+            ("objects", &report.objects),
+            ("blobs", &report.blobs),
+        ],
+    )?;
     match report.object_count {
         Some(count) => writeln!(out, "  object count     {count}")?,
         None => writeln!(out, "  object count     none: the store has no count yet")?,

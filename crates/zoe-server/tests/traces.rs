@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-mod wire;
+mod common;
 
-use wire::{Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s};
+use common::{Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s};
 
 /// A collector that keeps the body of each `POST /v1/traces`.
 struct Collector {

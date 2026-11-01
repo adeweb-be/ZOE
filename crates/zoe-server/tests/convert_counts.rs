@@ -13,43 +13,19 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use zoe_convert::to_datafs;
 use zoe_core::{Oid, Tid};
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::{fresh_dir, record, s, zoe};
 
 /// The class pickle of `ZODB.blob.Blob`, then the state `None`.
 const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
 /// The number of blob records whose files are missing.
 const MISSING: u64 = 150;
-
-/// A `PersistentMapping` whose state holds `value` under the key `v`.
-fn record(value: &[u8]) -> Vec<u8> {
-    assert!(value.len() < 256);
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-cli-counts-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
 
 /// Remove each blob file under `dir`. Return how many it removed.
 fn remove_blob_files(dir: &Path) -> u64 {
@@ -69,7 +45,7 @@ fn remove_blob_files(dir: &Path) -> u64 {
 /// Write the `Data.fs` and its blob directory in `dir`, without the blob
 /// files, and the target store. Return the paths of the three.
 fn prepare(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let source = common::open(&dir.join("source"));
+    let source = common::open_store(&dir.join("source"));
     let mut txn = source.tpc_begin(b"admin", b"create", b"").unwrap();
     txn.store(Oid(1), Tid(0), &record(b"a")).unwrap();
     txn.vote().unwrap();
@@ -89,7 +65,7 @@ fn prepare(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     assert_eq!(remove_blob_files(&blobs), MISSING);
 
     let path = dir.join("target");
-    let target = common::open(&path);
+    let target = common::open_store(&path);
     let mut txn = target
         .tpc_begin_restore(first, b"admin", b"create", b"")
         .unwrap();
@@ -110,19 +86,16 @@ fn has_count(line: &str, count: u64) -> bool {
 fn the_report_counts_problems_by_kind_before_the_list() {
     let dir = fresh_dir("kinds");
     let (data_fs, blobs, path) = prepare(&dir);
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(["convert", "--from-data-fs", s(&data_fs)])
-        .args(["--data-fs-blob-dir", s(&blobs), "--path", s(&path)])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = common::output(&mut command);
+    let args = [
+        "convert",
+        "--from-data-fs",
+        s(&data_fs),
+        "--data-fs-blob-dir",
+        s(&blobs),
+        "--path",
+        s(&path),
+    ];
+    let output = zoe(&args, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     // The exit status does not change: a conversion with problems fails.

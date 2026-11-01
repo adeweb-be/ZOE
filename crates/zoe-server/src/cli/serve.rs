@@ -32,7 +32,8 @@ use std::time::Duration;
 use clap::Args;
 use zoe_core::{Compression, Mode};
 
-use super::Failure;
+use super::{Boolish, Failure};
+use crate::defaults;
 
 /// The options of `zoe serve`.
 #[derive(Debug, Args)]
@@ -102,7 +103,7 @@ pub(super) struct ServeArgs {
         long,
         env = "ZOE_INVALIDATION_QUEUE_SIZE",
         value_name = "TRANSACTIONS",
-        default_value_t = 100_000
+        default_value_t = defaults::INVALIDATION_QUEUE_SIZE
     )]
     invalidation_queue_size: usize,
 
@@ -129,7 +130,7 @@ pub(super) struct ServeArgs {
         long,
         env = "ZOE_CLIENT_QUEUE_SIZE",
         value_name = "MESSAGES",
-        default_value_t = 1_000,
+        default_value_t = defaults::CLIENT_QUEUE_SIZE as u64,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     client_queue_size: u64,
@@ -221,7 +222,7 @@ pub(super) struct ServeArgs {
         long,
         env = "ZOE_SHUTDOWN_TIMEOUT",
         value_name = "SECONDS",
-        default_value = "30",
+        default_value = defaults::SHUTDOWN_TIMEOUT,
         value_parser = whole_seconds
     )]
     shutdown_timeout: Duration,
@@ -239,7 +240,7 @@ pub(super) struct ServeArgs {
         long,
         env = "ZOE_IDLE_TIMEOUT",
         value_name = "SECONDS",
-        default_value = "300",
+        default_value = defaults::IDLE_TIMEOUT,
         value_parser = whole_seconds
     )]
     idle_timeout: Duration,
@@ -295,17 +296,7 @@ pub(super) struct ServeArgs {
     /// read_only_fallback then registers read-only. A transaction fails at
     /// its vote, and new_oids and pack fail, with ReadOnlyError. The key
     /// read-only of a [storages.NAME] table makes one store read-only.
-    #[arg(
-        long,
-        env = "ZOE_READ_ONLY",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "false",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        action = clap::ArgAction::Set
-    )]
+    #[arg(long, env = "ZOE_READ_ONLY", boolish = defaults::READ_ONLY)]
     read_only: bool,
 
     /// Pack each store with garbage collection, the default. With false, a
@@ -315,17 +306,7 @@ pub(super) struct ServeArgs {
     /// newest revision there is a deletion goes. The key pack-gc = false of
     /// a [storages.NAME] table sets it for one store. The store records
     /// nothing, so give it at each start.
-    #[arg(
-        long,
-        env = "ZOE_PACK_GC",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "true",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        action = clap::ArgAction::Set
-    )]
+    #[arg(long, env = "ZOE_PACK_GC", boolish = defaults::PACK_GC)]
     pack_gc: bool,
 
     /// The mode of the structural merges (tier 1) of each class that
@@ -395,17 +376,7 @@ pub(super) struct ServeArgs {
     /// client can put a symbolic link in place of a blob file after the
     /// check of the server. Without the option, storeBlobShared fails the
     /// vote with an error that names shared-blob-dir.
-    #[arg(
-        long,
-        env = "ZOE_SHARED_BLOB_DIR",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "false",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        action = clap::ArgAction::Set
-    )]
+    #[arg(long, env = "ZOE_SHARED_BLOB_DIR", boolish = false)]
     shared_blob_dir: bool,
 
     /// The certificate chain of the server, as PEM, leaf first. With
@@ -449,8 +420,10 @@ pub(super) struct ServeArgs {
 
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
-    /// [`configure`] sets them.
+    /// [`configure`] sets them. Only the server reads them: a build without
+    /// the feature `serve` fails before it runs the command.
     #[arg(skip)]
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     storages: Vec<Storage>,
 }
 
@@ -499,17 +472,25 @@ pub(super) struct Storage {
     pub(super) pack_gc: bool,
 }
 
+impl Storage {
+    /// The store in `path` under the storage name `name`, with the
+    /// defaults of `serve::StorageOptions`.
+    pub(super) fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            path: path.into(),
+            blob_dir: None,
+            read_only: defaults::READ_ONLY,
+            pack_gc: defaults::PACK_GC,
+        }
+    }
+}
+
 /// Parse the value of `--storage`: `NAME=PATH`. The name ends at the first
 /// `=`. Neither the name nor the path is empty.
 fn named_storage(value: &str) -> Result<Storage, String> {
     match value.split_once('=') {
-        Some((name, path)) if !name.is_empty() && !path.is_empty() => Ok(Storage {
-            name: name.to_owned(),
-            path: PathBuf::from(path),
-            blob_dir: None,
-            read_only: false,
-            pack_gc: true,
-        }),
+        Some((name, path)) if !name.is_empty() && !path.is_empty() => Ok(Storage::new(name, path)),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
 }
@@ -662,11 +643,8 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
         );
     }
     let path = args.path.iter().map(|path| Storage {
-        name: crate::protocol::STORAGE_NAME.to_owned(),
-        path: path.clone(),
         blob_dir: args.blob_dir.clone(),
-        read_only: false,
-        pack_gc: true,
+        ..Storage::new(crate::protocol::STORAGE_NAME, path.clone())
     });
     let storages: Vec<Storage> = path
         .chain(args.storage.iter().cloned())

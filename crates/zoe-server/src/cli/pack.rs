@@ -10,11 +10,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::builder::BoolishValueParser;
-use clap::{ArgAction, Args};
+use clap::Args;
 use zoe_core::{Clock, Options, PackReport, Store, Tid, timestamp};
 
-use super::{Failure, open_read_only, store_failure};
+use super::{Boolish, Failure, open_read_only, store_failure};
 
 /// The seconds in a day.
 const DAY: u64 = 86_400;
@@ -41,34 +40,14 @@ pub(super) struct PackArgs {
     /// time, it keeps the newest one of each object, also when no reader
     /// can reach the object. An object whose newest revision there is a
     /// deletion goes. A dry run reports what such a pack would remove.
-    #[arg(
-        long,
-        env = "ZOE_PACK_GC",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "true",
-        value_parser = BoolishValueParser::new(),
-        action = ArgAction::Set
-    )]
+    #[arg(long, env = "ZOE_PACK_GC", boolish = true)]
     pack_gc: bool,
 
     /// Report what the pack would remove, by class, and change nothing.
     ///
     /// With --dry-run=false the command packs, also when the twin asks for a
     /// dry run.
-    #[arg(
-        long,
-        env = "ZOE_DRY_RUN",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "false",
-        value_parser = BoolishValueParser::new(),
-        action = ArgAction::Set
-    )]
+    #[arg(long, env = "ZOE_DRY_RUN", boolish = false)]
     dry_run: bool,
 }
 

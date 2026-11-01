@@ -33,6 +33,8 @@ dependencies = [
     "persistent",
     "zodbpickle",
     "BTrees",
+    # The server lifecycle and the provenance of every harness.
+    "zoe-bench-common",
 ]
 
 [dependency-groups]
@@ -45,6 +47,8 @@ dev = [
 # The cache keys of python/zoedb make uv build the extension again when the
 # Rust code changes. maturin builds it in the release profile.
 zoedb = { path = "../../python/zoedb", editable = true }
+# Editable, so that the package finds the repository from its own path.
+zoe-bench-common = { path = "../common", editable = true }
 # The fork of persistent that the workspace in python/ uses.
 persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c54959112f49ef563267f0ed2cb96228c21a" }
 # The fork of zodbpickle that the workspace in python/ uses.

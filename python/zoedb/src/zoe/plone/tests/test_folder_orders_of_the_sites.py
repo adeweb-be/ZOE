@@ -54,6 +54,8 @@ from zope.component.hooks import getSite, setSite
 from zope.event import notify
 from zope.lifecycleevent import ObjectModifiedEvent
 
+from zoe.plone.tests import helpers
+
 # The switch of the tests.
 SWITCH = "folder_orders"
 # The id of the second site of the database.
@@ -151,15 +153,7 @@ class TestFolderOrdersOfTheSites(unittest.TestCase):
     def add_site(self, site_id=OTHER):
         """Add a second Plone site to the Zope root, and commit. Return
         it."""
-        from Products.CMFPlone.factory import addPloneSite
-
-        site = getSite()
-        try:
-            addPloneSite(self.app, site_id)
-        finally:
-            setSite(site)
-        transaction.commit()
-        return self.app[site_id]
+        return helpers.add_site(self.app, site_id)
 
     def edit_type(self, site):
         """Change the title of the type Document of `site`, and notify the

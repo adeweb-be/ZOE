@@ -140,8 +140,8 @@ fn storage(name: &str, value: &Value) -> Result<Storage, String> {
     }
     let mut path = None;
     let mut blob_dir = None;
-    let mut read_only = false;
-    let mut pack_gc = true;
+    let mut read_only = None;
+    let mut pack_gc = None;
     for (key, value) in table {
         let boolean = || {
             value
@@ -151,18 +151,18 @@ fn storage(name: &str, value: &Value) -> Result<Storage, String> {
         match key.as_str() {
             "path" => path = Some(directory(name, key, value)?),
             "blob-dir" => blob_dir = Some(directory(name, key, value)?),
-            "read-only" => read_only = boolean()?,
-            "pack-gc" => pack_gc = boolean()?,
+            "read-only" => read_only = Some(boolean()?),
+            "pack-gc" => pack_gc = Some(boolean()?),
             _ => return Err(format!("{key} is not a key of {STORAGES}.{name}")),
         }
     }
     let path = path.ok_or_else(|| format!("{STORAGES}.{name} has no path"))?;
+    let defaults = Storage::new(name, path);
     Ok(Storage {
-        name: name.to_owned(),
-        path,
         blob_dir,
-        read_only,
-        pack_gc,
+        read_only: read_only.unwrap_or(defaults.read_only),
+        pack_gc: pack_gc.unwrap_or(defaults.pack_gc),
+        ..defaults
     })
 }
 

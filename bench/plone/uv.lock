@@ -1404,6 +1404,11 @@ wheels = [
 ]
 
 [[package]]
+name = "zoe-bench-common"
+version = "0.0.0"
+source = { editable = "../common" }
+
+[[package]]
 name = "zoe-plonebench"
 version = "0.0.0"
 source = { editable = "." }
@@ -1413,6 +1418,7 @@ dependencies = [
     { name = "msgpack" },
     { name = "psutil" },
     { name = "zeo" },
+    { name = "zoe-bench-common" },
 ]
 
 [package.dev-dependencies]
@@ -1427,6 +1433,7 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1" },
     { name = "psutil", specifier = ">=7" },
     { name = "zeo", specifier = ">=6" },
+    { name = "zoe-bench-common", editable = "../common" },
 ]
 
 [package.metadata.requires-dev]

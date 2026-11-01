@@ -14,66 +14,25 @@
 //! never goes past the last tid. With no commit after the backup, that is
 //! the last tid of the dumps.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Output;
 
 use serde_json::Value;
 use zoe_core::{Oid, Store, Tid};
 
 mod common;
 
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::{assert_exit, fresh_dir, record, s};
 
 /// The root object. A pack keeps what the root reaches.
 const ROOT: Oid = Oid(0);
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-backup-pack-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
 /// Run `zoe` with `args`, without the `ZOE_*` variables of the test
 /// process. The temporary directory of the child is `scratch`.
 fn zoe(args: &[&str], scratch: &Path) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .env("TMPDIR", scratch)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = common::zoe_command(args, &[]);
+    command.env("TMPDIR", scratch);
     common::output(&mut command)
-}
-
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// A record that holds `value`.
-fn record(value: &[u8]) -> Vec<u8> {
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
 }
 
 /// Commit one transaction that stores each record of `writes` over its
@@ -99,7 +58,7 @@ fn entries(dumps: &Path) -> Vec<String> {
 
 /// The pack watermark and the last tid of the store in `path`.
 fn watermark_and_last(path: &Path) -> (Tid, Tid) {
-    let store = common::open(path);
+    let store = common::open_store(path);
     (store.pack_watermark().unwrap(), store.last_transaction())
 }
 
@@ -144,7 +103,7 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
     // The root changes twice, so a pack removes its first record. The
     // root does not reach the other object, so a pack removes that object.
     let (first, dumped) = {
-        let store = common::open(&source);
+        let store = common::open_store(&source);
         let first = commit(&store, &[(ROOT, Tid(0), record(b"1"))]);
         let other = store.new_oid().unwrap();
         commit(&store, &[(other, Tid(0), record(b"other"))]);
@@ -162,7 +121,7 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
         "the pack is at the last tid of the dumps"
     );
     {
-        let store = common::open(&source);
+        let store = common::open_store(&source);
         assert!(
             store.load_serial(ROOT, first).is_err(),
             "the pack removed the first record of the root"
@@ -185,7 +144,7 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
 
     // A commit after the pack: the next dump continues the chain.
     let next = {
-        let store = common::open(&source);
+        let store = common::open_store(&source);
         commit(&store, &[(ROOT, dumped, record(b"3"))])
     };
     let output = backup();
@@ -208,7 +167,7 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
     // A commit, then a pack after the last tid of the dumps: the backup
     // refuses and writes nothing, and the check reports a difference.
     let later = {
-        let store = common::open(&source);
+        let store = common::open_store(&source);
         let other = store.new_oid().unwrap();
         commit(&store, &[(other, Tid(0), record(b"4"))])
     };

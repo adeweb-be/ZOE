@@ -701,6 +701,11 @@ wheels = [
 ]
 
 [[package]]
+name = "zoe-bench-common"
+version = "0.0.0"
+source = { editable = "../common" }
+
+[[package]]
 name = "zoe-shootout"
 version = "0.0.0"
 source = { editable = "." }
@@ -717,6 +722,7 @@ dependencies = [
     { name = "zodb" },
     { name = "zodbpickle" },
     { name = "zodbshootout" },
+    { name = "zoe-bench-common" },
     { name = "zoedb" },
 ]
 
@@ -739,6 +745,7 @@ requires-dist = [
     { name = "zodb", specifier = ">=6" },
     { name = "zodbpickle", git = "https://github.com/adeweb-be/zodbpickle?rev=84029ffb1d5e636b2fa20f44c65272832519263f" },
     { name = "zodbshootout", specifier = "==0.8.0" },
+    { name = "zoe-bench-common", editable = "../common" },
     { name = "zoedb", editable = "../../python/zoedb" },
 ]
 
@@ -759,7 +766,7 @@ requires-dist = [
     { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
     { name = "zconfig", specifier = ">=4" },
     { name = "zodb", specifier = ">=6" },
-    { name = "zodb", marker = "extra == 'uri'", specifier = ">=6.4" },
+    { name = "zodburi", marker = "extra == 'uri'", specifier = ">=3" },
 ]
 provides-extras = ["plone", "uri"]
 

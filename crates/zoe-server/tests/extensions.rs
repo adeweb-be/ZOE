@@ -9,9 +9,9 @@
 //! extension. A name that the server does not know is left out, never an
 //! error. A third argument that is not a list of strings is an error.
 
-mod wire;
+mod common;
 
-use wire::{Server, Value, fresh_dir};
+use common::{Server, Value, fresh_dir};
 
 /// The keys of `get_info` that a stock client reads.
 const INFO_KEYS: [&str; 6] = [

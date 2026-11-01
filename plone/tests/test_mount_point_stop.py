@@ -2,8 +2,8 @@
 
 The test makes the check fail after create_site.py wrote the site, then
 looks for a `zoe serve` process that the recipe left. Run it inside
-`devenv shell`: `uv run --directory python pytest ../plone/tests`. The
-first build needs the network.
+`devenv shell`: `just plone test plone/tests/test_mount_point_stop.py`.
+The first build needs the network.
 """
 
 import functools
@@ -14,25 +14,16 @@ import subprocess
 import threading
 from pathlib import Path
 
+from conftest import zoe_serve_processes
+
 REPO = Path(__file__).resolve().parents[2]
 VAR = REPO / "target" / "plone" / "zeoclient-mount" / "var"
 
 
-def zoe_serve_processes():
-    """Return the pids of the `zoe serve` processes on the stores of the
-    scenario.
-
-    The pattern names the store of `main`, so the servers of other
-    worktrees and of other tests do not match.
-    """
-    pattern = f"zoe serve --storage main={re.escape(str(VAR / 'main'))} "
-    result = subprocess.run(
-        ["pgrep", "-u", str(os.getuid()), "-f", pattern],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return {int(pid) for pid in result.stdout.split()}
+# The `zoe serve` processes on the stores of the scenario. It names the
+# store of `main`, so the servers of other worktrees and of other tests do
+# not match.
+SERVERS = f"zoe serve --storage main={re.escape(str(VAR / 'main'))} "
 
 
 def test_a_failed_read_of_the_mounted_site_stops_the_server():
@@ -63,4 +54,4 @@ def test_a_failed_read_of_the_mounted_site_stops_the_server():
     assert log.count("listening ") == 1, log
     assert (VAR / "main" / "zoe.redb").exists()
     assert (VAR / "content" / "zoe.redb").exists()
-    assert not zoe_serve_processes()
+    assert not zoe_serve_processes(SERVERS)

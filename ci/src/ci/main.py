@@ -49,12 +49,6 @@ SOURCE_IGNORE = [
     "python/zoedb/src/zoe/*.so",
     "ci/.venv",
     "ci/sdk",
-    "plone/.installed.cfg",
-    "plone/bin",
-    "plone/develop-eggs",
-    "plone/eggs",
-    "plone/parts",
-    "plone/var",
 ]
 
 Source = Annotated[
@@ -74,6 +68,30 @@ debug = false
 [profile.test.package."*"]
 debug = false
 """
+
+
+def just(
+    ctr: dagger.Container,
+    name: str,
+    args: tuple[str, ...] = (),
+    privileged: bool = False,
+    file_modes: bool = False,
+) -> dagger.Container:
+    """Run one just recipe inside the devenv shell of `ctr`."""
+    command = ["just", name, *args]
+    if file_modes:
+        # Root keeps its other capabilities. Without these two, the
+        # kernel applies the mode of each file to root too.
+        command = [
+            "setpriv",
+            f"--inh-caps={FILE_MODE_CAPS}",
+            f"--bounding-set={FILE_MODE_CAPS}",
+            *command,
+        ]
+    return ctr.with_exec(
+        ["devenv", "shell", "--", *command],
+        insecure_root_capabilities=privileged,
+    )
 
 
 @object_type
@@ -132,25 +150,19 @@ class Ci:
         cache_target: bool = True,
         privileged: bool = False,
         file_modes: bool = False,
+        env: dict[str, str] | None = None,
+        services: dict[str, dagger.Service] | None = None,
     ) -> dagger.Container:
-        """Run one just recipe inside the devenv shell."""
+        """Run one just recipe inside the devenv shell, with the variables
+        of `env` and the services of `services` under their host names."""
         ctr = await self.devenv(source)
         if cache_target:
             ctr = ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
-        command = ["just", name, *args]
-        if file_modes:
-            # Root keeps its other capabilities. Without these two, the
-            # kernel applies the mode of each file to root too.
-            command = [
-                "setpriv",
-                f"--inh-caps={FILE_MODE_CAPS}",
-                f"--bounding-set={FILE_MODE_CAPS}",
-                *command,
-            ]
-        return ctr.with_exec(
-            ["devenv", "shell", "--", *command],
-            insecure_root_capabilities=privileged,
-        )
+        for host, service in (services or {}).items():
+            ctr = ctr.with_service_binding(host, service)
+        for key, value in (env or {}).items():
+            ctr = ctr.with_env_variable(key, value)
+        return just(ctr, name, args, privileged=privileged, file_modes=file_modes)
 
     async def workspace(self, source: dagger.Directory) -> dict:
         """Return the workspace package table of Cargo.toml."""
@@ -213,9 +225,7 @@ class Ci:
         """Run the Plone suites on ZOE in-process, then through zoe serve."""
         # The second run starts from the first one, so it reuses its eggs.
         zoe = await self.recipe(source, "plone", ("zoe", "suites"))
-        zeoclient = zoe.with_exec(
-            ["devenv", "shell", "--", "just", "plone", "zeoclient", "suites"]
-        )
+        zeoclient = just(zoe, "plone", ("zeoclient", "suites"))
         return await zoe.stdout() + await zeoclient.stdout()
 
     @function
@@ -240,19 +250,18 @@ class Ci:
             .with_exposed_port(5432)
             .as_service()
         )
-        run = ["devenv", "shell", "--", "just", "bench", "run", "--output", "/results"]
-        ctr = await self.devenv(source)
-        return (
-            ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
-            .with_service_binding("postgres", postgres)
-            .with_env_variable(
-                "ZOE_BENCH_PG_DSN", "host=postgres dbname=zoe_bench user=postgres"
-            )
-            .with_env_variable("ZOE_BENCH_COMMIT", commit)
-            .with_exec(["devenv", "shell", "--", "just", "bench", "test"])
-            .with_exec(run + (["--quick"] if quick else []))
-            .directory("/results")
+        tests = await self.recipe(
+            source,
+            "bench",
+            ("test",),
+            env={
+                "ZOE_BENCH_PG_DSN": "host=postgres dbname=zoe_bench user=postgres",
+                "ZOE_BENCH_COMMIT": commit,
+            },
+            services={"postgres": postgres},
         )
+        run = ("run", "--output", "/results", *(("--quick",) if quick else ()))
+        return just(tests, "bench", run).directory("/results")
 
     @function(cache="never")
     async def crash(
@@ -336,10 +345,7 @@ class Ci:
             str, Doc("The git tag of the release. It must be v and the version.")
         ] = "",
     ) -> dagger.Directory:
-        """Build the release artifacts: the static binary and the server image.
-
-        The version bump, the wheels and the Helm chart are not built yet.
-        """
+        """Build the release artifacts: the static binary and the server image."""
         version = (await self.workspace(source))["version"]
         # The tag of the image is the version. So the git tag must name the
         # version that the build gives to the binary and the image.

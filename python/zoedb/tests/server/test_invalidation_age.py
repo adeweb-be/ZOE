@@ -15,17 +15,9 @@ limit.
 import time
 
 import pytest
+from support import client
 
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", **kw)
 
 
 def commit(storage, oids, serials):

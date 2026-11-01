@@ -19,8 +19,9 @@ No network thread of ZEO's own client starts during the run, so the tests
 exercise the native client.
 """
 
-import contextlib
 import unittest
+
+from suite_support import defining_class, zeo_client_threads
 
 import zoe.testing
 
@@ -36,15 +37,6 @@ SERVER_PYTHON = {
 
 CONFLICTS = ("ZODB.tests.ConflictResolution", "ConflictResolvingStorage")
 UNDO_CONFLICTS = ("ZODB.tests.ConflictResolution", "ConflictResolvingTransUndoStorage")
-
-
-def defining_class(test):
-    """Return the class that defines the method of test."""
-    method = test._testMethodName
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return cls
-    raise AssertionError(f"no class defines {test.id()}")
 
 
 def mixin_of(test):
@@ -68,25 +60,6 @@ def loaded(case):
         loader.testMethodPrefix = prefix
         suite.addTests(loader.loadTestsFromTestCase(case))
     return list(flatten(suite))
-
-
-@contextlib.contextmanager
-def zeo_client_threads():
-    """Record each network thread of ZEO's own client that starts."""
-    from ZEO.asyncio.client import ClientThread
-
-    started = []
-    init = ClientThread.__init__
-
-    def __init__(self, *args, **kw):
-        started.append(type(self).__name__)
-        init(self, *args, **kw)
-
-    ClientThread.__init__ = __init__
-    try:
-        yield started
-    finally:
-        ClientThread.__init__ = init
 
 
 def run(tests, skips):

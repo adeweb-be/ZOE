@@ -12,8 +12,8 @@ creates the mount point and a Plone site inside it by script, starts the
 instance, reads the site over HTTP, then stops the instance and the server.
 The objects of the site are in the `content` store, not in `main`.
 
-Run it inside `devenv shell`: `uv run --directory python pytest
-../plone/tests/test_mount_point.py`. The first build needs the network.
+Run it inside `devenv shell`: `just plone test plone/tests/test_mount_point.py`.
+The first build needs the network.
 """
 
 import subprocess

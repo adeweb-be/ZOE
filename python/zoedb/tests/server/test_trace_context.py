@@ -11,14 +11,12 @@ The test runs a small OTLP/HTTP collector that takes the JSON encoding.
 """
 
 import json
-import pickle
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from zoe.testing import ZoeServer
+from support import TIMEOUT, ZERO, record
 
-ZERO = bytes(8)
-TIMEOUT = 30
+from zoe.testing import ZoeServer
 
 
 class Collector:
@@ -57,11 +55,6 @@ class Collector:
 
     def close(self):
         self.server.shutdown()
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
 
 
 def test_the_span_of_a_load_joins_the_trace_of_the_client(tmp_path):

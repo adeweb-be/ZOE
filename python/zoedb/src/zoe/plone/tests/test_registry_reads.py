@@ -20,24 +20,13 @@ from plone.registry.record import Record
 from plone.registry.registry import Registry
 
 from zoe.plone import registry as backend
+from zoe.plone import registry_guard, registry_ops
 from zoe.plone.registry_rows import FIELD, dumps, loads, record_key
-from zoe.plone.tests.test_registry_backend import TITLE, namespace
+from zoe.plone.tests.helpers import TITLE, RegistryBackend, namespace
 
 
-class TestRegistryReads(unittest.TestCase):
+class TestRegistryReads(RegistryBackend, unittest.TestCase):
     layer = PLONE_FUNCTIONAL_TESTING
-
-    def setUp(self):
-        backend.install()
-        self.addCleanup(backend.uninstall)
-        self.portal = self.layer["portal"]
-        self.registry = self.portal.portal_registry
-
-    def moved(self):
-        """Move the registry of the site and commit. Return it."""
-        backend.move(self.registry)
-        transaction.commit()
-        return self.registry
 
     # The ranges of a view.
 
@@ -111,7 +100,7 @@ class TestRegistryReads(unittest.TestCase):
         key = record_key(FIELD, TITLE)
         row = namespace(registry).get(key)
         counter = aq_base(registry)._records.counter
-        with mock.patch.object(backend, "dumps", wraps=dumps) as counted:
+        with mock.patch.object(registry_ops, "dumps", wraps=dumps) as counted:
             registry.records[TITLE].field.title  # noqa: B018
             transaction.commit()
         # The move writes a pickle that a new pickle of the field gives.
@@ -141,7 +130,7 @@ class TestRegistryReads(unittest.TestCase):
         transaction.commit()
         registry = aq_base(self.registry)
         with mock.patch.object(
-            backend, "_holds_its_bucket", wraps=backend._holds_its_bucket
+            registry_guard, "_holds_its_bucket", wraps=backend._holds_its_bucket
         ) as checked:
             registry.records  # noqa: B018
             first = checked.call_count
@@ -155,7 +144,7 @@ class TestRegistryReads(unittest.TestCase):
             self.assertEqual(checked.call_count, first + 2)
         transaction.abort()
         with mock.patch.object(
-            backend, "_holds_its_bucket", wraps=backend._holds_its_bucket
+            registry_guard, "_holds_its_bucket", wraps=backend._holds_its_bucket
         ) as checked:
             # A new transaction reads the roots current again.
             registry.records  # noqa: B018

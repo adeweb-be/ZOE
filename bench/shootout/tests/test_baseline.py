@@ -4,7 +4,6 @@ The harness runs zodbshootout in its quick mode against one storage and
 returns results that validate against the published schema.
 """
 
-import json
 import os
 import pathlib
 
@@ -14,11 +13,6 @@ from shootout import run
 
 SCHEMA_PATH = pathlib.Path(__file__).parents[2] / "schema" / "results.schema.json"
 SCENARIOS = {"add", "update", "read_cold", "read_warm", "read_hot"}
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text())
 
 
 def check(result, storage, schema):

@@ -8,8 +8,6 @@ the backend themselves. The test of `reset` starts `zoe serve`: the `zoe`
 binary of `zoe.testing.ZoeServer.binary()` must exist.
 """
 
-import shutil
-import tempfile
 import unittest
 
 import transaction
@@ -20,27 +18,19 @@ from ZODB.POSException import Unsupported
 
 from zoe.plone import registry as backend
 from zoe.plone.registry_rows import MARKER, decode_marker
-from zoe.plone.tests.test_concurrent_creations import copy_records
-from zoe.plone.tests.test_registry_backend import TITLE, namespace, opened
+from zoe.plone.tests.helpers import (
+    TITLE,
+    RegistryBackend,
+    copied_store,
+    namespace,
+    opened,
+)
 
 TIMEOUT = 30
 
 
-class TestRegistryFollowUps(unittest.TestCase):
+class TestRegistryFollowUps(RegistryBackend, unittest.TestCase):
     layer = PLONE_FUNCTIONAL_TESTING
-
-    def setUp(self):
-        backend.install()
-        self.addCleanup(backend.uninstall)
-        self.portal = self.layer["portal"]
-        self.db = self.layer["zodbDB"]
-        self.registry = self.portal.portal_registry
-
-    def moved(self):
-        """Move the registry of the site and commit. Return it."""
-        backend.move(self.registry)
-        transaction.commit()
-        return self.registry
 
     # A rollback to a savepoint.
 
@@ -73,17 +63,7 @@ class TestRegistryFollowUps(unittest.TestCase):
     def served_copy(self):
         """Copy the site to a new `zoe.Storage`, move its registry there,
         write a record and commit. Return the path of the store, closed."""
-        import zoe
-
-        directory = tempfile.mkdtemp(prefix="zoe-registry-reset-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        path = f"{directory}/zoe"
-        storage = zoe.Storage(path)
-        try:
-            copy_records(self.db.storage, storage)
-        except BaseException:
-            storage.close()
-            raise
+        storage, path = copied_store(self, self.db.storage, "zoe-registry-reset-")
         db = DB(storage)
         try:
             with opened(db) as (app, manager):

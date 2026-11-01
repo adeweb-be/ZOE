@@ -131,14 +131,19 @@ pub(crate) fn reply(id: Value, result: Value) -> Vec<u8> {
 /// borrowed values.
 pub(crate) fn reply_of(id: &Value, result: &Value) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(16 + size_hint(id) + size_hint(result));
-    // An array of 4 values, then the id, the flags 0 and the method.
+    reply_head(&mut bytes, id);
+    write(&mut bytes, result);
+    bytes
+}
+
+/// Write the bytes of a reply to the call `id` before its result: an
+/// array of 4 values, then the id, the flags 0 and the method.
+fn reply_head(bytes: &mut Vec<u8>, id: &Value) {
     bytes.push(0x94);
-    write(&mut bytes, id);
+    write(bytes, id);
     bytes.push(0x00);
     bytes.push(0xa6);
     bytes.extend_from_slice(REPLY.as_bytes());
-    write(&mut bytes, result);
-    bytes
 }
 
 /// Encode the reply to the call `id` of a load that found a record:
@@ -148,12 +153,7 @@ pub(crate) fn reply_of(id: &Value, result: &Value) -> Vec<u8> {
 /// values, so a stock client gets the same frame. `data` is not copied.
 pub(crate) fn load_reply(id: &Value, data: Vec<u8>, serial: &Value, next: &Value) -> Vec<Vec<u8>> {
     let mut head = Vec::with_capacity(32 + size_hint(id));
-    // An array of 4 values, then the id, the flags 0 and the method.
-    head.push(0x94);
-    write(&mut head, id);
-    head.push(0x00);
-    head.push(0xa6);
-    head.extend_from_slice(REPLY.as_bytes());
+    reply_head(&mut head, id);
     // The result: an array of 3 values, the first of them bin data.
     head.push(0x93);
     // A record is shorter than 4 GiB: the core refuses a longer one.

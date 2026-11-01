@@ -22,13 +22,16 @@
 //! record, with their identity, and pickles them again as zodbpickle does.
 //! [`btrees`] reads and builds the states of the classes of BTrees on that
 //! model, for the conflict resolution of the core.
+//!
+//! [`opcode`] gives the opcodes of protocols 0 to 3 and the readers of
+//! their arguments, for the callers that build or read small pickles.
 
 pub mod btrees;
 mod decode;
 mod encode;
 mod error;
 mod iterative;
-mod opcode;
+pub mod opcode;
 pub mod python;
 mod references;
 #[cfg(feature = "testing")]

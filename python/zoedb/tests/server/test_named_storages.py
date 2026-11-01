@@ -9,38 +9,12 @@ and a commit on one store never waits for a lock of the other. An unknown
 name is refused at registration.
 """
 
-import pickle
 import threading
 
 import pytest
+from support import TIMEOUT, ZERO, client, commit, record
 
 from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def client(server, name, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage=name, **kw)
-
-
-def commit(storage, stores):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
 
 
 @pytest.fixture

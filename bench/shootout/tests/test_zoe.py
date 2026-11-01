@@ -11,13 +11,10 @@ seconds.
 """
 
 import importlib.metadata
-import json
 import pathlib
 
 import jsonschema
-import pytest
 
-import shootout
 from shootout import KB, Cell, Profile, run
 from shootout.storages import STORAGES, zconfig
 
@@ -30,17 +27,6 @@ TINY = Profile(
     processes=1,
     values=1,
 )
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text())
-
-
-@pytest.fixture
-def tiny(monkeypatch):
-    """Make the quick set of the harness the tiny profile."""
-    monkeypatch.setattr(shootout, "QUICK", TINY)
 
 
 def check(result, storage, schema):

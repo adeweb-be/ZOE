@@ -9,28 +9,17 @@ server: the error of an undo that does not merge, and an undo id as a
 import pickle
 
 import pytest
+from support import client, native
+from support import commit_one as commit
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import UndoError
 from ZODB.utils import z64
-
-import zoe.testing
-from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 
 
 def mapping(value):
     """A record of a `PersistentMapping`, which no tier merges."""
     meta = (("persistent.mapping", "PersistentMapping"), None)
     return pickle.dumps(meta, 3) + pickle.dumps({"data": {"v": value}}, 3)
-
-
-def commit(storage, oid, serial, data):
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
 
 
 def undo(storage, undo_id):
@@ -47,20 +36,9 @@ def undo(storage, undo_id):
         raise
 
 
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
-
-
 def clients(server):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw = dict(storage="1", wait_timeout=TIMEOUT)
-    return (
-        ClientStorage(server.address, **kw),
-        zoe.testing.native_client(server.address, **kw),
-    )
+    """Open a stock client and a native client of the storage 1 of server."""
+    return client(server), native(server)
 
 
 def test_an_undo_that_does_not_merge_raises_the_error_of_the_stock_client(server):

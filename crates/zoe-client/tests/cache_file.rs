@@ -1,8 +1,9 @@
 //! Tests of the cache file (ADR 0034, stage 2): `Cache::open`, the close,
 //! the checks of the open, and the verification at the open of a pool.
 //!
-//! The files go to the temporary directory of cargo in the target
-//! directory. The pool tests run `zoe serve` in the test process.
+//! The cache files go to the temporary directory of cargo in the target
+//! directory. The pool tests run `zoe serve` in the test process, on stores
+//! in the temporary directory of the system (`common::start`).
 
 mod common;
 
