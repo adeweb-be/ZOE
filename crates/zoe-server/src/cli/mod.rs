@@ -183,8 +183,13 @@ fn store_failure(path: &Path, error: ZoeError) -> Failure {
 /// the failure, which says that the store was not closed cleanly and gives
 /// the error of the system.
 fn open_read_only(path: &Path, options: Options) -> Result<Store, Failure> {
-    let store =
-        Store::open_read_only_repairing(path, options).map_err(|e| store_failure(path, e))?;
+    open_repairing(path, options).map_err(|e| store_failure(path, e))
+}
+
+/// Open the existing store in `path` read-only, with `options`, as
+/// `open_read_only` does, and give the error of the store.
+fn open_repairing(path: &Path, options: Options) -> Result<Store, ZoeError> {
+    let store = Store::open_read_only_repairing(path, options)?;
     if store.repaired() {
         let mut stderr = io::stderr().lock();
         let _ = writeln!(stderr, "{}", repair_line(path));

@@ -744,7 +744,7 @@ A client without a shared blob directory uploads a blob in chunks. `storeBlobSta
 
 #### Logs
 
-The logs go to stderr from the level INFO on, as text, or with `--log-format json` as one JSON object per line, with the fields of the event and of its spans. Each line of a connection has `client`, the label of `set_client_label` or else the address, and once it registered `storage`. A text that a client sends goes only into a quoted field, never into the message, so it cannot add a log line. `--lock-warn` and `--transaction-warn`, in whole seconds, set `lock-warn` and `transaction-warn` of each store: a lock held longer is logged when it is released, with its `oid`, `client` and `storage`, and a transaction open longer with its client and storage. A log line holds no pickle bytes, user or description.
+The logs go to stderr from the level INFO on, as text, or with `--log-format json` as one JSON object per line, with the fields of the event and of its spans. Each line of a connection has `client`, the label of `set_client_label` or else the address, and once it registered `storage`. A text that a client sends goes only into a quoted field, never into the message, so it cannot add a log line. `--lock-warn` and `--transaction-warn`, in whole seconds, set `lock-warn` and `transaction-warn` of each store: a lock held longer is logged when it is released, with its `oid`, `client` and `storage`, and a transaction open longer with its client and storage. After the open of a store, the server logs at ERROR, with the storage, the tids of a damaged last entry of the write-ahead log that the open cut (`Store::cut_at_open`, ADR 0056). A log line holds no pickle bytes, user or description.
 
 #### Stop
 

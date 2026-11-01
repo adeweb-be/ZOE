@@ -46,8 +46,8 @@ pub use datafs::from_datafs;
 pub use report::{ProblemKind, Report};
 pub use to_datafs::to_datafs;
 pub use verify::{
-    BlobProblem, CountProblem, Dangling, FrameProblem, IdForm, PickleProblem, Verification,
-    missing_blob_dir, verify,
+    BlobProblem, CountProblem, Dangling, FrameProblem, IdForm, LogProblem, PickleProblem,
+    Verification, missing_blob_dir, verify,
 };
 
 /// An error that stops a conversion.

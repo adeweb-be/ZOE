@@ -42,6 +42,9 @@ Each metric has the label `storage`, the storage name. A duration is a histogram
 | `zoe_vote_latency_seconds` | histogram | `storage` | The time of each `vote` call, its lock wait included. |
 | `zoe_finish_latency_seconds` | histogram | `storage` | The time of each `tpc_finish` call that ended a transaction, until the commit is durable and published. |
 | `zoe_fsync_batch_size` | histogram | `storage` | The commits that one sync made durable, in commits. |
+| `zoe_fold_seconds` | histogram | `storage` | The time of each slice of the fold: one durable write of commits of the write-ahead log into the tables (ADR 0056). |
+| `zoe_fold_commits_total` | counter | `storage` | The commits that the fold wrote from the write-ahead log into the tables. |
+| `zoe_backlog_wait_seconds` | histogram | `storage` | The time of each wait of a commit batch for the fold: for room in the backlog, or for an empty backlog before a batch that goes into the tables. |
 | `zoe_lock_wait_seconds` | histogram | `storage` | The time of each vote to take its locks, a wait past the lock timeout included. |
 | `zoe_lock_handoffs_total` | counter | `storage` | The locks that a finish handed to the vote at the head of their queues (ADR 0044). |
 | `zoe_intent_locks_total` | counter | `storage` | The early write-intent locks that the sessions took (ADR 0044, part B). |
@@ -53,6 +56,7 @@ Each metric has the label `storage`, the storage name. A duration is a histogram
 | `zoe_writes_on_get_total` | counter | `storage`, `class` | The records that the transactions of GET and HEAD requests committed, by class. `zoe.plone` marks such a transaction with the key `zoe.request_method` of its extension. A deletion and a pickle whose class does not decode count nothing. The metric has no sample before the first such record. |
 | `zoe_clients_connected` | gauge | `storage` | The connections that registered. |
 | `zoe_invalidation_queue_depth` | gauge | `storage` | The messages that wait in the deepest hub queue among the connections of the storage. |
+| `zoe_backlog_bytes` | gauge | `storage` | The backlog of the write-ahead log, in bytes: the commits that the log holds and the tables do not hold yet. |
 
 The buckets of a histogram in seconds have the upper bounds 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 and `+Inf`. The buckets of `zoe_fsync_batch_size` have the upper bounds 1, 2, 4, 8, 16, 32, 64, 128 and `+Inf`.
 
@@ -75,6 +79,7 @@ Some lines that an operator looks for:
 | WARN | `lock held past lock-warn` | `oid`, `duration_ms`; at most 10 lines for one release, then `summary of the locks held past lock-warn` with `locks` and `max_duration_ms` |
 | WARN | `transaction open past transaction-warn` | `duration_ms`, `oids`, and `oid` and `tid` when they are known |
 | WARN | the repair of a store that a writer left open, which holds `repaired the store` | `storage` |
+| ERROR | `the open cut the damaged last entry of the write-ahead log: the commits after previous_tid up to last_tid are lost` | `storage`, `previous_tid`, `last_tid` |
 | ERROR | `transaction timeout after the vote: closing the connection` | `seconds` |
 | INFO | `no frame within the idle timeout: closing the connection` | `client` |
 | WARN | `the shutdown timeout ends: closing the connections that remain` | none |
