@@ -20,4 +20,4 @@ The bytes and the names of the ZEO 6 msgpack protocol that `zoe serve` (`zoe-ser
 - `zoe-server` takes it only under its feature `serve`. `cargo tree -p zoe-py -e normal` lists it, lists tokio through `zoe-client`, and does not list rmcp.
 - Each byte that it writes is a byte of the wire protocol. A change to one is a change of the wire protocol: stop and ask.
 - Each caller maps the errors of the crate to its own error, with its own text.
-- The tests of the server and of the client keep their own codecs. A test that built its frames with this crate would not see a change of it.
+- A test that builds its frames with this crate does not see a change of it. The unit tests of `zoe-server` build their frames with `frame::encode` (`protocol::frame`, `protocol::testing`, `sim/net.rs`, `protocol/fuzz.rs`). Only these keep a codec of their own: the tests of `zoe-client`, the Rust tests of `zoe-server` over the binary (`tests/frames.rs`, `tests/common/wire.rs`), and the literal bytes of the frame test of `zoe-server/src/protocol/frame.rs`.

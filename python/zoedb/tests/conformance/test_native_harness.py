@@ -28,6 +28,8 @@ The test case is ZEO's `FileStorageTests` with two changes:
 import threading
 import unittest
 
+from suite_support import defining_class
+
 import zoe.testing
 
 # The longest time that a client waits for its connection.
@@ -50,15 +52,6 @@ RECONNECT = "it opens and closes many clients, a test of reconnects"
 SKIPS = {
     "RaceTests.test_race_external_invalidate_vs_disconnect": RECONNECT,
 }
-
-
-def defining_class(test):
-    """Return the class that defines the method of test."""
-    method = test._testMethodName
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return cls
-    raise AssertionError(f"no class defines {test.id()}")
 
 
 def selected(suite):

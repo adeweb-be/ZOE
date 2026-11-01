@@ -14,6 +14,7 @@ import sys
 import time
 
 import pytest
+from conftest import start
 
 from plonebench import __main__ as cli
 from plonebench import runner, showcase, stack
@@ -37,15 +38,8 @@ def entry(kind, **fields):
     raise AssertionError(f"no entry {kind} {fields}")
 
 
-@pytest.fixture(autouse=True)
-def lock(tmp_path, monkeypatch):
-    """Give each test a bench lock of its own."""
-    monkeypatch.setenv("ZOE_BENCH_LOCK", str(tmp_path / "bench.lock"))
-
-
-def start(directory, execute, *options):
-    argv = ["--dir", str(directory), "--max-load", "1000", *OPTIONS_ARGV, *options]
-    return showcase.main(argv, execute=execute)
+# Each test has a bench lock of its own.
+pytestmark = pytest.mark.usefixtures("lock")
 
 
 OPTIONS_ARGV = [
@@ -141,6 +135,24 @@ def test_a_result_that_the_run_writes_is_a_run_that_ended_well(
 def test_a_run_without_its_result_failed(tmp_path, monkeypatch):
     run = entry("native", python="3.13")
     monkeypatch.setattr(showcase.Execute, "command", lambda *_: 1)
+    (tmp_path / "state").mkdir()
+    with pytest.raises(RuntimeError, match="exited with 1"):
+        showcase.Execute(OPTIONS, 0, "c" * 40)(run, tmp_path)
+    assert list(tmp_path.glob("*.json")) == []
+
+
+@pytest.mark.parametrize("kind", ["native", "client"])
+def test_a_truncated_result_is_a_failed_run(tmp_path, monkeypatch, kind):
+    """Python exits with 1 also on an error, which can leave a part of the
+    result: the run failed, and the part is no document of the showcase."""
+    run = entry(kind, python="3.13")
+
+    def command(self, argv, log, env):
+        output = pathlib.Path(argv[argv.index("--output") + 1])
+        output.write_text('{"cells": [{"name": "add", ')
+        return 1
+
+    monkeypatch.setattr(showcase.Execute, "command", command)
     (tmp_path / "state").mkdir()
     with pytest.raises(RuntimeError, match="exited with 1"):
         showcase.Execute(OPTIONS, 0, "c" * 40)(run, tmp_path)
@@ -248,7 +260,7 @@ def test_sighup_stops_the_current_run_as_sigterm_does(tmp_path):
         )
         (pathlib.Path(directory) / "STOP").touch()
 
-    assert start(tmp_path / "showcase", execute) == 0
+    assert start(tmp_path / "showcase", execute, *OPTIONS_ARGV) == 0
     assert handlers == [(showcase._interrupt, showcase._interrupt)]
     assert signal.getsignal(signal.SIGHUP) == before
 
@@ -268,7 +280,7 @@ def test_the_end_counts_the_verdicts_and_publishes_only_a_pass(tmp_path):
             return {"exit": 0}
         return None
 
-    assert start(directory, execute) == 0
+    assert start(directory, execute, *OPTIONS_ARGV) == 0
     text = (directory / "showcase.log").read_text()
     assert "0 failed, 0 to do; 1 B5 runs not verified pass; 1 native gates not met" in (
         text
@@ -279,7 +291,10 @@ def test_the_end_counts_the_verdicts_and_publishes_only_a_pass(tmp_path):
 
     # A failed verification stays done: no start runs it again.
     calls = []
-    assert start(directory, lambda run, directory: calls.append(run["id"])) == 0
+    assert (
+        start(directory, lambda run, directory: calls.append(run["id"]), *OPTIONS_ARGV)
+        == 0
+    )
     assert calls == []
 
 
@@ -298,7 +313,10 @@ def test_two_starts_on_one_directory_never_run_a_run_twice(tmp_path, monkeypatch
             yield
 
     monkeypatch.setattr(showcase, "bench_lock", contended)
-    assert start(directory, lambda run, directory: calls.append(run["id"])) == 0
+    assert (
+        start(directory, lambda run, directory: calls.append(run["id"]), *OPTIONS_ARGV)
+        == 0
+    )
     assert calls[:2] == ["build-zoe", "build-plone-zoeclient"]
     assert "skip build-plone-zeo: another start ran it" in (
         (directory / "showcase.log").read_text()
@@ -314,11 +332,11 @@ def test_a_resume_warns_when_the_zoe_binary_changed(tmp_path, monkeypatch):
     def first(run, directory):
         (pathlib.Path(directory) / "STOP").touch()
 
-    assert start(directory, first) == 0
+    assert start(directory, first, *OPTIONS_ARGV) == 0
     record = json.loads((directory / "state" / "build-zoe.done").read_text())
     assert len(record["zoe_sha256"]) == 64
 
     binary.write_bytes(b"another build")
-    assert start(directory, lambda run, directory: None) == 0
+    assert start(directory, lambda run, directory: None, *OPTIONS_ARGV) == 0
     text = (directory / "showcase.log").read_text()
     assert "warning: the zoe binary changed since build-zoe ran" in text

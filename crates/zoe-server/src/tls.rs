@@ -280,10 +280,12 @@ mod tests {
     use rustls::CertificateError;
 
     use super::*;
+    use crate::protocol::testing::{self, Fresh};
 
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-tls-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Return a new empty directory for the test `name`.
+    #[track_caller]
+    fn fresh_dir(name: &str) -> Fresh {
+        let dir = testing::fresh_dir(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

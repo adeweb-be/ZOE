@@ -55,6 +55,7 @@ import sysconfig
 
 import jsonschema
 import pytest
+from conftest import output
 
 BENCH = pathlib.Path(__file__).parents[2]
 SCHEMA_PATH = BENCH / "schema" / "client.schema.json"
@@ -80,11 +81,6 @@ KEYS = [
 # client CPU per object, in seconds.
 ZEO_NUMBERS = (10_000.0, 50e-6)
 NATIVE_NUMBERS = (30_000.0, 8e-6)
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text())
 
 
 def row_of(client, key, numbers):
@@ -168,10 +164,6 @@ def report(path):
         text=True,
         check=False,
     )
-
-
-def output(result):
-    return result.stdout + result.stderr
 
 
 def report_rows(result):

@@ -21,21 +21,18 @@ the test fails when one row goes.
 import os
 import re
 import subprocess
-import threading
-import urllib.request
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
+from support import TIMEOUT, metrics
+
 import zoe
 from zoe.config import KEYS, twin
-from zoe.testing import ZoeServer, _die_with_parent
+from zoe.testing import ZoeServer
 
 ROOT = Path(__file__).resolve().parents[3]
 REFERENCE = ROOT / "docs" / "reference"
 COMPONENT = Path(zoe.__file__).with_name("component.xml")
-
-# The longest wait for the server, in seconds.
-TIMEOUT = 30
 
 
 def page(name):
@@ -161,42 +158,13 @@ def test_zope_conf_lists_every_section_and_key():
 def exported_metrics(tmp_path):
     """Return the name of each metric that `zoe serve` exports, from
     `GET /metrics` on its admin port."""
-    command = [
-        ZoeServer.binary(), "serve", "--path", str(tmp_path / "store"),
-        "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0",
-    ]  # fmt: skip
-    environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-    # On Linux, the server ends when the test process ends, also on SIGKILL.
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        env=environ,
-        text=True,
-        preexec_fn=_die_with_parent(),
-    )
+    args = ["--admin-listen", "127.0.0.1:0"]
+    server = ZoeServer(str(tmp_path / "store"), args=args).start(TIMEOUT)
     try:
-        admin = None
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    admin = value
-                elif word == "listening":
-                    break
-        finally:
-            timer.cancel()
-        assert admin, "zoe serve wrote no admin address"
-        url = f"http://{admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
+        assert server.admin, "zoe serve wrote no admin address"
+        text = metrics(server)
     finally:
-        process.kill()
-        process.wait()
-        process.stdout.close()
+        server.kill()
     return set(re.findall(r"^# TYPE (\S+) ", text, re.M))
 
 

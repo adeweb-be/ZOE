@@ -16,50 +16,18 @@
 //! `python/zoedb/tests/server/test_walking_skeleton.py` drives the server
 //! with an unmodified `ZEO.ClientStorage`, and runs the kill loop.
 
-use std::process::{Command, Output, Stdio};
-
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server as InProcess};
 
-mod wire;
+mod common;
 
-use wire::{
-    Conn, MAX, Server, Value, ZERO, ZOE, bytes_of, commit, fresh_dir, items, load, new_oids,
-    open_store, p64, record, s, spawn_lock, u64_of,
+use common::{
+    Conn, MAX, Server, Value, ZERO, assert_exit, bytes_of, commit, fresh_dir, items, load,
+    new_oids, open_store, p64, record, s, u64_of, zoe,
 };
-
-/// Run `zoe` with `args` and the variables `env` to its end. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let _spawn = spawn_lock();
-    command.spawn().unwrap().wait_with_output().unwrap()
-}
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// Check the exit code, and show the output if it is not the one expected.
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        text(&output.stdout),
-        text(&output.stderr)
-    );
 }
 
 #[test]
@@ -203,7 +171,7 @@ fn an_aborted_transaction_leaves_nothing() {
     let mut conn = server.client("1");
     let oid = new_oids(&mut conn, 1)[0];
 
-    wire::begin(&mut conn, 7);
+    common::begin(&mut conn, 7);
     conn.send_async(
         "storea",
         vec![

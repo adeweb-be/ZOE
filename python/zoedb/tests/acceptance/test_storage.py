@@ -11,28 +11,19 @@ module collects before these packages are installed.
 """
 
 import contextlib
-import pickle
 import threading
 import time
 
 import pytest
+from support import TIMEOUT, ZERO, record
+from support import commit_one as commit
 
 import zoe
 
-# The tid and the serial of an object that has no record yet.
-ZERO = bytes(8)
 # The largest tid. loadBefore(oid, MAX_TID) loads the current record.
 MAX_TID = (2**63 - 1).to_bytes(8, "big")
-# The longest time that a test waits for another thread.
-TIMEOUT = 30
 # The lock timeout, in seconds, of the test that waits for a lock.
 LOCK_TIMEOUT = 2
-
-
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
 
 
 def after(tid):
@@ -60,21 +51,6 @@ def database(path, **options):
         yield db
     finally:
         db.close()
-
-
-def commit(storage, oid, serial, data, **metadata):
-    """Store one record in one transaction. Return the tid."""
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData(**metadata)
-    storage.tpc_begin(txn)
-    try:
-        storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        return storage.tpc_finish(txn)
-    except Exception:
-        storage.tpc_abort(txn)
-        raise
 
 
 def raised_in_another_thread(func):

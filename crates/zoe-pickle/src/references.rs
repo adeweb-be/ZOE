@@ -236,12 +236,14 @@ impl Scanner<'_> {
                     Value::Other
                 }
                 BINPUT | LONG_BINPUT | PUT => {
-                    let index = memo_index(opcode, &self.bytes[arg], at)?;
+                    let index = memo_index(opcode, &self.bytes[arg])
+                        .ok_or_else(|| error(at, "a memo index does not read"))?;
                     self.memo.insert(index, top(&stack, at)?);
                     continue;
                 }
                 BINGET | LONG_BINGET | GET => {
-                    let index = memo_index(opcode, &self.bytes[arg], at)?;
+                    let index = memo_index(opcode, &self.bytes[arg])
+                        .ok_or_else(|| error(at, "a memo index does not read"))?;
                     self.memo
                         .get(&index)
                         .copied()
@@ -373,19 +375,6 @@ fn pop_mark(stack: &mut Vec<Entry>, at: usize) -> Result<Vec<Value>, Error> {
     let values = pop_values(stack, stack.len() - mark - 1, at)?;
     stack.pop();
     Ok(values)
-}
-
-/// Reads the memo index of a put or a get from its argument.
-fn memo_index(opcode: u8, arg: &[u8], at: usize) -> Result<u32, Error> {
-    let index = match opcode {
-        BINPUT | BINGET => arg.first().copied().map(u32::from),
-        LONG_BINPUT | LONG_BINGET => arg.try_into().ok().map(u32::from_le_bytes),
-        _ => arg
-            .split_last()
-            .and_then(|(_, digits)| std::str::from_utf8(digits).ok())
-            .and_then(|digits| digits.parse().ok()),
-    };
-    index.ok_or_else(|| error(at, "a memo index does not read"))
 }
 
 fn error(offset: usize, message: &str) -> Error {

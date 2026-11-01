@@ -11,15 +11,15 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Conn, Value, ZOE, fresh_dir, s};
+use common::{Conn, Value, ZOE, fresh_dir, s};
 
 #[test]
 fn a_line_feed_from_the_client_forges_no_text_log_line() {
     let dir = fresh_dir("log-lines");
     let log = dir.join("stderr.log");
-    let (mut child, mut stdout) = wire::spawn_until_output(
+    let (mut child, mut stdout) = common::spawn_until_output(
         Command::new(ZOE)
             .args([
                 "serve",

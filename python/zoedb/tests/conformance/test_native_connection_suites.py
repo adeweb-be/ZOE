@@ -16,39 +16,13 @@ test exercises the native client. ZEO's connection suites need the
 persistent cache of the client; the gate of the native client runs them.
 """
 
-import contextlib
-import doctest
 import unittest
+
+from suite_support import cases_and_layers, name_of, zeo_client_threads
 
 import zoe.testing
 
 RACE = "RaceTests.test_race_external_invalidate_vs_disconnect"
-
-
-def name_of(test):
-    if isinstance(test, doctest.DocTestCase):
-        return test.id().rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-    method = getattr(test, "_testMethodName", "runTest")
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return f"{cls.__name__}.{method}"
-    return test.id()
-
-
-def class_of(test):
-    return type(test).__name__
-
-
-def walk(suite, layers=()):
-    """Yield each test of suite with the layers of the suites around it."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from walk(item, layers)
-    else:
-        yield suite, layers
 
 
 def race_suite():
@@ -58,32 +32,15 @@ def race_suite():
     loader = unittest.TestLoader()
     loader.testMethodPrefix = "test"
     suite = loader.loadTestsFromTestCase(testZEO.FileStorageTests)
-    return unittest.TestSuite(test for test, _ in walk(suite) if name_of(test) == RACE)
+    return unittest.TestSuite(
+        test for test, _ in cases_and_layers(suite) if name_of(test) == RACE
+    )
 
 
 def collected():
     """Return the tests of the run, each with its layers."""
     base = (zoe.testing.ZEO_LAYER, zoe.testing.NATIVE_LAYER)
-    return list(walk(race_suite(), base))
-
-
-@contextlib.contextmanager
-def zeo_client_threads():
-    """Record each network thread of ZEO's own client that starts."""
-    from ZEO.asyncio.client import ClientThread
-
-    started = []
-    init = ClientThread.__init__
-
-    def __init__(self, *args, **kw):
-        started.append(type(self).__name__)
-        init(self, *args, **kw)
-
-    ClientThread.__init__ = __init__
-    try:
-        yield started
-    finally:
-        ClientThread.__init__ = init
+    return list(cases_and_layers(race_suite(), base))
 
 
 def run(tests):

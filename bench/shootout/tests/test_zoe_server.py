@@ -27,8 +27,6 @@ import subprocess
 import sys
 
 import jsonschema
-import pytest
-import shootout
 from shootout import KB, Cell, Profile, run
 from shootout.storages import STORAGES, zconfig
 
@@ -39,16 +37,6 @@ TINY = Profile(
     processes=1,
     values=1,
 )
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text())
-
-
-@pytest.fixture
-def tiny(monkeypatch):
-    monkeypatch.setattr(shootout, "QUICK", TINY)
 
 
 def cells(result):

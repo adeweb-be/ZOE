@@ -7,7 +7,7 @@
 //! connections stay up. The calls that wait for a session make the reader
 //! wait, and the connection stays open.
 
-mod wire;
+mod common;
 
 use std::io::Write;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use wire::{
+use common::{
     MAX, Server, TIMEOUT, Value, begin, bytes_of, commit, fresh_dir, items, load, new_oids, p64,
     record, s, u64_of,
 };

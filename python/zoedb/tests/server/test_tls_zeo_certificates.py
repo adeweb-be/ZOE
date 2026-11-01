@@ -19,23 +19,18 @@ The test uses the certificates of `ZEO.tests` and makes the others with the
 """
 
 import ssl
-import subprocess
 
 import pytest
+import support
+from support import commit, openssl
 
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 
 
 def zeo_certificates():
     from ZEO.tests import testssl
 
     return testssl
-
-
-def openssl(*args, cwd):
-    subprocess.run(["openssl", *args], cwd=cwd, check=True, capture_output=True)
 
 
 @pytest.fixture(scope="module")
@@ -98,21 +93,13 @@ def context(cert, key):
 
 
 def client(server, ctx, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", ssl=ctx, **kw)
+    """Open a stock client over TLS with the context `ctx`."""
+    return support.client(server, ssl=ctx, **kw)
 
 
 def commit_and_load(storage):
-    from ZODB.Connection import TransactionMetaData
-
     oid = storage.new_oid()
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    storage.store(oid, bytes(8), b"tls", "", txn)
-    storage.tpc_vote(txn)
-    tid = storage.tpc_finish(txn)
+    tid = commit(storage, [(oid, bytes(8), b"tls")])
     assert storage.load(oid) == (b"tls", tid)
 
 

@@ -11,33 +11,27 @@ iterator id of a lost listener, and `load_current`, which the cache answers.
 
 import socket
 import threading
-import time
 
 import msgpack
 import pytest
 import ZODB.interfaces
+from support import TIMEOUT, native, wait_for
 from ZEO.Exceptions import ClientDisconnected
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import POSKeyError, StorageTransactionError
 from ZODB.utils import p64, z64
 
-import zoe.testing
 import zoe.zeo
 from zoe.testing import ZoeServer
 
-TIMEOUT = 30
-
 
 @pytest.fixture
-def storage(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        native = zoe.testing.native_client(
-            server.address, storage="1", wait_timeout=TIMEOUT
-        )
-        try:
-            yield native
-        finally:
-            native.close()
+def storage(server):
+    opened = native(server)
+    try:
+        yield opened
+    finally:
+        opened.close()
 
 
 def commit(storage, records, tid=None):
@@ -56,7 +50,7 @@ def test_load_current_comes_from_the_cache_without_the_server(tmp_path):
     with ZoeServer(str(tmp_path / "store")) as server:
         # A load that the cache does not answer waits one second for a
         # server, then raises ClientDisconnected.
-        storage = zoe.testing.native_client(server.address, storage="1", wait_timeout=1)
+        storage = native(server, wait_timeout=1)
         try:
             oid = storage.new_oid()
             tid = commit(storage, {oid: (z64, b"data")})
@@ -65,11 +59,6 @@ def test_load_current_comes_from_the_cache_without_the_server(tmp_path):
             assert load_current(storage, oid) == (b"data", tid)
         finally:
             storage.close()
-
-
-def test_the_label_and_the_server_sync_are_built():
-    assert "client_label" not in zoe.zeo._NOT_BUILT
-    assert "server_sync" not in zoe.zeo._NOT_BUILT
 
 
 def test_the_serial_of_a_store_takes_the_str_of_zeo_tests():
@@ -178,20 +167,9 @@ def test_the_gc_of_a_disconnect_forgets_the_iterators(storage):
         next(iterator)
 
 
-def wait_until(condition, message):
-    """Poll `condition` until it is true, for `TIMEOUT` seconds at most."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(message)
-        time.sleep(0.01)
-
-
 def test_the_loss_of_the_listener_forgets_the_iterators(tmp_path):
     with ZoeServer(str(tmp_path / "store")) as server:
-        storage = zoe.testing.native_client(
-            server.address, storage="1", wait_timeout=TIMEOUT
-        )
+        storage = native(server)
         try:
             for _ in range(2):
                 commit(storage, {storage.new_oid(): (z64, b"a")})
@@ -201,9 +179,7 @@ def test_the_loss_of_the_listener_forgets_the_iterators(tmp_path):
             server.kill()
             # The thread of the deliveries gets the stale mark of the lost
             # listener.
-            wait_until(
-                lambda: not storage._iterator_ids, "the iterators stayed after the loss"
-            )
+            wait_for(lambda: not storage._iterator_ids, "the drop of the iterators")
             assert iterator._iid == -1
             with pytest.raises(ClientDisconnected):
                 next(iterator)
@@ -215,17 +191,15 @@ def test_an_iterator_id_of_a_lost_listener_never_reaches_the_new_one(tmp_path):
     import gc
 
     with ZoeServer(str(tmp_path / "store")) as server:
-        storage = zoe.testing.native_client(
-            server.address, storage="1", wait_timeout=TIMEOUT
-        )
+        storage = native(server)
         try:
             tids = [commit(storage, {storage.new_oid(): (z64, b"a")}) for _ in range(2)]
             old = storage.iterator()
             iid = old._iid
             server.stop()
-            wait_until(lambda: old._iid == -1, "the loss kept the iterator")
+            wait_for(lambda: old._iid == -1, "the drop of the iterator at the loss")
             server.start()
-            wait_until(storage.is_connected, "the client did not connect again")
+            wait_for(storage.is_connected, "the new connection of the client")
             # The reply of an iterator_start on the lost listener comes to a
             # thread after the stale mark, which registers it.
             late = storage._setup_iterator(type(old), iid)
@@ -320,9 +294,7 @@ def test_the_close_releases_the_iterators_with_their_connection(tmp_path):
     with ZoeServer(str(tmp_path / "store")) as server:
         tap = Tap(server.address)
         try:
-            storage = zoe.testing.native_client(
-                tap.address, storage="1", wait_timeout=TIMEOUT
-            )
+            storage = native(tap.address)
             try:
                 commit(storage, {storage.new_oid(): (z64, b"a")})
                 iterator = storage.iterator()
@@ -332,9 +304,9 @@ def test_the_close_releases_the_iterators_with_their_connection(tmp_path):
             finally:
                 storage.close()
             # The server drops the iterators of a connection that closes.
-            wait_until(
+            wait_for(
                 lambda: number in tap.closed,
-                "the connection of the iterator stayed open after the close",
+                "the close of the connection of the iterator",
             )
         finally:
             tap.close()

@@ -8,9 +8,9 @@
 
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Server, commit, fresh_dir, items, load, new_oids, record, s, u64_of};
+use common::{Server, commit, fresh_dir, items, load, new_oids, record, s, u64_of};
 
 #[test]
 fn a_queue_of_one_message_lets_a_client_commit() {

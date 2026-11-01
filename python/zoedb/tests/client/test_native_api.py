@@ -25,37 +25,21 @@ The tests open the native client through `zoe.testing.native_client`.
 import gc
 import itertools
 import json
-import os
 import socket
-import subprocess
 import threading
 import time
-import urllib.request
 
 import msgpack
 import pytest
+from client_support import AdminServer
+from support import ZERO, native, wait_for
+from support import client as stock
 from ZODB.Connection import TransactionMetaData
 from ZODB.utils import p64, u64
 
-import zoe.testing
 from zoe.testing import ZoeServer
 
-TIMEOUT = 30
-ZERO = bytes(8)
 LABEL = "native-api-worker"
-
-
-def native(address, **kw):
-    """Open a native client of the storage 1 at `address`."""
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return zoe.testing.native_client(address, storage="1", **kw)
-
-
-def stock(address):
-    """Open a stock ZEO client of the storage 1 at `address`."""
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(address, storage="1", wait_timeout=TIMEOUT)
 
 
 def commit(storage, records, serials=None):
@@ -67,79 +51,6 @@ def commit(storage, records, serials=None):
         storage.store(oid, serials.get(oid, ZERO), data, "", txn)
     storage.tpc_vote(txn)
     return storage.tpc_finish(txn)
-
-
-def wait_until(condition, message):
-    """Poll `condition` until it is true, for `TIMEOUT` seconds at most."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(message)
-        time.sleep(0.01)
-
-
-class AdminServer(ZoeServer):
-    """`zoe serve` with an admin port on 127.0.0.1, and its log in a file.
-
-    The server writes the line `admin ADDRESS` before the line `listening
-    ADDRESS`. `ZoeServer.start` reads past the first line, so this class
-    starts the process itself. `admin` is the address of the admin port.
-    With `log`, the log lines of the server go to that file.
-    """
-
-    def __init__(self, path, args=(), log=None):
-        super().__init__(path, args=["--admin-listen", "127.0.0.1:0", *args])
-        self.log = log
-        self.admin = None
-
-    def start(self, timeout=TIMEOUT):
-        command = [self.binary(), "serve", "--path", str(self.path)]
-        command += ["--listen", "127.0.0.1:0", *self.args]
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        stderr = open(self.log, "ab") if self.log else None
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                env=environ,
-                text=True,
-                # On Linux, the kernel kills the server when this thread
-                # ends, as for ZoeServer.
-                preexec_fn=zoe.testing._die_with_parent(),
-            )
-        finally:
-            if stderr is not None:
-                stderr.close()
-        timer = threading.Timer(timeout, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        process.wait()
-        process.stdout.close()
-        raise RuntimeError("zoe serve stopped before it listened")
-
-    def metric(self, name):
-        """Return the sample of the metric `name` for the storage 1."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
-        prefix = name + '{storage="1"} '
-        for line in text.splitlines():
-            if line.startswith(prefix):
-                return float(line[len(prefix) :])
-        raise AssertionError(f"/metrics has no sample of {name} for the storage 1")
 
 
 def receive(sock, size):
@@ -268,9 +179,9 @@ def test_prefetch_loads_at_once_and_fills_the_cache(tmp_path):
             storage.prefetch(list(records), start)
             # prefetch does not wait for the replies. Wait until the
             # server ended the 100 calls.
-            wait_until(
+            wait_for(
                 lambda: server.metric("zoe_load_latency_seconds_count") - ended >= 100,
-                "the server did not get the 100 loads of the prefetch",
+                "the end of the 100 loads of the prefetch on the server",
             )
             assert server.metric("zoe_loads_total") - loads == 100
 
@@ -304,7 +215,7 @@ def test_sync_with_server_sync_reaches_the_server_before_it_returns(tmp_path):
 def test_the_client_label_names_the_connection_in_the_log_of_the_server(tmp_path):
     log = tmp_path / "server.log"
     args = ["--log-format", "json", "--lock-warn", "1"]
-    with AdminServer(tmp_path / "store", args, log) as server:
+    with AdminServer(tmp_path / "store", args, log=log) as server:
         storage = native(server.address, client_label=LABEL)
         try:
             oid = storage.new_oid()
@@ -330,7 +241,7 @@ def test_the_client_label_names_the_connection_in_the_log_of_the_server(tmp_path
                     return True
             return False
 
-        wait_until(logged, f"no log line of the server names the client {LABEL}")
+        wait_for(logged, f"a log line of the server that names the client {LABEL}")
 
 
 def test_delete_object_makes_the_next_load_raise_pos_key_error(tmp_path):
@@ -399,7 +310,7 @@ def test_an_iterator_gives_its_transactions_in_order_and_is_released(tmp_path):
                     for n, message in wire.kept(wire.calls)
                 )
 
-            wait_until(released, f"no iterator_gc released the iterator {iid}")
+            wait_for(released, f"the iterator_gc of the iterator {iid}")
         finally:
             storage.close()
 
@@ -435,7 +346,7 @@ def test_new_addr_moves_the_client_to_another_server(tmp_path):
                 except ClientDisconnected:
                     return False
 
-            wait_until(moved, "the client did not move to the second server")
+            wait_for(moved, "the move of the client to the second server")
             assert storage.lastTransaction() == second_tid
         finally:
             storage.close()

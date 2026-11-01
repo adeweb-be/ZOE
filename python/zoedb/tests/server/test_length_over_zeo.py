@@ -12,17 +12,9 @@ import time
 import transaction
 import ZODB
 from persistent.mapping import PersistentMapping
+from support import client
 
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", **kw)
 
 
 def test_the_length_follows_commits_and_packs(tmp_path):

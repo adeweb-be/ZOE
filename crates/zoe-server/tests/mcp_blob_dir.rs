@@ -9,35 +9,20 @@
 //! The read-only open creates nothing in the blob directory.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::process::Command;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use zoe_core::{Oid, Options, Store, Tid};
 
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+mod common;
+
+use common::mcp::Session;
+use common::{ZOE, fresh_dir, s, spawn_lock};
 
 /// The class pickle of `ZODB.blob.Blob`, then the state `None`.
 const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
-
-static SPAWN: Mutex<()> = Mutex::new(());
-
-fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-mcp-blob-dir-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
 
 /// A `PersistentMapping` with an empty state.
 const MAPPING: &[u8] = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
@@ -69,106 +54,6 @@ fn tree(dir: &Path) -> BTreeSet<PathBuf> {
         }
     }
     found
-}
-
-/// A client of `zoe mcp` over its stdio.
-struct Session {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
-}
-
-impl Session {
-    /// Start `zoe mcp` with `args` and the variables `env`. No other
-    /// `ZOE_*` variable reaches it.
-    fn start(args: &[&str], env: &[(&str, &str)]) -> Session {
-        let mut command = Command::new(ZOE);
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("ZOE_") {
-                command.env_remove(name);
-            }
-        }
-        command
-            .arg("mcp")
-            .args(args)
-            .envs(env.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        // The reply to `initialize` comes after `exec`. So the mutex of the
-        // spawns stays held until the end of this call.
-        let _spawn = spawn_lock();
-        let mut child = command.spawn().unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut session = Session {
-            child,
-            stdin,
-            stdout,
-            next_id: 0,
-        };
-        let init = session.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "acceptance", "version": "0"}
-            }),
-        );
-        assert!(
-            init["result"]["capabilities"]["tools"].is_object(),
-            "{init}"
-        );
-        session
-            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}));
-        session
-    }
-
-    fn send(&mut self, message: Value) {
-        writeln!(self.stdin, "{message}").unwrap();
-        self.stdin.flush().unwrap();
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        loop {
-            let mut line = String::new();
-            assert!(
-                self.stdout.read_line(&mut line).unwrap() > 0,
-                "zoe mcp stopped"
-            );
-            let message: Value = serde_json::from_str(&line).unwrap();
-            if message["id"] == id {
-                return message;
-            }
-        }
-    }
-
-    /// Call a tool. Return whether it failed, and its result as JSON: the
-    /// structured content, or the JSON of its first text.
-    fn call(&mut self, tool: &str, arguments: Value) -> (bool, Value) {
-        let reply = self.request("tools/call", json!({"name": tool, "arguments": arguments}));
-        let result = &reply["result"];
-        assert!(result.is_object(), "{reply}");
-        let failed = result["isError"].as_bool().unwrap_or(false);
-        let value = if result["structuredContent"].is_object() {
-            result["structuredContent"].clone()
-        } else {
-            let text = result["content"][0]["text"].as_str().unwrap_or_default();
-            serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
-        };
-        (failed, value)
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// Check that `verify` and `space` read the blob of the store.

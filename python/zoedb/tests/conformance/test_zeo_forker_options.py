@@ -33,11 +33,11 @@ test passes; a skip counts as a failure.
 """
 
 import ssl
-import subprocess
 import time
-import unittest
 
 import pytest
+from suite_support import run_under_zeo_layer, select
+from support import client, commit_one, openssl
 
 import zoe.testing
 
@@ -94,61 +94,6 @@ SHARED_BLOB_TESTS = [
 ]
 
 
-def cases_and_layers(suite, layers=()):
-    """Yield each test of suite with the layers of the suites around it."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from cases_and_layers(item, layers)
-    else:
-        yield suite, layers
-
-
-def select(suite, ids):
-    """Return the tests of suite with these ids, each with its layers."""
-    found = [
-        (test, layers) for test, layers in cases_and_layers(suite) if test.id() in ids
-    ]
-    assert sorted(test.id() for test, _ in found) == sorted(ids)
-    return found
-
-
-def run(selected):
-    """Run the tests under ZEO_LAYER and their own layers. Fail on a problem."""
-    result = unittest.TestResult()
-    started = []
-    try:
-        for test, layers in selected:
-            layers = (zoe.testing.ZEO_LAYER, *layers)
-            for layer in layers:
-                if layer not in started:
-                    layer.setUp()
-                    started.append(layer)
-            for layer in layers:
-                if hasattr(layer, "testSetUp"):
-                    layer.testSetUp()
-            try:
-                test.run(result)
-            finally:
-                for layer in reversed(layers):
-                    if hasattr(layer, "testTearDown"):
-                        layer.testTearDown()
-    finally:
-        for layer in reversed(started):
-            layer.tearDown()
-    problems = [
-        f"{test.id()}\n{trace}" for test, trace in result.failures + result.errors
-    ]
-    problems += [f"{test.id()}: skipped: {why}" for test, why in result.skipped]
-    problems += [
-        f"{test.id()}: unexpected success" for test in result.unexpectedSuccesses
-    ]
-    assert not problems, "\n\n".join(problems)
-    assert result.testsRun == len(selected)
-
-
 @pytest.fixture(autouse=True)
 def in_tmp_path(tmp_path, monkeypatch):
     """Run each test in a new current directory."""
@@ -163,23 +108,6 @@ def layer():
         yield zoe.testing.ZEO_LAYER
     finally:
         zoe.testing.ZEO_LAYER.tearDown()
-
-
-def client(addr, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(addr, storage="1", **kw)
-
-
-def commit(storage, oid, serial, data):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
 
 
 def test_the_server_of_testconfig_is_zoe_serve(layer):
@@ -205,7 +133,7 @@ def test_the_server_of_testconfig_is_zoe_serve(layer):
 def test_the_tests_of_testconfig_and_the_password_of_testssl_pass():
     from ZEO.tests import testConfig, testssl
 
-    run(
+    run_under_zeo_layer(
         select(testConfig.test_suite(), CONFIG_TESTS)
         + select(testssl.test_suite(), SSL_TESTS)
     )
@@ -214,13 +142,13 @@ def test_the_tests_of_testconfig_and_the_password_of_testssl_pass():
 def test_the_read_only_and_timeout_tests_of_testconnection_pass():
     from ZEO.tests import testConnection
 
-    run(select(testConnection.test_suite(), CONNECTION_TESTS))
+    run_under_zeo_layer(select(testConnection.test_suite(), CONNECTION_TESTS))
 
 
 def test_the_log_shared_blob_and_filestorage_tests_of_testzeo_pass():
     from ZEO.tests import testZEO
 
-    run(select(testZEO.test_suite(), ZEO_TESTS))
+    run_under_zeo_layer(select(testZEO.test_suite(), ZEO_TESTS))
 
 
 def test_the_blob_suite_of_a_shared_blob_directory_passes():
@@ -230,11 +158,7 @@ def test_the_blob_suite_of_a_shared_blob_directory_passes():
     suite = testblob.storage_reusable_suite(
         "ClientStorageSharedBlobs", testZEO.create_storage_shared
     )
-    run(select(suite, SHARED_BLOB_TESTS))
-
-
-def openssl(*args, cwd):
-    subprocess.run(["openssl", *args], cwd=cwd, check=True, capture_output=True)
+    run_under_zeo_layer(select(suite, SHARED_BLOB_TESTS))
 
 
 def test_the_ssl_section_of_zeo_gives_tls(layer, tmp_path):
@@ -278,7 +202,7 @@ def test_the_ssl_section_of_zeo_gives_tls(layer, tmp_path):
     storage = client(addr, ssl=context)
     try:
         oid = storage.new_oid()
-        tid = commit(storage, oid, bytes(8), b"tls")
+        tid = commit_one(storage, oid, bytes(8), b"tls")
         assert storage.load(oid) == (b"tls", tid)
     finally:
         storage.close()

@@ -22,7 +22,6 @@ server. The tests open the native client through
 """
 
 import json
-import pickle
 import socket
 import subprocess
 import sys
@@ -30,13 +29,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import msgpack
+from support import TIMEOUT, ZERO, native, record
 from ZODB.Connection import TransactionMetaData
 
-import zoe.testing
 from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
 
 # A client process without opentelemetry: the entry None in sys.modules
 # makes each import of the package fail. It commits and loads one record.
@@ -194,15 +190,6 @@ class Wire:
                 sink.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def native(address):
-    return zoe.testing.native_client(address, storage="1", wait_timeout=TIMEOUT)
 
 
 def commit(storage, data):

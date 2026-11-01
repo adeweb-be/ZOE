@@ -22,10 +22,10 @@ import subprocess
 import sys
 
 import pytest
+from support import TIMEOUT
 
+import zoe.testing
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 
 
 @pytest.fixture
@@ -35,7 +35,9 @@ def binary():
 
 
 def start(conf, env):
-    process = subprocess.Popen(
+    """Start `zoe.serve` with the file `conf`. Return the process and its
+    address. The process dies with the test."""
+    process = zoe.testing._spawn(
         [sys.executable, "-m", "zoe.serve", "-C", str(conf)],
         stdout=subprocess.PIPE,
         text=True,
@@ -118,11 +120,15 @@ def test_an_unknown_key_is_an_error_before_anything_starts(tmp_path):
         </zoe-server>
         """
     )
-    result = subprocess.run(
+    process = zoe.testing._spawn(
         [sys.executable, "-m", "zoe.serve", "-C", str(conf)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
+    )
+    stdout, stderr = process.communicate(timeout=TIMEOUT)
+    result = subprocess.CompletedProcess(
+        process.args, process.returncode, stdout, stderr
     )
     assert result.returncode == 2
     assert "no-such-key" in result.stderr

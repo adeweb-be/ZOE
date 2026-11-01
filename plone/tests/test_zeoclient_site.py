@@ -7,27 +7,17 @@ scenario, `target/plone/zeoclient/var/zoe`, with the address of its
 starts the instance, reads the site over HTTP, then stops the instance
 and the server. The recipe starts and stops the server itself.
 
-Run it inside `devenv shell`: `uv run --directory python pytest
-../plone/tests/test_zeoclient_site.py`. The first build needs the network.
+Run it inside `devenv shell`: `just plone test plone/tests/test_zeoclient_site.py`.
+The first build needs the network.
 """
 
-import os
 import subprocess
 from pathlib import Path
 
+from conftest import zoe_serve_processes
+
 REPO = Path(__file__).resolve().parents[2]
 STORE = REPO / "target" / "plone" / "zeoclient" / "var" / "zoe"
-
-
-def zoe_serve_processes():
-    """Return the pids of the `zoe serve` processes of this user."""
-    result = subprocess.run(
-        ["pgrep", "-u", str(os.getuid()), "-f", "zoe serve"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return {int(pid) for pid in result.stdout.split()}
 
 
 def test_a_plone_site_runs_on_zeoclient_against_zoe_serve():

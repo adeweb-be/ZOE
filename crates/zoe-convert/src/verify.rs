@@ -28,8 +28,7 @@ use serde_json::{Value, json};
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
 use zoe_pickle::{decode_class_key, persistent_ids};
 
-/// The number of record keys that one read of the walk takes.
-const KEY_CHUNK: usize = 1024;
+use crate::walk::OidVersions;
 
 /// A frame that does not read: a record, a blob record, a transaction row,
 /// a sequence row or a row of a KV namespace.
@@ -387,30 +386,22 @@ impl Walk {
 /// Walk every record key: check each record frame, each blob record and
 /// each blob file, and read the current record of each oid.
 fn records(store: &Store, report: &mut Verification, walk: &mut Walk) {
-    let mut from = Oid(0);
+    let mut keys = OidVersions::new(store);
     let mut oids = 0;
     loop {
-        let keys = match store.record_keys(from, KEY_CHUNK) {
-            Ok(keys) => keys,
+        match keys.next() {
+            Ok(Some(versions)) => {
+                oids += 1;
+                oid_versions(store, versions, report, walk);
+            }
+            Ok(None) => {
+                walk.oids = Some(oids);
+                return;
+            }
             Err(error) => {
                 // The walk cannot go on. `dangling` asks the store about
                 // each reference that it did not see.
                 report.checksums.push(frame_problem(None, error));
-                return;
-            }
-        };
-        let Some(&(last, _)) = keys.last() else {
-            walk.oids = Some(oids);
-            return;
-        };
-        for versions in keys.chunk_by(|a, b| a.0 == b.0) {
-            oids += 1;
-            oid_versions(store, versions, report, walk);
-        }
-        match last.0.checked_add(1) {
-            Some(next) => from = Oid(next),
-            None => {
-                walk.oids = Some(oids);
                 return;
             }
         }
@@ -579,6 +570,7 @@ mod tests {
     use zoe_core::vfs::MemVfs;
 
     use super::*;
+    use crate::testing::commit;
 
     /// A `PersistentMapping` record that refers to `refs`.
     fn mapping(refs: &[u64]) -> Vec<u8> {
@@ -591,16 +583,6 @@ mod tests {
         }
         pickle.extend_from_slice(b"s.");
         pickle
-    }
-
-    fn commit(store: &Store, writes: &[(u64, Option<Vec<u8>>)]) -> Tid {
-        let tid = Tid(store.last_transaction().0 + 1);
-        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
-        for (oid, data) in writes {
-            txn.restore(Oid(*oid), data.as_deref()).unwrap();
-        }
-        txn.vote().unwrap();
-        txn.finish().unwrap()
     }
 
     #[test]

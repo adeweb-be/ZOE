@@ -13,8 +13,8 @@ scenario, on ZOE:
 suites run unchanged. The recipe prints the summary of zope.testrunner.
 No test is skipped because of the storage.
 
-Run it inside `devenv shell`: `uv run --directory python pytest
-../plone/tests/test_plone_suites.py`. It takes the time of the suites.
+Run it inside `devenv shell`: `just plone test
+plone/tests/test_plone_suites.py`. It takes the time of the suites.
 """
 
 import re

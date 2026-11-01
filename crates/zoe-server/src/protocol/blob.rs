@@ -115,7 +115,6 @@ fn read_error(oid: Oid, tid: Tid, error: io::Error) -> ZoeError {
 mod tests {
     use std::fs;
     use std::io::Write;
-    use std::net::{SocketAddr, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -123,15 +122,8 @@ mod tests {
     use zoe_core::Store;
 
     use super::*;
+    use crate::protocol::testing::{Client, TIMEOUT, bytes, decode, fresh_dir};
     use crate::serve::{ServeOptions, Server, StorageOptions};
-
-    const TIMEOUT: Duration = Duration::from_secs(30);
-
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-blob-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        dir
-    }
 
     /// Commit a blob that holds `bytes` for `oid`. Return its tid.
     fn commit_blob(store: &Store, oid: Oid, bytes: &[u8]) -> Tid {
@@ -141,24 +133,6 @@ mod tests {
         txn.store_blob(oid, Tid::ZERO, b"pickle", file).unwrap();
         txn.vote().unwrap();
         txn.finish().unwrap()
-    }
-
-    /// Decode the frame of a message: `[id, flags, method, args]`.
-    fn decode(frame: &[u8]) -> (Value, Value, String, Value) {
-        let value = rmpv::decode::read_value(&mut &frame[..]).unwrap();
-        let Value::Array(parts) = value else {
-            panic!("not a message: {value:?}");
-        };
-        let [id, flags, method, args] = <[Value; 4]>::try_from(parts).unwrap();
-        (id, flags, method.as_str().unwrap().to_owned(), args)
-    }
-
-    /// Return the bytes of a msgpack bin.
-    fn bytes(value: &Value) -> &[u8] {
-        match value {
-            Value::Binary(bytes) => bytes,
-            other => panic!("not bytes: {other:?}"),
-        }
     }
 
     /// Check that `frames` are the calls of the download of `bytes`, the
@@ -283,148 +257,6 @@ mod tests {
             .collect();
         names.sort();
         names
-    }
-
-    /// A raw client of the ZEO 6 msgpack protocol.
-    struct Client {
-        stream: TcpStream,
-        next: i64,
-    }
-
-    impl Client {
-        /// Connect to `addr`, then register for the storage `1`.
-        fn connect(addr: SocketAddr) -> Self {
-            Self::register(TcpStream::connect(addr).unwrap())
-        }
-
-        /// Connect as `connect` does, with a small receive buffer. So the
-        /// server soon waits for this client to read.
-        fn connect_slow(addr: SocketAddr) -> Self {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .build()
-                .unwrap();
-            let stream = runtime.block_on(async {
-                let socket = tokio::net::TcpSocket::new_v4().unwrap();
-                socket.set_recv_buffer_size(16 * 1024).unwrap();
-                let stream = socket.connect(addr).await.unwrap();
-                stream.into_std().unwrap()
-            });
-            stream.set_nonblocking(false).unwrap();
-            Self::register(stream)
-        }
-
-        /// Connect, do the handshake, then register read-only for the
-        /// storage `1`.
-        fn connect_read_only(addr: SocketAddr) -> Self {
-            let stream = TcpStream::connect(addr).unwrap();
-            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-            let mut client = Self { stream, next: 1 };
-            assert_eq!(client.read_frame(), b"M5");
-            client.write_frame(b"M5");
-            client.call("register", vec![Value::from("1"), Value::Boolean(true)]);
-            client
-        }
-
-        /// Do the handshake on `stream`, then register for the storage `1`.
-        fn register(stream: TcpStream) -> Self {
-            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-            let mut client = Self { stream, next: 1 };
-            assert_eq!(client.read_frame(), b"M5");
-            client.write_frame(b"M5");
-            client.call("register", vec![Value::from("1"), Value::Boolean(false)]);
-            client
-        }
-
-        fn write_frame(&mut self, payload: &[u8]) {
-            let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
-            self.stream.write_all(&len).unwrap();
-            self.stream.write_all(payload).unwrap();
-        }
-
-        fn read_frame(&mut self) -> Vec<u8> {
-            let mut len = [0; 4];
-            self.stream.read_exact(&mut len).unwrap();
-            let mut payload = vec![0; u32::from_be_bytes(len) as usize];
-            self.stream.read_exact(&mut payload).unwrap();
-            payload
-        }
-
-        fn write(&mut self, id: Value, flags: bool, method: &str, args: Vec<Value>) {
-            let message = Value::Array(vec![
-                id,
-                Value::Boolean(flags),
-                Value::from(method),
-                Value::Array(args),
-            ]);
-            let mut payload = Vec::new();
-            rmpv::encode::write_value(&mut payload, &message).unwrap();
-            self.write_frame(&payload);
-        }
-
-        /// Send a call without a reply.
-        fn send_async(&mut self, method: &str, args: Vec<Value>) {
-            self.write(Value::from(0), true, method, args);
-        }
-
-        /// Send a call. Return its id.
-        fn send(&mut self, method: &str, args: Vec<Value>) -> Value {
-            let id = Value::from(self.next);
-            self.next += 1;
-            self.write(id.clone(), false, method, args);
-            id
-        }
-
-        /// Begin the transaction `txn`.
-        fn begin(&mut self, txn: &Value) {
-            let empty = Value::Binary(Vec::new());
-            let begin = vec![txn.clone(), empty.clone(), empty, Value::Map(vec![])];
-            self.send_async("tpc_begin", begin);
-        }
-
-        /// Tell if the server closed the connection. Wait at most
-        /// `TIMEOUT` for the end of the stream.
-        fn is_closed(&mut self) -> bool {
-            let mut byte = [0; 1];
-            match self.stream.read(&mut byte) {
-                Ok(n) => n == 0,
-                Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
-            }
-        }
-
-        /// Send a call and return the args of its reply, which must not be
-        /// an error. Skip the calls of the server before the reply, as
-        /// `info` before the reply of `tpc_finish`.
-        fn call(&mut self, method: &str, args: Vec<Value>) -> Value {
-            let id = self.send(method, args);
-            loop {
-                let (got, flags, name, args) = decode(&self.read_frame());
-                if (&got, &flags) == (&Value::from(0), &Value::Boolean(true)) {
-                    continue;
-                }
-                assert_eq!((got, flags, name.as_str()), (id, Value::from(0), ".reply"));
-                return args;
-            }
-        }
-
-        /// Upload `blob` as the blob of `oid` in a new transaction, in
-        /// chunks of 59,000 bytes as a stock client sends them. Return the
-        /// tid of the commit.
-        fn commit_blob(&mut self, oid: Oid, blob: &[u8]) -> Tid {
-            let txn = Value::from(1);
-            let pickle = Value::Binary(b"pickle".to_vec());
-            self.begin(&txn);
-            let store = vec![p64(oid.0), p64(0), pickle, txn.clone()];
-            self.send_async("storea", store.clone());
-            self.send_async("storeBlobStart", vec![]);
-            for chunk in blob.chunks(59_000) {
-                self.send_async("storeBlobChunk", vec![Value::Binary(chunk.to_vec())]);
-            }
-            self.send_async("storeBlobEnd", store);
-            self.call("vote", vec![txn.clone()]);
-            let tid = self.call("tpc_finish", vec![txn]);
-            Tid(u64::from_be_bytes(bytes(&tid).try_into().unwrap()))
-        }
     }
 
     /// Return the temporary blob files in the blob temporary directory of

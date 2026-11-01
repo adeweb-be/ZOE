@@ -4,8 +4,8 @@ Each test runs a few tests of the three suites, selected with `-t`, and
 reads the summary of zope.testrunner. The layer of zoe.plone.testing must
 set up under `plone.testing.zope.Startup`, and the zeoclient run must stop
 its `zoe serve`, also when `bin/test` fails. Run them inside `devenv shell`:
-`uv run --directory python pytest ../plone/tests/test_suites_layer.py`.
-The first build needs the network.
+`just plone test plone/tests/test_suites_layer.py`. The first build needs
+the network.
 """
 
 import os
@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import zoe_serve_processes
 
 REPO = Path(__file__).resolve().parents[2]
 TARGET = REPO / "target" / "plone"
@@ -61,21 +62,9 @@ print("probe ok")
 """
 
 
-def zoe_serve_processes():
-    """Return the pids of the `zoe serve` processes on the store of the
-    suites.
-
-    The pattern names the store, so the servers of other worktrees and of
-    other tests do not match.
-    """
-    pattern = f"zoe serve --path {re.escape(str(STORE))}( |$)"
-    result = subprocess.run(
-        ["pgrep", "-u", str(os.getuid()), "-f", pattern],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return {int(pid) for pid in result.stdout.split()}
+# The `zoe serve` processes on the store of the suites. It names the store,
+# so the servers of other worktrees and of other tests do not match.
+SERVERS = f"zoe serve --path {re.escape(str(STORE))}( |$)"
 
 
 def suites(scenario, *args):
@@ -109,7 +98,7 @@ def test_a_selection_of_the_suites_runs_on_the_layer(scenario):
     if scenario == "zeoclient":
         assert re.search(r"zoe serve listens on 127\.0\.0\.1:\d+", output)
         assert (STORE / "zoe.redb").exists()
-        assert not zoe_serve_processes()
+        assert not zoe_serve_processes(SERVERS)
 
 
 def test_a_failed_test_run_stops_the_server():
@@ -117,7 +106,7 @@ def test_a_failed_test_run_stops_the_server():
     result, output = suites("zeoclient", "--no-such-option")
     assert result.returncode != 0, output[-5000:]
     assert "zoe serve listens on" in output
-    assert not zoe_serve_processes()
+    assert not zoe_serve_processes(SERVERS)
 
 
 def test_the_layer_gives_startup_a_zoe_base(tmp_path):

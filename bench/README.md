@@ -14,7 +14,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench native` | the phase 3 gate (ADR 0039): `zoe-native` against `zeo` in the 30 cells of the gate set, in about a minute; writes `target/bench/native/<started>.json` and prints the report (see [The gate](#the-gate)) |
 | `just bench native --cell threads:1:1024 --scenario read_warm` | a part of the phase 3 gate |
 | `just bench native report FILE` | the rows of a result of the phase 3 gate and its verdict |
-| `just bench test` | the tests of the harness (the acceptance test of the baseline) |
+| `just bench test` | the tests of the harness (the acceptance test of the baseline) and of `bench/common` |
 | `just bench test FILE...` | the tests of those files only |
 | `just bench client` | the client benchmark: `ZEO.ClientStorage` against the native client (see [The client benchmark](#the-client-benchmark)) |
 | `just bench client report FILE` | the rows of a result of the client benchmark and its verdict |
@@ -24,6 +24,10 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench plone COMMAND` | the Plone end-to-end benchmark: Locust against a Plone site on ZEO and on ZOE (see [The Plone end-to-end benchmark](#the-plone-end-to-end-benchmark)) |
 | `just bench showcase` | the publishable set in one command: the builds, B5 on `small` and `medium`, a B5 summary per fixture, the native gate and the client benchmark on CPython 3.13 and 3.14t; writes `target/bench/showcase/<started>/` (see [The showcase](#the-showcase)) |
 | `just bench showcase --plan` | each run of the set with its estimate; runs nothing |
+
+Every harness of `bench/` (the baseline, the Plone end-to-end benchmark, the log replay, the showcase and `publish`) starts and stops its servers, and records where its numbers come from, through `bench/common`, the package `benchcommon`. It uses the standard library only, so the log replay, which runs in the interpreter of a Plone instance, takes it from `PYTHONPATH`; the other harnesses take it as an editable path source. It holds a free port; the start of a ZEO server, and the start of `zoe serve`, which waits for its line `listening <address>`; the stop of a server: SIGTERM, then a wait, then SIGKILL; the `zoe` binary; the environment of a server, without the `ZOE_*` variables of the caller; the atomic write of a result; the bench lock; and the provenance of a result: the machine, its CPU model, the commit and whether the tree differs from it. `just check` checks that the harnesses that build zoedb pin the forks of `persistent`, `zodbpickle` and `BTrees` that `python/` pins.
+
+**The bench lock.** One benchmark runs at a time. Each benchmark of `just bench` holds an exclusive `flock(2)` on `ZOE_BENCH_LOCK` (`target/bench/bench.lock` by default) from before its build to its end: `run`, `native`, `client`, `load`, `saturate`, `plone prepare`, `plone run`, `plone campaign` and `replay RUN`. When another holds it, the recipe says `wait for the bench lock` and waits. The showcase holds it for each of its runs. A child command of a holder, such as the native gate of a run of the showcase, takes the lock through the open file of its parent, which `ZOE_BENCH_LOCK_FD` names, so it does not wait for its parent. The tests, the reports, `gate`, `index`, `publish` and `--plan` take no lock.
 
 The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
@@ -35,11 +39,11 @@ dagger call --mod ci bench --quick export --path target/bench/ci-results
 
 Other settings:
 
-- `ZOE_BENCH_MACHINE` or `--machine`: the machine name in the results. The default is the CPU model, for example `intel-core-ultra-7-155h`.
+- `ZOE_BENCH_MACHINE` or `--machine`: the machine name in the results. The default is the CPU model, for example `intel-core-ultra-7-155h`: on Linux the `model name` of `/proc/cpuinfo`, on macOS `sysctl machdep.cpu.brand_string`, such as `apple-m2-pro`. Every harness gives one machine the same name.
 - `ZOE_BENCH_COMMIT`: the commit to record. The default is `git rev-parse HEAD`. Each result also records `run.dirty`: true when `git status --porcelain --untracked-files=no` lists a change, false when it lists none, null when git fails, as in the container of the Dagger function `bench`, which has no `.git`. It is null too when `ZOE_BENCH_COMMIT` names another commit than the tree, which is then no record of that commit.
 - `UV_PYTHON`: the interpreter, `3.13` by default. Each interpreter gets its own environment under `target/bench/`.
 - `--workdir`: where the storages write their files, `target/bench/work` by default. Keep it on the disk under test, not on a tmpfs. Its disk needs the free space of one value (see [The disk](#the-disk)).
-- `ZOE_BINARY`: the `zoe` binary of the storages `zoe-server` and `zoe-native`. Without it, the harness takes `target/release/zoe` of the repository (under `CARGO_TARGET_DIR` when it is set), and cargo builds it when it is missing. `just bench run` and `just bench test` build it in release first, so it is never stale.
+- `ZOE_BINARY`: the `zoe` binary of the storages `zoe-server` and `zoe-native`. Without it, the harness takes `target/release/zoe` of the repository (under `CARGO_TARGET_DIR` when it is set). When the binary is missing, the harness stops with the command that builds it. `just bench run` and `just bench test` build it in release first, so it is never stale.
 
 ## What it measures
 
@@ -166,7 +170,7 @@ just bench plone serve --stack zeo             # a stack on a copy of the fixtur
 just bench plone test                          # the tests of the harness
 ```
 
-**The stacks.** Every setting but the storage section is the same: the runner writes `zope.conf` and `wsgi.ini` of each instance from one template (`plonebench/stack.py`), with the eggs of the buildout scenarios of `plone/`.
+**The stacks.** Every setting but the storage section is the same: the runner writes `zope.conf` and `wsgi.ini` of each instance from one template (`plonebench/stack/templates.py`), with the eggs of the buildout scenarios of `plone/`.
 
 | Stack | Server | Client | What differs from `zeo` |
 | --- | --- | --- | --- |
@@ -274,7 +278,7 @@ just bench publish target/bench/showcase/<started> CHECKOUT
 
 **The options of the set.** `--fixtures small,medium`; `--step-seconds 60`, `--warmup 60` and `--trim 5`, the defaults of `run`; `--client-objects 1000`, the `--objects` of the client benchmark; and the pinning of each B5 run, for both stacks: `--server-cpus 0`, `--zope-cpus "1;3"` and `--locust-cpus 6`. On the reference machine these CPUs are on separate physical cores, so each Zope instance has a core of its own (a decision of the human); the settings of each result record the pinning. A directory records these options and its commit: `ZOE_BENCH_COMMIT`, else `git rev-parse HEAD`. A start with another commit or other options of the set exits with 2 and runs nothing. `--max-load` and `--port-offset` are not options of the set, so a start with other values resumes the directory.
 
-**A start** runs the runs that are not done, in the order of the plan, one at a time. For each run, it holds an exclusive `flock(2)` on `ZOE_BENCH_LOCK` (`target/bench/bench.lock` by default), so that a benchmark that takes the same lock does not run beside it, and it waits while the 1-minute load average is `--max-load` (8) or more. After the run, a file `STOP` in the directory ends the showcase with exit 0; a `STOP` that exists when a start begins goes away. On Linux, `systemd-inhibit` keeps the machine awake until the showcase ends; when it is missing or refuses, the showcase warns and goes on. A tree that differs from its commit gives a warning too: the runs go on, and `publish` refuses their documents.
+**A start** runs the runs that are not done, in the order of the plan, one at a time. For each run, it holds the bench lock (see [Run it](#run-it)), so that no other benchmark runs beside it, and it waits while the 1-minute load average is `--max-load` (8) or more. After the run, a file `STOP` in the directory ends the showcase with exit 0; a `STOP` that exists when a start begins goes away. On Linux, `systemd-inhibit` keeps the machine awake until the showcase ends; when it is missing or refuses, the showcase warns and goes on. A tree that differs from its commit gives a warning too: the runs go on, and `publish` refuses their documents.
 
 **Failures.** A failed build or `prepare` stops the showcase at once. A failed B5 run, native gate, client benchmark or summary stays to do, and the showcase goes on with the next run, but not with the summary of a fixture whose B5 runs are not all done. The exit code is 0 when no run failed, 1 when a run failed, and 2 when the directory belongs to another commit or other options. A later start runs only what is to do. A native gate or a client benchmark that writes its result ended well, also when it exits with 1: the report gives the verdict. A B5 run whose verification fails ended well too, and no later start runs it again: the log and the summary give its verdict, and `publish` refuses the summary. The last line of the log counts the runs that failed, the runs to do, the B5 runs whose verdict is not `pass` and the native gates that exit with 1, and it says `to publish` only when every run is done and every B5 verdict is `pass`.
 

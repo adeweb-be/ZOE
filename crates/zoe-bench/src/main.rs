@@ -317,7 +317,7 @@ fn address(command: &str, option: &str, text: &str) -> Option<SocketAddr> {
 /// Run `future` on a tokio runtime, and print its report on stdout.
 fn run<R: Serialize>(
     command: &str,
-    future: impl Future<Output = Result<R, load::Error>>,
+    future: impl Future<Output = Result<R, zoe_bench::Error>>,
 ) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

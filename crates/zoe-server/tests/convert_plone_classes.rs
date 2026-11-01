@@ -19,15 +19,14 @@
 //!
 //! The test writes the records directly. It needs no Python and no Plone.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Output;
 
 use zoe_core::{Flavour, Oid, Store, Tid};
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::{assert_exit, fresh_dir, s, zoe};
 
 /// A way to give `--force`: a name, the arguments and the variables.
 type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
@@ -42,20 +41,6 @@ const HISTORY: &str = "zoe.plone.history.WorkflowHistory";
 const MEMBER: Oid = Oid(0x2a);
 const GROUP: Oid = Oid(0x2b);
 const WORKFLOW: Oid = Oid(0x40);
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zoe-convert-plone-classes-{name}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
 
 /// Run `zoe convert --to-data-fs` of the store `store` into `target`, with
 /// the arguments `extra` and the variables `env`. No other `ZOE_*`
@@ -77,40 +62,12 @@ fn convert(store: &Path, target: &Path, extra: &[&str], env: &[(&str, &str)]) ->
     zoe(&args, env)
 }
 
-/// Run `zoe` with the arguments `args` and the variables `env`. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[String], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    common::output(&mut command)
-}
-
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        stdout(output),
-        stderr(output)
-    );
 }
 
 /// Return a pickle of an object of the class `class`, whose state is the
@@ -146,7 +103,7 @@ fn commit(store: &Store, records: &[(Oid, Vec<u8>)]) {
 /// Make a store in `dir` with a root, two principals and one history,
 /// each in a record of its class of `zoe.plone`.
 fn store_with_plone_classes(dir: &Path) -> Store {
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     commit(
         &store,
         &[
@@ -289,7 +246,7 @@ fn the_record_of_a_deleted_principal_refuses_until_a_pack() {
     // a principal that the site deleted before stays, with no reference.
     let sheet = Oid(0x10);
     {
-        let store = common::open(&store_dir);
+        let store = common::open_store(&store_dir);
         commit(
             &store,
             &[

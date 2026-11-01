@@ -10,9 +10,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, Server, TIMEOUT, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s,
 };
 
@@ -26,7 +26,7 @@ const BEAT: Duration = Duration::from_millis(500);
 
 /// Wait at most `limit` for the reply to the call `id`, and send nothing
 /// meanwhile. Fail when the server closes the connection first.
-fn reply_silently(conn: &mut Conn, id: &Value, limit: Duration) -> wire::Message {
+fn reply_silently(conn: &mut Conn, id: &Value, limit: Duration) -> common::Message {
     let started = Instant::now();
     conn.stream().set_read_timeout(Some(limit)).unwrap();
     loop {
@@ -125,7 +125,7 @@ fn a_client_that_waits_for_the_reply_of_its_call_is_not_idle() {
     let finish = waiter.send_call("tpc_finish", vec![Value::from(3)]);
     let reply = reply_silently(&mut waiter, &finish, Duration::from_secs(20));
     assert!(!reply.is_error(), "{reply:?}");
-    let tid = wire::u64_of(&reply.args);
+    let tid = common::u64_of(&reply.args);
 
     // Then the waiter sends nothing more, and the server closes it after
     // the timeout.

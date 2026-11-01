@@ -11,9 +11,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, Server, TIMEOUT, Value, ZOE, begin, commit, fresh_dir, load, new_oids, p64, record, s,
     u64_of,
 };
@@ -63,7 +63,7 @@ fn status(conn: &mut Conn, key: &str) -> Value {
 #[test]
 fn the_help_names_the_timeout_and_its_twin() {
     let output = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         std::process::Command::new(ZOE)
             .args(["serve", "--help"])
             .output()
@@ -198,7 +198,7 @@ fn a_second_vote_does_not_start_the_time_again() {
     let mut conn = server.client("1");
     let reply = store_and_vote(&mut conn, 3, oid, first, b"stale");
     let first_vote = Instant::now();
-    let listed = wire::items(&reply).into_iter().any(|item| {
+    let listed = common::items(&reply).into_iter().any(|item| {
         item.as_map().is_some_and(|map| {
             map.iter()
                 .any(|(k, v)| k.as_str() == Some("oid") && *v == p64(oid))

@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use zoe_core::testing::TempDir;
 use zoe_core::{Oid, Store, Tid};
+use zoe_loupe::Folder;
 
 /// The variable that names the directory where the end-to-end tests of
 /// the window want the fixture store.
@@ -151,12 +153,19 @@ pub fn class_name(data: &[u8]) -> String {
     format!("{module}.{name}")
 }
 
-/// Return an empty directory for one test.
-pub fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-loupe-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// Return a new, empty directory for the test `name` of this test binary.
+/// The drop of the directory removes it, except when the test panics.
+pub fn fresh_dir(name: &str) -> TempDir {
+    zoe_core::testing::fresh_dir(&format!("loupe-{name}"))
+}
+
+/// Open the fixture store in a new directory. The folder needs the
+/// directory, so keep the directory while the folder is open.
+pub fn open(name: &str) -> (TempDir, Fixture, Folder) {
+    let dir = fresh_dir(name);
+    let fixture = write_store(&dir);
+    let folder = Folder::open(&dir).unwrap();
+    (dir, fixture, folder)
 }
 
 /// Write the transactions of the fixture to a new store in `dir`, with

@@ -14,43 +14,7 @@
 use std::collections::HashMap;
 
 use rmpv::Value;
-
-const PROTO: u8 = 0x80;
-const STOP: u8 = b'.';
-const MARK: u8 = b'(';
-const NONE: u8 = b'N';
-const NEWTRUE: u8 = 0x88;
-const NEWFALSE: u8 = 0x89;
-const INT: u8 = b'I';
-const LONG: u8 = b'L';
-const BININT1: u8 = b'K';
-const BININT2: u8 = b'M';
-const BININT: u8 = b'J';
-const LONG1: u8 = 0x8a;
-const LONG4: u8 = 0x8b;
-const BINFLOAT: u8 = b'G';
-const SHORT_BINSTRING: u8 = b'U';
-const BINSTRING: u8 = b'T';
-const BINUNICODE: u8 = b'X';
-const SHORT_BINBYTES: u8 = b'C';
-const BINBYTES: u8 = b'B';
-const EMPTY_TUPLE: u8 = b')';
-const TUPLE: u8 = b't';
-const TUPLE1: u8 = 0x85;
-const TUPLE2: u8 = 0x86;
-const TUPLE3: u8 = 0x87;
-const EMPTY_LIST: u8 = b']';
-const LIST: u8 = b'l';
-const APPEND: u8 = b'a';
-const APPENDS: u8 = b'e';
-const EMPTY_DICT: u8 = b'}';
-const DICT: u8 = b'd';
-const SETITEM: u8 = b's';
-const SETITEMS: u8 = b'u';
-const BINPUT: u8 = b'q';
-const LONG_BINPUT: u8 = b'r';
-const BINGET: u8 = b'h';
-const LONG_BINGET: u8 = b'j';
+use zoe_pickle::opcode::*;
 
 /// The most levels of tuples, lists and dicts in an extension that
 /// `unpickle` reads. A frame of the protocol holds about 60 levels, so an
@@ -263,7 +227,7 @@ impl<'a> Machine<'a> {
                 NEWTRUE => self.leaf(Value::Boolean(true)),
                 NEWFALSE => self.leaf(Value::Boolean(false)),
                 INT => {
-                    let line = self.line()?;
+                    let line = self.line(op)?;
                     let value = match line {
                         b"00" => Value::Boolean(false),
                         b"01" => Value::Boolean(true),
@@ -272,43 +236,33 @@ impl<'a> Machine<'a> {
                     self.leaf(value);
                 }
                 LONG => {
-                    let line = self.line()?;
+                    let line = self.line(op)?;
                     let digits = line.strip_suffix(b"L").unwrap_or(line);
                     let value = int_value(decimal(digits)?)?;
                     self.leaf(value);
                 }
                 BININT1 => {
-                    let n = self.take(1)?[0];
+                    let [n] = self.fixed(op)?;
                     self.leaf(Value::from(n));
                 }
                 BININT2 => {
-                    let n = u16::from_le_bytes(self.array()?);
+                    let n = u16::from_le_bytes(self.fixed(op)?);
                     self.leaf(Value::from(n));
                 }
                 BININT => {
-                    let n = i32::from_le_bytes(self.array()?);
+                    let n = i32::from_le_bytes(self.fixed(op)?);
                     self.leaf(Value::from(n));
                 }
-                LONG1 => {
-                    let len = usize::from(self.take(1)?[0]);
-                    let value = int_value(signed(self.take(len)?)?)?;
-                    self.leaf(value);
-                }
-                LONG4 => {
-                    let len = self.len4()?;
-                    let value = int_value(signed(self.take(len)?)?)?;
+                LONG1 | LONG4 => {
+                    let value = int_value(signed(self.counted(op)?)?)?;
                     self.leaf(value);
                 }
                 BINFLOAT => {
-                    let f = f64::from_be_bytes(self.array()?);
+                    let f = f64::from_be_bytes(self.fixed(op)?);
                     self.leaf(Value::F64(f));
                 }
                 SHORT_BINSTRING | BINSTRING => {
-                    let len = match op {
-                        SHORT_BINSTRING => usize::from(self.take(1)?[0]),
-                        _ => self.len4()?,
-                    };
-                    let bytes = self.take(len)?;
+                    let bytes = self.counted(op)?;
                     let value = match std::str::from_utf8(bytes) {
                         Ok(text) if bytes.is_ascii() => Value::from(text),
                         _ => Value::Binary(bytes.to_vec()),
@@ -316,17 +270,12 @@ impl<'a> Machine<'a> {
                     self.leaf(value);
                 }
                 BINUNICODE => {
-                    let len = self.len4()?;
-                    let text = std::str::from_utf8(self.take(len)?)
+                    let text = std::str::from_utf8(self.counted(op)?)
                         .map_err(|_| "a str of the extension is not UTF-8")?;
                     self.leaf(Value::from(text));
                 }
                 SHORT_BINBYTES | BINBYTES => {
-                    let len = match op {
-                        SHORT_BINBYTES => usize::from(self.take(1)?[0]),
-                        _ => self.len4()?,
-                    };
-                    let bytes = self.take(len)?.to_vec();
+                    let bytes = self.counted(op)?.to_vec();
                     self.leaf(Value::Binary(bytes));
                 }
                 EMPTY_TUPLE => self.stack.push(Slot::Value(Value::Array(Vec::new()), 1)),
@@ -372,20 +321,12 @@ impl<'a> Machine<'a> {
                     let items = self.pop_mark()?;
                     self.set_items(items)?;
                 }
-                BINPUT => {
-                    let index = u32::from(self.take(1)?[0]);
+                BINPUT | LONG_BINPUT => {
+                    let index = self.index(op)?;
                     self.put(index)?;
                 }
-                LONG_BINPUT => {
-                    let index = u32::from_le_bytes(self.array()?);
-                    self.put(index)?;
-                }
-                BINGET => {
-                    let index = u32::from(self.take(1)?[0]);
-                    self.get(index)?;
-                }
-                LONG_BINGET => {
-                    let index = u32::from_le_bytes(self.array()?);
+                BINGET | LONG_BINGET => {
+                    let index = self.index(op)?;
                     self.get(index)?;
                 }
                 _ => {
@@ -413,25 +354,42 @@ impl<'a> Machine<'a> {
         Ok(head)
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
-        Ok(self.take(N)?.try_into().expect("N bytes"))
+    /// Take the argument of the opcode `op`. `argument_len` knows each
+    /// opcode that `run` reads, so `None` means that the bytes end early.
+    fn argument(&mut self, op: u8) -> Result<&'a [u8], String> {
+        let len = argument_len(op, self.input).ok_or("the pickle ends early")?;
+        self.take(len)
     }
 
-    /// Take a 4-byte little-endian length.
-    fn len4(&mut self) -> Result<usize, String> {
-        let len = u32::from_le_bytes(self.array()?);
-        usize::try_from(len).map_err(|_| "a length of the pickle is too large".into())
+    /// Take the argument of an opcode with a fixed width of `N` bytes.
+    fn fixed<const N: usize>(&mut self, op: u8) -> Result<[u8; N], String> {
+        self.argument(op)?
+            .try_into()
+            .map_err(|_| "an argument of the pickle does not read".into())
     }
 
-    /// Take the bytes up to the next newline. Return them without the
-    /// newline.
-    fn line(&mut self) -> Result<&'a [u8], String> {
-        let end = self
-            .input
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .ok_or("the pickle ends early")?;
-        Ok(&self.take(end + 1)?[..end])
+    /// Take the argument of an opcode with a length, then that many bytes.
+    /// Return the bytes after the length.
+    fn counted(&mut self, op: u8) -> Result<&'a [u8], String> {
+        let argument = self.argument(op)?;
+        let width = match op {
+            LONG1 | SHORT_BINSTRING | SHORT_BINBYTES => 1,
+            _ => 4,
+        };
+        Ok(&argument[width..])
+    }
+
+    /// Take the argument of an opcode that ends with a newline. Return it
+    /// without the newline.
+    fn line(&mut self, op: u8) -> Result<&'a [u8], String> {
+        let argument = self.argument(op)?;
+        Ok(argument.strip_suffix(b"\n").unwrap_or(argument))
+    }
+
+    /// Take the argument of a put or a get. Return its memo index.
+    fn index(&mut self, op: u8) -> Result<u32, String> {
+        let argument = self.argument(op)?;
+        memo_index(op, argument).ok_or_else(|| "an argument of the pickle does not read".into())
     }
 
     fn leaf(&mut self, value: Value) {

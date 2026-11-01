@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::ZOE;
 
 /// The number of rounds. In each round, one thread closes the store and
 /// opens it again while the other thread runs `zoe --version`.
@@ -33,7 +32,7 @@ fn memory_dir(name: &str) -> PathBuf {
 #[test]
 fn a_store_opens_again_while_another_thread_runs_zoe() {
     let dir = memory_dir("cli-helpers");
-    drop(common::open(&dir));
+    drop(common::open_store(&dir));
     // A channel without a buffer: each send waits for the receive. It
     // carries the time that the last close of the store took.
     let (round_start, round_started) = sync_channel::<Duration>(0);
@@ -61,12 +60,12 @@ fn a_store_opens_again_while_another_thread_runs_zoe() {
         let round_start = round_start;
         let mut close = Duration::ZERO;
         for _ in 0..ROUNDS {
-            let store = common::open(&dir);
+            let store = common::open_store(&dir);
             round_start.send(close).unwrap();
             let start = Instant::now();
             drop(store);
             close = start.elapsed();
-            drop(common::open(&dir));
+            drop(common::open_store(&dir));
         }
     });
     std::fs::remove_dir_all(&dir).unwrap();

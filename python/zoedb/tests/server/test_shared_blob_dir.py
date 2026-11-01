@@ -18,24 +18,15 @@ a temporary name, fails the vote too, and the server touches no file.
 import os
 
 import pytest
+import support
+from support import ZERO
 
 from zoe.testing import ZoeServer
 
-ZERO = bytes(8)
-TIMEOUT = 30
-
 
 def client(server, blob_dir, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(
-        server.address,
-        storage="1",
-        wait_timeout=TIMEOUT,
-        blob_dir=str(blob_dir),
-        shared_blob_dir=True,
-        **kw,
-    )
+    """Open a stock client that shares the blob directory `blob_dir`."""
+    return support.client(server, blob_dir=str(blob_dir), shared_blob_dir=True, **kw)
 
 
 def write_blob(db, name, data):
