@@ -57,6 +57,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--requests", type=int, default=200)
     parser.add_argument("--py-spy", action="store_true")
     parser.add_argument("--rate", type=int, default=499)
+    parser.add_argument(
+        "--reader",
+        action="store_true",
+        help="give each connection the reader in Rust of zoe.reader",
+    )
+    parser.add_argument(
+        "--oracle",
+        action="store_true",
+        help="run the oracle of the reader on the FileStorage of the fixture",
+    )
     args = parser.parse_args(argv)
     name = args.fixture or fixture.default_name(corpus.PRESETS["small"], "small")
     source = fixture.fixture_dir(name)
@@ -93,7 +103,17 @@ def main(argv: list[str] | None = None) -> int:
             f"127.0.0.1:{settings.admin_port}",
             str(paths),
             str(args.requests),
+            "reader" if args.reader else "python",
         ]
+        if args.oracle:
+            command = [
+                str(stack.interpreter(config)),
+                str(stack.INZOPE / "run.py"),
+                str(conf),
+                "reader_oracle.py",
+                str(source / "store" / "filestorage" / "Data.fs"),
+                str(run / "oracle.json"),
+            ]
         if args.py_spy:
             command = [
                 "py-spy",

@@ -20,6 +20,7 @@ mod client;
 mod errors;
 mod kv;
 mod publish;
+mod reader;
 mod sequence;
 mod signals;
 mod storage;
@@ -33,6 +34,8 @@ mod _zoe {
     use crate::cli::main;
     #[pymodule_export]
     use crate::client::{NativeClient, NativeIntents, NativeTransaction};
+    #[pymodule_export]
+    use crate::reader::{_reader_counts, _reader_reset, Reader};
     #[pymodule_export]
     use crate::sequence::Sequence;
     #[pymodule_export]

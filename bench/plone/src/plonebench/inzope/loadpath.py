@@ -34,9 +34,16 @@ from ZODB.serialize import ObjectReader
 from ZPublisher.WSGIPublisher import publish_module
 
 out, admin, paths_file, requests = sys.argv[1:5]
+reader = sys.argv[5:6] == ["reader"]
 requests = int(requests)
 paths = json.loads(open(paths_file).read())
 db = app._p_jar.db()  # noqa: F821 - run.py gives app
+if reader:
+    # The reader of the spike ZOE-274: setGhostState and getState in Rust.
+    import zoe.reader
+
+    zoe.reader.install(db)
+    zoe.reader.reset_counts()
 
 
 def server_loads():
@@ -187,7 +194,12 @@ for kind in sorted({row["kind"] for row in rows}):
                 },
             }
 loads = counts["loads"] or 1
+reader_counts = None
+if reader:
+    reader_counts = zoe.reader.counts()
 result = {
+    "reader": reader,
+    "reader_counts": reader_counts,
     "requests": rows,
     "groups": groups,
     "counted_requests": len(paths),

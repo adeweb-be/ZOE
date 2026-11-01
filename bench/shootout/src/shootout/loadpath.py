@@ -64,7 +64,7 @@ TIMED = "_touch"
 
 
 @contextlib.contextmanager
-def opened(client: str, size: int, objects: int, workdir: Path):
+def opened(client: str, size: int, objects: int, workdir: Path, reader: bool = False):
     """Start a server, open a `DB` on a client of it, write the corpus, and
     yield the `Fixture`. Stop all at the exit."""
     import ZODB
@@ -95,6 +95,12 @@ def opened(client: str, size: int, objects: int, workdir: Path):
         # leaves it between two rounds but by `cacheMinimize`.
         db = ZODB.DB(storage, cache_size=10 * objects)
         stack.callback(db.close)
+        if reader:
+            # The reader of the spike ZOE-274: setGhostState and getState
+            # in Rust.
+            import zoe.reader
+
+            zoe.reader.install(db)
         conn = db.open()
         stack.callback(conn.close)
         yield Fixture(client, size, objects, db, conn, admin)
@@ -298,8 +304,9 @@ def pass_mapping_new(f):
     from persistent import PickleCache
     from ZODB.serialize import ObjectReader
 
+    klass = type(f.reader) if hasattr(f.reader, "_decode") else ObjectReader
     readers = [
-        ObjectReader(f.conn, PickleCache(f.conn, 10 * len(f.oids)), f.reader._factory)
+        klass(f.conn, PickleCache(f.conn, 10 * len(f.oids)), f.reader._factory)
         for _ in range(MAPPING_REPEAT)
     ]
     p = f.mapping_pickle
@@ -436,6 +443,7 @@ def terms_of(hit: dict, miss: dict | None) -> dict:
         - net["setstate"]
         - net["book"],
         "find_global alone": net["find_global"],
+        "getState": net["getstate"],
         "access of a loaded object": hit["access"],
         "cacheMinimize per object": hit["minimize"],
         "callback per reference": hit["callback"] - hit["empty"],
@@ -534,21 +542,30 @@ def summary(values: list[float]) -> dict:
 
 
 def run_terms(args) -> dict:
-    result = {"machine": machine(), "cache_size": CACHE_SIZE, "rows": []}
+    result = {
+        "machine": machine(),
+        "cache_size": CACHE_SIZE,
+        "reader": args.reader,
+        "rows": [],
+    }
     for client in args.client:
         for size in args.size:
             objects = args.objects or OBJECTS[size]
             rounds = args.rounds or ROUNDS[size]
             with tempfile.TemporaryDirectory(dir=args.workdir) as tmp:
-                result["rows"].append(one_row(client, size, objects, rounds, Path(tmp)))
+                result["rows"].append(
+                    one_row(client, size, objects, rounds, Path(tmp), args.reader)
+                )
             print_row(result["rows"][-1])
     result["machine"]["gil_enabled_at_end"] = machine()["gil_enabled"]
     return result
 
 
-def one_row(client: str, size: int, objects: int, rounds: int, workdir: Path) -> dict:
+def one_row(
+    client: str, size: int, objects: int, rounds: int, workdir: Path, reader: bool
+) -> dict:
     load_before = os.getloadavg()
-    with opened(client, size, objects, workdir) as f:
+    with opened(client, size, objects, workdir, reader) as f:
         # One round of each before the timed rounds warms them up.
         hit_round(f)
         miss_round(f)
@@ -570,7 +587,14 @@ def one_row(client: str, size: int, objects: int, rounds: int, workdir: Path) ->
             m["prefetch_touch_loads"] for m in misses if "prefetch_touch_loads" in m
         ]
         pickle_bytes = statistics.median(len(p) for p in f.pickles)
+        reader_counts = None
+        if reader:
+            import zoe.reader
+
+            reader_counts = zoe.reader.counts()
     return {
+        "reader": reader,
+        "reader_counts": reader_counts,
         "client": client,
         "size": size,
         "objects": objects,
@@ -596,6 +620,7 @@ def one_row(client: str, size: int, objects: int, rounds: int, workdir: Path) ->
 def print_row(row: dict) -> None:
     print(
         f"\n{row['client']} {row['size']} B ({row['pickle_bytes']} B pickles), "
+        f"reader {'on' if row['reader'] else 'off'}, "
         f"{row['objects']} objects, {row['rounds']} rounds, "
         f"load {row['loadavg_before'][0]:.2f} -> {row['loadavg_after'][0]:.2f}"
     )
@@ -638,6 +663,7 @@ def run_loop(args) -> int:
             args.size[0],
             args.objects or OBJECTS[args.size[0]],
             Path(tmp),
+            args.reader,
         ) as f:
             profiler = None
             if args.cprofile:
@@ -666,6 +692,8 @@ def loop_args(args) -> list[str]:
     out = ["loop", "--kind", args.kind, "--seconds", str(args.seconds)]
     out += ["--client", args.client[0], "--size", str(args.size[0])]
     out += ["--workdir", str(args.workdir)]
+    if args.reader:
+        out += ["--reader"]
     if args.objects:
         out += ["--objects", str(args.objects)]
     return out
@@ -903,6 +931,11 @@ def main(argv: list[str] | None = None) -> int:
             help="objects per row (default: 1000 at 1 KB, 200 at 100 KB)",
         )
         cmd.add_argument("--workdir", type=Path, default=Path("target/bench/work"))
+        cmd.add_argument(
+            "--reader",
+            action="store_true",
+            help="give each connection the reader in Rust of zoe.reader",
+        )
     terms = commands.choices["terms"]
     terms.add_argument(
         "--rounds", type=int, help="rounds per row (default: 30 at 1 KB, 15 at 100 KB)"

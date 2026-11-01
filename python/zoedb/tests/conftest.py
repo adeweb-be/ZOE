@@ -12,6 +12,19 @@ import pytest
 # collects them there.
 collect_ignore = ["conformance", "crash"]
 
+# The switch of the reader spike: with SPIKE_ZOE_READER=1, each Connection
+# of the run makes a `zoe.reader.Reader` in place of ZODB's `ObjectReader`.
+# The end of the run prints the counts of the readers.
+if os.environ.get("SPIKE_ZOE_READER") == "1":
+    import ZODB.Connection
+
+    import zoe.reader
+
+    ZODB.Connection.ObjectReader = zoe.reader.Reader
+
+    def pytest_terminal_summary(terminalreporter):
+        terminalreporter.write_line(f"zoe.reader counts: {zoe.reader.counts()}")
+
 
 @pytest.fixture
 def server(tmp_path):
