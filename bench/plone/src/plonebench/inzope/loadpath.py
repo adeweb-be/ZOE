@@ -10,8 +10,9 @@ request, it calls `cacheMinimize()` on the database, so each object that
 the request reads loads through `Connection.setstate`. For each request it
 records the time, the loads of the connections (`_load_count`) and the
 loads that `zoe serve` counted on its admin port ADMIN: the misses of the
-client cache. The function `_request` runs the request alone, so a profile
-of this process can count the samples under it.
+client cache. The functions `_request_folder` and `_request_document`
+run these requests only, so a profile of this process can count the
+samples under each.
 
 Then it sends each path once more with `sys.setprofile` on, and counts the
 loads, the `persistent_load` callbacks and the Python calls under
@@ -73,7 +74,7 @@ def environ(path):
     }
 
 
-def _request(path):
+def publish(path):
     status = []
 
     def start_response(code, headers, exc_info=None):
@@ -86,13 +87,26 @@ def _request(path):
     return status[0], size
 
 
+# The requests of each kind run in a function of their own, so a profile
+# can count the samples of each kind apart.
+def _request_folder(path):
+    return publish(path)
+
+
+def _request_document(path):
+    return publish(path)
+
+
+REQUEST = {"folder": _request_folder, "document": _request_document}
+
+
 rows = []
 for index in range(requests):
     kind, path = paths[index % len(paths)]
     db.cacheMinimize()
     loads_before, server_before = load_count(), server_loads()
     start = perf_counter()
-    status, size = _request(path)
+    status, size = REQUEST[kind](path)
     seconds = perf_counter() - start
     rows.append(
         {
@@ -137,7 +151,7 @@ for _kind, path in paths:
     db.cacheMinimize()
     sys.setprofile(profile)
     try:
-        _request(path)
+        publish(path)
     finally:
         sys.setprofile(None)
 

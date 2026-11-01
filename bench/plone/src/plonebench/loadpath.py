@@ -9,9 +9,10 @@ zoeclient scenario: one Zope thread that sends the requests through the
 publisher of Zope in its own process. The paths are the published Folders
 (their listing) and Documents (their view) of the first section of the
 fixture. With `--py-spy`, py-spy samples that process (`record --native`,
-raw format); `python -m shootout.loadpath frames FILE --root _request`
-prints the time per frame of the requests. It writes `loadpath.json`
-and, with `--py-spy`, `py-spy.txt` into `target/bench/plone/loadpath/`.
+raw format), and `python -m shootout.loadpath frames FILE --root
+_request_folder` (or `_request_document`) prints the time per frame of the
+requests of one kind. It writes `loadpath.json` and, with `--py-spy`,
+`py-spy.txt` into `target/bench/plone/loadpath/`.
 """
 
 from __future__ import annotations

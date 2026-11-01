@@ -388,33 +388,24 @@ def miss_round(f) -> dict:
 
 
 def prefetch_round(f) -> dict:
-    """The miss round with a prefetch of every oid first: once with a wait
-    for the replies before the touch, once with the touch at once."""
+    """The miss round with a prefetch of every oid, then the reads at once,
+    as a prefetch after the miss of the container gives them."""
     n = len(f.oids)
-    out = {}
-    f.conn.cacheMinimize()
-    f.clear()
-    t = perf_counter()
-    f.storage.prefetch(f.oids, f.start)
-    while f.entries() < n:
-        pass
-    waited = perf_counter() - t
-    out["prefetch_touch_wait"] = (waited + pass_touch(f)) / n
-    out["prefetch_wait"] = waited / n
     f.conn.cacheMinimize()
     f.clear()
     before = f.server_loads()
     t = perf_counter()
     f.storage.prefetch(f.oids, f.start)
     _touch(f.objs)
-    out["prefetch_touch"] = (perf_counter() - t) / n
-    # Wait for the prefetches still in flight before the count.
+    out = {"prefetch_touch": (perf_counter() - t) / n}
+    # Wait for the prefetches still in flight before the count. A count of
+    # the entries walks every slot of the cache under its lock, so count
+    # at most once in a millisecond.
     deadline = time.monotonic() + 10
     while f.entries() < n and time.monotonic() < deadline:
         time.sleep(0.001)
     time.sleep(0.05)
-    after = f.server_loads()
-    out["prefetch_touch_loads"] = (after - before) / n
+    out["prefetch_touch_loads"] = (f.server_loads() - before) / n
     return out
 
 
@@ -456,11 +447,8 @@ def terms_of(hit: dict, miss: dict | None) -> dict:
         terms["miss load"] = miss["touch"] - hit["access"]
         terms["miss: round trip and store"] = miss["client"] - hit["client"]
         terms["miss: MVCCAdapterInstance.load"] = miss["mvcc"] - miss["client"]
-        for key in ("prefetch_touch_wait", "prefetch_wait", "prefetch_touch"):
-            if key in miss:
-                terms[key.replace("_", " ")] = miss[key] - (
-                    hit["access"] if "touch" in key else 0
-                )
+        if "prefetch_touch" in miss:
+            terms["prefetch, then the reads"] = miss["prefetch_touch"] - hit["access"]
     return terms
 
 
@@ -713,6 +701,52 @@ FRAMES = (
 )
 
 
+# The parts of a load: each sample goes to the deepest frame of its stack
+# that one of these matches, with the rules of FRAMES, else to "outside a
+# load". A part with a fourth item matches only below that part.
+PARTS = (
+    ("unghostify (C)", "unghostify", "cPersistence.c"),
+    ("Connection.setstate and bookkeeping", "setstate", "ZODB/Connection.py"),
+    ("MVCCAdapterInstance.load", "load", "ZODB/mvccadapter.py"),
+    ("zoe.zeo frames", "loadBefore", "zoe/zeo/_native.py"),
+    ("zoe.zeo frames", "_with_server", "zoe/zeo/_native.py"),
+    ("zoe.zeo frames", "<lambda>", "zoe/zeo/_native.py"),
+    ("ZEO frames", "loadBefore", "ZEO/ClientStorage.py"),
+    ("client cache (ZEO.cache)", "loadBefore", "ZEO/cache.py"),
+    ("Rust call (pyo3, getpid, bytes)", "*___pymethod_load_before__", ""),
+    ("client cache (Rust)", "*Cache16load_before_with", ""),
+    ("wait for the server", "syscall", "libc.so.6", "Rust call (pyo3, getpid, bytes)"),
+    ("ObjectReader frames", "setGhostState", "ZODB/serialize.py"),
+    ("ObjectReader frames", "getState", "ZODB/serialize.py"),
+    ("unpickler setup", "_get_unpickler", "ZODB/serialize.py"),
+    ("state decode (C unpickler)", "load", "_pickle_33.c"),
+    ("class lookup (find_global)", "find_global", "ZODB/serialize.py"),
+    ("persistent_load callbacks", "_persistent_load", "ZODB/serialize.py"),
+    ("__setstate__ (C)", "pickle___setstate__", "cPersistence.c"),
+    ("__setstate__ (Python)", "__setstate__", ".py"),
+)
+OUTSIDE = "outside a load"
+
+
+def matches(frame: str, function: str, path: str) -> bool:
+    name, where = split_frame(frame)
+    if function.startswith("*"):
+        return function[1:] in name
+    return name == function and where.endswith(path)
+
+
+def part_of(frames: list[str]) -> str:
+    """The part of one sample: the part of its deepest matching frame."""
+    label = OUTSIDE
+    for frame in frames:
+        for part in PARTS:
+            within = part[3] if len(part) > 3 else None
+            if (within is None or within == label) and matches(frame, *part[1:3]):
+                label = part[0]
+                break
+    return label
+
+
 def run_frames(args) -> int:
     """Print the share of the samples under the root function of each
     frame of a load, inclusive, and the frames with the most own samples."""
@@ -720,6 +754,7 @@ def run_frames(args) -> int:
     total = 0
     inclusive = Counter()
     own = Counter()
+    parts = Counter()
     for line in Path(args.file).read_text().splitlines():
         stack, _, count = line.rpartition(" ")
         if not stack:
@@ -733,20 +768,19 @@ def run_frames(args) -> int:
         total += n
         seen = set()
         for frame in frames:
-            name, where = split_frame(frame)
             for label, function, path in FRAMES:
-                if function.startswith("*"):
-                    match = function[1:] in name
-                else:
-                    match = name == function and where.endswith(path)
-                if match and label not in seen:
+                if label not in seen and matches(frame, function, path):
                     seen.add(label)
                     inclusive[label] += n
         own[short(frames[-1]) if frames else root] += n
+        parts[part_of(frames)] += n
     print(f"{total} samples under {root}")
     for label, _, _ in FRAMES:
         if inclusive[label]:
             print(f"  {label:34} {100 * inclusive[label] / total:5.1f} %")
+    print("parts, each sample once:")
+    for label, n in parts.most_common():
+        print(f"  {label:36} {100 * n / total:5.1f} %")
     print("own samples:")
     for frame, n in own.most_common(args.top):
         print(f"  {100 * n / total:5.1f} %  {frame}")
