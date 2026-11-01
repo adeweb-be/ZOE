@@ -34,7 +34,7 @@ pub(super) fn bytes<'py>(
 ) -> Option<Bound<'py, PyBytes>> {
     PyBytes::new_with_writer(py, len, |writer| {
         let mut written = true;
-        let good = copy(&mut |block| written &= writer.write_all(block).is_ok());
+        let good = copy(&mut |block| written &= writer.write_bytes(block).is_ok());
         if good && written {
             Ok(())
         } else {
