@@ -726,6 +726,8 @@ FRAMES = (
     ("Client.load_before (Rust)", "*___pymethod_load_before__", ""),
     ("Cache.load_before_with (Rust)", "*Cache16load_before_with", ""),
     ("getpid", "getpid", "libc.so.6"),
+    ("Reader.setGhostState (Rust)", "*__pymethod_setGhostState__", ""),
+    ("reader decode (Rust)", "*6reader7Decoder", ""),
 )
 
 
@@ -750,6 +752,9 @@ PARTS = (
     ("state decode (C unpickler)", "load", "_pickle_33.c"),
     ("class lookup (find_global)", "find_global", "ZODB/serialize.py"),
     ("persistent_load callbacks", "_persistent_load", "ZODB/serialize.py"),
+    ("reader: the call (Rust)", "*__pymethod_setGhostState__", ""),
+    ("reader: decode (Rust)", "*6reader7Decoder", ""),
+    ("reader: decode (Rust)", "*6reader6decode", ""),
     ("__setstate__ (C)", "pickle___setstate__", "cPersistence.c"),
     ("__setstate__ (Python)", "__setstate__", ".py"),
 )

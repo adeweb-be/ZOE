@@ -148,7 +148,7 @@ def test_states_equal_the_python_path(db):
     rust = db.open()
     rust._reader = zoe.reader.Reader(rust, rust._cache, db.classFactory)
     python = db.open()
-    assert type(python._reader) is ObjectReader
+    python._reader = ObjectReader(python, python._cache, db.classFactory)
     for oid in oids:
         pickle, _ = rust._storage.load(oid)
         state, reason = rust._reader._decode(pickle)
@@ -175,14 +175,14 @@ def test_loads_through_install(db):
     holder.child = Child(3)
     transaction.commit()
     conn.cacheMinimize()
-    zoe.reader.reset_counts()
+    before = zoe.reader.counts()
     assert root["h"].ints == values()["ints"]
     assert root["h"].child.n == 3
     assert root["h"].slotted == Slotted(1, [2])
     assert root["h"].mixed.y == 2
-    counts = zoe.reader.counts()
-    assert counts["decoded"] >= 3
-    assert counts["fallback"] == {}
+    after = zoe.reader.counts()
+    assert after["decoded"] - before["decoded"] >= 3
+    assert after["fallback"] == before["fallback"]
     conn.close()
 
 
@@ -207,9 +207,9 @@ def test_weak_and_cross_database_references_take_the_python_path():
     assert state is None
     assert reason in ("other database", "weak reference")
     conn.cacheMinimize()
-    zoe.reader.reset_counts()
+    before = sum(zoe.reader.counts()["fallback"].values())
     assert conn.root()["x"].target.n == 1
-    assert sum(zoe.reader.counts()["fallback"].values()) == 1
+    assert sum(zoe.reader.counts()["fallback"].values()) - before == 1
     conn.close()
     one.close()
     two.close()
