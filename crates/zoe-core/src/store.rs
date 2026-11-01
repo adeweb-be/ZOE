@@ -1855,16 +1855,24 @@ mod tests {
         (oid, commit(&store, oid, Tid::ZERO, b"a").unwrap())
     }
 
-    /// Return the bytes of each file in `dir`, by name.
+    /// Return the bytes of each file under `dir`, the files of `wal/`
+    /// included, by path in `dir`.
     fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| {
-                let path = entry.unwrap().path();
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                (name, std::fs::read(&path).unwrap())
-            })
-            .collect()
+        let mut files = BTreeMap::new();
+        let mut todo = vec![PathBuf::new()];
+        while let Some(sub) = todo.pop() {
+            for entry in std::fs::read_dir(dir.join(&sub)).unwrap() {
+                let entry = entry.unwrap();
+                let name = sub.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    todo.push(name);
+                } else {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    files.insert(name.to_string_lossy().into_owned(), bytes);
+                }
+            }
+        }
+        files
     }
 
     #[test]

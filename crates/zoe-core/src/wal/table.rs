@@ -152,9 +152,8 @@ impl Table {
     }
 
     /// Insert `commits`, commits of `entry`, into the table and the
-    /// backlog, at the monotonic time `now`. The commits come in tid order,
-    /// after each commit of the backlog. Return the number of their records
-    /// whose previous serial is `Tid::ZERO`.
+    /// backlog, at the monotonic time `now`, and count them in `counters`.
+    /// The commits come in tid order, after each commit of the backlog.
     pub(super) fn publish(
         &mut self,
         entry: Arc<LogEntry>,
@@ -502,5 +501,109 @@ pub(super) fn empty_range(from: Bound<&[u8]>, to: Bound<&[u8]>) -> bool {
             from >= to
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::wal::EntryBuilder;
+
+    /// Return an entry of two commits, tids 5 and 6, each with a record of
+    /// oid 1 and a write of the durable row `k`, and an expiry key in the
+    /// first.
+    fn entry() -> (LogEntry, Vec<EntryCommit>) {
+        let mut builder = EntryBuilder::new(0);
+        for (tid, data) in [(Tid(5), b"five"), (Tid(6), b"sixx")] {
+            builder
+                .txn(tid, |out| out.extend_from_slice(b"row"))
+                .unwrap();
+            builder
+                .record(OpKind::Record, Oid(1), tid, |out| {
+                    out.extend_from_slice(data)
+                })
+                .unwrap();
+            builder
+                .kv(Flavour::Durable, b"k", |out| out.extend_from_slice(data))
+                .unwrap();
+            if tid == Tid(5) {
+                builder.expiry(b"x").unwrap();
+            }
+        }
+        let mut entry = builder.finish();
+        entry.seal(1, Tid(4));
+        let commits = entry.commits.clone();
+        (
+            LogEntry {
+                bytes: entry.bytes,
+                ops: entry.ops,
+            },
+            commits,
+        )
+    }
+
+    #[test]
+    fn a_read_ignores_what_is_after_the_published_tid() {
+        let (entry, commits) = entry();
+        let counters = Counters::default();
+        let mut table = Table::default();
+        table.publish(Arc::new(entry), &commits, Duration::ZERO, &counters);
+        assert_eq!(counters.commits.load(Ordering::SeqCst), 2);
+
+        let newest = |p| {
+            table
+                .newest_before(Oid(1), Tid::MAX, Tid(p))
+                .map(|(t, f)| (t, f.to_vec()))
+        };
+        assert_eq!(newest(6), Some((Tid(6), b"sixx".to_vec())));
+        assert_eq!(newest(5), Some((Tid(5), b"five".to_vec())));
+        assert_eq!(newest(4), None);
+        assert_eq!(table.first_from(Oid(1), Tid(6), Tid(5)), None);
+        assert_eq!(table.first_from(Oid(1), Tid(6), Tid(6)), Some(Tid(6)));
+        assert_eq!(
+            table.row(Flavour::Durable, b"k", Tid(5)),
+            Some(Some(&b"five"[..]))
+        );
+        assert_eq!(table.row(Flavour::Durable, b"k", Tid(4)), None);
+        assert!(table.has_expiry(b"x", Tid(5)));
+        assert!(!table.has_expiry(b"x", Tid(4)));
+        assert_eq!(table.commits(Tid::ZERO, Tid::MAX, Tid(5)).count(), 1);
+        assert_eq!(
+            table.keys(Oid(0), 10, Tid(6)),
+            [(Oid(1), Tid(5)), (Oid(1), Tid(6))]
+        );
+    }
+
+    #[test]
+    fn an_entry_counts_whole_until_its_last_commit_leaves() {
+        let (entry, commits) = entry();
+        let len = entry.bytes.len() as u64;
+        let ops = entry.ops.len() as u64;
+        let counters = Counters::default();
+        let mut table = Table::default();
+        table.publish(Arc::new(entry), &commits, Duration::ZERO, &counters);
+        assert_eq!(
+            counters.bytes.load(Ordering::SeqCst),
+            len + OP_INDEX_BYTES * ops
+        );
+        let picked = table.pick(Tid(6), 1);
+        assert_eq!(picked.len(), 1, "a slice takes at least one commit");
+        table.remove_front(1, &counters);
+        let left = commits[1].ops.len() as u64;
+        assert_eq!(
+            counters.bytes.load(Ordering::SeqCst),
+            len + OP_INDEX_BYTES * left
+        );
+        assert_eq!(table.front(), Some(Tid(6)));
+        assert!(!table.has_expiry(b"x", Tid(6)));
+        assert_eq!(
+            table.row(Flavour::Durable, b"k", Tid(6)),
+            Some(Some(&b"sixx"[..]))
+        );
+        table.remove_front(1, &counters);
+        assert_eq!(counters.bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(table.row(Flavour::Durable, b"k", Tid(6)), None);
+        assert_eq!(table.newest_before(Oid(1), Tid::MAX, Tid(6)), None);
     }
 }

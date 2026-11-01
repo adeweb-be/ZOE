@@ -409,3 +409,138 @@ fn scan<F: LogFile>(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::wal::{EntryBuilder, OpKind, encode_segment_header};
+    use crate::types::Oid;
+
+    /// A segment file in memory.
+    struct Bytes(Vec<u8>);
+
+    impl LogFile for Bytes {
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.0.len() as u64)
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+            let at = offset as usize;
+            out.copy_from_slice(&self.0[at..at + out.len()]);
+            Ok(())
+        }
+    }
+
+    /// Return the sealed entry of one commit `tid` of epoch `epoch` after
+    /// `previous`.
+    fn entry(epoch: u64, previous: Tid, tid: Tid) -> Vec<u8> {
+        let mut builder = EntryBuilder::new(0);
+        builder
+            .txn(tid, |out| out.extend_from_slice(b"row"))
+            .unwrap();
+        builder
+            .record(OpKind::Record, Oid(1), tid, |out| {
+                out.extend_from_slice(b"data")
+            })
+            .unwrap();
+        let mut entry = builder.finish();
+        entry.seal(epoch, previous);
+        entry.bytes
+    }
+
+    /// Return a segment in use with `epoch` and the entries of the tids
+    /// `tids`, chained from `Tid::ZERO`, with `tail` zeros after them.
+    fn segment(epoch: u64, tids: &[u64], tail: usize) -> (Vec<u8>, Vec<u64>) {
+        let header = SegmentHeader {
+            state: SegmentState::InUse,
+            epoch,
+        };
+        let mut bytes = encode_segment_header(header).to_vec();
+        let mut offsets = Vec::new();
+        let mut previous = Tid::ZERO;
+        for &tid in tids {
+            offsets.push(bytes.len() as u64);
+            bytes.extend(entry(epoch, previous, Tid(tid)));
+            previous = Tid(tid);
+        }
+        bytes.resize(bytes.len() + tail, 0);
+        (bytes, offsets)
+    }
+
+    fn run(bytes: Vec<u8>, folded: u64) -> Result<Replayed<Bytes>> {
+        replay(vec![(1, Bytes(bytes))], Tid(folded), true)
+    }
+
+    #[test]
+    fn the_replay_keeps_the_commits_after_the_folded_tid() {
+        let (bytes, _) = segment(3, &[10, 20, 30], 64);
+        let replayed = run(bytes, 10).unwrap();
+        assert_eq!(replayed.entries.len(), 2);
+        assert_eq!(replayed.last, Tid(30));
+        assert_eq!(replayed.max_epoch, 3);
+        assert_eq!(replayed.cut, None);
+        assert!(replayed.unfolded);
+    }
+
+    #[test]
+    fn a_damaged_last_entry_is_cut_and_a_damaged_middle_entry_fails() {
+        let (bytes, offsets) = segment(3, &[10, 20, 30], 64);
+        let mut last = bytes.clone();
+        last[offsets[2] as usize + ENTRY_HEADER_LEN + 2] ^= 1;
+        let replayed = run(last, 0).unwrap();
+        assert_eq!(replayed.cut, Some((Tid(20), Tid(30))));
+        assert_eq!(replayed.last, Tid(20));
+
+        let mut middle = bytes;
+        middle[offsets[1] as usize + ENTRY_HEADER_LEN + 2] ^= 1;
+        assert!(matches!(
+            run(middle, 0),
+            Err(ZoeError::CorruptTxn { tid: Tid(20) })
+        ));
+    }
+
+    #[test]
+    fn a_damaged_header_is_read_from_its_first_entry() {
+        let (mut bytes, _) = segment(7, &[10, 20], 64);
+        bytes[20] ^= 1;
+        let replayed = run(bytes, 0).unwrap();
+        assert_eq!(replayed.last, Tid(20));
+        assert!(matches!(
+            replayed.files[0].kind,
+            Kind::InUse {
+                epoch: 7,
+                damaged: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_broken_chain_fails_the_open() {
+        // The entry names a previous tid that the log does not hold.
+        let header = SegmentHeader {
+            state: SegmentState::InUse,
+            epoch: 1,
+        };
+        let mut bytes = encode_segment_header(header).to_vec();
+        bytes.extend(entry(1, Tid(15), Tid(20)));
+        assert!(matches!(
+            run(bytes.clone(), 10),
+            Err(ZoeError::CorruptTxn { tid: Tid(15) })
+        ));
+        assert!(!run(bytes, 15).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_spare_holds_no_entry_that_counts() {
+        let (mut bytes, _) = segment(4, &[10], 0);
+        let spare = SegmentHeader {
+            state: SegmentState::Spare,
+            epoch: 4,
+        };
+        bytes[..32].copy_from_slice(&encode_segment_header(spare));
+        let replayed = run(bytes, 0).unwrap();
+        assert!(!replayed.unfolded);
+        assert_eq!(replayed.files[0].kind, Kind::Spare(4));
+    }
+}

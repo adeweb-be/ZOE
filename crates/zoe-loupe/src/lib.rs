@@ -779,6 +779,9 @@ mod tests {
         txn.store(Oid(0), Tid(0), b"root").unwrap();
         txn.vote().unwrap();
         let tid = txn.finish().unwrap();
+        // The commit goes into the tables, so the copy of the database file
+        // alone holds it.
+        store.fold().unwrap();
         std::fs::create_dir_all(&copy).unwrap();
         std::fs::copy(live.join("zoe.redb"), copy.join("zoe.redb")).unwrap();
         drop(store);

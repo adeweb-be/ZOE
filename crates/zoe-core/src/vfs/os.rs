@@ -491,6 +491,11 @@ impl redb::StorageBackend for OsFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
+        // A segment of the log and a spill file hold no write, so their sync
+        // does not wait for a growth that another thread makes.
+        if self.mode != Mode::Database {
+            return sync_data(&self.file);
+        }
         // The mutex makes this sync wait for a `make` that another thread
         // runs: its writes can be writes of the commit that syncs.
         self.make(&mut self.lock())?;

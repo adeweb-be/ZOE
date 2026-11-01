@@ -210,9 +210,8 @@ pub(crate) struct Logged {
     closed: AtomicBool,
 }
 
-/// Return the tid of the last commit of `commits` that is a record with
-/// the previous serial `Tid::ZERO`, counted: the new oids that a log batch
-/// adds to the object count.
+/// Return the records of `commits`, commits of `entry`, whose previous
+/// serial is `Tid::ZERO`: the new oids that they add to the object count.
 fn new_oids(entry: &LogEntry, commits: &[wal::Commit]) -> u64 {
     commits
         .iter()
@@ -291,9 +290,21 @@ impl Logged {
         let mut table = Table::default();
         let counters = Counters::default();
         let now = clock.monotonic();
+        // The fold starts at once with the replayed commits whose tid is
+        // older than `fold_age`: the open asks for their fold.
+        let aged = clock
+            .now()
+            .checked_sub(settings.fold_age)
+            .map_or(Tid::ZERO, crate::clock::timestamp);
+        let mut target = Tid::ZERO;
         let mut max_oid: Option<Oid> = None;
         let mut new = 0;
         for (entry, commits) in replayed.entries {
+            for commit in &commits {
+                if commit.tid <= aged {
+                    target = target.max(commit.tid);
+                }
+            }
             new += new_oids(&entry, &commits);
             for commit in &commits {
                 for op in &entry.ops[commit.ops.clone()] {
@@ -367,7 +378,7 @@ impl Logged {
             mark: SyncMark::new(Arc::clone(&fold_waiter)),
             fold_waiter,
             requests: Mutex::new(Requests {
-                target: Tid::ZERO,
+                target,
                 stop: false,
                 waiters: Vec::new(),
             }),
