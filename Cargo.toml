@@ -29,7 +29,7 @@ libc = "0.2"
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "http-json", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
-pyo3 = "0.29"
+pyo3 = "0.30"
 redb = "4.3"
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
 # The msgpack values of the ZEO protocol.

@@ -25,7 +25,7 @@ classifiers = [
 [project.optional-dependencies]
 # zoe serve speaks only the msgpack protocol M5 of ZEO. A stock ZEO client
 # needs msgpack for it.
-plone = ["Products.CMFPlone>=6.1", "msgpack>=1"]
+plone = ["Products.CMFPlone>=6.1", "msgpack>=1.2.4"]
 # zoe:// URIs through zodburi, which needs ZEO.
 uri = ["zodburi>=3"]
 
