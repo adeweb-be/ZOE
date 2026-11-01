@@ -82,18 +82,35 @@ for oid in storage._index.keys():
     expected = python._reader.getState(pickle)
     try:
         got, refs = dump(state)
-        want, _ = dump(expected)
+        want, seen = dump(expected)
     except Exception as error:  # noqa: BLE001 - the oracle reports it
         uncomparable.append([oid_repr(oid), klass, repr(error)])
         continue
     if got == want:
         equal += 1
     else:
-        mismatches.append([oid_repr(oid), klass])
+        at = next(
+            (i for i, (x, y) in enumerate(zip(got, want, strict=False)) if x != y),
+            min(len(got), len(want)),
+        )
+        mismatches.append(
+            [
+                oid_repr(oid),
+                klass,
+                len(got),
+                len(want),
+                at,
+                repr(got[max(0, at - 60) : at + 60]),
+                repr(want[max(0, at - 60) : at + 60]),
+            ]
+        )
     for obj in refs:
         if rust._cache.get(obj._p_oid) is not obj:
             not_cached.append([oid_repr(oid), klass, oid_repr(obj._p_oid)])
-    del state, expected, refs
+    # No name may keep a ghost of one connection alive into the next record:
+    # a ghost that lives on keeps the oid bytes of an older record.
+    obj = None
+    del state, expected, refs, seen
     if records % 5000 == 0:
         rust.cacheMinimize()
         python.cacheMinimize()
