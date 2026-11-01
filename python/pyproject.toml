@@ -13,7 +13,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "pytest>=9.1",
+    "pytest>=9.2.0",
     "ZODB[test]",
     # The tests of the zoe:// URI. zoedb takes it through its uri extra.
     "zodburi>=3",
