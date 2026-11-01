@@ -25,22 +25,13 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::process::Output;
 
 use zoe_core::{Oid, Options, Store, Tid};
 
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+mod common;
 
-/// A spawned child keeps a copy of each file descriptor of the test
-/// process until `exec` closes them in the child, the lock of a store too.
-/// So each open of a store holds this mutex, and each spawn holds it until
-/// the child ends.
-static SPAWN: Mutex<()> = Mutex::new(());
-
-fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
-}
+use common::{Fresh, assert_exit, fresh_dir, s, spawn_lock, zoe};
 
 /// Open the store in `dir` with its blob files in `blobs`.
 fn open(dir: &Path, blobs: &Path) -> Store {
@@ -52,49 +43,8 @@ fn open(dir: &Path, blobs: &Path) -> Store {
     Store::open_with(dir, options).unwrap()
 }
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-blob-dir-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-/// Run `zoe` with the arguments `args` and the variables `env`. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let _spawn = spawn_lock();
-    command.spawn().unwrap().wait_with_output().unwrap()
-}
-
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-/// Check the exit code, and show the output if it is not the one expected.
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        stderr(output)
-    );
 }
 
 /// Run `zoe verify --format json` on the store `dir` with the extra
@@ -161,6 +111,8 @@ struct Corpus {
     /// The blob records of `FIRST` and `SECOND`, as `(oid, tid)`.
     first: (Oid, Tid),
     second: (Oid, Tid),
+    /// The directory of the test, which holds the two others.
+    _root: Fresh,
 }
 
 /// A store whose blob files live in a directory beside the store
@@ -184,6 +136,7 @@ fn corpus(name: &str) -> Corpus {
         blobs,
         first: (Oid(1), tid),
         second: (Oid(2), tid),
+        _root: root,
     }
 }
 

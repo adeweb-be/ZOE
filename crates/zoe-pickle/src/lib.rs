@@ -15,30 +15,39 @@
 //!
 //! [`persistent_ids`] lists the persistent references of a record, also
 //! those inside opaque nodes, for pack and the other tools that follow
-//! references. [`decode_class_name`] reads the class of a record from its
-//! class pickle alone.
+//! references. [`decode_class_name`] and [`decode_class_key`] read the
+//! class of a record from its class pickle alone.
 //!
 //! [`python`] models the objects that Python's unpickler builds from a
 //! record, with their identity, and pickles them again as zodbpickle does.
 //! [`btrees`] reads and builds the states of the classes of BTrees on that
 //! model, for the conflict resolution of the core.
+//!
+//! [`opcode`] gives the opcodes of protocols 0 to 3 and the readers of
+//! their arguments, for the callers that build or read small pickles.
 
 pub mod btrees;
 mod decode;
 mod encode;
 mod error;
 mod iterative;
-mod opcode;
+pub mod opcode;
 pub mod python;
 mod references;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub mod testing;
 mod text;
 mod tree;
 mod zones;
 
-pub use decode::{Limits, NODE_BUDGET, decode_class_name, decode_record, decode_record_with};
+pub use decode::{
+    Limits, NODE_BUDGET, decode_class_key, decode_class_name, decode_record, decode_record_with,
+};
 pub use encode::encode_record;
 pub use error::Error;
 pub use references::{PersistentId, persistent_ids};
+pub use text::{raw_unicode, unquote};
 pub use tree::{
     Batch, Bool, ByteString, Bytes, Dict, Float, Get, Global, Int, List, MemoForm, Node, Opaque,
     Put, Reduce, Resolver, Tree, Tuple, Unicode, Walk, Width,

@@ -1,32 +1,21 @@
 """Unit tests of the KV namespaces of `zoe.Storage` and of `zoe.kv` (ADR
 0043): the storage methods, the writes in the two-phase commit, the data
-manager of a connection, savepoints, and the errors."""
+manager of a connection, savepoints, and the errors.
+`acceptance/test_kv_namespaces.py` covers the expiry of an ephemeral key, a
+reopen, a write without a change of an object, and an abort."""
 
 import time
 
 import pytest
 import transaction
 import ZODB
+from support import commit_kv as commit
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import ReadOnlyError, Unsupported
 from ZODB.utils import z64
 
 import zoe
 import zoe.kv
-
-
-def commit(storage, *writes):
-    """Commit `writes`, each a tuple of the arguments of `kv_set` without the
-    transaction, or `("delete", flavour, name, key)`. Return the tid."""
-    meta = TransactionMetaData()
-    storage.tpc_begin(meta)
-    for write in writes:
-        if write[0] == "delete":
-            storage.kv_delete(*write[1:], meta)
-        else:
-            storage.kv_set(*write, meta)
-    storage.tpc_vote(meta)
-    return storage.tpc_finish(meta)
 
 
 @pytest.fixture
@@ -55,15 +44,6 @@ def test_an_abort_writes_nothing(storage):
     storage.tpc_vote(meta)
     storage.tpc_abort(meta)
     assert storage.kv_get("durable", "registry", b"title") is None
-
-
-def test_an_ephemeral_key_expires(storage):
-    commit(storage, ("ephemeral", "sessions", b"s1", b"data", 0.2))
-    assert storage.kv_get("ephemeral", "sessions", b"s1") == b"data"
-    assert storage.kv_scan("ephemeral", "sessions") == [(b"s1", b"data")]
-    time.sleep(0.3)
-    assert storage.kv_get("ephemeral", "sessions", b"s1") is None
-    assert storage.kv_scan("ephemeral", "sessions") == []
 
 
 def test_a_scan_takes_bounds_and_a_limit(storage):
@@ -160,19 +140,6 @@ def test_a_storage_with_ephemeral_keys_closes_and_opens_again(tmp_path):
         storage.close()
 
 
-def test_a_durable_key_survives_a_reopen(tmp_path):
-    path = str(tmp_path / "store")
-    storage = zoe.Storage(path)
-    tid = commit(storage, ("durable", "registry", b"title", b"site", None))
-    storage.close()
-    storage = zoe.Storage(path)
-    try:
-        assert storage.kv_get("durable", "registry", b"title") == b"site"
-        assert storage.kv_generation("registry") == tid
-    finally:
-        storage.close()
-
-
 @pytest.fixture
 def db(tmp_path):
     db = ZODB.DB(zoe.Storage(str(tmp_path / "store")))
@@ -193,34 +160,6 @@ def test_a_namespace_commits_with_the_objects_of_a_connection(db):
     assert db.storage.kv_get("durable", "registry", b"title") == b"site"
     # One commit holds both: the generation is the tid of the object.
     assert registry.generation() == conn.root()._p_serial
-    conn.close()
-
-
-def test_a_namespace_without_object_changes_commits_alone(db):
-    manager = transaction.TransactionManager()
-    conn = db.open(manager)
-    sessions = zoe.kv.Namespace(conn, "ephemeral", "sessions")
-    last = db.storage.lastTransaction()
-    sessions.set(b"s1", b"data", ttl=60)
-    manager.commit()
-    assert db.storage.lastTransaction() > last
-    assert sessions.get(b"s1") == b"data"
-    sessions.delete(b"s1")
-    assert sessions.get(b"s1") is None
-    manager.commit()
-    assert db.storage.kv_get("ephemeral", "sessions", b"s1") is None
-    conn.close()
-
-
-def test_an_abort_of_the_transaction_drops_the_writes(db):
-    manager = transaction.TransactionManager()
-    conn = db.open(manager)
-    registry = zoe.kv.Namespace(conn, "durable", "registry")
-    registry.set("title", b"site")
-    manager.abort()
-    assert registry.get("title") is None
-    manager.commit()
-    assert db.storage.kv_get("durable", "registry", b"title") is None
     conn.close()
 
 

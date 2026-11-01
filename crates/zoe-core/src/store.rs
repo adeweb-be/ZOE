@@ -18,10 +18,11 @@ use crate::lock::LockManager;
 use crate::merge::StructuralMerges;
 use crate::merge::policy::{Policy, PolicyCache};
 use crate::pack::PackState;
-use crate::redb_backend::RedbBackend;
+use crate::redb::RedbBackend;
 use crate::sequence::{Sequence, Sequences};
 use crate::types::{Oid, Tid};
-use crate::vfs::{MemVfs, OsVfs, Vfs};
+use crate::vfs::{Dir, MemVfs, OsVfs, Vfs};
+use crate::wal::Logged;
 
 /// The name of the database file in the store directory.
 const DATABASE: &str = "zoe.redb";
@@ -42,19 +43,48 @@ fn read_only_database(
     builder.open_read_only(path)
 }
 
-/// Repair the database file `path` that a writer left open, with a page
-/// cache of `cache_size` bytes, or the default of redb.
+/// Open the database file `path` for writes, with a page cache of
+/// `cache_size` bytes, or the default of redb.
 ///
 /// redb repairs the file when it opens it for writes. The open creates no
 /// file. The drop of the database closes it cleanly: it writes the
 /// allocator state and clears the recovery flag.
-fn repair_database(path: &Path, cache_size: Option<usize>) -> Result<()> {
+fn open_for_repair(path: &Path, cache_size: Option<usize>) -> Result<redb::Database> {
     let mut builder = redb::Builder::new();
     if let Some(bytes) = cache_size {
         builder.set_cache_size(bytes);
     }
-    drop(builder.open(path).map_err(repair_failed)?);
+    builder.open(path).map_err(repair_failed)
+}
+
+/// Repair the database file `path` that a writer left open, with a page
+/// cache of `cache_size` bytes, or the default of redb.
+#[cfg(test)]
+fn repair_database(path: &Path, cache_size: Option<usize>) -> Result<()> {
+    drop(open_for_repair(path, cache_size)?);
     Ok(())
+}
+
+/// Repair the store in `dir`, whose database file is `path`: open the
+/// database for writes, which repairs it, then fold the log into its tables
+/// slice by slice (ADR 0056, section 14). Write only the database file. A
+/// damaged log fails with `CorruptTxn` after the repair of the database,
+/// and folds nothing.
+fn repair_store(dir: &Path, path: &Path, options: &Options) -> Result<()> {
+    let db = open_for_repair(path, options.cache_size)?;
+    let backend = RedbBackend::open(db)?;
+    crate::wal::fold_into(dir, &backend, options.write_log.slice_bytes)
+}
+
+/// How a read-only open treats the write-ahead log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// Refuse a store whose database or log a writer left open.
+    Strict,
+    /// Repair the database and fold the log first.
+    Repairing,
+    /// Refuse a store whose database a writer left open, and read no log.
+    Tables,
 }
 
 /// Return the `RepairFailed` error of the redb error `error`. An error of
@@ -93,6 +123,25 @@ fn blob_location(blob_dir: &Path) -> Result<(PathBuf, String)> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((parent.to_owned(), name.to_owned())),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The directory that holds the blob directory of a store, and the name of
+/// the blob directory there. `None` keeps the blob files in `blobs` in the
+/// store directory.
+type Relocation = Option<(Box<dyn Dir>, String)>;
+
+/// Return the relocation of the blob directory that `options` gives, with
+/// `open` to open the directory that holds it. Without `blob_dir`, return
+/// `None` and open nothing. `blob_location` checks the path first.
+fn relocation(
+    options: &Options,
+    open: impl FnOnce(PathBuf) -> Result<Box<dyn Dir>>,
+) -> Result<Relocation> {
+    let Some(blob_dir) = options.blob_dir.as_deref() else {
+        return Ok(None);
+    };
+    let (parent, name) = blob_location(blob_dir)?;
+    Ok(Some((open(parent)?, name)))
 }
 
 /// The options of a store.
@@ -167,10 +216,71 @@ pub struct Options {
     /// mode of their classes, and the rules of ADR 0042. The default is
     /// tier 1 on for every class, and the rules off.
     pub structural_merges: StructuralMerges,
+    /// The write-ahead log of the store (ADR 0056). The skins do not
+    /// expose these settings: tests and benchmarks set them.
+    pub write_log: WriteLog,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
     pub _more: (),
+}
+
+/// The settings of the write-ahead log of a store (ADR 0056).
+///
+/// A finish appends its commit batch to the log and syncs the log. The
+/// fold writes the commits of the log into the tables later, in slices.
+/// The open checks the settings: an open with settings that do not hold
+/// together fails with an `InvalidInput` I/O error.
+///
+/// Build it from the defaults, for example
+/// `WriteLog { fold_bytes, ..WriteLog::default() }`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteLog {
+    /// True, the default, sends commit batches to the log. False writes
+    /// each batch into the tables, as a direct batch. The open replays a
+    /// log that exists, also when this is false.
+    pub enabled: bool,
+    /// The size at which a segment file stops to grow and the next batch
+    /// goes into another segment. A segment holds at least one entry, so
+    /// a larger entry makes its segment larger. At least 4,096. The
+    /// default is 64 MiB.
+    pub segment_bytes: u64,
+    /// The backlog at which the fold starts: the bytes of the commits that
+    /// the log holds and the tables do not. The default is 16 MiB.
+    pub fold_bytes: u64,
+    /// The age of the oldest commit of the backlog at which the fold
+    /// starts, on the monotonic time of the store clock. It bounds the time
+    /// that a commit stays in the log alone. The default is 5 s.
+    pub fold_age: Duration,
+    /// The most bytes of log entries that one backend write of the fold
+    /// takes. A slice takes at least one commit. The default is 4 MiB.
+    pub slice_bytes: u64,
+    /// The bound of the backlog. A finish that would go past it waits for
+    /// the fold. At least `fold_bytes`. The default is 256 MiB.
+    pub backlog_bytes: u64,
+    /// The pickle size from which a record is large. A batch whose large
+    /// records hold at least half of its pickle bytes goes into the tables
+    /// directly when the backlog is empty. The default is 64 KiB.
+    pub large_record: u64,
+    /// Not an option. This field makes `..WriteLog::default()` necessary
+    /// when a caller sets every option.
+    #[doc(hidden)]
+    pub _more: (),
+}
+
+impl Default for WriteLog {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            segment_bytes: 64 << 20,
+            fold_bytes: 16 << 20,
+            fold_age: Duration::from_secs(5),
+            slice_bytes: 4 << 20,
+            backlog_bytes: 256 << 20,
+            large_record: 64 << 10,
+            _more: (),
+        }
+    }
 }
 
 impl Default for Options {
@@ -188,6 +298,7 @@ impl Default for Options {
             cache_size: None,
             pack_gc: true,
             structural_merges: StructuralMerges::default(),
+            write_log: WriteLog::default(),
             _more: (),
         }
     }
@@ -221,7 +332,7 @@ pub struct Store {
     /// iterator and a blob file hold only a weak reference, so dropping
     /// the `Store` closes the store.
     pub(crate) backend: Arc<Opened>,
-    pub(crate) clock: Box<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
     pub(crate) guardrails: Guardrails,
@@ -249,9 +360,18 @@ pub struct Store {
     pub(crate) structural_merges: StructuralMerges,
     /// The merge policy that the store read last (ADR 0046).
     policy: Mutex<PolicyCache>,
+    /// The settings of the write-ahead log. The leader reads the size of a
+    /// large record from them.
+    pub(crate) write_log: WriteLog,
 }
 
 impl Store {
+    /// Tell if the directory `dir` holds a store: its database file is a
+    /// regular file. A read-only open of a directory without one fails.
+    pub fn exists(dir: impl AsRef<Path>) -> bool {
+        dir.as_ref().join(DATABASE).is_file()
+    }
+
     /// Open the store in the directory `dir` with the default options, and
     /// create it if necessary.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
@@ -269,16 +389,9 @@ impl Store {
     /// fails leaves no lock file and no database. The blob directory itself
     /// comes with the first blob.
     pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        let relocated = match options.blob_dir.as_deref().map(blob_location) {
-            Some(location) => {
-                let (parent, name) = location?;
-                let parent: Box<dyn blob::BlobDir> = Box::new(OsVfs::unlocked(&parent)?);
-                Some((parent, name))
-            }
-            None => None,
-        };
+        let relocated = relocation(&options, |parent| Ok(Box::new(OsVfs::unlocked(&parent)?)))?;
         let vfs = OsVfs::new(dir.as_ref())?;
-        Self::open_parts(vfs, SystemClock, options, None, relocated)
+        Self::open_parts(vfs, SystemClock, options, relocated)
     }
 
     /// Open the store in the simulated filesystem `vfs`, and create it if
@@ -296,19 +409,24 @@ impl Store {
     /// Open the store in the simulated filesystem `vfs` with no page
     /// cache, and create it if necessary. Each page that a read needs then
     /// comes from the file, so a test can count the bytes that a read
-    /// costs.
+    /// costs. Only the feature `testing` builds it.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn open_vfs_uncached(vfs: MemVfs) -> Result<Self> {
-        Self::open_cached(vfs, SystemClock, Options::default(), Some(0))
+        let options = Options {
+            cache_size: Some(0),
+            ..Options::default()
+        };
+        Self::open_full(vfs, SystemClock, options)
     }
 
     /// Open the store in the simulated filesystem `vfs`, with its blob
     /// directory `name` in the simulated filesystem `parent`.
     #[cfg(test)]
     pub(crate) fn open_relocated(vfs: MemVfs, parent: MemVfs, name: &str) -> Result<Self> {
-        let parent: Box<dyn blob::BlobDir> = Box::new(parent);
+        let parent: Box<dyn Dir> = Box::new(parent);
         let relocated = Some((parent, name.to_owned()));
-        Self::open_parts(vfs, SystemClock, Options::default(), None, relocated)
+        Self::open_parts(vfs, SystemClock, Options::default(), relocated)
     }
 
     /// Open the store in `vfs` with the clock `clock` and `options`, and
@@ -323,30 +441,19 @@ impl Store {
         clock: impl Clock + 'static,
         options: Options,
     ) -> Result<Self> {
-        Self::open_cached(vfs, clock, options, None)
+        Self::open_parts(vfs, clock, options, None)
     }
 
-    /// Open the store as `open_full` does. `cache_size` sets the page cache
-    /// of the database in bytes. `None` keeps `options.cache_size`.
-    fn open_cached<V: Vfs>(
-        vfs: V,
-        clock: impl Clock + 'static,
-        options: Options,
-        cache_size: Option<usize>,
-    ) -> Result<Self> {
-        Self::open_parts(vfs, clock, options, cache_size, None)
-    }
-
-    /// Open the store in `vfs` as `open_cached` does. `relocated` is the
+    /// Open the store in `vfs` as `open_full` does. `relocated` is the
     /// directory that holds the blob directory, and the name of the blob
     /// directory there. `None` keeps the blob files in `blobs` in `vfs`.
     pub(crate) fn open_parts<V: Vfs>(
         vfs: V,
         clock: impl Clock + 'static,
         options: Options,
-        cache_size: Option<usize>,
-        relocated: Option<(Box<dyn blob::BlobDir>, String)>,
+        relocated: Relocation,
     ) -> Result<Self> {
+        crate::wal::check_settings(&options.write_log)?;
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
                 vfs.remove(NEW_DATABASE)?;
@@ -363,14 +470,33 @@ impl Store {
         vfs.sync_dir()?;
 
         let mut builder = redb::Builder::new();
-        if let Some(bytes) = cache_size.or(options.cache_size) {
+        if let Some(bytes) = options.cache_size {
             builder.set_cache_size(bytes);
         }
         let db = builder
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
+        // The open checks the format of the database before it creates
+        // anything for the log.
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
-        Self::assemble(backend, vfs, Box::new(clock), options, false, relocated)
+        let clock: Arc<dyn Clock> = Arc::new(clock);
+        let dir: Arc<dyn Dir> = Arc::new(vfs);
+        let logged = Logged::open(
+            backend,
+            Arc::clone(&dir),
+            Arc::clone(&clock),
+            options.write_log.clone(),
+        )?;
+        let next_oid = logged.next_oid();
+        Self::assemble(
+            Box::new(logged),
+            next_oid,
+            dir,
+            clock,
+            options,
+            false,
+            relocated,
+        )
     }
 
     /// Open the existing store in the directory `dir` for reads only.
@@ -403,7 +529,19 @@ impl Store {
     /// check that the blob directory is the one of the store:
     /// `check_blob_dir` does.
     pub fn open_read_only_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        Self::open_reader(dir.as_ref(), options, false)
+        Self::open_reader(dir.as_ref(), options, Reader::Strict)
+    }
+
+    /// Open the existing store in the directory `dir` for reads only, with
+    /// `options`, as `open_read_only_with` does, and read no byte of its
+    /// write-ahead log (ADR 0056, section 14). The store gives the commits
+    /// of its tables alone. A store that a writer left open fails with
+    /// `NotClosedCleanly`.
+    ///
+    /// Only `zoe verify` calls it: when the log is damaged, it reports the
+    /// damage and verifies the tables with this open.
+    pub fn open_read_only_tables(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        Self::open_reader(dir.as_ref(), options, Reader::Tables)
     }
 
     /// Open the existing store in the directory `dir` for reads only, with
@@ -434,39 +572,58 @@ impl Store {
     /// byte. Another holder of the lock fails the call with `Locked`
     /// before any write.
     pub fn open_read_only_repairing(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        Self::open_reader(dir.as_ref(), options, true)
+        Self::open_reader(dir.as_ref(), options, Reader::Repairing)
     }
 
-    /// Open the existing store in `dir` for reads only, with `options`.
-    /// With `repair`, repair a store that a writer left open, as
-    /// `open_read_only_repairing` tells. Without it, such a store fails
-    /// with `NotClosedCleanly`.
-    fn open_reader(dir: &Path, options: Options, repair: bool) -> Result<Self> {
-        let relocated = match options.blob_dir.as_deref().map(blob_location) {
-            Some(location) => {
-                let (parent, name) = location?;
-                let parent: Box<dyn blob::BlobDir> = Box::new(blob::ReadOnlyDir::new(parent));
-                Some((parent, name))
-            }
-            None => None,
-        };
-        let dir = OsVfs::existing(dir, DATABASE)?;
-        let path = dir.path(DATABASE);
-        let (db, repaired) = match read_only_database(&path, options.cache_size) {
-            Ok(db) => (db, false),
+    /// Open the existing store in `dir` for reads only, with `options`, as
+    /// `reader` tells.
+    ///
+    /// The strict open refuses a store whose database a writer left open,
+    /// or whose log holds a commit after the folded tid, with
+    /// `NotClosedCleanly`, and a damaged log with `CorruptTxn`. The open of
+    /// the tools repairs the database and folds the log into it first, as
+    /// `open_read_only_repairing` tells. The open of the tables reads no
+    /// log.
+    fn open_reader(dir: &Path, options: Options, reader: Reader) -> Result<Self> {
+        let relocated = relocation(&options, |parent| {
+            Ok(Box::new(blob::ReadOnlyDir::new(parent)))
+        })?;
+        let vfs = OsVfs::existing(dir, DATABASE)?;
+        let path = vfs.path(DATABASE);
+        let repair = reader == Reader::Repairing;
+        let mut repaired = false;
+        let db = match read_only_database(&path, options.cache_size) {
+            Ok(db) => db,
             Err(redb::DatabaseError::RepairAborted) if repair => {
-                repair_database(&path, options.cache_size)?;
-                let db = read_only_database(&path, options.cache_size).map_err(repair_failed)?;
-                (db, true)
+                repair_store(dir, &path, &options)?;
+                repaired = true;
+                read_only_database(&path, options.cache_size).map_err(repair_failed)?
             }
             Err(redb::DatabaseError::RepairAborted) => return Err(ZoeError::NotClosedCleanly),
             Err(e) => return Err(ZoeError::Backend(Box::new(e))),
         };
-        let backend = RedbBackend::open_read_only(db)?;
+        let mut backend = RedbBackend::open_read_only(db)?;
+        if reader != Reader::Tables
+            && crate::wal::read_only_check(dir, crate::backend::Backend::last_tid(&backend))?
+        {
+            // A halted writer closed its database cleanly and left commits
+            // in its log.
+            if !repair {
+                return Err(ZoeError::NotClosedCleanly);
+            }
+            drop(backend);
+            repair_store(dir, &path, &options)?;
+            repaired = true;
+            let db = read_only_database(&path, options.cache_size).map_err(repair_failed)?;
+            backend = RedbBackend::open_read_only(db)?;
+        }
+        let next_oid = backend.next_oid()?;
+        let dir: Arc<dyn Dir> = Arc::new(vfs);
         let mut store = Self::assemble(
-            backend,
+            Box::new(backend),
+            next_oid,
             dir,
-            Box::new(SystemClock),
+            Arc::new(SystemClock),
             options,
             true,
             relocated,
@@ -482,30 +639,41 @@ impl Store {
         self.repaired
     }
 
+    /// Return the message of the repair of the store in `dir`, for the
+    /// line that a tool writes when `repaired` is true:
+    /// `<dir>: the store was not closed cleanly: repaired the store`.
+    pub fn repair_message(dir: impl AsRef<Path>) -> String {
+        format!(
+            "{}: the store was not closed cleanly: repaired the store",
+            dir.as_ref().display()
+        )
+    }
+
     /// Make a store from an open backend and the directory that holds its
     /// lock. The blob store and the staging area share the directory.
     /// `relocated` puts the blob directory outside it, as `open_full`
     /// tells: the staging area stays in the store directory.
-    fn assemble<V: Vfs>(
-        backend: RedbBackend,
-        dir: V,
-        clock: Box<dyn Clock>,
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        backend: Box<dyn Backend>,
+        next_oid: Oid,
+        dir: Arc<dyn Dir>,
+        clock: Arc<dyn Clock>,
         options: Options,
         read_only: bool,
-        relocated: Option<(Box<dyn blob::BlobDir>, String)>,
+        relocated: Relocation,
     ) -> Result<Self> {
-        let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
-        let dir = Arc::new(dir);
-        let store_dir: Box<dyn blob::BlobDir> = Box::new(Arc::clone(&dir));
-        let blob_dir = match relocated {
-            Some((parent, name)) => Box::new(blob::Relocated::new(store_dir, parent, name)),
-            None => store_dir,
+        // The store directory is held once. The blob store and the staging
+        // area share it.
+        let blob_dir: Arc<dyn Dir> = match relocated {
+            Some((parent, name)) => Arc::new(blob::Relocated::new(Arc::clone(&dir), parent, name)),
+            None => Arc::clone(&dir),
         };
         let opened = Arc::new(Opened {
-            backend: Box::new(backend),
+            backend,
             blobs: BlobStore::new(blob_dir),
-            staging: StagingArea::new(Box::new(dir), options.staging_memory, read_only),
+            staging: StagingArea::new(dir, options.staging_memory, read_only),
         });
         // `Opened` holds the database and the directory here, so an error
         // drops them in order: the database closes before the lock goes.
@@ -530,6 +698,7 @@ impl Store {
             sequences: Sequences::default(),
             structural_merges: options.structural_merges,
             policy: Mutex::new(PolicyCache::default()),
+            write_log: options.write_log,
         })
     }
 
@@ -538,11 +707,7 @@ impl Store {
     /// of the root or of the policy changed since its last read. Only a vote
     /// with a conflict calls this.
     pub(crate) fn merge_policy(&self) -> Result<Option<Arc<Policy>>> {
-        let mut cache = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.get(&**self.backend, &self.structural_merges)
+        crate::lock(&self.policy).get(&**self.backend, &self.structural_merges)
     }
 
     /// Fail with `ReadOnly` when the store is open for reads only.
@@ -648,6 +813,41 @@ impl Store {
         Ok(())
     }
 
+    /// Fold every commit that the log holds into the tables, and wait for
+    /// the end of that fold (ADR 0056). The commits after the call can
+    /// stay in the log.
+    ///
+    /// A store with nothing to fold, a read-only store included, returns
+    /// at once. A store that halted, or whose fold failed, fails with
+    /// `Halted`.
+    pub fn fold(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        let last = {
+            let sequencer = self.lock_sequencer();
+            (*sequencer).ok_or(ZoeError::Halted)?
+        };
+        self.backend.fold(last.max(self.last_transaction()))
+    }
+
+    /// Return the bytes of the backlog: the commits that the log holds and
+    /// the tables do not, as the bound `WriteLog::backlog_bytes` counts
+    /// them (ADR 0056). The call reads no file.
+    pub fn backlog_bytes(&self) -> u64 {
+        self.backend.backlog_bytes()
+    }
+
+    /// Return the tids of the log entry that the open cut while its header
+    /// passed and its body did not: the previous tid and the last tid of
+    /// the entry (ADR 0056, section 12). The commits of that entry are lost:
+    /// a crash stopped their finish, or a damage of the disk destroyed
+    /// them after their sync. The open cannot tell which. `None` when the
+    /// open cut no such entry.
+    pub fn cut_at_open(&self) -> Option<(Tid, Tid)> {
+        self.backend.cut_at_open()
+    }
+
     /// Return the current pickle of `oid` and its serial.
     pub fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid)> {
         match self.backend.load_before(oid, Tid::MAX)? {
@@ -678,17 +878,22 @@ impl Store {
 
     /// Remove the key `(tid, oid)` of the transaction index and keep the
     /// record. A test uses it to damage the store. Fail with `NotFound`
-    /// when the key does not exist.
+    /// when the key does not exist. Only the feature `testing` builds it.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
+        self.fold()?;
         self.backend.remove_index_key_for_test(tid, oid)
     }
 
     /// Remove the record of `oid` at `tid` and keep its key in the
     /// transaction index. A test uses it to damage the store. Fail with
-    /// `NotFound` when the record does not exist.
+    /// `NotFound` when the record does not exist. Only the feature
+    /// `testing` builds it.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
+        self.fold()?;
         self.backend.remove_record_for_test(oid, tid)
     }
 
@@ -793,8 +998,14 @@ impl Store {
             .ok_or(ZoeError::NotFound { oid })
     }
 
+    /// Lock the commit sequencer. A failed fold of the log halts the store
+    /// here: the outcome of its slice is unknown.
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
-        self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
+        let mut sequencer = crate::lock(&self.sequencer);
+        if sequencer.is_some() && self.backend.fold_failed() {
+            *sequencer = None;
+        }
+        sequencer
     }
 
     /// Make the next oid greater than `oid`, so that `new_oid` never gives
@@ -802,6 +1013,17 @@ impl Store {
     pub(crate) fn raise_next_oid(&self, oid: Oid) {
         self.next_oid
             .fetch_max(oid.0.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
+/// The close of a store (ADR 0056, section 13). A store that did not halt
+/// folds its log and marks each segment spare. Each store stops the fold
+/// thread and waits for its end, so the database closes when the last
+/// reference to it drops.
+impl Drop for Store {
+    fn drop(&mut self) {
+        let halted = crate::lock(&self.sequencer).is_none() || self.backend.fold_failed();
+        self.backend.close(!halted);
     }
 }
 
@@ -849,12 +1071,11 @@ mod tests {
     }
 
     use super::*;
-    use crate::backend::{
-        BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnRecords, WriteTxn,
-    };
+    use crate::backend::{BlobRecord, Bytes, Record, RecordMeta, TxnIter, TxnRecords, WriteTxn};
     use crate::format;
     use crate::format::Codec;
     use crate::kv::{Flavour, Swept};
+    use crate::testing::{fresh_dir, try_commit as commit};
     use crate::vfs::LOCK;
 
     /// A clock that never moves.
@@ -1004,6 +1225,39 @@ mod tests {
             Ok(write)
         }
 
+        // A commit batch takes the path of the inner store, the log or the
+        // tables, with the faults of `begin_write`.
+        fn begin_batch(&self, plan: &crate::backend::BatchPlan) -> Result<Box<dyn WriteTxn + '_>> {
+            if self.faults.write.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            let write = self.inner.begin_batch(plan)?;
+            if self.faults.landed.load(Ordering::Relaxed) {
+                return Ok(Box::new(Landed(write)));
+            }
+            Ok(write)
+        }
+
+        fn fold(&self, tid: Tid) -> Result<()> {
+            self.inner.fold(tid)
+        }
+
+        fn backlog_bytes(&self) -> u64 {
+            self.inner.backlog_bytes()
+        }
+
+        fn fold_failed(&self) -> bool {
+            self.inner.fold_failed()
+        }
+
+        fn set_observer(&self, observer: Arc<dyn crate::Observer>) {
+            self.inner.set_observer(observer);
+        }
+
+        fn close(&self, fold: bool) {
+            self.inner.close(fold);
+        }
+
         fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
             if self.faults.rows.load(Ordering::Relaxed) {
                 return Box::new(std::iter::once(Err(injected())));
@@ -1032,10 +1286,6 @@ mod tests {
 
         fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
             self.inner.current_from(from)
-        }
-
-        fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
-            self.inner.pack(before, reachable)
         }
 
         fn pack_watermark(&self) -> Result<Tid> {
@@ -1096,28 +1346,21 @@ mod tests {
 
     /// Open a store whose backend fails when a test turns a fault on.
     fn faulty_store() -> (Store, Arc<Faults>) {
-        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
         // The inner store keeps the directory. The tests of this store use
         // no blob, so its blob store has an empty directory of its own. So
         // has its staging area, which spills each pickle.
         let faulty = Faulty {
-            inner: store.backend,
+            inner: Arc::clone(&store.backend),
             faults: Arc::clone(&faults),
         };
-        let backend = Arc::new(Opened {
+        store.backend = Arc::new(Opened {
             backend: Box::new(faulty),
-            blobs: BlobStore::new(Box::new(MemVfs::new())),
-            staging: StagingArea::new(Box::new(MemVfs::new()), 0, false),
+            blobs: BlobStore::new(Arc::new(MemVfs::new())),
+            staging: StagingArea::new(Arc::new(MemVfs::new()), 0, false),
         });
-        (Store { backend, ..store }, faults)
-    }
-
-    fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Result<Tid> {
-        let mut txn = store.tpc_begin(b"", b"", b"")?;
-        txn.store(oid, serial, data)?;
-        txn.vote()?;
-        txn.finish()
+        (store, faults)
     }
 
     /// An observer that keeps the count of each `intent_locks_acquired`.
@@ -1599,17 +1842,9 @@ mod tests {
 
     #[test]
     fn a_second_process_cannot_open_a_locked_store() {
-        let dir = std::env::temp_dir().join(format!("zoe-locked-{}", std::process::id()));
+        let dir = fresh_dir("locked");
         let _store = Store::open(&dir).unwrap();
         assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
-    }
-
-    /// Return a new empty directory for one test.
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     /// Write a store with one object to `dir` and close it. Return the oid
@@ -1620,16 +1855,24 @@ mod tests {
         (oid, commit(&store, oid, Tid::ZERO, b"a").unwrap())
     }
 
-    /// Return the bytes of each file in `dir`, by name.
+    /// Return the bytes of each file under `dir`, the files of `wal/`
+    /// included, by path in `dir`.
     fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| {
-                let path = entry.unwrap().path();
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                (name, std::fs::read(&path).unwrap())
-            })
-            .collect()
+        let mut files = BTreeMap::new();
+        let mut todo = vec![PathBuf::new()];
+        while let Some(sub) = todo.pop() {
+            for entry in std::fs::read_dir(dir.join(&sub)).unwrap() {
+                let entry = entry.unwrap();
+                let name = sub.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    todo.push(name);
+                } else {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    files.insert(name.to_string_lossy().into_owned(), bytes);
+                }
+            }
+        }
+        files
     }
 
     #[test]

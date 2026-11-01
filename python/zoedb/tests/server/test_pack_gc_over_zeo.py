@@ -18,19 +18,11 @@ import pytest
 import transaction
 import ZODB
 from persistent.mapping import PersistentMapping
+from support import TIMEOUT, client
 from ZODB.POSException import POSKeyError
 
 import zoe
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-
-
-def client(server, storage="1", **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage=storage, **kw)
 
 
 def unreachable_object(db):

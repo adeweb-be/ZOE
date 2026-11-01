@@ -1,13 +1,12 @@
 # zoe-convert
 
-Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe", section "Converters", and F14.
+Converters between `Data.fs` and ZOE stores, in both directions, and the verify, backup and restore of a store. There is no RelStorage converter and no ZOE-to-ZOE converter. Specification: "Loupe", section "Converters", and F14.
 
 ## Invariants
 
 - A conversion copies tids, oids and pickles unchanged.
 - A conversion can resume from a tid.
 - Every conversion verifies the transaction count, the last tid and a sample of records byte for byte, and writes a report.
-- The RelStorage reader refuses a schema version that it does not know.
 
 ## `Data.fs` to ZOE
 
@@ -68,6 +67,7 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 ## Verify
 
 - `verify` checks a store without Python. It runs no unpickler and changes nothing. The CLI opens the store read-only.
+- A damaged write-ahead log fails the open of the tools with `CorruptTxn` (ADR 0056, section 14). `LogProblem::of` turns that error into the finding `log` (the tid and the text of the error); any other error of the open is no finding. `zoe verify` then opens the tables alone with `Store::open_read_only_tables`, runs `verify` on them, and sets `Verification::log`, which `verify` never sets. The finding counts in `problems`, and `to_json` gives it under the key `log`, or null.
 - It walks every record key in key order, deletions too. Each record frame and each blob record must read and pass its checksum. Each blob file must have the size and the BLAKE3 hash of its blob record. A missing blob file and a damaged one give two different texts (`Store::has_blob_file` tells them apart): only the text of a missing file says "missing". The texts name no path, because a path can hold any word. Each transaction row must read. `Store::txn_rows` gives the rows one at a time, and `verify` only counts them, so it holds one row at a time.
 - `Store::sequence_names` lists the sequence rows, and each must read with `Store::sequence_end` and pass its checksum. A row that does not read is a finding in `checksums`, without an oid and a tid. Its text names the sequence. A listed name whose row the read does not find is a finding too. A name that does not decode, such as a name that is not UTF-8, fails the whole list: one finding in `checksums`, whose text names the name before it, and no sequence row counts.
 - Of each oid, the newest record is the current record. A deletion is not current. An oid whose newest record does not read exists: no reference to it dangles.
@@ -77,7 +77,7 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - A walk that stops early does not make a reference dangle: a load of the oid confirms each dangling reference.
 - The memory of `verify` grows with the number of oids and of references, not with the size of the records or of the transaction rows. The walk keeps 8 bytes for each oid with a current record. It keeps about 24 bytes for each reference to a later oid, in the list `ahead`, until the walk ends. ZODB gives a new object its oid when it pickles the parent, so nearly every reference in a store that ZODB builds points to a later oid.
 - A blob record without its record is not checked: no read of the store lists the blob records.
-- The walk counts the oids that have at least one record, deletions included. When the store has `object_count` and the walk read every record key, a count that differs is one finding, `Verification::count`. A store of `ZOE format 1` has no count (`Verification::object_count` is `None`): the report says so in one line, and that is no finding.
+- The walk counts the oids that have at least one record, deletions included. When the store has `object_count` and the walk read every record key, a count that differs is one finding, `Verification::count`. A store without a count (`Verification::object_count` is `None`) gets one line in the report, and that is no finding.
 
 ## Dumps
 

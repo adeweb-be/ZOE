@@ -15,15 +15,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Conn, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s};
+use common::{Conn, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s};
 
 #[test]
 fn the_help_names_the_timeout_and_its_twin() {
     let output = {
-        let _spawn = wire::spawn_lock();
-        std::process::Command::new(wire::ZOE)
+        let _spawn = common::spawn_lock();
+        std::process::Command::new(common::ZOE)
             .args(["serve", "--help"])
             .output()
             .unwrap()
@@ -141,7 +141,7 @@ fn an_idle_server_stops_at_once_and_closes_its_store() {
         "an idle server took {took:?}"
     );
     // The store was closed cleanly: a read-only open accepts it.
-    let _spawn = wire::spawn_lock();
+    let _spawn = common::spawn_lock();
     zoe_core::Store::open_read_only(&path).unwrap();
 }
 

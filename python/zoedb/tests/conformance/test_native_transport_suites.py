@@ -23,9 +23,9 @@ ZEO's own client starts during the run, so the tests exercise the native
 client.
 """
 
-import contextlib
-import doctest
 import unittest
+
+from suite_support import cases_and_layers, class_of, name_of, zeo_client_threads
 
 import zoe.testing
 
@@ -52,63 +52,18 @@ EXPECTED = {
 }
 
 
-def name_of(test):
-    if isinstance(test, doctest.DocTestCase):
-        return test.id().rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-    method = getattr(test, "_testMethodName", "runTest")
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return f"{cls.__name__}.{method}"
-    return test.id()
-
-
-def class_of(test):
-    return type(test).__name__
-
-
-def walk(suite, layers=()):
-    """Yield each test of suite with the layers of the suites around it."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from walk(item, layers)
-    else:
-        yield suite, layers
-
-
 def collected():
     """Return the tests of the run, each with its layers."""
     from ZEO.tests import testssl, testZEO
 
     base = (zoe.testing.ZEO_LAYER, zoe.testing.NATIVE_LAYER)
-    tests = list(walk(testssl.test_suite(), base))
+    tests = list(cases_and_layers(testssl.test_suite(), base))
     tests += [
         (test, layers)
-        for test, layers in walk(testZEO.test_suite(), base)
+        for test, layers in cases_and_layers(testZEO.test_suite(), base)
         if name_of(test) == "unix_domain_sockets"
     ]
     return tests
-
-
-@contextlib.contextmanager
-def zeo_client_threads():
-    """Record each network thread of ZEO's own client that starts."""
-    from ZEO.asyncio.client import ClientThread
-
-    started = []
-    init = ClientThread.__init__
-
-    def __init__(self, *args, **kw):
-        started.append(type(self).__name__)
-        init(self, *args, **kw)
-
-    ClientThread.__init__ = __init__
-    try:
-        yield started
-    finally:
-        ClientThread.__init__ = init
 
 
 def run(tests):

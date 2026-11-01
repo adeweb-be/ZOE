@@ -30,13 +30,13 @@ builder never changes it: a test that fails is a bug, and a test that
 cannot pass is a question for the human.
 
 The gate also checks that the native inside is the default of
-`zoe.zeo.ClientStorage` and of `<zoeclient>`, and that `zoe.zeo._NOT_BUILT`,
-the list of the arguments of `ZEO.ClientStorage` whose feature the native
-client does not have, is empty.
+`zoe.zeo.ClientStorage` and of `<zoeclient>`.
 """
 
 import threading
 import unittest
+
+from suite_support import cases_and_layers, class_of, name_of
 
 import zoe.testing
 from zoe.testing import ZoeServer
@@ -64,7 +64,7 @@ OUT_MODULES = {
 TLS_FILES = (
     "it gives an ssl context, or the self-signed server.pem of ZEO's tests; "
     "the native client takes TLS only from the files of the <ssl> section, "
-    "and its certificates must chain to a CA (follow-up #338); "
+    "and its certificates must chain to a CA; "
     "test_native_transports.py covers TLS"
 )
 POOL = (
@@ -202,7 +202,7 @@ def phase_2():
     """Return the module of the gate of phase 2, test_zeo_suites.py.
 
     It is in the directory of this module, and gives MODULES, OUT,
-    OUT_MODULES and the code that walks a suite.
+    OUT_MODULES and `suite_of`.
     """
     import test_zeo_suites
 
@@ -222,9 +222,9 @@ def run(module_name, layers, out):
     result = unittest.TestResult()
     started, ran = [], 0
     try:
-        for test, test_layers in suites.walk(suites.suite_of(module_name), layers):
-            name = suites.name_of(test)
-            if name in out or suites.class_of(test) in out:
+        for test, test_layers in cases_and_layers(suites.suite_of(module_name), layers):
+            name = name_of(test)
+            if name in out or class_of(test) in out:
                 continue
             for layer in test_layers:
                 if layer not in started:
@@ -269,18 +269,12 @@ def test_the_named_tests_and_the_out_modules_are_in_the_suites():
 
     classes, names = set(), set()
     for module_name in modules():
-        for test, _ in suites.walk(suites.suite_of(module_name)):
+        for test, _ in cases_and_layers(suites.suite_of(module_name)):
             classes.update(cls.__name__ for cls in type(test).__mro__)
-            names.add(suites.name_of(test))
+            names.add(name_of(test))
     assert NAMED_CLASSES <= classes, f"the run misses {NAMED_CLASSES - classes}"
     assert NAMED_DOCTESTS <= names, f"the run misses {NAMED_DOCTESTS - names}"
     assert set(OUT) <= names | classes, f"OUT names no test: {set(OUT) - names}"
-
-
-def test_every_argument_of_zeo_client_storage_is_built():
-    import zoe.zeo
-
-    assert not list(zoe.zeo._NOT_BUILT), zoe.zeo._NOT_BUILT
 
 
 def test_the_native_inside_is_the_default(tmp_path):

@@ -21,10 +21,9 @@ of `sequence_next` without the declaration is refused.
 import threading
 
 import pytest
+from support import TIMEOUT
+from support import client as stock_client
 
-from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 # The largest number of values that a restart can skip.
 MAX_GAP = 100
 
@@ -34,19 +33,6 @@ def zoe_client(address, **kw):
 
     kw.setdefault("wait_timeout", TIMEOUT)
     return zoe.zeo.ClientStorage(address, storage="1", **kw)
-
-
-def stock_client(address, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(address, storage="1", **kw)
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
 
 
 def test_the_client_is_a_zeo_client_storage():

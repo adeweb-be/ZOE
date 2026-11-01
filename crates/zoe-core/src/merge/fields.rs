@@ -19,11 +19,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use zoe_pickle::python::{Canon, DictKey, Heap, Object, ObjectId, Pickler, Undecided, Value};
+use zoe_pickle::python::{Canon, DictKey, Heap, Object, ObjectId, Undecided, Value};
 
 use super::btrees::text;
 use super::policy::{ClassPolicy, Strategy};
-use super::{MAX_KEYS, Merge, Outcome, Reason, Trees, budget};
+use super::{MAX_KEYS, Merge, Outcome, Reason, Trees, budget, pickle};
 
 /// Merges the three records of a conflict with the entry of their class,
 /// and notes in `merge` the fields that the new record changed.
@@ -55,13 +55,7 @@ pub(super) fn merge(trees: &Trees, entry: &ClassPolicy, merge: &mut Merge) -> Ou
     }
     let mut canon = Canon::new(budget(trees.len));
     match merge_fields(&mut heap, &mut canon, entry, &states, merge) {
-        Ok(state) => {
-            let mut pickler = Pickler::new(&heap);
-            match pickler.dump(class).and_then(|()| pickler.dump(state)) {
-                Ok(()) => Outcome::Merged(pickler.into_bytes()),
-                Err(unsupported) => Outcome::Undecided(unsupported.0),
-            }
-        }
+        Ok(state) => pickle(&heap, class, state).map_or_else(Outcome::Undecided, Outcome::Merged),
         Err(outcome) => outcome,
     }
 }
@@ -740,6 +734,8 @@ fn keys(
 
 #[cfg(test)]
 mod tests {
+    use zoe_pickle::python::Pickler;
+
     use super::*;
     use crate::merge::{Mode, tier2};
     use std::collections::BTreeMap;

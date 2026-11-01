@@ -45,6 +45,22 @@ pub enum PersistentId {
     List,
 }
 
+impl PersistentId {
+    /// Returns the oid of a reference to an object of the same database,
+    /// as a number from its 8 big-endian bytes. Returns `None` for another
+    /// form, and `Some(Err)` with the length of an oid that is not 8 bytes.
+    pub fn oid_u64(&self) -> Option<Result<u64, usize>> {
+        let PersistentId::Oid(bytes) = self else {
+            return None;
+        };
+        Some(
+            <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_be_bytes)
+                .map_err(|_| bytes.len()),
+        )
+    }
+}
+
 /// Returns the persistent ids of a record, in pickle order, with each
 /// repeat. The class pickle and the state pickle both count, and so do the
 /// parts that the tree keeps as opaque bytes.
@@ -220,12 +236,14 @@ impl Scanner<'_> {
                     Value::Other
                 }
                 BINPUT | LONG_BINPUT | PUT => {
-                    let index = memo_index(opcode, &self.bytes[arg], at)?;
+                    let index = memo_index(opcode, &self.bytes[arg])
+                        .ok_or_else(|| error(at, "a memo index does not read"))?;
                     self.memo.insert(index, top(&stack, at)?);
                     continue;
                 }
                 BINGET | LONG_BINGET | GET => {
-                    let index = memo_index(opcode, &self.bytes[arg], at)?;
+                    let index = memo_index(opcode, &self.bytes[arg])
+                        .ok_or_else(|| error(at, "a memo index does not read"))?;
                     self.memo
                         .get(&index)
                         .copied()
@@ -359,19 +377,6 @@ fn pop_mark(stack: &mut Vec<Entry>, at: usize) -> Result<Vec<Value>, Error> {
     Ok(values)
 }
 
-/// Reads the memo index of a put or a get from its argument.
-fn memo_index(opcode: u8, arg: &[u8], at: usize) -> Result<u32, Error> {
-    let index = match opcode {
-        BINPUT | BINGET => arg.first().copied().map(u32::from),
-        LONG_BINPUT | LONG_BINGET => arg.try_into().ok().map(u32::from_le_bytes),
-        _ => arg
-            .split_last()
-            .and_then(|(_, digits)| std::str::from_utf8(digits).ok())
-            .and_then(|digits| digits.parse().ok()),
-    };
-    index.ok_or_else(|| error(at, "a memo index does not read"))
-}
-
 fn error(offset: usize, message: &str) -> Error {
     Error::Decode {
         offset,
@@ -389,11 +394,9 @@ mod tests {
     fn oids(record: &[u8]) -> Vec<u64> {
         persistent_ids(record)
             .unwrap()
-            .into_iter()
-            .filter_map(|id| match id {
-                PersistentId::Oid(oid) => Some(u64::from_be_bytes(oid.try_into().unwrap())),
-                _ => None,
-            })
+            .iter()
+            .filter_map(PersistentId::oid_u64)
+            .map(Result::unwrap)
             .collect()
     }
 

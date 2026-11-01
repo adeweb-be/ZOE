@@ -21,6 +21,7 @@ import logging
 
 import transaction
 
+from zoe.plone.tests import helpers
 from zoe.plone.tests import test_folder_orders_of_the_sites as sites
 
 # The profile id of the overrides of the profile of `zoe.plone`.
@@ -53,18 +54,9 @@ class TestContainersOfTheSites(sites.TestFolderOrdersOfTheSites):
         """Add a second Plone site with the types of plone.app.contenttypes
         to the Zope root, as the site of the layer has them, and commit.
         Return it."""
-        from Products.CMFPlone.factory import addPloneSite
-        from zope.component.hooks import getSite, setSite
-
-        site = getSite()
-        try:
-            addPloneSite(
-                self.app, site_id, extension_ids=("plone.app.contenttypes:default",)
-            )
-        finally:
-            setSite(site)
-        transaction.commit()
-        return self.app[site_id]
+        return helpers.add_site(
+            self.app, site_id, extension_ids=("plone.app.contenttypes:default",)
+        )
 
     def give(self, site, classes=None):
         """Give `site` the overrides of the profile, and the entries

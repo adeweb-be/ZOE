@@ -44,18 +44,64 @@ pub trait Observer: Send + Sync {
     fn intent_locks_acquired(&self, locks: usize, wait: Duration) {
         let _ = (locks, wait);
     }
+
+    /// One slice of the fold wrote `commits` commits of the log, `bytes`
+    /// bytes of log entries, into the tables in one backend write, which
+    /// took `duration` on the monotonic time of the store clock (ADR 0056).
+    /// The thread of the fold calls it after the backend commit of the
+    /// slice.
+    fn slice_folded(&self, commits: usize, bytes: u64, duration: Duration) {
+        let _ = (commits, bytes, duration);
+    }
+
+    /// The leader of a commit batch waited `wait` for the fold, on the
+    /// monotonic time of the store clock: the backlog was full, or the
+    /// batch goes into the tables and waited for an empty backlog (ADR
+    /// 0056). The leader calls it after the wait.
+    fn backlog_waited(&self, wait: Duration) {
+        let _ = wait;
+    }
 }
 
 impl Store {
     /// Give the store its observer. Only the first call sets it. Return
     /// false when the store has an observer already.
     pub fn set_observer(&self, observer: Arc<dyn Observer>) -> bool {
-        self.group.observer.set(observer).is_ok()
+        if self.group.observer.set(Arc::clone(&observer)).is_err() {
+            return false;
+        }
+        // The fold of the log tells the observer of its slices.
+        self.backend.set_observer(observer);
+        true
     }
 
     /// Return the observer of the store, if it has one.
     pub(crate) fn observer(&self) -> Option<&dyn Observer> {
         self.group.observer.get().map(|observer| &**observer)
+    }
+}
+
+/// A stopwatch on the monotonic time of the store clock, for the
+/// observer. A store without an observer reads no clock for it. The
+/// monotonic time is the time of the lock timeout, so a simulator gives it
+/// on simulated time.
+pub(crate) struct Stopwatch<'s> {
+    store: &'s Store,
+    started: Option<Duration>,
+}
+
+impl<'s> Stopwatch<'s> {
+    /// Start a stopwatch on the clock of `store`.
+    pub(crate) fn start(store: &'s Store) -> Self {
+        let started = store.observer().map(|_| store.clock.monotonic());
+        Stopwatch { store, started }
+    }
+
+    /// Return the time since the start, or `None` when the store has no
+    /// observer.
+    pub(crate) fn elapsed(&self) -> Option<Duration> {
+        self.started
+            .map(|started| self.store.clock.monotonic().saturating_sub(started))
     }
 }
 

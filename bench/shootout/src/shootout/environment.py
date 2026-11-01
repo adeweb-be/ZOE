@@ -3,14 +3,15 @@
 The description holds no host name, user name or path.
 """
 
+import datetime
 import importlib.metadata
 import os
 import platform
-import re
-import subprocess
 import sys
 import sysconfig
 from pathlib import Path
+
+from benchcommon import provenance
 
 # The distributions whose versions every result records.
 SOFTWARE = (
@@ -29,9 +30,9 @@ ZOE_SOFTWARE = ("zoedb",)
 
 def machine(workdir: Path, name: str | None = None) -> dict:
     """Describe the machine. The disk is the one that holds workdir."""
-    cpu = _cpu_model()
+    cpu = provenance.cpu_model()
     return {
-        "name": name or os.environ.get("ZOE_BENCH_MACHINE") or _slug(cpu),
+        "name": name or provenance.machine_name(cpu),
         "cpu": cpu,
         "logical_cpus": os.cpu_count() or 1,
         "memory_bytes": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
@@ -66,58 +67,38 @@ def software(names: tuple[str, ...]) -> dict[str, str]:
 
 def commit() -> str | None:
     """Return the commit of the repository that the harness runs from."""
-    if value := os.environ.get("ZOE_BENCH_COMMIT"):
-        return value
-    return _git("rev-parse", "HEAD") or None
+    return provenance.commit()
 
 
 def dirty() -> bool | None:
-    """Return true when the tree of the harness holds changes that its
-    commit does not, false when it holds none, and None when git fails, as
-    in a tree with no .git. Return None also when ZOE_BENCH_COMMIT names
-    another commit than the tree: the tree is then no record of that
-    commit."""
-    head = _git("rev-parse", "HEAD")
-    if not head:
-        return None
-    named = os.environ.get("ZOE_BENCH_COMMIT")
-    if named and not head.startswith(named.lower()):
-        return None
-    status = _git("status", "--porcelain", "--untracked-files=no")
-    if status is None:
-        return None
-    return bool(status)
+    """Return whether the tree holds changes that its commit does not, as
+    `benchcommon.provenance.dirty` gives it."""
+    return provenance.dirty()
 
 
-def _git(*args: str) -> str | None:
-    """Run git in the tree of the harness. Return its output without the
-    spaces at its ends, or None when it fails."""
-    try:
-        out = subprocess.run(
-            ["git", *args],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=Path(__file__).parent,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return out.stdout.strip()
-
-
-def _cpu_model() -> str:
-    try:
-        cpuinfo = Path("/proc/cpuinfo").read_text()
-    except OSError:
-        cpuinfo = ""
-    if match := re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.MULTILINE):
-        return match.group(1).strip()
-    return platform.processor() or platform.machine() or "unknown"
-
-
-def _slug(text: str) -> str:
-    text = re.sub(r"\((r|tm)\)", "", text.lower())
-    return re.sub(r"[^a-z0-9]+", "-", text).strip("-") or "unknown"
+def header(
+    schema_version: int,
+    workdir: Path,
+    machine_name: str | None,
+    software_versions: dict[str, str],
+    started: datetime.datetime,
+    **run,
+) -> dict:
+    """Return the head of a result document: its version, the machine, the
+    Python build, the software, and the run with its start, its commit,
+    whether the tree held changes and the fields of `run`."""
+    return {
+        "schema_version": schema_version,
+        "machine": machine(workdir, machine_name),
+        "python": python(),
+        "software": software_versions,
+        "run": {
+            "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "commit": commit(),
+            "dirty": dirty(),
+            **run,
+        },
+    }
 
 
 def _disk(path: Path) -> dict | None:

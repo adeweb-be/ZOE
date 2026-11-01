@@ -1,6 +1,6 @@
 # 0033. The store counts its objects: `object_count` in `meta`, ZOE format 2
 
-Status: accepted. The human decided the count in `meta` on #283 and approved this format change. The human settled the name `ZOE format 2`, the read-only open of a format-1 store, and the upgrade open as the one exception to N7 on #287.
+Status: accepted. The human decided the count in `meta` on #283 and approved this format change. The human settled the name `ZOE format 2`, the read-only open of a format-1 store, and the upgrade open as the one exception to N7 on #287. On #523 the human removed the upgrade open and the read-only open of a format-1 store: nothing runs ZOE in production, so no store of format 1 needs them.
 
 ## Context
 
@@ -22,13 +22,11 @@ A count by a scan of `records` at each call reads every key of the store. A coun
 
 **Reads.** The backend keeps the count of the last write that changed records in memory, and stores it after the commit of that write, under the commit sequencer. `Store::object_count()` gives it as `Some(count)` and reads no row. So after `finish` returns, the count includes the commit. `len(zoe.Storage)` and the `length` of `get_info`, of the `info` after a commit and after a pack, and of `get_size_info` give the count.
 
-**The format name.** The name becomes `ZOE format 2`. A new store starts with format 2 and a count of 0. A store of format 2 without `object_count`, or with a row that is not 8 bytes, fails the open with `Format`. Another name fails as before. A build from before this change refuses a store of format 2, because it compares the name. So no older writer changes the records of a store and leaves its count wrong.
+**The format name.** The name becomes `ZOE format 2`. A new store starts with format 2 and a count of 0. A store of format 2 without `object_count`, or with a row that is not 8 bytes, fails the open with `Format`. Another name, `ZOE format 1` included, fails the open with `Format`. A build from before this change refuses a store of format 2, because it compares the name. So no older writer changes the records of a store and leaves its count wrong.
 
-**The upgrade.** A writer open of a store of `ZOE format 1` counts the distinct oids of `records` once. It writes `object_count` and the name `ZOE format 2` in one backend write transaction, with a sync, before the open returns. The count and the write run in the same write transaction. A crash before its commit leaves format 1, and the next writer open counts again. The count reads every key of `records`, so N7 does not hold for that one open. This is the only exception to N7.
+**A store of format 1.** An open refuses a store of `ZOE format 1` with `Format`, as it refuses any other name. The refused open writes no row, so the store keeps its format name. A read-only open changes no byte. A writer open lets redb write its own state into `zoe.redb` when the database closes, as for any other format name. No tool upgrades it. A read-only open of a store of format 2 reads the row.
 
-**The read-only open.** A read-only open of a store of format 1 writes nothing and reads nothing more. `Store::object_count()` gives `None`, and `len(zoe.Storage)` and the `length` of `zoe serve --read-only` give 0, as before. A read-only open of a store of format 2 reads the row. `zoe.Storage(read_only=True)` opens the store for writes in the core, so it upgrades a store of format 1.
-
-**`zoe verify`.** The walk of the record keys counts the distinct oids. When the store has `object_count` and the walk read every key, a count that differs is one finding. A store of format 1 gets one line, "the store has no count yet", which is no finding.
+**`zoe verify`.** The walk of the record keys counts the distinct oids. When the store has `object_count` and the walk read every key, a count that differs is one finding.
 
 ## Why the count is not decided at the vote
 
@@ -36,13 +34,14 @@ The vote reads the current record of each written oid, so it knows which oids ha
 
 ## Why a new format name
 
-The naming table says that the format name bumps only with a migration tool. The upgrade open is that migration. Without a new name, a build from before this change would open a store of the new format and commit without changing the count.
+The naming table says that the format name bumps only with a migration tool. The upgrade open was that migration until #523 removed it. Without a new name, a build from before this change would open a store of the new format and commit without changing the count.
 
 ## Consequences
 
 - `len(zoe.Storage)` and the `length` of `zoe serve` are exact, as FileStorage's. ZODB's doctest `IExternalGC.test` passes through ZEO's suite.
 - Each write that changes records reads at most one key of `records` for each oid that it touches (none for an oid at or above `next_oid`, which has no record yet), and a pack batch reads one more for each oid that it removes a record of. The write of the row is one more `meta` row in a write that already writes `last_tid`.
-- The first writer open of a store of format 1 reads every key of `records`, so it takes longer than N7 allows. Each later open reads the row.
+- An open refuses a store of format 1. No open reads every key of `records` to count it, so N7 has no exception for the count.
 - A flipped bit in the row is outside the bit-flip gate, as for `last_tid` and `next_oid`, because `meta` has no frames. `zoe verify` finds such a count. A later write adds to and subtracts from the damaged value; it never fails for it.
 - No tool takes a store back to format 1.
 - Only the redb backend counts. The trait method `Backend::object_count` has a default that gives `None`.
+- With the write-ahead log, the count in memory also takes the new oids of a log batch at its publication, the records whose written previous serial is `Tid::ZERO`, and each backend write adds its own change less the oids that the log counted for its records. The count in `meta` stays exact in each snapshot, because a slice of the fold counts as a batch write did (ADR 0056, section 19).

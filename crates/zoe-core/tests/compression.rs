@@ -3,16 +3,13 @@
 //! A store reads records of every codec, whatever its current setting.
 //! The default options store records raw.
 
-use std::path::{Path, PathBuf};
+mod support;
 
-use zoe_core::{Codec, Compression, Oid, Options, Store, Tid};
+use std::path::Path;
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-zstd-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+use support::fresh_dir;
+use zoe_core::testing::commit;
+use zoe_core::{Codec, Compression, Options, Store, Tid};
 
 fn open(dir: &Path, compression: Compression) -> Store {
     let options = Options {
@@ -48,21 +45,15 @@ fn noise(len: usize) -> Vec<u8> {
         .collect()
 }
 
-fn commit(store: &Store, oid: Oid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(oid, Tid::ZERO, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
 #[test]
 fn raw_is_the_default() {
     assert_eq!(Options::default().compression, Compression::None);
-    let store = Store::open(fresh_dir("default")).unwrap();
+    let dir = fresh_dir("default");
+    let store = Store::open(&dir).unwrap();
     assert_eq!(store.compression(), Compression::None);
     let oid = store.new_oid().unwrap();
     let data = repetitive_pickle();
-    let tid = commit(&store, oid, &data);
+    let tid = commit(&store, oid, Tid::ZERO, &data);
     let info = store.record_info(oid, tid).unwrap();
     assert_eq!(info.codec, Codec::None);
     assert_eq!(info.stored_len, data.len() as u64);
@@ -75,7 +66,7 @@ fn a_compressible_pickle_is_stored_with_zstd() {
     let (oid, tid) = {
         let store = open(&dir, Compression::Zstd { level: 3 });
         let oid = store.new_oid().unwrap();
-        let tid = commit(&store, oid, &data);
+        let tid = commit(&store, oid, Tid::ZERO, &data);
         let info = store.record_info(oid, tid).unwrap();
         assert_eq!(info.codec, Codec::Zstd);
         assert_eq!(info.data_len, data.len() as u64);
@@ -88,10 +79,11 @@ fn a_compressible_pickle_is_stored_with_zstd() {
 
 #[test]
 fn an_incompressible_pickle_is_stored_as_it_is() {
-    let store = open(&fresh_dir("noise"), Compression::Zstd { level: 3 });
+    let dir = fresh_dir("noise");
+    let store = open(&dir, Compression::Zstd { level: 3 });
     let oid = store.new_oid().unwrap();
     let data = noise(4096);
-    let tid = commit(&store, oid, &data);
+    let tid = commit(&store, oid, Tid::ZERO, &data);
     let info = store.record_info(oid, tid).unwrap();
     assert_eq!(info.codec, Codec::None);
     assert_eq!(info.stored_len, data.len() as u64);
@@ -100,9 +92,10 @@ fn an_incompressible_pickle_is_stored_as_it_is() {
 
 #[test]
 fn compression_off_writes_plain_records() {
-    let store = open(&fresh_dir("off"), Compression::None);
+    let dir = fresh_dir("off");
+    let store = open(&dir, Compression::None);
     let oid = store.new_oid().unwrap();
-    let tid = commit(&store, oid, &repetitive_pickle());
+    let tid = commit(&store, oid, Tid::ZERO, &repetitive_pickle());
     assert_eq!(store.record_info(oid, tid).unwrap().codec, Codec::None);
 }
 
@@ -113,12 +106,12 @@ fn a_store_reads_records_of_every_codec() {
     let (plain, plain_tid) = {
         let store = open(&dir, Compression::None);
         let oid = store.new_oid().unwrap();
-        (oid, commit(&store, oid, &data))
+        (oid, commit(&store, oid, Tid::ZERO, &data))
     };
     let (packed, packed_tid) = {
         let store = open(&dir, Compression::Zstd { level: 3 });
         let oid = store.new_oid().unwrap();
-        (oid, commit(&store, oid, &data))
+        (oid, commit(&store, oid, Tid::ZERO, &data))
     };
     for compression in [Compression::None, Compression::Zstd { level: 19 }] {
         let store = open(&dir, compression);

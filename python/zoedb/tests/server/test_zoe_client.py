@@ -14,17 +14,15 @@ of the system without `authenticate`.
 import io
 import shutil
 import socket
-import subprocess
 import types
 
 import pytest
 import ZConfig
+from support import TIMEOUT, commit, openssl
 from ZODB.POSException import ReadOnlyError
 
 import zoe
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
 
 SCHEMA = """
 <schema>
@@ -279,10 +277,6 @@ def test_the_native_tls_takes_a_directory_or_the_system_store(tmp_path):
     for authenticate in [None, "", "DYNAMIC"]:
         tls = zoe.zeo._native_tls(ssl_section(authenticate=authenticate), None)
         assert tls[2] is None, authenticate
-
-
-def openssl(*args, cwd):
-    subprocess.run(["openssl", *args], cwd=cwd, check=True, capture_output=True)
 
 
 NEW_KEY = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
@@ -550,14 +544,8 @@ def fell_back(caplog):
 
 
 def commit_and_load(storage):
-    from ZODB.Connection import TransactionMetaData
-
     oid = storage.new_oid()
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    storage.store(oid, bytes(8), b"data", "", txn)
-    storage.tpc_vote(txn)
-    tid = storage.tpc_finish(txn)
+    tid = commit(storage, [(oid, bytes(8), b"data")])
     assert storage.load(oid) == (b"data", tid)
 
 
@@ -732,7 +720,7 @@ def test_a_child_of_fork_refuses_a_client_of_its_parent(tmp_path):
 def test_the_native_client_declares_the_extensions_of_the_client_of_zeo():
     import zoe.zeo
 
-    assert zoe.zeo._NATIVE_EXTENSIONS == zoe.zeo.EXTENSIONS
+    assert zoe.zeo._NATIVE_EXTENSIONS == (*zoe.zeo.EXTENSIONS, "server_writes")
     traces = "trace_context" in zoe.zeo._NATIVE_EXTENSIONS
     assert traces == (zoe.zeo._PROPAGATOR is not None)
 

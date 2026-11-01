@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use super::staging::Staging;
 use super::{Finished, Observer, check_restore_tid, next_tid};
-use crate::backend::{TxnMeta, TxnStatus, WriteTxn};
+use crate::backend::{BatchPlan, TxnMeta, TxnStatus, WriteTxn};
 use crate::blob::PendingBlob;
 use crate::clock::{Waiter, timestamp};
 use crate::error::{Result, ZoeError};
@@ -117,7 +117,7 @@ impl GroupCommit {
     fn lock(&self) -> MutexGuard<'_, Queue> {
         // The queue stays valid after a panic: `Lead` ends the lead when
         // it unwinds.
-        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.queue)
     }
 
     /// Commit `member` in a batch of `store`. Return the member and its
@@ -281,7 +281,7 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
             tracing::info_span!("fsync", commits)
         };
-        match span.in_scope(|| write(store, &mut members, deferred, now_ms)) {
+        match span.in_scope(|| write(store, &mut members, deferred, now_ms, start)) {
             Ok(intents) => {
                 if deferred {
                     // A crash before the next durable commit loses this
@@ -339,16 +339,91 @@ pub(super) fn check_undone(store: &Store, undone: Option<Tid>) -> Result<()> {
     }
 }
 
-/// Place the blobs of the members that have a tid, then write these
-/// members in one backend write transaction and commit it, without a sync
-/// when `deferred` is true. `now_ms` is the time of the write, in
-/// milliseconds since the Unix epoch. Return the intent files of the blobs.
+/// The bytes of the fixed part of an op of an entry of the log, the frame
+/// header included, and of the indexes of an op in the backlog (ADR 0056,
+/// sections 3 and 7).
+const OP_FIXED: u64 = 1 + 8 + 4 + format::HEADER_LEN as u64 + 64;
+
+/// The bytes of the fixed part of an op of an entry on a namespace row,
+/// with the indexes of the op: the kind, the key length and the frame
+/// length and header.
+const KV_OP_FIXED: u64 = 1 + 2 + 4 + format::HEADER_LEN as u64 + 64;
+
+/// Return the plan of the batch of `members` (ADR 0056, section 4): its
+/// pickle bytes, the bytes of its large records and its size in the
+/// backlog, from the lengths that the index of the staging holds. A frame
+/// is never longer than its pickle and its header, so the estimate is
+/// never below the size. `previous` is the last tid of the store before
+/// the batch.
+fn plan(
+    store: &Store,
+    members: &[(Member, Result<Finished>)],
+    deferred: bool,
+    previous: Tid,
+) -> BatchPlan {
+    let large_record = store.write_log.large_record;
+    // The header of the entry and the zeros of its alignment.
+    let mut estimate: u64 = 56 + 7;
+    let (mut pickle_bytes, mut large_bytes) = (0u64, 0u64);
+    for (member, finished) in members {
+        if finished.is_err() {
+            continue;
+        }
+        // The transaction row: its status, its count and three lengths.
+        let fields = member.user.len() + member.description.len() + member.extension.len();
+        estimate += OP_FIXED + 1 + 8 + 12 + fields as u64;
+        for (oid, staged) in member.staged.iter() {
+            let len = staged.pickle_len() as u64;
+            pickle_bytes += len;
+            if len >= large_record {
+                large_bytes += len;
+            }
+            estimate += OP_FIXED + len;
+            if member.blobs.contains_key(&oid) {
+                estimate += OP_FIXED + format::blob::BLOB_RECORD_LEN as u64;
+            }
+        }
+        for (flavour, key, value, delete) in member.staged.kv_lens() {
+            let (key, value) = (key as u64, value as u64);
+            estimate += if delete {
+                1 + 2 + key + 64
+            } else {
+                KV_OP_FIXED + key + format::KV_U64_LEN as u64 + value
+            };
+            match flavour {
+                // The key of the index of the expiries.
+                Flavour::Ephemeral => estimate += 1 + 2 + format::KV_U64_LEN as u64 + key + 64,
+                // The generation row of the namespace, at most once for each
+                // write.
+                Flavour::Durable => estimate += KV_OP_FIXED + key + format::KV_U64_LEN as u64,
+            }
+        }
+    }
+    BatchPlan {
+        previous,
+        pickle_bytes,
+        large_bytes,
+        estimate,
+        deferred,
+    }
+}
+
+/// Write the members that have a tid in one write of the backend and commit
+/// it, without a sync when `deferred` is true. The write appends the batch
+/// to the log, or writes it into the tables, as `Backend::begin_batch`
+/// chooses after its waits. The blob files go into place before the write.
+/// `now_ms` is the time of the write, in milliseconds since the Unix epoch,
+/// and `previous` the last tid of the store before the batch. Return the
+/// intent files of the blobs.
 fn write(
     store: &Store,
     members: &mut [(Member, Result<Finished>)],
     deferred: bool,
     now_ms: u64,
+    previous: Tid,
 ) -> Result<Vec<Option<String>>> {
+    let plan = plan(store, members, deferred, previous);
+    let mut write = store.backend.begin_batch(&plan)?;
     let mut intents = Vec::new();
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
@@ -359,10 +434,19 @@ fn write(
         // commit, so a blob record never lacks its file.
         intents.push(store.blobs().place(finished.tid, &mut member.blobs)?);
     }
-    let mut write = store.backend.begin_write()?;
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
         let tid = finished.tid;
+        // The transaction row comes first: an entry of the log starts each
+        // commit with it.
+        write.put_txn(&TxnMeta {
+            tid,
+            user: mem::take(&mut member.user),
+            description: mem::take(&mut member.description),
+            extension: mem::take(&mut member.extension),
+            oid_count: member.staged.len() as u64,
+            status: TxnStatus::Committed,
+        })?;
         // An attached payload goes into its frame as it is. A spilled
         // pickle without one is read back here, one at a time. A record
         // merged onto a commit in flight comes after the record of that
@@ -383,14 +467,6 @@ fn write(
                 write.put_blob(oid, tid, blob.record())?;
             }
         }
-        write.put_txn(&TxnMeta {
-            tid,
-            user: mem::take(&mut member.user),
-            description: mem::take(&mut member.description),
-            extension: mem::take(&mut member.extension),
-            oid_count: member.staged.len() as u64,
-            status: TxnStatus::Committed,
-        })?;
         write_kv(&mut *write, &member.staged, tid, now_ms)?;
     }
     if deferred {
@@ -466,161 +542,21 @@ fn copy(error: &ZoeError) -> ZoeError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::io::{self, Read};
-    use std::path::PathBuf;
+    use std::io;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use zoe_pickle::btrees::new_bucket_state;
-    use zoe_pickle::python::{Heap, Pickler, Value};
+    use zoe_pickle::python::{Heap, Value};
 
     use super::*;
     use crate::commit::Txn;
     use crate::lock::LockCancel;
     use crate::merge::{Resolution, Resolved};
-    use crate::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
-
-    /// The database file of a store.
-    const DATABASE: &str = "zoe.redb";
-
-    /// A `MemVfs` that counts the syncs and the writes of the database
-    /// file.
-    #[derive(Clone, Default)]
-    struct Counting {
-        vfs: MemVfs,
-        syncs: Arc<AtomicU64>,
-        writes: Arc<AtomicU64>,
-    }
-
-    /// A file of `Counting`.
-    #[derive(Debug)]
-    struct CountedFile {
-        file: MemFile,
-        /// The counters of the database file, `None` for another file.
-        counters: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
-    }
-
-    impl Counting {
-        fn counted(&self, name: &str, file: MemFile) -> CountedFile {
-            let counters = (name == DATABASE).then(|| (self.syncs.clone(), self.writes.clone()));
-            CountedFile { file, counters }
-        }
-
-        fn syncs(&self) -> u64 {
-            self.syncs.load(Ordering::SeqCst)
-        }
-    }
-
-    impl redb::StorageBackend for CountedFile {
-        fn len(&self) -> io::Result<u64> {
-            self.file.len()
-        }
-
-        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-            self.file.read(offset, out)
-        }
-
-        fn set_len(&self, len: u64) -> io::Result<()> {
-            self.file.set_len(len)
-        }
-
-        fn sync_data(&self) -> io::Result<()> {
-            if let Some((syncs, _)) = &self.counters {
-                syncs.fetch_add(1, Ordering::SeqCst);
-            }
-            self.file.sync_data()
-        }
-
-        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-            if let Some((_, writes)) = &self.counters {
-                writes.fetch_add(1, Ordering::SeqCst);
-            }
-            self.file.write(offset, data)
-        }
-    }
-
-    impl Vfs for Counting {
-        type File = CountedFile;
-
-        fn exists(&self, name: &str) -> io::Result<bool> {
-            self.vfs.exists(name)
-        }
-
-        fn open(&self, name: &str) -> io::Result<CountedFile> {
-            Ok(self.counted(name, self.vfs.open(name)?))
-        }
-
-        fn create_new(&self, name: &str) -> io::Result<CountedFile> {
-            Ok(self.counted(name, self.vfs.create_new(name)?))
-        }
-
-        fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-            self.vfs.rename(from, to)
-        }
-
-        fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
-            self.vfs.hard_link(from, to)
-        }
-
-        fn remove(&self, name: &str) -> io::Result<()> {
-            self.vfs.remove(name)
-        }
-
-        fn sync_dir(&self) -> io::Result<()> {
-            self.vfs.sync_dir()
-        }
-
-        fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
-            self.vfs.sync_dir_at(dir)
-        }
-
-        fn create_dir(&self, name: &str) -> io::Result<()> {
-            self.vfs.create_dir(name)
-        }
-
-        fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
-            self.vfs.list_files(dir)
-        }
-
-        fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
-            self.vfs.list_entries(dir)
-        }
-
-        fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
-            self.vfs.create_file(name)
-        }
-
-        fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
-            self.vfs.read_file(name)
-        }
-
-        fn sync_file(&self, name: &str) -> io::Result<()> {
-            self.vfs.sync_file(name)
-        }
-
-        fn set_read_only(&self, name: &str) -> io::Result<()> {
-            self.vfs.set_read_only(name)
-        }
-
-        fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
-            self.vfs.lock_dir(name)
-        }
-
-        fn path(&self, name: &str) -> PathBuf {
-            self.vfs.path(name)
-        }
-    }
-
-    /// Wait until `done` is true. Fail the test after 10 s.
-    fn wait_until(done: impl Fn() -> bool) {
-        let start = Instant::now();
-        while !done() {
-            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
+    use crate::testing::{CountingVfs, record, wait_until};
+    use crate::vfs::MemVfs;
 
     /// Begin a transaction that writes `data` for the new oid `oid`, and
     /// vote.
@@ -661,7 +597,7 @@ mod tests {
     #[test]
     fn concurrent_finishes_share_one_sync() {
         const FINISHES: u64 = 16;
-        let vfs = Counting::default();
+        let vfs = CountingVfs::default();
         let store = Store::open_in(vfs.clone(), crate::clock::SystemClock).unwrap();
         let txns = (0..FINISHES)
             .map(|_| voted(&store, store.new_oid().unwrap(), b"pickle"))
@@ -750,7 +686,7 @@ mod tests {
 
     #[test]
     fn a_batch_of_deferred_restores_does_not_sync() {
-        let vfs = Counting::default();
+        let vfs = CountingVfs::default();
         let store = Store::open_in(vfs.clone(), crate::clock::SystemClock).unwrap();
         let batches = Arc::new(Batches::default());
         assert!(store.set_observer(batches.clone()));
@@ -891,13 +827,6 @@ mod tests {
         let flat = vec![Value::Int(key), heap.new_dict(dict)];
         let state = new_bucket_state(&mut heap, flat, None);
         record(&heap, class, state)
-    }
-
-    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-        let mut pickler = Pickler::new(heap);
-        pickler.dump(class).unwrap();
-        pickler.dump(state).unwrap();
-        pickler.into_bytes()
     }
 
     /// Commit `data` as a new object. Return its oid and its serial.

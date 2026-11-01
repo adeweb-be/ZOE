@@ -17,15 +17,13 @@ import threading
 import unittest
 
 import pytest
+from support import TIMEOUT, ZERO
+from support import commit_one as commit
 
 import zoe
 
-# The tid and the serial of an object that has no record yet.
-ZERO = bytes(8)
 # The largest tid. loadBefore(oid, MAX_TID) loads the current record.
 MAX_TID = (2**63 - 1).to_bytes(8, "big")
-# The longest time that a test waits for another thread.
-TIMEOUT = 30
 # The time that the test gives a blocked commit to end, which it must not.
 BLOCKED = 0.5
 
@@ -54,21 +52,6 @@ def value(data):
     from ZODB.tests.StorageTestBase import zodb_unpickle
 
     return zodb_unpickle(data)._value
-
-
-def commit(storage, oid, serial, data):
-    """Store one record in one transaction. Return the tid."""
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        return storage.tpc_finish(txn)
-    except Exception:
-        storage.tpc_abort(txn)
-        raise
 
 
 def test_the_storage_is_a_conflict_resolving_storage(tmp_path):

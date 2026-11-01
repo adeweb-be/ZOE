@@ -24,6 +24,11 @@ changed no object, the data manager begins a storage transaction of its
 own and drives its vote, its finish and its abort. An abort drops the
 writes.
 
+`scan_all` gives every pair of a range, page after page, from a function
+that gives one page: `Namespace.scan`, or the `kv_scan` of a storage.
+`SCAN_LIMIT` is the most pairs of one page, `MAX_KEY` the longest key in
+bytes, and `MAX_TTL` the longest TTL in seconds.
+
 A `DemoStorage` whose chain of bases ends at a ZOE storage, as the test
 layers of plone.testing stack them, has namespaces too. Its writes go to an
 overlay in memory that belongs to the `DemoStorage`: they never reach the
@@ -44,14 +49,31 @@ from ZODB.Connection import TransactionMetaData
 from ZODB.DemoStorage import DemoStorage
 from ZODB.POSException import Unsupported
 
-__all__ = ["Namespace"]
+__all__ = ["MAX_KEY", "MAX_TTL", "SCAN_LIMIT", "Namespace", "scan_all"]
 
 # The data manager of the writes of the current transaction of each
 # connection.
 _managers = weakref.WeakKeyDictionary()
 
-# The most pairs that one scan of the store gives.
-_SCAN_LIMIT = 1000
+#: The most pairs that one scan of the store gives.
+SCAN_LIMIT = 1000
+
+#: The longest key of a namespace, in bytes.
+MAX_KEY = 1024
+
+#: The longest TTL of an ephemeral key, in seconds, as the core takes it.
+MAX_TTL = 2**32 - 1
+
+# The flavours of the namespaces.
+_FLAVOURS = ("ephemeral", "durable")
+
+
+def _check_flavour(flavour):
+    """Raise `ValueError` when `flavour` is not a flavour of a namespace."""
+    if flavour not in _FLAVOURS:
+        raise ValueError(
+            f'the flavour of a namespace is "ephemeral" or "durable", not {flavour!r}'
+        )
 
 
 def _key(key):
@@ -74,11 +96,14 @@ def _has_namespaces(storage):
     return kv_supported is not None and bool(kv_supported())
 
 
-def _storage_of(connection):
-    """Return the namespaces of the storage of the database of
-    `connection`: the storage itself, or the overlay of a `DemoStorage`
-    over a ZOE storage. Another storage raises `Unsupported`."""
-    storage = connection.db().storage
+def _storage_of(db):
+    """Return the namespaces of the storage of the database `db`: the
+    storage itself, or the overlay of a `DemoStorage` over a ZOE storage.
+    Another storage raises `Unsupported`. `db` can also be a connection, or
+    another object whose `db()` gives the database."""
+    if not hasattr(db, "storage"):
+        db = db.db()
+    storage = db.storage
     if isinstance(storage, DemoStorage):
         return _DemoNamespaces(storage)
     if not _has_namespaces(storage):
@@ -93,7 +118,7 @@ def _supported(connection):
     """Tell if the storage of the database of `connection` has KV
     namespaces."""
     try:
-        _storage_of(connection)
+        _storage_of(connection.db())
     except Unsupported:
         return False
     return True
@@ -119,7 +144,7 @@ def _merge(scan, extra, start, stop, limit):
     cursor = start
     index = 0
     while len(pairs) < limit:
-        count = min(_SCAN_LIMIT, limit - len(pairs) + len(extra) - index)
+        count = min(SCAN_LIMIT, limit - len(pairs) + len(extra) - index)
         page = scan(cursor, count)
         last = page[-1][0] if page else None
         merged = dict(page)
@@ -138,21 +163,36 @@ def _merge(scan, extra, start, stop, limit):
     return pairs[:limit]
 
 
+def scan_all(scan, start=None, stop=None):
+    """Yield every pair `(key, value)` of a namespace from `start`
+    (included) to `stop` (excluded), in the byte order of the keys.
+
+    `scan(start, stop, limit)` gives one page of at most `limit` pairs:
+    `Namespace.scan`, or the `kv_scan` of a storage with its flavour and its
+    name bound. Each page holds `SCAN_LIMIT` pairs at most, and the next
+    page starts after the last key of a page. An empty page is the end. The
+    pages are read when the caller takes their pairs.
+    """
+    cursor = start
+    while True:
+        page = scan(cursor, stop, SCAN_LIMIT)
+        if not page:
+            return
+        yield from page
+        cursor = bytes(page[-1][0]) + b"\x00"
+
+
 class Namespace:
     """The namespace `name` of `flavour` of the store of `connection`."""
 
     def __init__(self, connection, flavour, name):
-        if flavour not in ("ephemeral", "durable"):
-            raise ValueError(
-                'the flavour of a namespace is "ephemeral" or "durable",'
-                f" not {flavour!r}"
-            )
+        _check_flavour(flavour)
         if not isinstance(name, str):
             raise TypeError(
                 f"the name of a namespace is a str, not {type(name).__name__}"
             )
         self._connection = connection
-        self._storage = _storage_of(connection)
+        self._storage = _storage_of(connection.db())
         self.flavour = flavour
         self.name = name
 
@@ -200,7 +240,7 @@ class Namespace:
         start, stop = _bound(start), _bound(stop)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("the limit of a scan is an int of 1 or more")
-        limit = min(limit, _SCAN_LIMIT)
+        limit = min(limit, SCAN_LIMIT)
         writes = self._staged(create=False)
         staged = {} if writes is None else writes.of(self.flavour, self.name)
 
@@ -380,9 +420,6 @@ _overlays_lock = threading.Lock()
 # The generations that the overlays give, above every tid of a store.
 _generations = itertools.count(2**63)
 
-# The longest TTL, in seconds, as the core takes it.
-_MAX_TTL = 2**32 - 1
-
 
 class _Overlay:
     """The namespace writes that the commits on one `DemoStorage` made."""
@@ -462,7 +499,7 @@ class _DemoNamespaces:
         def scan(cursor, count):
             return self._base.kv_scan(flavour, name, cursor, stop, count)
 
-        return _merge(scan, rows, start, stop, min(limit, _SCAN_LIMIT))
+        return _merge(scan, rows, start, stop, min(limit, SCAN_LIMIT))
 
     def kv_generation(self, name):
         with _overlays_lock:
@@ -480,7 +517,7 @@ class _DemoNamespaces:
                 raise ValueError(
                     "the name of a namespace is empty or longer than 255 bytes"
                 )
-            if not 1 <= len(key) <= 1024:
+            if not 1 <= len(key) <= MAX_KEY:
                 raise ValueError("a key is empty or longer than 1,024 bytes")
             if value is None:
                 continue
@@ -491,7 +528,7 @@ class _DemoNamespaces:
                     raise ValueError("an ephemeral key needs a TTL")
                 if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
                     raise TypeError("a TTL is an int or a float")
-                if not 0 < ttl <= _MAX_TTL:
+                if not 0 < ttl <= MAX_TTL:
                     raise ValueError("a TTL is a number of seconds from 0 to 2^32 - 1")
 
     def apply(self, writes):

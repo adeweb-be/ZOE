@@ -15,29 +15,21 @@ Through an unmodified `ZEO.ClientStorage`:
 - the locks are per oid: a transaction that holds the lock of one oid
   between its vote and its finish does not stop a commit on another oid,
   and an abort after the vote releases its locks.
+
+The stale serial and the abort after the vote run twice: through a stock
+client and through the native client of `zoe.zeo`.
 """
 
-import pickle
 import threading
 import time
 
 import pytest
+from support import TIMEOUT, ZERO, client, commit, native, record
 
 from zoe.testing import ZoeServer
 
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT, **kw)
+# The clients of the tests that run through both kinds of client.
+OPENERS = {"zeo-client": client, "native-client": native}
 
 
 def begin(storage, tid=None):
@@ -49,14 +41,6 @@ def begin(storage, tid=None):
     else:
         storage.tpc_begin(txn, tid)
     return txn
-
-
-def commit(storage, stores):
-    txn = begin(storage)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    storage.tpc_vote(txn)
-    return storage.tpc_finish(txn)
 
 
 def after(tid):
@@ -81,6 +65,19 @@ def other(server):
     storage = client(server)
     yield storage
     storage.close()
+
+
+@pytest.fixture(params=list(OPENERS))
+def pair(request, server):
+    """Two clients of `server` of one kind: stock or native."""
+    opened = []
+    try:
+        for _ in range(2):
+            opened.append(OPENERS[request.param](server))
+        yield opened
+    finally:
+        for storage in opened:
+            storage.close()
 
 
 def test_a_stale_read_current_serial_is_a_read_conflict(storage):
@@ -131,18 +128,20 @@ def test_delete_object_writes_a_deletion(storage):
     assert next_oid is None
 
 
-def test_a_stale_serial_is_a_conflict_with_its_serials(storage, other):
+def test_a_stale_serial_is_a_conflict_with_its_serials(pair):
     from ZODB.POSException import ConflictError
 
+    storage, other = pair
     oid = storage.new_oid()
     first = commit(storage, [(oid, ZERO, record(1))])
     second = commit(other, [(oid, first, record(2))])
 
+    # The client raises at the store or at the vote.
     with pytest.raises(ConflictError) as caught:
         commit(storage, [(oid, first, record(3))])
     assert caught.value.oid == oid
     assert caught.value.serials == (second, first)
-    assert storage.load(oid) == (record(2), second)
+    assert tuple(storage.load(oid)) == (record(2), second)
 
 
 def test_a_lock_wait_past_the_timeout_is_a_conflict(storage, other):
@@ -188,19 +187,25 @@ def test_locks_are_per_oid(storage, other):
     storage.tpc_finish(holder)
 
 
-def test_an_abort_after_the_vote_releases_the_locks(storage, other):
+def test_an_abort_after_the_vote_releases_the_locks(pair):
+    storage, other = pair
     oid = storage.new_oid()
     first = commit(storage, [(oid, ZERO, record(1))])
 
     txn = begin(storage)
-    storage.store(oid, first, record("aborted"), "", txn)
-    storage.tpc_vote(txn)
-    storage.tpc_abort(txn)
+    try:
+        storage.store(oid, first, record("aborted"), "", txn)
+        storage.tpc_vote(txn)
+    finally:
+        storage.tpc_abort(txn)
 
+    # With the locks still held, the vote of the other client fails after
+    # the lock timeout of the server.
     started = time.monotonic()
     tid = commit(other, [(oid, first, record(2))])
     assert time.monotonic() - started < 0.5
-    assert other.load(oid) == (record(2), tid)
+    assert tid > first
+    assert tuple(other.load(oid)) == (record(2), tid)
 
 
 def test_tpc_begin_with_a_tid_commits_under_that_tid(storage):

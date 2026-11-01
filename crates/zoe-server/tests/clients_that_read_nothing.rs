@@ -9,9 +9,11 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{Conn, MAX, Server, Value, begin, commit, fresh_dir, new_oids, p64, record, s, u64_of};
+use common::{
+    Conn, MAX, Server, Value, begin, commit, fresh_dir, new_oids, p64, record, s, u64_of,
+};
 
 /// The frame of the call `id` of `method` with `args`.
 fn frame(id: i64, method: &str, args: Vec<Value>) -> Vec<u8> {

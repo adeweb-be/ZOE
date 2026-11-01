@@ -2,20 +2,16 @@
 //! in memory up to `staging_memory` bytes and spills the rest to a file
 //! under `staging/` in the store directory.
 
-use std::path::{Path, PathBuf};
+mod support;
 
+use std::path::Path;
+
+use support::fresh_dir;
 use zoe_core::{Oid, Options, Store, Tid};
 
 const LIMIT: usize = 1 << 20;
 const OBJECT: usize = 64 * 1024;
 const OBJECTS: usize = 64;
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-staging-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn open(dir: &Path) -> Store {
     let options = Options {

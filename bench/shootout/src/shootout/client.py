@@ -40,6 +40,7 @@ from shootout import (
     _percentile,
     environment,
     gil,
+    publish,
 )
 from shootout.clientworker import (
     NATIVE_CLIENT,
@@ -58,7 +59,7 @@ from shootout.storages import (
 )
 
 SCHEMA_VERSION = 1
-SCHEMA = Path(__file__).resolve().parents[3] / "schema" / "client.schema.json"
+SCHEMA = publish.SCHEMAS / publish.SCHEMA_OF["client"]
 CLIENTS = (ZEO_CLIENT, NATIVE_CLIENT)
 SERVERS = ("zoe-serve", "zeo")
 SHAPES = (("threads", 1), ("threads", 16), ("processes", 16))
@@ -154,10 +155,16 @@ def run(
     software = environment.software(("ZEO", "ZODB", "zoedb"))
     if "zoe-serve" in servers:
         software |= server_versions(STORAGES["zoe-server"], None)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "machine": environment.machine(workdir, machine),
-        "python": environment.python(),
+    head = environment.header(
+        SCHEMA_VERSION,
+        workdir,
+        machine,
+        software,
+        started,
+        objects=objects,
+        commits=commits,
+    )
+    return head | {
         "gil_enabled_by": sorted(
             {
                 name
@@ -166,14 +173,6 @@ def run(
                 for name in w["gil_enabled_by"]
             }
         ),
-        "software": software,
-        "run": {
-            "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "commit": environment.commit(),
-            "dirty": environment.dirty(),
-            "objects": objects,
-            "commits": commits,
-        },
         "rows": rows,
     }
 

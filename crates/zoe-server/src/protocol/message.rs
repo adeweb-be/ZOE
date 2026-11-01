@@ -9,15 +9,7 @@
 //! `reduce_exception` gives them.
 
 use rmpv::Value;
-
-/// The message id of a heartbeat. It gets no reply.
-pub(crate) const HEARTBEAT: i64 = -1;
-
-/// The flags of an error reply.
-const ERROR: u8 = 2;
-
-/// The key of the W3C traceparent in the trace context of a call.
-const TRACEPARENT: &str = "traceparent";
+use zoe_wire::{ERROR, HEARTBEAT, REPLY, TRACEPARENT, msgpack};
 
 /// The decode budget for one frame. rmpv spends about two steps on each
 /// level of arrays or maps, so this allows about 60 levels. A deeper frame
@@ -139,14 +131,19 @@ pub(crate) fn reply(id: Value, result: Value) -> Vec<u8> {
 /// borrowed values.
 pub(crate) fn reply_of(id: &Value, result: &Value) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(16 + size_hint(id) + size_hint(result));
-    // An array of 4 values, then the id, the flags 0 and the method.
-    bytes.push(0x94);
-    write(&mut bytes, id);
-    bytes.push(0x00);
-    bytes.push(0xa6);
-    bytes.extend_from_slice(b".reply");
+    reply_head(&mut bytes, id);
     write(&mut bytes, result);
     bytes
+}
+
+/// Write the bytes of a reply to the call `id` before its result: an
+/// array of 4 values, then the id, the flags 0 and the method.
+fn reply_head(bytes: &mut Vec<u8>, id: &Value) {
+    bytes.push(0x94);
+    write(bytes, id);
+    bytes.push(0x00);
+    bytes.push(0xa6);
+    bytes.extend_from_slice(REPLY.as_bytes());
 }
 
 /// Encode the reply to the call `id` of a load that found a record:
@@ -156,26 +153,12 @@ pub(crate) fn reply_of(id: &Value, result: &Value) -> Vec<u8> {
 /// values, so a stock client gets the same frame. `data` is not copied.
 pub(crate) fn load_reply(id: &Value, data: Vec<u8>, serial: &Value, next: &Value) -> Vec<Vec<u8>> {
     let mut head = Vec::with_capacity(32 + size_hint(id));
-    // An array of 4 values, then the id, the flags 0 and the method.
-    head.push(0x94);
-    write(&mut head, id);
-    head.push(0x00);
-    head.push(0xa6);
-    head.extend_from_slice(b".reply");
+    reply_head(&mut head, id);
     // The result: an array of 3 values, the first of them bin data.
     head.push(0x93);
-    let len = data.len();
-    if let Ok(len) = u8::try_from(len) {
-        head.extend_from_slice(&[0xc4, len]);
-    } else if let Ok(len) = u16::try_from(len) {
-        head.push(0xc5);
-        head.extend_from_slice(&len.to_be_bytes());
-    } else {
-        // A record is shorter than 4 GiB: the core refuses a longer one.
-        let len = u32::try_from(len).expect("a record of less than 4 GiB");
-        head.push(0xc6);
-        head.extend_from_slice(&len.to_be_bytes());
-    }
+    // A record is shorter than 4 GiB: the core refuses a longer one.
+    let len = u32::try_from(data.len()).expect("a record of less than 4 GiB");
+    msgpack::write_bin_head(&mut head, len);
     let mut tail = Vec::with_capacity(size_hint(serial) + size_hint(next));
     write(&mut tail, serial);
     write(&mut tail, next);
@@ -211,7 +194,7 @@ pub(crate) fn error(id: Value, class: &str, args: Value) -> Vec<u8> {
     encode(Value::Array(vec![
         id,
         Value::from(ERROR),
-        Value::from(".reply"),
+        Value::from(REPLY),
         Value::Array(vec![Value::from(class), args]),
     ]))
 }
@@ -290,9 +273,10 @@ fn check_values(frame: &[u8], max: usize) -> Result<(), String> {
 /// Return the big-endian number of `size` bytes at `at` in `frame`, or 0
 /// when the frame ends before it.
 fn length(frame: &[u8], at: usize, size: usize) -> u64 {
-    frame.get(at..at.saturating_add(size)).map_or(0, |bytes| {
-        bytes.iter().fold(0, |n, &b| n << 8 | u64::from(b))
-    })
+    frame
+        .get(at..)
+        .and_then(|rest| msgpack::big_endian(rest, size))
+        .map_or(0, |n| n as u64)
 }
 
 #[cfg(test)]

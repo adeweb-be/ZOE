@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+use zoe_client::lock;
 use zoe_core::Tid;
 
 /// The last published tid of a store.
@@ -40,7 +41,7 @@ impl Published {
     }
 
     fn lock(&self) -> MutexGuard<'_, Tid> {
-        self.last.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.last)
     }
 
     fn key(&self) -> usize {

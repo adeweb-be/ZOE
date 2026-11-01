@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, MAX, Server, Value, begin, bytes_of, commit, fresh_dir, items, load, new_oids, p64,
     record, s, u64_of,
 };
@@ -233,7 +233,7 @@ fn a_load_never_shows_a_transaction_that_did_not_finish() {
     let first = commit(&mut writer, 1, &[(old, 0, record(b"old"))]).unwrap();
     assert_eq!(
         reader
-            .wait_for("invalidateTransaction", wire::TIMEOUT)
+            .wait_for("invalidateTransaction", common::TIMEOUT)
             .map(|args| u64_of(&items(&args)[0])),
         Some(first)
     );
@@ -276,7 +276,7 @@ fn a_load_never_shows_a_transaction_that_did_not_finish() {
         .map(|oid| reader.send_call("loadBefore", current(*oid)))
         .collect();
     let invalidation = reader
-        .wait_for("invalidateTransaction", wire::TIMEOUT)
+        .wait_for("invalidateTransaction", common::TIMEOUT)
         .unwrap();
     assert_eq!(u64_of(&items(&invalidation)[0]), tid);
     for (id, data) in ids.iter().zip([record(b"changed"), record(b"added")]) {
@@ -304,7 +304,7 @@ fn a_load_after_an_invalidation_shows_its_commit() {
         )
         .unwrap();
         let invalidation = reader
-            .wait_for("invalidateTransaction", wire::TIMEOUT)
+            .wait_for("invalidateTransaction", common::TIMEOUT)
             .unwrap();
         assert_eq!(u64_of(&items(&invalidation)[0]), serial);
         let (data, loaded) = load(&mut reader, oid).unwrap();

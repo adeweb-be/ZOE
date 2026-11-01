@@ -13,9 +13,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, MAX, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s, u64_of,
 };
 
@@ -265,7 +265,7 @@ fn a_client_that_does_not_read_is_closed_and_the_others_go_on() {
         let args = reader
             .wait_for("invalidateTransaction", Duration::from_secs(30))
             .expect("the reader missed an invalidation");
-        assert_eq!(u64_of(&wire::items(&args)[0]), tid);
+        assert_eq!(u64_of(&common::items(&args)[0]), tid);
     }
     // The slow client was closed.
     assert!(slow.closed_within(Duration::from_secs(60)));

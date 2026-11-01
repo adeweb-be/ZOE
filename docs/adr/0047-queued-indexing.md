@@ -1,154 +1,116 @@
 # 0047. Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them
 
-Status: accepted. The checkpoint of ZOE-218 (step 2). The human approved it with the recommendation of each of the questions at its end. After the review of the build, the human chose to serve mounted databases (the last item of section 4), then approved the text of that item and of the cookie of section 6. The search of the sites by the thread of each database (the second item of "Mounted databases" in section 4, and question 12), from the checkpoint of ZOE-220: the human approved its text with the recommendation of question 12. It adds an opt-in backend to `zoe.plone`, a public Python API (`zoe.plone.indexing`), and a behaviour that the specification states (lever 4 of section 9). It changes no on-disk format, no wire protocol and no code of the core.
+Status: accepted. It adds an opt-in backend and a public Python API, `zoe.plone.indexing`, to `zoe.plone`. It changes no on-disk format, no wire protocol and no code of the core.
 
 ## Context
 
-The gate of phase 4 fails on `main` (#440). On the B5 log of ZOE-208, `zoe-native` raises 46 % of the `ConflictError`s of `zeo`; the limit is 10 %. The conflicts that are left are on the buckets of the catalog: the postings of the text indexes, the posting trees, and other buckets of the indexes. No merge of one record resolves them safely: the word count of an index lives in another object (ADR 0042).
+Without this backend, `zoe-native` raises 46 % of the `ConflictError`s of `zeo` on the B5 log; the gate of phase 4 allows 10 %. The facts of the spike (`docs/spikes/queued-indexing.md`):
 
-The spike of this card (`docs/spikes/queued-indexing.md`) gives the facts that the design rests on:
+- The processor `portal-catalog` of the indexing queue of CMFCore writes the catalog in the transaction of the save: 85 catalog objects for an edit of the B5 fixture, 163 for a creation.
+- 753 of the 793 `ConflictError`s of `edit` and 706 of the 806 of `create-spread` are on catalog buckets: the text indexes, `sortable_title`, `path`, `UID`. No merge of one record resolves them: the word count of an index lives in another object (ADR 0042).
 
-- **What a save writes.** Through the forms and plone.restapi of the B5 fixture, a save writes these objects of the catalog: an edit of the title and the description 85, in 13 indexes; a creation 163, in 31 structures; a workflow transition 33; a rename 158; a move 149; a delete 139; a REST `PATCH` of the title 25. The acceptance test of the planner finds the same on the functional layer of plone.app.testing: an edit writes 25 records of the catalog, an add 144, and the second of two saves from one snapshot conflicts on an `OIBTree` of the catalog.
-- **Where the conflicts are.** In the B5 baseline on `zoe-native`, 753 of the 793 `ConflictError`s of `edit` and 706 of the 806 of `create-spread` are on objects of the catalog; most of the others are on objects that the run created and that the maps do not name, and 70 of `create-spread` are on the storage of CMFEditions. In `edit` they are on the `_wordinfo` buckets of the text indexes `SearchableText` and `Description`, then on their posting trees and on `sortable_title`. In `create-spread` they are on the same buckets and trees, and on the trees of `sortable_title`, `path`, `cmf_uid`, `id`, `UID` and the uids, as write conflicts and as the read conflicts of the vote.
-- **The queue of CMFCore.** `CatalogTool.indexObject`, `reindexObject` and `unindexObject` put an operation in a queue of the thread (`Products/CMFCore/indexing.py`). A hook before the commit processes the queue: it coalesces the operations of each object, sorts the unindexes first, and calls each `IIndexQueueProcessor` utility. The utility `portal-catalog` (`PortalCatalogProcessor`) writes the catalog. So the writes stay in the transaction of the save. Each search of the catalog first processes the queue (`processQueue()`), so a search sees the changes of its own transaction.
-- **The operations of each change.** An edit queues one reindex of all indexes. A creation queues four: the object in full, its `review_state`, its `cmf_uid`, and the container in full. A transition queues a reindex of the workflow indexes, a reindex of all indexes (`editMetadata`), and a reindex of `allowedRolesAndUsers` for each object of the subtree that the catalog lists: 157 for a folder of the fixture. A rename and a move queue an unindex of the old path, an index of the new path and of each object below it, and a reindex of each container. A delete queues an unindex of the object and of each object below it, and a reindex of the container. Plone's `CatalogTool.indexObject` calls `reindexObject`, so most operations are reindexes.
-- **What reads the catalog after a save.** Every page of the classic UI: the global sections and the navigation portlet. The folder views (`plone.app.contentlisting`), the folder contents, the collections, `@@search`, the items of a folder in plone.restapi, `@search`, and `uuidToObject` (plone.app.uuid), which `resolveuid` links and relation widgets use. The redirect after an edit or an add goes to the object itself, and its view reads the object; the breadcrumbs read the objects, not the catalog.
-- **What reads the catalog inside a save.** `reindexObjectSecurity`, after the workflow of a creation and of each transition, lists the subtree of the object from the catalog. The handler of plone.app.discussion for a moved object searches the comments at the old path and uncatalogs them directly.
-
-ADR 0043 gives the durable namespace: its writes commit or abort with the transaction, take no lock, and the last writer of a key wins; a read gives the last committed value, not the value at the snapshot of the connection; the generation row of a namespace is the tid of the last commit that wrote it. A `DemoStorage` over a ZOE storage has namespaces too.
+The durable namespace of ADR 0043 commits or aborts with the transaction and takes no lock.
 
 ## Decision
 
+The specification holds the mechanics of each part: "Server mode", "`zoe.plone` and queued indexing". Each section below keeps the rules that the specification does not state.
+
 ### 1. The option
 
-- `zoe.plone.indexing` is a backend of `zoe.plone`, opt-in, as `locking` is: `ZOE_PLONE_BACKENDS=indexing` (names separated by commas, so `locking,indexing`) in the `<environment>` of `zope.conf`, or the ZCML file `zoe.plone:indexing.zcml`. Both call `install()` when the ZCML loads.
-- `install()` registers the queue processor of `zoe.plone` as the global utility `portal-catalog` of `IPortalCatalogQueueProcessor`, in place of `PortalCatalogProcessor`, and keeps the stock utility. It starts no thread. `uninstall()` registers the stock utility again. `installed()` tells if the backend is installed. A second call of either does nothing.
-- Each instance of a site should have the option. An instance without it writes the catalog as today. The catalog still converges (section 3), but the saves of that instance conflict on the catalog with the indexer.
+`indexing` is an opt-in backend of `zoe.plone`, as `locking` is: `ZOE_PLONE_BACKENDS=indexing` (or `locking,indexing`) or `zoe.plone:indexing.zcml`, which call `install()`. `install()` registers the processor of `zoe.plone` as the utility `portal-catalog` of `IPortalCatalogQueueProcessor`, keeps the stock one and starts no thread. A second call of `install()` or `uninstall()` does nothing. Every instance of a site needs the option: an instance without it writes the catalog in the save, which converges (section 3) but conflicts with the indexer.
 
 ### 2. The queue processor
 
-- For each operation, the processor finds the catalog of the object (`getToolByName(obj, "portal_catalog")`) and the connection of the catalog. A new object has no connection yet; its catalog has one.
-- When the storage of that connection has KV namespaces (`zoe.kv`), the processor writes one key for each operation in the durable namespace `zoe.plone.indexing:` followed by the oid of the catalog in 16 hex digits, in the current transaction. It writes no object of the catalog. Else it calls the stock processor (section 8).
-- **The key**, 20 bytes: the time of the write in microseconds since the Unix epoch (8 bytes, big-endian), 8 random bytes that each processing of the queue draws once (in `begin()` of the processor), and the number of the operation in that processing (4 bytes, big-endian). No two writes have one key, so the rule that the last writer wins never applies. The order of the keys is about the order of the saves, and within a processing the order of CMFCore, which puts the unindexes first.
-- **The value** is JSON in UTF-8: `{"op": "index" | "reindex" | "unindex", "path": "/Plone/folder/doc", "idxs": [...], "metadata": true | false}`. The path is the key of the catalog: the physical path of the object, or for an unindex the path that `PathProxy` of CMFCore kept, which is the old path of a move. `idxs` is the list of indexes of a reindex, empty for all. JSON is not a pickle: a reader of the namespace runs no code.
-- The keys commit or abort with the save (ADR 0043). A retry of Zope writes new keys. Their bytes count toward `max-transaction-size`: the folder transition of the spike writes 159 keys of about 150 bytes.
-- A search in the transaction of the save still calls `processQueue()`. The operations then go to the namespace, not to the catalog (section 4).
+The processor writes one key for each operation in `zoe.plone.indexing:<oid of the catalog, 16 hex digits>`, and no catalog object.
+
+- The key: the time in microseconds (8 bytes, big-endian), 8 random bytes that `begin()` draws once for each processing, the operation number (4 bytes, big-endian). No two writes share a key.
+- The value: JSON `{"op": "index" | "reindex" | "unindex", "path": ..., "idxs": [...], "metadata": bool}`. An empty `idxs` means all indexes. An unindex has the path that `PathProxy` kept. A reader of JSON runs no code.
+- A retry of Zope writes new keys. The keys count toward `max-transaction-size`: a folder transition writes 159 keys of about 150 bytes.
+- A search in the save calls `processQueue()`, which sends the operations to the namespace (section 5).
 
 ### 3. The indexer
 
-`zoe.plone.indexing.Indexer(site, batch_size=100)` applies the queue of the catalog of `site`. `run()` applies batches until a scan of the queue gives no key. After the commit of each batch, it calls `after_batch(indexer, keys)`, an attribute that does nothing by default.
-
-- **Its connection.** `Indexer` opens a connection of its own on the database of `site`, with a transaction manager of its own. It finds the site by its physical path from the root of that connection, under the system user, with a request from `Testing.makerequest` as the global request and the site as the local site. It closes the connection when `run()` ends, also on an error.
-- **A batch.**
-  1. Scan the queue from its first key: at most `batch_size` keys.
-  2. Read the generation of the namespace. Each key of the scan committed at or before that tid: its commit wrote the generation row in the same backend write.
-  3. Wait until the storage has seen that tid (`lastTransaction()`), then begin a transaction. Its snapshot holds the save of each key of the batch. A read of the namespace gives the last committed keys, and a ZEO client can get the invalidations of a commit after the commit itself. The wait lasts at most 10 s; then the batch fails as a `TransientError` does (below). On a `DemoStorage` the indexer does not wait: it runs in the process of the commits, and the overlays give generations that are not tids.
-  4. Coalesce the operations by path: one entry for each path, with the union of the indexes, or all indexes when one operation is an index, an unindex or a reindex of all indexes; and the metadata when one operation asks for it.
-  5. Expand the security reindexes. An operation whose indexes are only the security indexes of CMFCore (`allowedRolesAndUsers`) also names each path that the catalog holds below its path, with the same indexes. The indexer searches the catalog of its snapshot only for the highest such paths of the batch: a path below one of them is in its subtree already.
-  6. Resolve each path in the snapshot: the object at that path, found without acquisition (its physical path is the path), that has `reindexObject`, as `clearFindAndRebuild` of Plone takes it.
-  7. Apply the removals first: each path that the catalog holds and that has no such object; each path whose object has another UID than the UID that the catalog holds for it; and each path that the UID index holds for the UID of an object of the batch, when that path is not the path of the object and has no object with that UID. The catalog uncatalogs each of them (`uncatalog_object` with the path, as `_unindexObject` does). Then apply the other paths: a path that the catalog does not hold is indexed in full (`_indexObject`), and a path that it holds is reindexed with the union (`_reindexObject`). These are the calls of the stock processor, so the indexers of plone.indexer, the wrapper of the catalog and the counter of the catalog work as today.
-  8. Delete each key of the batch, in the same transaction.
-  9. Commit, with the note `zoe.plone: indexing queue` and the system user. Then call `after_batch`.
-- **Convergence.** Each path resolves against the newest state, so the indexer gives the same entry when it applies a path once or twice, and in any order of the paths. Two paths share one thing: the UID index keeps one document for each UID (`UUIDIndex`), and it refuses a UID that it holds at another path. The removals come first in each batch, and the unindex of a move comes before its index in the order of the keys. The clocks of two processes can differ, so the keys of a later move can come before the keys of an earlier move, in another batch: the third removal of step 7 frees the UID for it. When the queue is empty, each path that an operation named holds the entry of its object as it is now, or no entry, and every other path keeps its entry. That equals a reindex from scratch when each change of an indexed value queued an operation: the stock catalog makes the same assumption.
-- **The subtree of a security change.** `reindexObjectSecurity` of CMFCore lists the subtree of the object from the catalog. In the transaction of a save, that list misses each object below it whose operation is still in the queue. Without step 5, such an object can keep the security of its container before the save: a document added to a folder, then the folder made private in the window, keeps the role `Anonymous` in `allowedRolesAndUsers`, and its title shows in the searches of anonymous users. With step 5, the indexer applies that object either in a batch whose snapshot holds the security change, or in an earlier batch; then the catalog holds it when the batch of the security change searches the subtree.
-- **Each operation once.** The keys of a batch go in the transaction that applies them. A crash before that commit leaves the keys, and a crash after it leaves none. So a second run applies each key that is left, once. When two indexers apply one key at once, their writes change the same keys of the same buckets of the catalog (the entry of the document in `_unindex` or `_docwords`, the path in `uids`), so the vote of one of them fails, and it retries with a snapshot that holds the other commit.
-- **A failure and its retry.**
-  - A `TransientError` (a `ConflictError` too): the indexer aborts, waits 0.1 s, 0.2 s, 0.4 s, then 0.8 s, and applies the batch again in a new transaction, at most 5 times. Then `run()` raises the error. The keys stay in the queue.
-  - Another `Exception` while it applies one path: the indexer aborts, adds 1 to the field `failures` of each key of that path in a transaction of its own, and applies the batch again without them. A key with 5 failures goes to the durable namespace `zoe.plone.indexing.failed:` followed by the oid of the catalog, with the text of the error, and leaves the queue. The indexer logs an ERROR event with the path. A later operation on that object is a new key.
-  - A `BaseException` that is not an `Exception`, such as `SystemExit` or `KeyboardInterrupt`: the indexer aborts and raises it at once.
-- **The batch size** is 100 keys. At the rates of B5 a batch holds a few keys; 100 bounds the length of a transaction after a large move.
+- `Indexer` uses its own connection and transaction manager, the system user, a `Testing.makerequest` request and the site as local site. It closes the connection when `run()` ends.
+- Coalescing keeps one entry for each path: the union of the indexes, or all indexes when one operation is an index, an unindex or a reindex of all. A path resolves to an object that has `reindexObject`.
+- The wait for the generation fails as a `TransientError` after 10 s. On a `DemoStorage` the indexer does not wait.
+- A `TransientError`: abort, pause 0.1, 0.2, 0.4, then 0.8 s; after 5 tries `run()` raises it, and the keys stay.
+- Another `Exception` on a path: abort, add 1 to `failures` of its keys in a transaction of its own, and apply the batch without them. A key with 5 failures moves to `zoe.plone.indexing.failed:<oid>` with the error, and an ERROR event.
+- A `BaseException` that is not an `Exception`: abort and raise at once.
+- **Convergence.** The catalog equals a reindex from scratch when each change of an indexed value queued an operation, as the stock catalog assumes.
+- **The security subtree.** `reindexObjectSecurity` in a save misses the objects still in the queue. The indexer adds the catalog subtree of each security reindex, so a new document in a folder made private loses `Anonymous`.
+- Two indexers on one key write the same buckets, so one vote fails and retries.
+- The batch size 100, the scan every 0.2 s, the lease of 30 s and the wait of 2 s are module constants, not keys of `zope.conf`.
 
 ### 4. The thread, and one indexer for each site
 
-- When the backend is installed, `zoe.plone` starts a daemon thread in each Zope process at `IDatabaseOpenedWithRoot`. The test layers of plone.testing do not send that event, so no thread runs in a test.
-- **The lease.** The thread runs an `Indexer` for a site only while it holds the lease of that site: a key of the ephemeral namespace `zoe.plone.indexing.lease`, the oid of the catalog, with a random token of the thread as its value and a TTL of 30 s. The thread takes the lease when the key holds no live token: it writes its token in a commit with no record, then reads the key again, and goes on only when the key holds its own token. The transaction of each batch writes the token again, so a lease lives while its indexer works. Before each batch, the indexer of a thread reads the lease, and its run stops when the lease holds the token of another thread, so two holders overlap by one batch at most. At the exit of the process, the thread deletes its lease, so another process takes it at once. After a crash, another process takes it within 30 s.
-- The last writer of a key wins (ADR 0043), so two threads can hold one lease for a moment. They then cost conflicts on the catalog, not a wrong catalog (section 3).
-- **The wake.** When a commit wrote keys, a hook after the commit wakes the thread of the process of the save. The thread also scans one key of the queue of each site every 0.2 s, for the saves of other processes. It finds the sites at the top of the Zope root at its start and every minute, and each site whose processor wrote a key in its process.
-- `Indexer.run()` itself takes no lease. A script, a test or an operator runs it at once.
-- **Mounted databases** (the human's decision on the review of the build). A site whose catalog is in a mounted database with KV namespaces keeps its queue, its keys and its lease in the store of that database, and the thread of that database serves it:
-  - Each Zope process has a thread for each of its databases with namespaces: the root database and each mounted database. Zope opens the database of each mount point before `IDatabaseOpenedWithRoot`, so the threads start at that event. A root database without namespaces (a FileStorage, a ZEO server) has no thread; the thread of each mounted database with namespaces starts all the same. A database that joins the databases of the root later gets its thread when the processor writes its first key there.
-  - Each thread searches the sites of its own database, at its start and every minute: the thread of the root database at the top of the Zope root, and the thread of a mounted database at and just below each mount point that the configuration of Zope gives to that database (`listMountPaths()` of the `dbtab`, whose name is the name of the database). It gives each site to the thread of the database of its catalog. So no thread depends on the thread of the root database: when the root database has no namespaces, the thread of each mounted database still finds the sites of its mount points. After a restart, it applies the keys that are left with no save in the process, and the thread of another process takes over the lease of a site that its process never saved to. A commit wakes the thread of each database that it wrote keys to, for each site.
-  - The thread and the `Indexer` of a mounted site open a connection on the root database and find the site through the mount point. The catalog, the queue, the keys and the lease are in the mounted store, so a batch writes the catalog and deletes its keys in one transaction of that store; the root store gets nothing.
-  - The cookie of section 6 also names the database of the catalog, so the wait reads the queue in the store of the catalog.
-  - The thread finds the catalog of a site as an attribute of the site, not as the utility of the local site of its caller.
+- A thread takes a free lease: it writes its token in a commit with no record, reads the key again, and goes on only when it holds its token. It reads the lease before each batch, so two holders overlap by one batch at most, which costs conflicts, not a wrong catalog. After a crash, another process takes the lease within 30 s.
+- A thread reads only the mount points of its own database (`listMountPaths()` of the `dbtab`), so a search does not grow with the number of databases.
+- The thread finds the catalog as an attribute of the site, not as a local utility.
 
 ### 5. What stays synchronous
 
-- **The catalog API called directly**: `catalog_object`, `uncatalog_object`, `reindexIndex`, `refreshCatalog`, `clearFindAndRebuild`, `manage_catalogRebuild`, the import step of `catalog.xml`, and upgrade steps. The handler of plone.app.discussion for a moved object with comments calls `uncatalog_object`. These calls write the catalog in their own transaction, as today. They can conflict with a batch, and the indexer retries.
-- **Reads in the transaction of a save** no longer see the operations of that transaction: `processQueue()` sends them to the namespace. `reindexObjectSecurity` of a new object finds no subtree, and the index of the object computes its security anyway. The search of plone.app.discussion finds the comments at the old path, which the catalog holds. A code that needs the catalog to hold the changes of its own transaction reads the catalog as it was before the save.
-- Nothing else is synchronous. An index that stays synchronous, such as `path` or `UID`, writes objects of the catalog, and two saves conflict on them again.
+- Direct calls of the catalog API write the catalog in their own transaction: `catalog_object`, `uncatalog_object`, `reindexIndex`, `refreshCatalog`, `clearFindAndRebuild`, `manage_catalogRebuild`, the import of `catalog.xml`, upgrade steps, the plone.app.discussion handler of a move. A conflict with a batch makes the indexer retry.
+- A read in a save does not see the operations of that save. `reindexObjectSecurity` of a new object finds no subtree; the index of the object computes its security anyway.
+- Nothing else is synchronous. A synchronous index, such as `path` or `UID`, brings the conflicts back.
 
 ### 6. The window, and the next request of the same user
 
-- **The window** of a save runs from its commit to the commit of the batch that applies it: the wake (at once in the process of the save, at most 0.2 s from another process), then the batch. Meanwhile the catalog shows the site as it was before the save: the navigation, the folder views, the folder contents, the collections, the searches, the items of a folder in plone.restapi, and `uuidToObject`. A page that reads the object itself shows the save at once: its view, its edit form, a REST `GET` of the item, the breadcrumbs.
-- **The user who saved.** When a request queues operations and has a response, the processor sets the session cookie `zoe.indexing` to the oid of the catalog and the last key that the request wrote, in hex, the name of the database of the catalog and the path of the site. It replaces the cookie that the request expired at its start. A later request with that cookie waits at `PubStart`, before its traversal reads anything: until the queue holds no key at or below that key (a scan of one key), then until its storage has seen the generation of the namespace. Then it begins its transaction again, so that its snapshot holds the batch, and marks it again for the writes-on-GET report. It waits 2 s at most, then goes on with the catalog as it is and logs a WARN event. The request expires the cookie, when the queue holds no such key and also after a wait that ran out. It expires without a wait a cookie that does not parse, and a cookie whose key is more than 60 s in the future. The cookie holds no user data and no secret; it is `HttpOnly`, `SameSite=Lax`, for the path of the site.
-- **The bound.** In B5 `edit` and `create-spread` at 16 users, the delay of a key (section 11) is at most 1 s at p95 and at most 5 s for every key, and the queue is empty at most 10 s after the last save of the run. Step 4 of the card measures it.
-- So the redirect after a save, and each request of the same browser after it, read a catalog that holds the save. A REST client that keeps cookies waits too; one that keeps none reads within the window. Another user sees the save after the window.
+The window of a save runs from its commit to the commit of its batch. Meanwhile the catalog shows the site before the save, and a page that reads the object shows the save. The cookie `zoe.indexing` makes the next request of the same browser wait for the batch, at most 2 s. It holds no user data and no secret, and its path is the site. A client without cookies and every other user read within the window.
+
+**The bound.** In B5 `edit` and `create-spread` at 16 users on `zoe-native-qi`, the delay of a key (section 11) is at most 1 s at p95 and 5 s for every key, and the queue is empty at most 10 s after the last save.
 
 ### 7. plone.protect
 
-- A key is no object. The automatic CSRF protection of plone.protect checks the objects that the connections registered (`plone/protect/auto.py:215-237`), so it does not see the keys (ADR 0043). It sees the save as today, because the save writes the content object.
-- A `GET` whose only write is a queued operation passes the check. Such an operation can only make the catalog equal to the object as it is: it changes no content. A reindex of all indexes calls `notifyModified()`, which writes the object, so plone.protect sees it.
-- The indexer runs outside a request, so plone.protect does not apply to it.
+A `GET` whose only write is a key passes the CSRF check: an operation only makes the catalog equal to the object. A reindex of all indexes calls `notifyModified()`, which writes the object, so the check sees it. The indexer runs outside a request.
 
 ### 8. A site without namespaces
 
-A site whose storage has no KV namespaces (a ZEO server, a FileStorage, RelStorage, or a `zoe.zeo.ClientStorage` whose server did not accept `kv`) keeps the stock behaviour: the processor calls the stock processor for each operation, and logs one WARN event for each process and storage. The thread skips such a site. So the option on a ZEO site changes nothing, and refuses nothing.
+A storage without KV namespaces keeps the stock processor, and the thread skips its site. The option on a ZEO site changes nothing and refuses nothing.
 
 ### 9. Test layers on a DemoStorage
 
-- On a `DemoStorage` whose chain of bases ends at a ZOE storage, the keys go to the overlay of `zoe.kv`, and the indexer reads them there. No thread runs (section 4), so a test runs the indexer itself.
-- The acceptance test (`python/zoedb/src/zoe/plone/tests/test_queued_indexing.py`) keeps its helpers as the planner wrote them: `switch_on(test)` calls `install()`, and `uninstall()` at the end of the test; `drain(portal)` calls `Indexer(portal).run()`, then `transaction.begin()`; `crash_after_first_batch(portal, batch_size)` gives `Indexer` the keyword `batch_size` and raises a `BaseException` from `after_batch`. A second `Indexer` runs at once, because `run()` takes no lease.
-- Plone's own suites run without the option: they search the catalog right after a change, in the same transaction. `just plone zoe backends` keeps `ZOE_PLONE_BACKENDS=locking`; the tests of this backend install it themselves.
-- On a `DemoStorage` over a storage without namespaces, the processor falls back to the stock processor (section 8).
+On a `DemoStorage` over a ZOE storage, the keys go to the overlay of `zoe.kv`. No thread runs in a test layer, so a test calls `Indexer(portal).run()`; a crash test raises a `BaseException` from `after_batch`. Plone's own suites search the catalog in the transaction of a change, so they run without the option: `just plone zoe backends` keeps `ZOE_PLONE_BACKENDS=locking`.
 
 ### 10. The way back, copies and undo
 
-- **Off.** Run the indexer until the queue of each site is empty: the thread does it, or `bin/instance run` with a script that calls `Indexer(site).run()`. Then remove the option from every instance and restart them. An instance without the option runs no indexer, so a key left in the queue stays out of its catalog.
-- **A lost queue.** A copy through the ZODB iterator (`zodbconvert`, `copyTransactionsFrom`) and `zoe convert` to a `Data.fs` leave the durable rows out (ADR 0043), so the catalog of the copy misses the keys of the queue. Empty the queue before such a copy, or rebuild the catalog of the copy (`clearFindAndRebuild`). `zoe backup` and `zoe restore` keep the queue.
-- **Undo.** The undo of a save gives back the objects of the save, but not the catalog writes: the indexer made them in another transaction, and an undo gives back no key. Reindex the objects after an undo. With the stock catalog, the undo of a save also undoes its catalog writes.
+To switch off, empty each queue, then remove the option from every instance. An instance without the option runs no indexer, so a key left in the queue stays out of its catalog. The specification gives the rules of copies and undo.
 
 ### 11. The status
 
-`@@zoe-indexing` on a site, for the permission `Manage portal`, gives JSON: the number of keys in the queue, the age of the oldest key in seconds, the number of failed keys, whether a thread holds the lease, and the delays of the keys that the indexers of this process applied (their count, p50, p95 and maximum, in seconds). The delay of a key runs from the time in the key to the commit of its batch. The B5 harness reads the view: it waits for an empty queue before it stops the instances for the verification, and it records the delays.
+`@@zoe-indexing` gives the state of the queue as JSON. The delay of a key runs from the time in the key to the commit of its batch. The B5 harness waits on it for an empty queue and records the delays.
 
 ## Consequences
 
-- With the option, a save writes no object of the catalog. Two saves of different objects no longer conflict on the catalog. What is left in a save: the content object, its versions in CMFEditions, the container of a creation or a delete, the intid and relation catalogs, and the keys. Step 4 of the card measures what conflicts on them.
-- The catalog work moves from the commit of each request to one indexer for each site. Its cost stays the same; the save commits fewer records (85 of the 111 objects of the edit of the spike are catalog objects), and so fewer scattered pages of redb (`docs/findings/plone-end-to-end.md`, item 28).
-- The indexer of each site applies its batches one after the other, in one thread of one process. Its transactions conflict only with direct writers of the catalog (section 5).
-- An indexer that raises, from an add-on, no longer aborts the save: the error goes to the log and to the failed keys.
-- The catalog of a site lags its content by the window. The same user reads its own saves; other users can read a catalog that is a second or less behind. Searches in the transaction of a save do not see its own operations.
-- Two Plone sites in one Zope root have two queues and two leases.
-- The writes-on-GET report (F32) does not count the keys, which are no records, nor the commits of the indexer, which run outside a request.
-- Step 5 of the card updates lever 4 of section 9, the section of `zoe.plone` and the testing table of the specification.
+- Two saves of different objects do not conflict on the catalog. A save still writes the content object, its versions, the container of a creation or a delete, the intid and relation catalogs, and the keys.
+- The catalog work moves to one indexer for each site, at the same cost. An edit commits 85 fewer records of its 111.
+- An add-on indexer that raises does not abort the save.
+- The catalog lags the content by the window.
+- Two sites in one Zope root have two queues and two leases.
+- The writes-on-GET report (F32) counts neither the keys nor the commits of the indexer.
+- The acceptance tests: `python/zoedb/src/zoe/plone/tests/test_queued_indexing.py` and `test_queued_indexing_mounted.py`.
 
 ## Alternatives
 
-- **More merges in tier 1.** Two saves that add or remove one word change the `Length` of the words of an index and its postings; a merge of one record cannot keep that count exact (ADR 0042).
-- **A queue in the object graph**, an `IOTreeSet` of oids at a known path, as the reindex queue of Loupe (F16). Each save then writes the buckets of the queue, and the indexer deletes from the buckets that the saves insert into: the conflicts move to the queue.
-- **The indexing in an after-commit hook of the request**, in a second transaction of the same thread. Two such transactions of two requests write the catalog as the saves did, and conflict as they did, and the response waits for the second commit.
-- **Keys from a store sequence.** A sequence costs a call to the server for each processing, and a `DemoStorage` has no sequence. The order of the keys does not decide the result (section 3), so the time and a random part suffice.
-- **One key for each transaction**, with all its operations. Fewer keys, but a large move gives one large value, and the card asks for one key for each operation.
-- **The UID as the key of an operation.** The catalog is keyed by path: a move must remove the old path, and an unindex has no object to read a UID from after a delete.
-- **A synchronous mode for the searches of a save**: a search after a change processes the queue into the catalog, as today. The spike finds such a search in every creation and every transition (`reindexObjectSecurity`), so it would bring the catalog writes back to most saves.
-- **An indexer in a process of its own**, outside Zope. It needs a deployment of its own and the eggs of the site; a thread of each instance with a lease needs neither.
-- **Solr or another search engine** (`collective.solr`). Out of the scope of the card.
-- **The catalog projection of phase 10**: delta records instead of buckets. It needs the mirror of phase 6 first.
-
-## Questions for the human
-
-Each question gives Claude's recommendation first.
-
-1. **Where the indexer runs.** Recommended: a daemon thread in each Zope process with the backend, and one indexer for each site through the lease (section 4). Other choices: a process of its own (`bin/instance run` in a loop), or the request thread after its commit.
-2. **The next request of the same user.** Recommended: the cookie and a wait of at most 2 s at `PubStart` (section 6). Other choices: no wait, and the window shows to everyone; or a wait in every request of a logged-in user.
-3. **A site without namespaces.** Recommended: the stock behaviour, with one WARN event (section 8). Other choice: `install()` or the first operation raises.
-4. **Searches in the transaction of a save.** Recommended: they read the catalog before the save (section 5). Other choice: a search after a change writes the catalog, as today; the spike shows that this brings the catalog writes back to creations and transitions.
-5. **A failed operation.** Recommended: 5 tries, then the failed namespace and an ERROR event (section 3). Other choices: retry it forever, or drop it after the first failure.
-6. **The bound of the acceptance in B5.** Recommended: the bound of section 6, on `zoe-native-qi`: a delay of at most 1 s at p95 and 5 s for every key, and an empty queue 10 s after the last save. Other choice: a bound from the numbers of step 4.
-7. **The constants.** Recommended: a batch of 100 keys, a scan of the queues every 0.2 s, a lease of 30 s and a wait of 2 s, as constants of the module, measured in step 4. Other choice: keys of `<environment>` in `zope.conf`.
-8. **Undo.** Recommended: the operator reindexes the objects after an undo (section 10). Other choice: `zoe.plone` queues an operation for each catalogued object of the undone transaction.
-9. **The status view** `@@zoe-indexing` (section 11), which the B5 harness needs to wait for the queue and to record the delays. Recommended: build it. Other choice: the harness reads the log of the instances.
-10. **The helpers of the acceptance test.** Recommended: keep them as the planner wrote them; the names of this ADR fit them (section 9).
-11. **The window and security.** Recommended: the indexer expands each security reindex to the subtree that its own snapshot of the catalog holds (step 5), and frees a UID that the UID index holds at a stale path (step 7). The build adds a test for each: a document added to a folder, then the folder made private before the indexer runs; two moves of one document whose keys come in the reverse order. Other choice: `zoe.plone` replaces `reindexObjectSecurity` with one operation for the subtree, which changes a method of CMFCore.
-12. **The sites of a mounted database under a root without namespaces** (the checkpoint of ZOE-220; the human approved the recommendation). Recommended: each thread searches the sites of its own database, the thread of a mounted database at its own mount points (section 4). The search reads one level below each mount point, as today, and each thread reads only the mount points of its database, so the work of the search does not grow with the number of databases. Other choices: each thread searches the whole Zope root and every mount point, and keeps the sites of its database; one thread searches for all (the thread of the root database, else the first thread that starts); or section 4 states the limit, and a mounted site then waits for a save in the process. The acceptance test of ZOE-220 needs the search: a site in a mounted ZOE store, under a root on a FileStorage, gets its queue applied after a restart, with no save in the process.
+- **More merges in tier 1.** No exact word count (ADR 0042).
+- **A queue in the object graph** (an `IOTreeSet` of oids). The conflicts move to the queue.
+- **Index in an after-commit hook.** Same conflicts, and the response waits.
+- **Keys from a store sequence.** A server call for each processing; no sequence on a `DemoStorage`.
+- **One key for each transaction.** A large move gives one large value.
+- **The UID as the key.** The catalog is keyed by path; a delete leaves no object.
+- **A synchronous mode for searches in a save.** Most saves search, so they write the catalog again.
+- **An indexer in its own process.** Its own deployment and the eggs of the site.
+- **No wait for the user who saved.** That user sees the window.
+- **A wait in every request of a logged-in user.** Requests that saved nothing pay it.
+- **Raise on a site without namespaces.** The option then stops a ZEO site.
+- **Retry a failed operation forever.** It stays in each batch.
+- **Drop an operation after one failure.** A passing error loses a change.
+- **A bound set from the measured numbers.** It accepts any result.
+- **The constants as keys of `zope.conf`.** Four more public keys.
+- **Queue the objects of an undone transaction.** Code for a rare act that a reindex covers.
+- **No status view.** The log gives no queue size to wait on.
+- **One operation for a security subtree in `reindexObjectSecurity`.** It changes CMFCore.
+- **Each thread searches every mount point.** The work grows with the databases.
+- **One thread searches every database.** Each mounted site depends on it.
+- **No search by the thread of a mounted database.** A restart leaves its keys until a save.
+- **Solr or another search engine.** Another service.
+- **The catalog projection of phase 10.** It needs the mirror of phase 6.

@@ -19,8 +19,12 @@ import time
 import urllib.parse
 
 import pytest
+from support import TIMEOUT, ZERO, record
+from support import commit_one as commit
 
 import zoe
+
+pytestmark = pytest.mark.usefixtures("no_zoe_environment")
 
 # The keys of the stanza: the keys of the example in the specification,
 # read-only, as in <filestorage> and <zeoclient>, and compression, as the
@@ -50,20 +54,8 @@ SCHEMA = """
   <section type="ZODB.storage" name="*" attribute="storage"/>
 </schema>
 """
-# The tid and the serial of an object that has no record yet.
-ZERO = bytes(8)
 # The largest tid. loadBefore(oid, MAX_TID) loads the current record.
 MAX_TID = (2**63 - 1).to_bytes(8, "big")
-# The longest time that a test waits for another thread.
-TIMEOUT = 30
-
-
-@pytest.fixture(autouse=True)
-def no_zoe_environment(monkeypatch):
-    """Remove each ZOE_* variable, so that only the test sets them."""
-    for name in list(os.environ):
-        if name.startswith("ZOE_"):
-            monkeypatch.delenv(name)
 
 
 def twin(key):
@@ -103,27 +95,6 @@ def closing(storage):
         yield storage
     finally:
         storage.close()
-
-
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def commit(storage, oid, serial, data):
-    """Store one record in one transaction. Return the tid."""
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        return storage.tpc_finish(txn)
-    except Exception:
-        storage.tpc_abort(txn)
-        raise
 
 
 def commit_blob(storage, data):

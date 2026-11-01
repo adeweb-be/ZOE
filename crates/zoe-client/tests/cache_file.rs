@@ -1,8 +1,11 @@
 //! Tests of the cache file (ADR 0034, stage 2): `Cache::open`, the close,
 //! the checks of the open, and the verification at the open of a pool.
 //!
-//! The files go to the temporary directory of cargo in the target
-//! directory. The pool tests run `zoe serve` in the test process.
+//! The cache files go to the temporary directory of cargo in the target
+//! directory. The pool tests run `zoe serve` in the test process, on stores
+//! in the temporary directory of the system (`common::start`).
+
+mod common;
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -12,9 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use common::{commit_other, start};
 use zoe_client::{Cache, Client, Connect, Error, FileCheck, Open, Pool, Reconnect, Tokio};
 use zoe_core::{Oid, Tid};
-use zoe_server::serve::{ServeOptions, Server};
+use zoe_server::serve::Server;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const SIZE: u64 = 64 * 1024;
@@ -339,18 +343,6 @@ fn a_verification_without_the_commits_moves_applied_down_too() {
 
 // The verification at the open of a pool.
 
-fn start(name: &str) -> Server {
-    Server::start(ServeOptions::new(dir(name).join("store"))).unwrap()
-}
-
-/// Commit `data` for `oid` through `client`.
-async fn commit(client: &Client, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = client.begin(b"", b"", b"").await.unwrap();
-    txn.store(oid, serial, data).await.unwrap();
-    txn.vote().await.unwrap();
-    txn.finish().await.unwrap()
-}
-
 /// Open a pool on `server` with the cache file `path`, and wait until the
 /// cache serves.
 async fn open_pool(server: &Server, path: &Path) -> Pool {
@@ -381,7 +373,7 @@ async fn a_pool_verifies_its_file_at_the_open() {
     let oids = other.new_oids(3).await.unwrap();
     let mut serials = Vec::new();
     for (i, oid) in oids.iter().enumerate() {
-        serials.push(commit(&other, *oid, Tid(0), &data(i as u64)).await);
+        serials.push(commit_other(&other, *oid, Tid(0), &data(i as u64)).await);
     }
     load_all(open_pool(&server, &path).await, &oids).await;
 
@@ -396,7 +388,7 @@ async fn a_pool_verifies_its_file_at_the_open() {
     pool.disconnect();
 
     // A commit while the pool was closed drops its oid only.
-    let tid = commit(&other, oids[0], serials[0], b"new").await;
+    let tid = commit_other(&other, oids[0], serials[0], b"new").await;
     let pool = open_pool(&server, &path).await;
     assert_eq!(pool.take_file_check(), Some(FileCheck::Quick));
     let cache = pool.cache().unwrap().clone();
@@ -414,7 +406,7 @@ async fn a_pool_drops_a_file_ahead_of_its_server() {
     let path = dir(&format!("{name}-var")).join("c-1.zoec");
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oid = other.new_oids(1).await.unwrap()[0];
-    let tid = commit(&other, oid, Tid(0), b"one").await;
+    let tid = commit_other(&other, oid, Tid(0), b"one").await;
     load_all(open_pool(&server, &path).await, &[oid]).await;
 
     // The file claims commits that the server does not have.
@@ -441,9 +433,9 @@ async fn a_pool_drops_a_file_whose_last_transaction_the_server_does_not_hold() {
     let path = dir(&format!("{name}-var")).join("c-1.zoec");
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oids = other.new_oids(2).await.unwrap();
-    let first = commit(&other, oids[0], Tid(0), b"zero").await;
+    let first = commit_other(&other, oids[0], Tid(0), b"zero").await;
     load_all(open_pool(&server, &path).await, &oids[..1]).await;
-    let last = commit(&other, oids[1], Tid(0), b"one").await;
+    let last = commit_other(&other, oids[1], Tid(0), b"one").await;
     assert!(other.holds_transaction(first).await.unwrap());
     assert!(!other.holds_transaction(Tid(first.0 + 1)).await.unwrap());
 
@@ -488,10 +480,10 @@ async fn a_pool_without_a_server_at_the_open_verifies_its_file_at_its_first_conn
     let path = dir(&format!("{name}-var")).join("c-1.zoec");
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oids = other.new_oids(2).await.unwrap();
-    let first = commit(&other, oids[0], Tid(0), b"zero").await;
-    commit(&other, oids[1], Tid(0), b"one").await;
+    let first = commit_other(&other, oids[0], Tid(0), b"zero").await;
+    commit_other(&other, oids[1], Tid(0), b"one").await;
     load_all(open_pool(&server, &path).await, &oids).await;
-    let tid = commit(&other, oids[0], first, b"new").await;
+    let tid = commit_other(&other, oids[0], first, b"new").await;
 
     let gate = Arc::new(AtomicBool::new(false));
     let reconnect = Reconnect::new(
@@ -611,10 +603,10 @@ async fn a_failed_mark_ends_the_wait_of_ready_at_once() {
     let path = dir(&format!("{name}-var")).join("c-1.zoec");
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oid = other.new_oids(1).await.unwrap()[0];
-    let first = commit(&other, oid, Tid(0), b"one").await;
+    let first = commit_other(&other, oid, Tid(0), b"one").await;
     load_all(open_pool(&server, &path).await, &[oid]).await;
     // A commit while the pool is closed: the verification writes.
-    commit(&other, oid, first, b"two").await;
+    commit_other(&other, oid, first, b"two").await;
 
     let addr = server.addr();
     let listener = Client::connect(addr, "1").await.unwrap();

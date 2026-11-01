@@ -20,18 +20,20 @@ serve = [
     "dep:rmpv",
     "dep:toml",
     "dep:zoe-mcp",
+    "dep:zoe-pickle",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:opentelemetry",
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
     "dep:tracing-opentelemetry",
+    "dep:zoe-wire",
 ]
 # The module `fuzz`: the entry of the fuzz targets in `fuzz/`.
 fuzz = ["serve"]
 # The deterministic simulator `zoe_server::sim`. Only the dev-dependency
 # below turns it on, so only test builds have it.
-sim = ["serve", "dep:redb", "dep:zoe-client", "dep:zoe-pickle"]
+sim = ["serve", "dep:redb", "dep:zoe-client"]
 
 [[bin]]
 name = "zoe"
@@ -62,6 +64,7 @@ tracing-opentelemetry = { workspace = true, optional = true }
 zoe-client = { workspace = true, optional = true }
 zoe-mcp = { workspace = true, optional = true }
 zoe-pickle = { workspace = true, optional = true }
+zoe-wire = { workspace = true, optional = true }
 
 [dev-dependencies]
 rmpv.workspace = true
@@ -69,6 +72,8 @@ serde_json.workspace = true
 # This crate with the simulator. Cargo builds dev-dependencies only for
 # tests, examples and benchmarks.
 zoe-server = { workspace = true, features = ["sim"] }
+# The core with the test hooks that damage a store on purpose.
+zoe-core = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

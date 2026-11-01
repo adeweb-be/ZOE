@@ -24,7 +24,6 @@ place of the quick set.
 
 import collections
 import contextlib
-import json
 import os
 import pathlib
 import subprocess
@@ -57,17 +56,6 @@ SLACK = 64 * 1024
 # machine with room to spare.
 LARGEST = 50 * 10**9
 POPEN = subprocess.Popen
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text())
-
-
-@pytest.fixture
-def tiny(monkeypatch):
-    """Make the quick set of the harness the tiny profile."""
-    monkeypatch.setattr(shootout, "QUICK", TINY)
 
 
 def disk_use(root):

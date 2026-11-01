@@ -2,29 +2,29 @@
 //! written oids, shared locks for read-current oids, a wait queue per oid
 //! in arrival order, and a lock-wait timeout that becomes a conflict.
 
-use std::path::PathBuf;
+mod support;
+
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use support::fresh_dir;
+use zoe_core::testing::TempDir;
 use zoe_core::{Oid, Options, Store, Tid, ZoeError};
 
 const PICKLE: &[u8] =
     b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datag\x01s.";
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-locks-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn open(name: &str, lock_timeout: Duration) -> Store {
+/// Open a store in a new directory. Return the directory and the store:
+/// the store drops first, then the directory goes.
+fn open(name: &str, lock_timeout: Duration) -> (TempDir, Store) {
     let options = Options {
         lock_timeout,
         ..Options::default()
     };
-    Store::open_with(fresh_dir(name), options).unwrap()
+    let dir = fresh_dir(name);
+    let store = Store::open_with(&dir, options).unwrap();
+    (dir, store)
 }
 
 /// Commit `oids` as new objects and return the tid of the commit.
@@ -43,7 +43,7 @@ fn new_oids(store: &Store, n: usize) -> Vec<Oid> {
 
 #[test]
 fn votes_on_disjoint_oids_do_not_wait() {
-    let store = open("disjoint", Duration::from_secs(10));
+    let (_dir, store) = open("disjoint", Duration::from_secs(10));
     let oids = new_oids(&store, 2);
     let serial = create(&store, &oids);
 
@@ -63,7 +63,7 @@ fn votes_on_disjoint_oids_do_not_wait() {
 
 #[test]
 fn a_waiter_gets_the_lock_when_the_holder_aborts() {
-    let store = open("abort", Duration::from_secs(10));
+    let (_dir, store) = open("abort", Duration::from_secs(10));
     let oids = new_oids(&store, 1);
     let serial = create(&store, &oids);
 
@@ -89,7 +89,7 @@ fn a_waiter_gets_the_lock_when_the_holder_aborts() {
 
 #[test]
 fn a_waiter_sees_the_conflict_as_soon_as_the_holder_finishes() {
-    let store = open("finish", Duration::from_secs(10));
+    let (_dir, store) = open("finish", Duration::from_secs(10));
     let oids = new_oids(&store, 1);
     let serial = create(&store, &oids);
 
@@ -116,7 +116,7 @@ fn a_waiter_sees_the_conflict_as_soon_as_the_holder_finishes() {
 
 #[test]
 fn waiters_get_the_lock_in_arrival_order() {
-    let store = open("order", Duration::from_secs(10));
+    let (_dir, store) = open("order", Duration::from_secs(10));
     let oids = new_oids(&store, 1);
     let serial = create(&store, &oids);
 
@@ -152,7 +152,7 @@ fn waiters_get_the_lock_in_arrival_order() {
 #[test]
 fn a_wait_past_the_timeout_is_a_conflict() {
     let timeout = Duration::from_millis(300);
-    let store = open("timeout", timeout);
+    let (_dir, store) = open("timeout", timeout);
     let oids = new_oids(&store, 1);
     let serial = create(&store, &oids);
 
@@ -183,7 +183,7 @@ fn a_wait_past_the_timeout_is_a_conflict() {
 
 #[test]
 fn read_current_oids_share_their_lock() {
-    let store = open("shared", Duration::from_secs(10));
+    let (_dir, store) = open("shared", Duration::from_secs(10));
     let oids = new_oids(&store, 3);
     let serial = create(&store, &oids);
 
@@ -224,7 +224,7 @@ fn read_current_oids_share_their_lock() {
 
 #[test]
 fn a_stale_read_current_serial_is_a_read_conflict() {
-    let store = open("read-conflict", Duration::from_secs(10));
+    let (_dir, store) = open("read-conflict", Duration::from_secs(10));
     let oids = new_oids(&store, 2);
     let old = create(&store, &oids);
 

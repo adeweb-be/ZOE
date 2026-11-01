@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 
 use zoe_core::{Compression, Oid, Options, Store, Tid};
 
-mod wire;
+mod common;
 
-use wire::{Server, ZOE, fresh_dir, load, s, spawn_lock};
+use common::{Server, ZOE, fresh_dir, load, s, spawn_lock};
 
 fn env_mb(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -155,7 +155,7 @@ fn a_large_store_starts_fast_and_serves_in_bounded_memory() {
         .map(|c| {
             let addr = server.addr;
             thread::spawn(move || {
-                let mut conn = wire::Conn::open(addr);
+                let mut conn = common::Conn::open(addr);
                 conn.register("1", false).unwrap();
                 let mut x = c * 7919 + 1;
                 for _ in 0..(objects / 4).max(500) {

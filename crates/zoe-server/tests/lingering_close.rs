@@ -19,9 +19,9 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, MAX, Server, Value, begin, bytes_of, commit, fresh_dir, load, new_oids, p64, record, s,
     u64_of,
 };
@@ -88,7 +88,7 @@ fn a_stop_never_resets_a_connection_that_sent_bytes_after_it() {
     std::thread::sleep(Duration::from_millis(500));
 
     let sent = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         Command::new("kill")
             .args(["-TERM", &server.pid().to_string()])
             .status()

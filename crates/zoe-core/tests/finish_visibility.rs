@@ -5,8 +5,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use zoe_core::testing::commit_txn;
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Store, Tid};
+use zoe_core::{Oid, Store, Tid, Txn};
 
 /// The objects that each transaction updates.
 const UPDATED: usize = 50;
@@ -22,9 +23,9 @@ fn pickle(oid: Oid, version: usize) -> Vec<u8> {
     format!("object {} version {version}", oid.0).into_bytes()
 }
 
-/// Commit one transaction that writes `updated` at their serial `serial`
-/// and `ADDED` new objects. Return the tid.
-fn commit(store: &Store, updated: &[Oid], serial: Tid, version: usize) -> Tid {
+/// Begin a transaction that writes `updated` at their serial `serial` and
+/// `ADDED` new objects.
+fn writing<'s>(store: &'s Store, updated: &[Oid], serial: Tid, version: usize) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     for &oid in updated {
         txn.store(oid, serial, &pickle(oid, version)).unwrap();
@@ -33,15 +34,14 @@ fn commit(store: &Store, updated: &[Oid], serial: Tid, version: usize) -> Tid {
         let oid = store.new_oid().unwrap();
         txn.store(oid, Tid::ZERO, &pickle(oid, version)).unwrap();
     }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
+    txn
 }
 
 #[test]
 fn a_reader_during_commits_sees_none_or_all_of_each_transaction() {
     let store = Store::open_vfs(MemVfs::new()).unwrap();
     let updated: Vec<Oid> = (0..UPDATED).map(|_| store.new_oid().unwrap()).collect();
-    let first = commit(&store, &[], Tid::ZERO, 0);
+    let first = commit_txn(writing(&store, &[], Tid::ZERO, 0));
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     for &oid in &updated {
         txn.store(oid, Tid::ZERO, &pickle(oid, 0)).unwrap();
@@ -55,7 +55,7 @@ fn a_reader_during_commits_sees_none_or_all_of_each_transaction() {
         scope.spawn(|| {
             let mut serial = created;
             for version in 1..=TXNS {
-                serial = commit(&store, &updated, serial, version);
+                serial = commit_txn(writing(&store, &updated, serial, version));
             }
             done.store(true, Ordering::SeqCst);
         });

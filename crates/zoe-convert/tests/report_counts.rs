@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use zoe_convert::{ProblemKind, from_datafs, to_datafs};
 use zoe_core::{Oid, Store, Tid};
 
+mod support;
+use support::fresh_dir;
+
 /// The class pickle of `ZODB.blob.Blob`, then the state `None`.
 const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
@@ -33,13 +36,6 @@ fn record(value: &[u8]) -> Vec<u8> {
     pickle.extend_from_slice(value);
     pickle.extend_from_slice(b"q\x02s.");
     pickle
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-report-counts-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// Remove each blob file under `dir`. Return how many it removed.

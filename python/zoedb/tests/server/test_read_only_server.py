@@ -11,41 +11,20 @@ with `read_only_fallback` registers again as read-only. `tpc_begin`,
 
 import hashlib
 import os
-import pickle
 
 import pytest
+from support import ZERO, client, commit, record
 
 import zoe
 from zoe.testing import ZoeServer
 
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-def record(value):
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
-
-
-def client(server, name="1", **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage=name, **kw)
-
 
 def make_store(path):
     """Write one object in-process. Return its oid and serial."""
-    from ZODB.Connection import TransactionMetaData
-
     storage = zoe.Storage(str(path))
     try:
         oid = storage.new_oid()
-        txn = TransactionMetaData()
-        storage.tpc_begin(txn)
-        storage.store(oid, ZERO, record("kept"), "", txn)
-        storage.tpc_vote(txn)
-        tid = storage.tpc_finish(txn)
+        tid = commit(storage, [(oid, ZERO, record("kept"))])
     finally:
         storage.close()
     return oid, tid

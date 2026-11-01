@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, MAX, Server, Value, begin, bytes_of, commit, fresh_dir, load, new_oids, p64, record, s,
     u64_of,
 };
@@ -119,7 +119,7 @@ fn a_stop_closes_only_when_the_send_queue_is_empty() {
     std::thread::sleep(Duration::from_millis(500));
 
     let sent = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         Command::new("kill")
             .args(["-TERM", &server.pid().to_string()])
             .status()

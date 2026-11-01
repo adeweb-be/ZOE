@@ -13,7 +13,7 @@
 //! the store holds one transaction and a slice of tids at a time, whatever
 //! the size of the store.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,11 @@ use std::path::{Path, PathBuf};
 use zoe_core::{Oid, Store, Tid, ZoeError};
 
 use crate::blobs::{BlobDir, LAYOUT_FILE, Layout};
-use crate::datafs::{BLOB_SAMPLE_STRIDE, Problems, check_blob, compare_txn, stop_problem};
-use crate::filestorage::{DataRecord, Reader, TxnHeader, hex};
+use crate::compare::{BLOB_SAMPLE_STRIDE, TxnJoin, TxnPair, check_blob, compare_txn, stop_problem};
+use crate::filestorage::Reader;
+use crate::fsutil::{CHUNK, create_dirs, exists, io_error, parent, sibling, sync_dir, try_lock};
+use crate::report::Problems;
+use crate::walk::each_durable_row;
 use crate::writer::{Writer, tail};
 use crate::{Error, ProblemKind, Report};
 
@@ -37,9 +40,6 @@ const BLOB_TEMP_DIR: &str = "tmp";
 
 /// The layout that the converter writes.
 const BUSHY: &[u8] = b"bushy";
-
-/// The size of the buffer of a blob copy.
-const CHUNK: usize = 1 << 16;
 
 /// Convert the store `source` into the FileStorage file `data_fs` and the
 /// blob directory `blob_dir`, then verify the file against the store.
@@ -96,17 +96,12 @@ pub fn to_datafs(source: &Store, data_fs: &Path, blob_dir: &Path) -> Result<Repo
 /// Return the keys of the durable namespaces of `source`, without the
 /// generation rows.
 fn durable_keys(source: &Store) -> Result<u64, Error> {
-    const CHUNK: usize = 1024;
     let mut keys = 0;
-    let mut after: Option<Vec<u8>> = None;
-    loop {
-        let (rows, next) = source.kv_durable_rows(after.as_deref(), CHUNK)?;
-        keys += rows.iter().filter(|row| !row.key.is_empty()).count() as u64;
-        if rows.len() < CHUNK {
-            return Ok(keys);
-        }
-        after = next;
-    }
+    each_durable_row(source, |row| {
+        keys += u64::from(!row.key.is_empty());
+        Ok(())
+    })?;
+    Ok(keys)
 }
 
 /// Do the conversion of `to_datafs` through the temporary file `temp`.
@@ -195,13 +190,7 @@ fn lock(path: &Path) -> Result<File, Error> {
         .truncate(false)
         .open(path)
         .map_err(|source| io_error(path, source))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(Error::Locked {
-            path: path.to_owned(),
-        }),
-        Err(TryLockError::Error(source)) => Err(io_error(path, source)),
-    }
+    try_lock(file, path)
 }
 
 /// Copy the file `from` to `to`. The copy must have `len` bytes.
@@ -351,11 +340,25 @@ fn verify(
     let mut unread = Problems::default();
     let mut differences = Problems::default();
     let mut reader = Reader::open(path)?;
-    let mut next = read_txn(&mut reader)?;
-    for txn in store.iterator(None, Some(last))? {
-        let txn = match txn {
-            Ok(txn) => txn,
-            Err(error) => {
+    let mut join = TxnJoin::new(&mut reader, store.iterator(None, Some(last))?);
+    while let Some(pair) = join.next()? {
+        let txn = match pair {
+            TxnPair::Both((header, records), txn) => {
+                compare_txn(&header, &records, &txn, &mut differences);
+                txn
+            }
+            TxnPair::FileOnly((header, _)) => {
+                differences.add(ProblemKind::MissingTransaction, not_in_store(header.tid));
+                continue;
+            }
+            TxnPair::StoreOnly(Ok(txn)) => {
+                differences.add(
+                    ProblemKind::MissingTransaction,
+                    format!("the Data.fs lacks transaction {}", txn.tid.hex()),
+                );
+                txn
+            }
+            TxnPair::StoreOnly(Err(error)) => {
                 differences.add(
                     ProblemKind::UnreadableStore,
                     format!("the store does not read: {error}"),
@@ -367,26 +370,9 @@ fn verify(
         report.records += txn.records.len() as u64;
         report.last_tid = txn.tid;
 
-        while let Some((header, _)) = &next
-            && header.tid < txn.tid
-        {
-            differences.add(ProblemKind::MissingTransaction, not_in_store(header.tid));
-            next = read_txn(&mut reader)?;
-        }
-        match &next {
-            Some((header, records)) if header.tid == txn.tid => {
-                compare_txn(header, records, &txn, &mut differences);
-                next = read_txn(&mut reader)?;
-            }
-            _ => differences.add(
-                ProblemKind::MissingTransaction,
-                format!("the Data.fs lacks transaction {}", hex(txn.tid.0)),
-            ),
-        }
-
         for record in txn.records.iter().filter(|record| record.data.is_some()) {
             let (oid, tid) = (record.oid, txn.tid);
-            let at = format!("oid {} at {}", hex(oid.0), hex(tid.0));
+            let at = format!("oid {} at {}", oid.hex(), tid.hex());
             match store.blob_path(oid, tid) {
                 Ok(_) => {}
                 Err(ZoeError::NotFound { .. }) => continue,
@@ -426,10 +412,6 @@ fn verify(
             }
         }
     }
-    while let Some((header, _)) = next {
-        differences.add(ProblemKind::MissingTransaction, not_in_store(header.tid));
-        next = read_txn(&mut reader)?;
-    }
     if let Some(problem) = reader.end().and_then(stop_problem) {
         differences.add_summary(ProblemKind::Stopped, problem);
     }
@@ -437,74 +419,11 @@ fn verify(
     Ok((report, differences.finish()))
 }
 
-/// Read the next transaction of `reader` with its records.
-fn read_txn(reader: &mut Reader) -> Result<Option<(TxnHeader, Vec<DataRecord>)>, Error> {
-    let Some(header) = reader.next_txn()? else {
-        return Ok(None);
-    };
-    let records = reader.records(&header).collect::<Result<_, _>>()?;
-    Ok(Some((header, records)))
-}
-
 fn not_in_store(tid: Tid) -> String {
     format!(
         "the Data.fs has transaction {}, which the store does not have",
-        hex(tid.0)
+        tid.hex()
     )
-}
-
-/// Create the directory `path` and its missing parents. Sync the parent of
-/// each directory that the call creates, so that its entry is durable.
-fn create_dirs(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            create_dirs(parent(path))?;
-            match fs::create_dir(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-        Err(error) => return Err(error),
-    }
-    File::open(parent(path))?.sync_all()
-}
-
-/// Sync the directory `path`, so that its entries are durable.
-fn sync_dir(path: &Path) -> Result<(), Error> {
-    File::open(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|source| io_error(path, source))
-}
-
-/// Return the directory of `path`. A bare name is in the current directory.
-fn parent(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    }
-}
-
-/// Return the path of `path` with `suffix` after its file name.
-fn sibling(path: &Path, suffix: &str) -> Result<PathBuf, Error> {
-    let Some(name) = path.file_name() else {
-        let error = io::Error::new(ErrorKind::InvalidInput, "the path has no file name");
-        return Err(io_error(path, error));
-    };
-    let mut name = name.to_owned();
-    name.push(suffix);
-    Ok(path.with_file_name(name))
-}
-
-/// Tell if something exists at `path`.
-fn exists(path: &Path) -> Result<bool, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error(path, error)),
-    }
 }
 
 /// Remove the file at `path`, if it exists.
@@ -516,18 +435,12 @@ fn remove_if_exists(path: &Path) -> Result<(), Error> {
     }
 }
 
-fn io_error(path: &Path, source: io::Error) -> Error {
-    Error::Io {
-        path: path.to_owned(),
-        source,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::compare::read_txn;
     use crate::filestorage::tests::test_dir;
     use crate::from_datafs;
 
@@ -824,7 +737,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&path, b"evil").unwrap();
 
-        let at = format!("oid 0x0000000000000002 at {}", hex(tid.0));
+        let at = format!("oid 0x0000000000000002 at {}", tid.hex());
         // A first run and a run with nothing to add give the same report.
         for copied in [1, 0] {
             let report = convert(&store, &dir).unwrap();
@@ -871,7 +784,7 @@ mod tests {
             panic!("not a mismatch: {error:?}");
         };
         assert_eq!(path, &data_fs);
-        let txn = format!("transaction {}", hex(tid.0));
+        let txn = format!("transaction {}", tid.hex());
         assert_eq!(
             problems,
             &[
@@ -922,7 +835,7 @@ mod tests {
         );
         let difference = format!(
             "transaction {}: the record of oid 0x0000000000000001 differs",
-            hex(t1.0)
+            t1.hex()
         );
         let error = convert(&s2, &dir).unwrap_err();
         assert!(
@@ -959,7 +872,7 @@ mod tests {
         let Error::Mismatch { problems, .. } = &error else {
             panic!("not a mismatch: {error:?}");
         };
-        let at = format!("oid 0x0000000000000001 at {}", hex(tid.0));
+        let at = format!("oid 0x0000000000000001 at {}", tid.hex());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].starts_with(&format!("{at}: the blob directory has no blob file")),

@@ -1,6 +1,6 @@
 [package]
 name = "zoe-convert"
-description = "Converters between Data.fs, RelStorage and ZOE stores."
+description = "Converters between Data.fs and ZOE stores, and the verify, backup and restore of a store."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+# The JSON of the report of `verify`.
+serde_json.workspace = true
 thiserror.workspace = true
 # The hash that names a key of a namespace in a report, never the key.
 xxhash-rust.workspace = true
@@ -20,6 +22,10 @@ zoe-pickle.workspace = true
 # The acceptance test of the batched sync counts the syncs of the database
 # file through a storage backend of redb.
 redb.workspace = true
+# The record builders of `zoe_pickle::testing`.
+zoe-pickle = { workspace = true, features = ["testing"] }
+# The core with the test hooks that damage a store on purpose.
+zoe-core = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

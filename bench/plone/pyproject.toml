@@ -22,12 +22,18 @@ dependencies = [
     "psutil>=7",
     # `report --json` validates its summary against bench/schema.
     "jsonschema>=4",
+    # The server lifecycle and the provenance of every harness.
+    "zoe-bench-common",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1",
 ]
+
+[tool.uv.sources]
+# Editable, so that the package finds the repository from its own path.
+zoe-bench-common = { path = "../common", editable = true }
 
 [tool.uv.build-backend]
 module-name = "plonebench"

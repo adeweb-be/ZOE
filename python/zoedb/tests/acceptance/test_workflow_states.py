@@ -42,13 +42,12 @@ import contextlib
 import threading
 
 import pytest
+from acceptance_support import current_record as record
 from persistent import Persistent
 
 import zoe.testing
 from zoe.testing import ZoeServer
 
-# The largest tid. loadBefore(oid, MAX_TID) loads the current record.
-MAX_TID = (2**63 - 1).to_bytes(8, "big")
 # The longest time that a test waits for the server.
 TIMEOUT = 60
 # The modes: in-process, and through zoe serve with each client.
@@ -176,10 +175,6 @@ def create(db, name, history):
         conn.root()[name] = document
     with db.transaction() as conn:
         return conn.root()[name].workflow_history._p_oid
-
-
-def record(db, oid):
-    return db.storage.loadBefore(oid, MAX_TID)[0]
 
 
 def statuses(db, name):

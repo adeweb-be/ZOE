@@ -8,12 +8,11 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use clap::builder::BoolishValueParser;
-use clap::{ArgAction, ArgGroup, Args};
+use clap::{ArgGroup, Args};
 use zoe_convert::{ClassRecord, Report, records_of_classes};
 use zoe_core::{DurableRow, Options, Store};
 
-use super::{Failure, blob_dir_failure, open_with_blobs, store_failure};
+use super::{Boolish, Failure, blob_dir_failure, open_with_blobs, store_failure};
 
 /// The first bytes of a FileStorage file.
 const MAGIC: &[u8] = b"FS30";
@@ -205,17 +204,7 @@ pub(super) struct ConvertArgs {
     /// With --force, the command converts and writes a warning that names
     /// each registry and each class. With --force=false the command refuses, also when the twin
     /// forces. With --from-data-fs it has no effect.
-    #[arg(
-        long,
-        env = "ZOE_FORCE",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "false",
-        value_parser = BoolishValueParser::new(),
-        action = ArgAction::Set
-    )]
+    #[arg(long, env = "ZOE_FORCE", boolish = false)]
     force: bool,
 }
 
@@ -490,7 +479,7 @@ fn write_report(
     writeln!(out, "  copied        {}", report.copied)?;
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;
-    writeln!(out, "  last tid      {:#018x}", report.last_tid.0)?;
+    writeln!(out, "  last tid      {}", report.last_tid.hex())?;
     if report.durable_keys > 0 {
         writeln!(
             out,

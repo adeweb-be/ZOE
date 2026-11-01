@@ -31,6 +31,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from benchcommon import servers as common
+
 from plonebench import (
     analysis,
     corpus,
@@ -135,12 +137,7 @@ def run_locust(
         except BaseException:
             # An interrupt stops Locust too, so that it sends no load to the
             # next run.
-            process.terminate()
-            try:
-                process.wait(30)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            common.stop(process, 30)
             raise
     return code, started
 

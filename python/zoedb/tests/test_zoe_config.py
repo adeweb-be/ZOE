@@ -16,6 +16,8 @@ import zodburi
 
 from zoe import config
 
+pytestmark = pytest.mark.usefixtures("no_zoe_environment")
+
 SCHEMA = """
 <schema>
   <import package="ZODB"/>
@@ -23,14 +25,6 @@ SCHEMA = """
   <section type="ZODB.storage" name="*" attribute="storage"/>
 </schema>
 """
-
-
-@pytest.fixture(autouse=True)
-def no_zoe_environment(monkeypatch):
-    """Remove each ZOE_* variable, so that only the test sets them."""
-    for name in list(os.environ):
-        if name.startswith("ZOE_"):
-            monkeypatch.delenv(name)
 
 
 def stanza(*lines):

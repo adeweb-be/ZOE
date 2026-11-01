@@ -35,13 +35,12 @@ Plone.
 """
 
 import copy
-import sys
-from collections.abc import MutableMapping
 
 import transaction
-from persistent import Persistent
 from persistent.mapping import PersistentMapping
 from zope.interface import Interface
+
+from zoe.plone._bases import EntryMapping
 
 __all__ = [
     "BATCH",
@@ -74,55 +73,16 @@ class IAppendOnlyHistory(Interface):
     history of the object is a `WorkflowHistory`."""
 
 
-class WorkflowHistory(Persistent, MutableMapping):
+class WorkflowHistory(EntryMapping):
     """A mapping of workflow id to the tuple of its statuses.
 
-    Its state is the mapping itself. `__setstate__` interns the keys, as
-    `Persistent.__setstate__` does, so the record of a client that loads
-    the history and writes it again is the record of the store. A change
-    of an item marks the object as changed.
+    Its state is the mapping itself (`EntryMapping`): each workflow is a
+    field of the record.
     """
-
-    def __init__(self, items=()):
-        self._entries = dict(items)
-
-    def __getstate__(self):
-        return dict(self._entries)
-
-    def __setstate__(self, state):
-        entries = {
-            (sys.intern(key) if type(key) is str else key): value
-            for key, value in state.items()
-        }
-        self.__dict__.clear()
-        self.__dict__["_entries"] = entries
-
-    def __getitem__(self, key):
-        return self._entries[key]
-
-    def __setitem__(self, key, value):
-        self._entries[key] = value
-        self._p_changed = True
-
-    def __delitem__(self, key):
-        del self._entries[key]
-        self._p_changed = True
-
-    def __iter__(self):
-        return iter(self._entries)
-
-    def __len__(self):
-        return len(self._entries)
-
-    def __contains__(self, key):
-        return key in self._entries
 
     def copy(self):
         """Return a new history with the same items."""
         return type(self)(self._entries)
-
-    def __repr__(self):
-        return f"<{type(self).__name__} of {sorted(map(repr, self._entries))}>"
 
 
 def policy():

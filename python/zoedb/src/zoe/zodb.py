@@ -83,6 +83,57 @@ def hot_classes(early_locks, classes):
     return classes
 
 
+class _IntentOwners:
+    """The owners of the early write-intent locks of a storage (ADR 0045).
+
+    The storage has a default owner. A connection names an owner of its own
+    with `new_intent_owner`, and binds it to its thread for its
+    `tpc_begin` with `bind_intent_owner`. A subclass gives `_new_owner()`,
+    which returns a new owner, `_take_intents(owner, oids)` and
+    `_release_intents(owner)`. It calls `_init_intents()` before the first
+    lock, and its `tpc_begin` adopts the locks of `_begin_owner()`.
+    """
+
+    def _init_intents(self):
+        """Make the default owner, and the owner that each thread binds."""
+        self._default_intents = self._new_owner()
+        self._bound_intents = threading.local()
+
+    def new_intent_owner(self):
+        """Return a new owner of early write-intent locks."""
+        return self._new_owner()
+
+    def lock_intent(self, oids, owner=None):
+        """Take the early write-intent lock of each oid of `oids`, in
+        ascending order, and return the current serial of each one.
+
+        Without `owner`, the locks belong to the default owner of the
+        storage, and the next `tpc_begin` adopts them. An oid at or below an
+        oid that the owner holds raises `StorageTransactionError` and takes
+        nothing. A wait past the lock timeout raises `ConflictError`.
+        """
+        return self._take_intents(self._owner(owner), list(oids))
+
+    def unlock_intent(self, owner=None):
+        """Release every early write-intent lock of the owner."""
+        self._release_intents(self._owner(owner))
+
+    def bind_intent_owner(self, owner):
+        """Make `owner` the owner of the intent locks that the next
+        `tpc_begin` of the calling thread adopts, or the default owner again
+        when `owner` is None."""
+        self._bound_intents.owner = owner
+
+    def _owner(self, owner):
+        """Return `owner`, or the default owner when it is None."""
+        return self._default_intents if owner is None else owner
+
+    def _begin_owner(self):
+        """Return the owner whose locks the next `tpc_begin` of the calling
+        thread adopts: the owner that the thread bound, or the default."""
+        return getattr(self._bound_intents, "owner", None) or self._default_intents
+
+
 class _Intents:
     """The intent locks of one connection."""
 

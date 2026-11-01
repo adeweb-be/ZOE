@@ -9,9 +9,9 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-mod wire;
+mod common;
 
-use wire::{Server, Value, fresh_dir, load, record, s};
+use common::{Server, Value, fresh_dir, load, record, s};
 use zoe_core::Tid;
 
 /// The objects that no reader reaches. The pack removes them all, in
@@ -24,7 +24,7 @@ const PER_TXN: usize = 1_000;
 /// Write `GARBAGE` objects that nothing refers to into a new store in
 /// `path`. Return their oids, in ascending order.
 fn write_garbage(path: &Path) -> Vec<u64> {
-    let store = wire::open_store(path);
+    let store = common::open_store(path);
     let mut oids = Vec::with_capacity(GARBAGE);
     for _ in 0..GARBAGE / PER_TXN {
         let mut txn = store.tpc_begin(b"user", b"garbage", b"").unwrap();
@@ -67,7 +67,7 @@ fn sigterm_stops_a_running_pack_between_two_batches() {
 
     // The stores closed cleanly: a read-only open accepts the store.
     {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         zoe_core::Store::open_read_only(&path).unwrap();
     }
 

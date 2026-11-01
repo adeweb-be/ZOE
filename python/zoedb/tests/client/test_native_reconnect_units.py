@@ -69,10 +69,6 @@ def storage(native):
     return result
 
 
-def test_the_wait_of_the_open_is_built():
-    assert "wait" not in zoe.zeo._NOT_BUILT
-
-
 def test_read_only_follows_the_server_of_the_native_client():
     native = Native(read_only=True)
     s = storage(native)

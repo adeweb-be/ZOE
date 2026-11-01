@@ -8,29 +8,11 @@ and the server answers from the transaction log of the store, so the
 answer also holds after a restart of the server.
 """
 
-import time
-
 import pytest
+from support import client, wait_for
 
 import zoe
 from zoe.testing import ZoeServer
-
-TIMEOUT = 30
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", **kw)
-
-
-def wait_for(condition):
-    """Wait until condition() is true. Fail after TIMEOUT."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        assert time.monotonic() < deadline, "timed out"
-        time.sleep(0.01)
 
 
 @pytest.fixture

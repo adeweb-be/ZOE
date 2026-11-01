@@ -19,9 +19,19 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util"] }
 zoe-client.workspace = true
 zoe-core.workspace = true
+# The names of the extensions.
+zoe-wire.workspace = true
 
 [dev-dependencies]
+# The measurements of the core: a storage backend of redb that times the
+# database file, and a subscriber of the span `fsync`.
+redb.workspace = true
+tracing.workspace = true
+# The codec of the record frames, for the measurement of the shrink ratio.
+zoe-core = { workspace = true, features = ["testing"] }
 zoe-server = { workspace = true, features = ["serve"] }
+# The zstd contexts that the measurement of the shrink ratio keeps.
+zstd.workspace = true
 
 [lints]
 workspace = true

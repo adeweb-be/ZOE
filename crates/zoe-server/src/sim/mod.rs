@@ -16,14 +16,16 @@
 //! simulator gives its own runtime.
 //!
 //! The driver is an executor of its own. It polls the tasks and runs the
-//! blocking threads of the server one at a time. A thread gives the baton
-//! back when it waits for a channel or for a lock (through a waiter of the
-//! simulation), when the core syncs the database file, and when it ends.
+//! blocking threads of the server and the fold of the store one at a time.
+//! A thread gives the baton back when it waits for a channel, for a lock or
+//! for the fold (through a waiter of the simulation), when the core syncs
+//! the database file or a file of the write-ahead log, and when it ends.
 //!
 //! Only the dev-dependency of this crate on itself turns the feature `sim`
 //! on, so only test builds have this module.
 
 mod client;
+mod common;
 mod disk;
 mod net;
 mod pool;
@@ -44,7 +46,7 @@ use zoe_core::{Clock, Oid, Options, Store, Tid};
 
 use crate::protocol::{NamedStorage, Pool, Queues, STORAGE_NAME, Storages};
 use client::SimClient;
-use disk::{Cache, DATABASE, SimClock, SimVfs};
+use disk::{Caches, CheckClock, SimClock, SimVfs};
 use pool::SimPoolClient;
 use rng::Rng;
 pub(crate) use world::handed_off;
@@ -96,8 +98,9 @@ pub struct Faults {
     pub ack_before_durable: bool,
     /// A crash is a power loss: the disk keeps the synced writes, a seeded
     /// prefix of the other operations, and a seeded subset of the unsynced
-    /// writes to the database file, some of them torn. When false, a crash
-    /// is a kill of the process, and the disk keeps every write.
+    /// writes to the database file and to the files of the write-ahead log,
+    /// some of them torn. When false, a crash is a kill of the process, and
+    /// the disk keeps every write.
     pub power_loss: bool,
     /// The number of times that the network breaks the listener of a pool
     /// (`Simulation::pool`) in a run. Each time, a finish of that pool has
@@ -139,9 +142,9 @@ pub struct Report {
     pub crashes: usize,
     /// The phase of the commit at each crash, in order: `staged` (the
     /// client stored and did not vote), `locked` (between the vote and
-    /// `tpc_finish`), `finishing` (at the sync of the database file in
-    /// `tpc_finish`) or `acknowledged` (the client got the reply of
-    /// `tpc_finish`).
+    /// `tpc_finish`), `finishing` (at a sync of the database file or of a
+    /// file of the log: in `tpc_finish`, or in a slice of the fold) or
+    /// `acknowledged` (the client got the reply of `tpc_finish`).
     pub crash_phases: Vec<&'static str>,
     /// The findings on the store after the last crash: those of the checks
     /// of `zoe verify`, a blob file without its blob record, and a store
@@ -245,8 +248,8 @@ pub struct Simulation {
     /// The hot oid holds a `BTrees.Length.Length` that each transaction
     /// that writes it increments.
     hot_length: bool,
-    /// A sync of the database file takes simulated time, and other tasks
-    /// and threads run meanwhile.
+    /// A sync of the database file or of a file of the log takes simulated
+    /// time, and other tasks and threads run meanwhile.
     slow_syncs: bool,
     /// The clients are split writers of one tree, with `split_merges` on.
     split_merges: bool,
@@ -327,13 +330,13 @@ impl Simulation {
         self
     }
 
-    /// With `true`, a sync of the database file takes 100 µs to 2 ms of
-    /// simulated time, as the seed chooses, and the driver runs other tasks
-    /// and threads meanwhile. So other votes and finishes run while a
-    /// commit batch syncs, as they do on a disk. A sync that follows a
-    /// change of the length of the file goes on at once: redb grows the
-    /// file under a lock of its own, which a read takes too. Without it,
-    /// the thread that syncs goes on at once.
+    /// With `true`, a sync of the database file or of a file of the log
+    /// takes 100 µs to 2 ms of simulated time, as the seed chooses, and the
+    /// driver runs other tasks and threads meanwhile. So other votes and
+    /// finishes run while a commit batch syncs, as they do on a disk. A
+    /// sync that follows a change of the length of the file goes on at
+    /// once: redb grows the file under a lock of its own, which a read takes
+    /// too. Without it, the thread that syncs goes on at once.
     #[must_use]
     pub fn slow_syncs(mut self, slow_syncs: bool) -> Self {
         self.slow_syncs = slow_syncs;
@@ -383,8 +386,9 @@ struct Driver {
     yields: mpsc::Receiver<(u64, Why)>,
     /// The disk of the current server process.
     disk: MemVfs,
-    /// The cache of the database file of the current server process.
-    cache: Arc<Cache>,
+    /// The caches of the database file and of the files of the log of the
+    /// current server process.
+    caches: Arc<Caches>,
     crashes: usize,
     crash_phases: Vec<&'static str>,
     flush_pending: bool,
@@ -445,7 +449,7 @@ impl Driver {
             batons: BTreeMap::new(),
             yields,
             disk: MemVfs::new(),
-            cache: Arc::default(),
+            caches: Arc::default(),
             crashes: 0,
             crash_phases: Vec::new(),
             flush_pending: false,
@@ -538,8 +542,11 @@ impl Driver {
         let clock = SimClock(Arc::clone(&self.shared));
         let start = clock.now();
         let vfs = SimVfs::new(self.disk.clone());
-        self.cache = Arc::clone(&vfs.cache);
+        self.caches = Arc::clone(&vfs.caches);
         let opened = Store::open_full(vfs, clock, Options::default());
+        // The open started the fold of the store as a thread of the
+        // simulation: the driver takes its baton before the next step.
+        self.adopt();
         let mut state = self.shared.lock();
         match opened {
             Ok(store) => {
@@ -641,7 +648,7 @@ impl Driver {
                 if state.server.up && state.server.generation == generation {
                     state.trace("server syncs late");
                     drop(state);
-                    let _ = self.cache.flush(&self.disk.file(DATABASE));
+                    let _ = self.caches.flush(&self.disk);
                 }
                 return;
             }
@@ -787,8 +794,10 @@ impl Driver {
                 if let Some(thread) = state.threads.get_mut(&id) {
                     thread.wait = Wait::Parked { waiter, deadline };
                     let client = thread.client;
-                    // A finite deadline is a lock wait of the core.
-                    if deadline != Duration::MAX && how != Resume::Killed {
+                    // A finite deadline is a lock wait of the core. A thread
+                    // of the store waits for its work.
+                    let store = thread.name.is_some();
+                    if deadline != Duration::MAX && how != Resume::Killed && !store {
                         let client = client.map_or_else(String::new, |c| format!("c{c} "));
                         let most = deadline.saturating_sub(now).as_millis();
                         state.trace(format!("s {client}waits for a lock, {most} ms at most"));
@@ -808,9 +817,9 @@ impl Driver {
         why
     }
 
-    /// Note a sync of the database file: a commit in the phase
-    /// `finishing`. Return how the thread goes on, or `None` when the
-    /// server crashes now.
+    /// Note a sync of the database file or of a file of the log: a commit
+    /// in the phase `finishing`, or a slice of the fold. Return how the
+    /// thread goes on, or `None` when the server crashes now.
     fn on_sync(&mut self) -> Option<Resume> {
         let mut state = self.shared.lock();
         if state.crash_at(phase::FINISHING) {
@@ -849,9 +858,10 @@ impl Driver {
 
     /// Stop the server process as a crash does. With a power loss, the
     /// disk keeps what was synced, a seeded prefix of the other operations,
-    /// and a seeded subset of the cached writes to the database file, some
-    /// of them torn; with a kill, it keeps every write. Every connection of
-    /// the process breaks, its tasks drop, and its threads end.
+    /// and a seeded subset of the cached writes to the database file and to
+    /// the files of the log, some of them torn; with a kill, it keeps every
+    /// write. Every connection of the process breaks, its tasks drop, its
+    /// store drops, and its threads end.
     fn stop(&mut self, why: &str) {
         let power_loss = self.shared.lock().faults.power_loss;
         let draw = self.images.next_u64();
@@ -866,16 +876,16 @@ impl Driver {
             n
         });
         let cached = self
-            .cache
+            .caches
             .crash(&image, power_loss, &mut self.images)
             .expect("a crash image takes the cached writes");
         // The cached writes that landed are on the disk, as the rest of the
         // image is.
         let image = image.durable_copy();
-        let (generation, wakers) = {
+        let (generation, wakers, process) = {
             let mut state = self.shared.lock();
             state.trace(format!(
-                "server {why}: {} of {} pending writes and {} of {} cached writes of the database land",
+                "server {why}: {} of {} pending writes and {} of {} cached writes of the database and the log land",
                 landed.0, landed.1, cached.0, cached.1
             ));
             let generation = state.server.generation;
@@ -894,8 +904,7 @@ impl Driver {
                 self.syncs.1 += commits as u64;
             }
             state.server.up = false;
-            state.server.storages = None;
-            state.server.store = None;
+            let process = (state.server.storages.take(), state.server.store.take());
             state.server.generation += 1;
             let conns: Vec<u64> = state
                 .conns
@@ -907,11 +916,21 @@ impl Driver {
             for conn in conns {
                 wakers.extend(net::reset(&mut state, conn));
             }
-            (generation, wakers)
+            (generation, wakers, process)
         };
         for waker in wakers {
             waker.wake();
         }
+        // The store drops on a thread of the process, never on the driver:
+        // its close waits for the end of its fold, a thread of the process
+        // too. The thread holds the store until its turn below.
+        world::spawn_thread(
+            &self.shared,
+            generation,
+            None,
+            None,
+            Box::new(move || drop(process)),
+        );
         // The tasks of the process drop first. So each channel of its
         // threads closes, and each thread ends at its next wait.
         self.adopt();
@@ -920,24 +939,32 @@ impl Driver {
         let mut resumes = 0u32;
         loop {
             // A thread that syncs ends first: it can lead a commit batch
-            // that other threads wait for.
-            let next = self
+            // that other threads wait for. Then each thread runs in turn
+            // until it waits or ends, so a thread that waits for another
+            // one, as the close of the store waits for its fold, lets it
+            // run.
+            let mut threads: Vec<(bool, u64)> = self
                 .shared
                 .lock()
                 .threads
                 .iter()
                 .filter(|(_, thread)| thread.generation == generation)
-                .min_by_key(|(_, thread)| !matches!(thread.wait, Wait::Syncing { .. }))
-                .map(|(id, _)| *id);
-            let Some(id) = next else { break };
-            resumes += 1;
-            assert!(
-                resumes < 100_000,
-                "a thread of a dead server does not end:\n{}",
-                self.tail()
-            );
-            self.resume(id, Resume::Killed);
-            self.adopt();
+                .map(|(id, thread)| (!matches!(thread.wait, Wait::Syncing { .. }), *id))
+                .collect();
+            if threads.is_empty() {
+                break;
+            }
+            threads.sort_unstable();
+            for (_, id) in threads {
+                resumes += 1;
+                assert!(
+                    resumes < 100_000,
+                    "a thread of a dead server does not end:\n{}",
+                    self.tail()
+                );
+                self.resume(id, Resume::Killed);
+                self.adopt();
+            }
         }
         self.disk = image;
     }
@@ -963,7 +990,9 @@ impl Driver {
         tree::Checked,
     ) {
         let acked = self.shared.lock().acked.clone();
-        let clock = SimClock(Arc::clone(&self.shared));
+        // No thread of the simulation runs during the check, so the store
+        // runs its fold on a thread of the system.
+        let clock = CheckClock(Arc::clone(&self.shared));
         let vfs = SimVfs::new(self.disk.clone());
         let store = match Store::open_full(vfs, clock, Options::default()) {
             Ok(store) => store,

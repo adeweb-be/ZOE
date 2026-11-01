@@ -584,8 +584,8 @@ impl Store {
     /// least one record, a deletion included, as the `len()` of
     /// FileStorage. A pack lowers it when it removes every record of an
     /// oid. The count includes each commit whose `finish` returned and
-    /// each pack batch that committed. A read-only open of a store of
-    /// format 1 has no count and gives `None`. The call reads no row.
+    /// each pack batch that committed. A backend that keeps no count
+    /// gives `None`. The call reads no row.
     pub fn object_count(&self) -> Option<u64> {
         self.backend.object_count()
     }
@@ -1351,6 +1351,8 @@ mod tests {
     /// oid 1 at `tid`, with no pack. A damaged index of the database looks
     /// the same to a read.
     fn remove_outside_a_pack(store: &Store, tid: Tid, record: bool) {
+        // The fold puts the commits into the tables, where the removal works.
+        store.fold().unwrap();
         let mut write = store.backend.begin_write().unwrap();
         if record {
             write.remove_record(Oid(1), tid).unwrap();

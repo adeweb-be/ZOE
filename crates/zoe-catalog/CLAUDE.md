@@ -2,6 +2,8 @@
 
 The catalog mirror: the ZCatalog indexes in memory, versioned per tid. Specification: "Catalog acceleration and search".
 
+Nothing is built yet: `src/lib.rs` holds only its doc comment. The invariants below are for the crate to come.
+
 ## Invariants
 
 - A query is answered as of the snapshot tid of the client. A result never names an object that the Connection cannot load.

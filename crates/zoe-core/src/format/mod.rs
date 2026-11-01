@@ -62,6 +62,7 @@
 //! has no frame and no tag, as the transaction index.
 
 pub mod blob;
+pub(crate) mod wal;
 
 use std::borrow::Cow;
 
@@ -71,8 +72,6 @@ use crate::backend::{TxnMeta, TxnStatus};
 use crate::types::{Oid, Tid};
 
 mod codec;
-#[cfg(test)]
-mod synthetic;
 
 pub use codec::{Codec, Compression};
 
@@ -83,14 +82,10 @@ pub(crate) use codec::compressions;
 pub(crate) use codec::{decode as decode_payload, encode as encode_payload};
 
 /// The name and version of the format, in the `format` row of `meta`.
-/// A store of this format has the row `object_count` in `meta`. An open
-/// refuses a store with a name other than this one and `FORMAT_1_NAME`.
-pub const FORMAT_NAME: &[u8] = b"ZOE format 2";
-
-/// The name of the format without the row `object_count`. A writer open
-/// counts the objects of such a store once, then writes the count and
-/// `FORMAT_NAME`. A read-only open reads such a store and has no count.
-pub const FORMAT_1_NAME: &[u8] = b"ZOE format 1";
+/// A store of this format has the row `object_count` in `meta`, and its
+/// write-ahead log in `wal/` (`wal`, ADR 0056). An open refuses a store
+/// with another name.
+pub const FORMAT_NAME: &[u8] = b"ZOE format 3";
 
 /// The key space of a frame. Its tag is the first byte of the checksum
 /// input, so a frame verifies only in the key space that wrote it.
@@ -220,21 +215,65 @@ pub(crate) fn encode_frame_payload(
     codec: Codec,
     payload: &[u8],
 ) -> Vec<u8> {
-    let payload_len = u32::try_from(payload.len()).expect("a payload fits in 4 GiB");
     let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-    frame.push(FRAME_VERSION);
-    frame.push(0);
-    frame.push(codec.byte());
-    frame.push(0);
-    frame.extend_from_slice(&branch.to_le_bytes());
-    frame.extend_from_slice(&prev.0.to_le_bytes());
-    frame.extend_from_slice(&payload_len.to_le_bytes());
-    frame.extend_from_slice(&0u16.to_le_bytes());
-    frame.extend_from_slice(&0u16.to_le_bytes());
-    let checksum = checksum(space, key, &frame[..24], &[], payload);
-    frame.extend_from_slice(&checksum.to_le_bytes());
-    frame.extend_from_slice(payload);
+    append_frame_payload(&mut frame, space, key, branch, prev, codec, payload);
     frame
+}
+
+/// Append to `out` the frame that `encode_frame_payload` gives. The log
+/// writes its frames into its entry with this call, so no frame is copied
+/// after its encode.
+pub(crate) fn append_frame_payload(
+    out: &mut Vec<u8>,
+    space: KeySpace,
+    key: &[u8],
+    branch: u32,
+    prev: Tid,
+    codec: Codec,
+    payload: &[u8],
+) {
+    let payload_len = u32::try_from(payload.len()).expect("a payload fits in 4 GiB");
+    let start = out.len();
+    out.reserve(HEADER_LEN + payload.len());
+    out.push(FRAME_VERSION);
+    out.push(0);
+    out.push(codec.byte());
+    out.push(0);
+    out.extend_from_slice(&branch.to_le_bytes());
+    out.extend_from_slice(&prev.0.to_le_bytes());
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    let checksum = checksum(space, key, &out[start..start + 24], &[], payload);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// Append to `out` the frame that `encode_frame_with` gives for `data` and
+/// `compression`.
+pub(crate) fn append_frame_with(
+    out: &mut Vec<u8>,
+    space: KeySpace,
+    key: &[u8],
+    prev: Tid,
+    data: &[u8],
+    compression: Compression,
+) {
+    assert!(
+        u32::try_from(data.len()).is_ok(),
+        "the data of a frame fits in 4 GiB"
+    );
+    let (codec, payload) = codec::encode(data, compression);
+    append_frame_payload(out, space, key, MAIN_BRANCH, prev, codec, &payload);
+}
+
+/// Return the previous serial in the header of `frame`, a frame that a
+/// caller checked or wrote. A frame shorter than its header gives
+/// `Tid::ZERO`.
+pub(crate) fn frame_prev(frame: &[u8]) -> Tid {
+    frame.get(8..16).map_or(Tid::ZERO, |bytes| {
+        Tid(u64::from_le_bytes(bytes.try_into().unwrap()))
+    })
 }
 
 /// Encode the frame of the row `key` of `space` with the codec byte

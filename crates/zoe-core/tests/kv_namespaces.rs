@@ -3,44 +3,19 @@
 //! generation of a durable namespace, the sweep step, a crash, and the
 //! checks of `zoe verify`.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use zoe_core::testing;
+use zoe_core::testing::ManualClock;
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Clock, Flavour, Oid, Options, Store, Tid, Txn, ZoeError};
+use zoe_core::{Flavour, Oid, Options, Store, Tid, Txn, ZoeError};
 
 const PICKLE: &[u8] =
     b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datag\x01s.";
 
 const MINUTE: Duration = Duration::from_secs(60);
 const DAY: Duration = Duration::from_secs(86_400);
-
-/// A clock that moves only when the test moves it.
-#[derive(Clone)]
-struct ManualClock(Arc<Mutex<SystemTime>>);
-
-impl ManualClock {
-    fn new() -> Self {
-        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        Self(Arc::new(Mutex::new(start)))
-    }
-
-    fn advance(&self, by: Duration) {
-        *self.0.lock().unwrap() += by;
-    }
-
-    fn millis(&self) -> u64 {
-        let now = *self.0.lock().unwrap();
-        now.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-    }
-}
-
-impl Clock for ManualClock {
-    fn now(&self) -> SystemTime {
-        *self.0.lock().unwrap()
-    }
-}
 
 fn open() -> (Store, ManualClock, MemVfs) {
     open_with(Options::default())
@@ -235,6 +210,8 @@ fn each_write_of_a_key_sets_its_ttl_again() {
     set_session(&store, b"s1", b"two", MINUTE);
     clock.advance(Duration::from_secs(50));
     assert_eq!(session(&store, b"s1").as_deref(), Some(&b"two"[..]));
+    // The sweep reads the tables only, so the commits fold first.
+    store.fold().unwrap();
     // The sweep takes the index key of the first expiry, and keeps the row
     // that the second write refreshed.
     let swept = store.sweep(1000).unwrap();
@@ -267,6 +244,8 @@ fn a_sweep_step_takes_at_most_its_limit_in_the_order_of_the_expiries() {
     }
     set_session(&store, b"late", b"v", Duration::from_secs(3600));
     clock.advance(Duration::from_secs(20));
+    // The sweep reads the tables only, so the commits fold first.
+    store.fold().unwrap();
     let swept = store.sweep(3).unwrap();
     assert_eq!((swept.taken, swept.removed), (3, 3));
     let swept = store.sweep(3).unwrap();

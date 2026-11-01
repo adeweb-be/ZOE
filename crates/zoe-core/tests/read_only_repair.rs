@@ -14,27 +14,23 @@
 //! The crash image is a copy of the database file of an open store after
 //! a commit, as a kill of the writer leaves it.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use support::fresh_dir;
+use zoe_core::testing::{Meta, commit_as};
 use zoe_core::{Oid, Options, Store, Tid, ZoeError};
+
+/// The user, the description and the extension of each commit.
+const META: Meta = (b"user", b"description", b"");
 
 /// The database file of a store.
 const DATABASE: &str = "zoe.redb";
 /// The lock file of a store.
 const LOCK: &str = "lock";
-
-/// Return a new empty directory for the test `name`.
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zoe-read-only-repair-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// Return every entry under `dir`, by path: the bytes of a file, `None`
 /// for a directory.
@@ -56,19 +52,11 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     entries
 }
 
-/// Commit `data` as the record of `oid` over `serial`. Return the tid.
-fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"user", b"description", b"").unwrap();
-    txn.store(oid, serial, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
 /// Write a store in `dir` and close it cleanly. Return the tid of its
 /// commit.
 fn clean_store(dir: &Path) -> Tid {
     let store = Store::open(dir).unwrap();
-    commit(&store, Oid(0), Tid::ZERO, b"first")
+    commit_as(&store, META, &[(Oid(0), Tid::ZERO, b"first")])
 }
 
 /// Make a store in `root/image` that a writer left open after its last
@@ -79,7 +67,10 @@ fn crash_image(root: &Path) -> (PathBuf, Tid) {
     // The open sets the recovery flag of redb. The commit is durable, and
     // only a clean close writes the allocator state after it.
     let store = Store::open(&live).unwrap();
-    let last = commit(&store, Oid(0), first, b"second");
+    let last = commit_as(&store, META, &[(Oid(0), first, b"second")]);
+    // The commit goes into the tables, so the copy of the database file
+    // alone holds it.
+    store.fold().unwrap();
     fs::create_dir_all(&image).unwrap();
     fs::copy(live.join(DATABASE), image.join(DATABASE)).unwrap();
     fs::write(image.join(LOCK), b"").unwrap();
@@ -109,7 +100,8 @@ fn assert_only_the_database_changed(
 
 #[test]
 fn the_strict_read_only_open_still_refuses_a_store_left_open_and_writes_nothing() {
-    let (image, _) = crash_image(&fresh_dir("strict"));
+    let root = fresh_dir("strict");
+    let (image, _) = crash_image(&root);
     let before = tree(&image);
 
     let result = Store::open_read_only(&image);
@@ -124,7 +116,8 @@ fn the_strict_read_only_open_still_refuses_a_store_left_open_and_writes_nothing(
 
 #[test]
 fn the_repairing_open_repairs_a_store_left_open_and_reads_its_last_commit() {
-    let (image, last) = crash_image(&fresh_dir("repair"));
+    let root = fresh_dir("repair");
+    let (image, last) = crash_image(&root);
     let before = tree(&image);
 
     let store = Store::open_read_only_repairing(&image, Options::default()).unwrap();
@@ -153,7 +146,8 @@ fn the_repairing_open_repairs_a_store_left_open_and_reads_its_last_commit() {
 
 #[test]
 fn the_repairing_open_of_a_clean_store_writes_nothing() {
-    let dir = fresh_dir("clean").join("store");
+    let root = fresh_dir("clean");
+    let dir = root.join("store");
     let tid = clean_store(&dir);
     let before = tree(&dir);
 
@@ -166,7 +160,8 @@ fn the_repairing_open_of_a_clean_store_writes_nothing() {
 
 #[test]
 fn a_second_repairing_open_writes_nothing() {
-    let (image, last) = crash_image(&fresh_dir("twice"));
+    let root = fresh_dir("twice");
+    let (image, last) = crash_image(&root);
     drop(Store::open_read_only_repairing(&image, Options::default()).unwrap());
     let repaired = tree(&image);
 
@@ -179,7 +174,8 @@ fn a_second_repairing_open_writes_nothing() {
 
 #[test]
 fn the_repair_leaves_the_leftovers_of_the_writer_to_the_next_writer_open() {
-    let (image, last) = crash_image(&fresh_dir("leftovers"));
+    let root = fresh_dir("leftovers");
+    let (image, last) = crash_image(&root);
     // Files that a writer open removes: a blob file of an unfinished
     // commit and a spill file. The repair writes only the database file.
     fs::create_dir_all(image.join("blobs/tmp")).unwrap();
@@ -216,7 +212,8 @@ fn the_repairing_open_creates_nothing_in_a_blob_directory_elsewhere() {
 
 #[test]
 fn the_repairing_open_writes_nothing_while_another_open_holds_the_lock() {
-    let (image, _) = crash_image(&fresh_dir("locked"));
+    let root = fresh_dir("locked");
+    let (image, _) = crash_image(&root);
     let before = tree(&image);
     let holder = fs::File::open(image.join(LOCK)).unwrap();
     holder.try_lock().unwrap();
@@ -236,7 +233,8 @@ fn the_repairing_open_writes_nothing_while_another_open_holds_the_lock() {
 
 #[test]
 fn the_repaired_store_holds_its_lock_against_a_writer() {
-    let (image, _) = crash_image(&fresh_dir("exclusive"));
+    let root = fresh_dir("exclusive");
+    let (image, _) = crash_image(&root);
 
     let reader = Store::open_read_only_repairing(&image, Options::default()).unwrap();
 

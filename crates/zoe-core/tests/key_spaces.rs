@@ -14,11 +14,13 @@
 //! `testing` of `zoe-core` builds the hook. The dev-dependency of
 //! `zoe-core` on itself turns the feature on.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 
-use zoe_core::testing::{self, Key};
+use support::fresh_dir;
+use zoe_core::testing::{self, Key, compressible};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Codec, Compression, Oid, Options, Store, Tid, ZoeError};
 
@@ -27,13 +29,6 @@ const USER: &[u8] = b"someone";
 const EXTENSION: &[u8] = b"ext";
 
 const BLOB_PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-key-spaces-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// A small protocol-3 record.
 fn small(title: &str) -> Vec<u8> {
@@ -52,18 +47,6 @@ fn open_zstd() -> Store {
         ..Options::default()
     };
     Store::open_full(MemVfs::new(), zoe_core::SystemClock, options).unwrap()
-}
-
-/// A record that zstd shrinks, so that a store with compression keeps it
-/// with codec 1.
-fn compressible() -> Vec<u8> {
-    let mut data = b"\x80\x03capp.content\nDocument\nq\x00.\x80\x03}q\x01(".to_vec();
-    for i in 0..500u32 {
-        data.extend_from_slice(b"X\x0b\x00\x00\x00descriptionq\x02X\x05\x00\x00\x00title");
-        data.extend_from_slice(&i.to_le_bytes());
-    }
-    data.extend_from_slice(b"u.");
-    data
 }
 
 fn content(len: usize) -> Vec<u8> {

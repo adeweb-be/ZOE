@@ -13,17 +13,22 @@
 //! A store error is a finding, never a failure of the call.
 //!
 //! The walk counts the oids that have at least one record, deletions
-//! included. A store of format 2 keeps this count in `object_count`, and
-//! a count that differs is a finding. A store of format 1 has no count
-//! yet, which is no finding.
+//! included. The store keeps this count in `object_count`, and a count
+//! that differs is a finding. A store without a count gives no finding.
+//!
+//! A damaged write-ahead log fails the open of the tools with `CorruptTxn`
+//! (ADR 0056). `zoe verify` then reports the damage as the finding `log`
+//! ([`LogProblem`]), opens the tables alone with
+//! `Store::open_read_only_tables`, and checks them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
+use serde_json::{Value, json};
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
-use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
+use zoe_pickle::{decode_class_key, persistent_ids};
 
-/// The number of record keys that one read of the walk takes.
-const KEY_CHUNK: usize = 1024;
+use crate::walk::OidVersions;
 
 /// A frame that does not read: a record, a blob record, a transaction row,
 /// a sequence row or a row of a KV namespace.
@@ -84,6 +89,32 @@ pub struct CountProblem {
     pub counted: u64,
 }
 
+/// A write-ahead log that the open of the tools refused: the log hides a
+/// commit, or its chain of entries breaks (ADR 0056).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogProblem {
+    /// The tid that the error names: a commit that the log cannot give.
+    pub tid: Tid,
+    /// The text of the error.
+    pub error: String,
+}
+
+impl LogProblem {
+    /// Return the finding of `error`, the error of a read-only open of a
+    /// store, when it tells of a damaged log: `CorruptTxn`. An open reads
+    /// no transaction row, so only the log gives this error there. Return
+    /// `None` for another error.
+    pub fn of(error: &ZoeError) -> Option<Self> {
+        match error {
+            ZoeError::CorruptTxn { tid } => Some(Self {
+                tid: *tid,
+                error: error.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// The findings and the counts of `verify`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verification {
@@ -103,8 +134,8 @@ pub struct Verification {
     pub objects: u64,
     /// The blob records.
     pub blobs: u64,
-    /// The `object_count` that the store keeps. A store of format 1 has
-    /// none until its first writer open: that is no finding.
+    /// The `object_count` that the store keeps. A store without a count
+    /// gives `None`: that is no finding.
     pub object_count: Option<u64>,
     /// The object count when it differs from the oids of the records. The
     /// check runs only when the walk read every record key.
@@ -125,6 +156,19 @@ pub struct Verification {
     /// The classes of `classes` that the list of known classes does not
     /// name. It is empty when `verify` gets no list.
     pub unknown_classes: Vec<String>,
+    /// The damage of the write-ahead log, when the open of the tools
+    /// refused the store and the check read the tables alone. `verify`
+    /// does not set it: the caller that opened the store does.
+    pub log: Option<LogProblem>,
+}
+
+/// The form of the oids and the tids in the JSON of a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdForm {
+    /// A number, as `zoe verify --format json` gives it.
+    Number,
+    /// A string in ZODB form, such as `0x01`, as `zoe mcp` gives it.
+    Zodb,
 }
 
 impl Verification {
@@ -136,7 +180,71 @@ impl Verification {
             + self.pickles.len()
             + self.unknown_classes.len()
             + usize::from(self.count.is_some())
+            + usize::from(self.log.is_some())
     }
+
+    /// Return the findings as one JSON object: the lists `checksums`,
+    /// `blobs`, `references` and `pickles`, each with its first `limit`
+    /// findings, then `classes`, `unknown_classes`, and `log`, the damage
+    /// of the write-ahead log or null. The oids and the tids have the form
+    /// `ids`. The caller adds its other keys.
+    pub fn to_json(&self, ids: IdForm, limit: usize) -> Value {
+        let oid = |oid: Oid| match ids {
+            IdForm::Number => json!(oid.0),
+            IdForm::Zodb => json!(oid.repr()),
+        };
+        let tid = |tid: Tid| match ids {
+            IdForm::Number => json!(tid.0),
+            IdForm::Zodb => json!(tid.repr()),
+        };
+        fn first<T>(items: &[T], limit: usize, json: impl Fn(&T) -> Value) -> Vec<Value> {
+            items.iter().take(limit).map(json).collect()
+        }
+        let checksums = first(
+            &self.checksums,
+            limit,
+            |p| json!({"oid": p.oid.map(oid), "tid": p.tid.map(tid), "error": p.error}),
+        );
+        let blobs = first(
+            &self.blob_files,
+            limit,
+            |p| json!({"oid": oid(p.oid), "tid": tid(p.tid), "error": p.error}),
+        );
+        let references = first(
+            &self.references,
+            limit,
+            |d| json!({"oid": oid(d.oid), "tid": tid(d.tid), "missing": oid(d.missing)}),
+        );
+        let pickles = first(
+            &self.pickles,
+            limit,
+            |p| json!({"oid": oid(p.oid), "tid": tid(p.tid), "error": p.error}),
+        );
+        let log = self
+            .log
+            .as_ref()
+            .map(|p| json!({"tid": tid(p.tid), "error": p.error}));
+        json!({
+            "checksums": checksums,
+            "blobs": blobs,
+            "references": references,
+            "pickles": pickles,
+            "classes": self.classes,
+            "unknown_classes": self.unknown_classes,
+            "log": log,
+        })
+    }
+}
+
+/// Return the message of a store with blob records whose blob directory
+/// `blobs` has no layout file, for a tool that takes `--blob-dir`. The
+/// blob directory of the store is elsewhere.
+pub fn missing_blob_dir(blobs: &Path) -> String {
+    format!(
+        "the store has blobs, but the blob directory {} has no layout file: \
+         give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
+        blobs.display()
+    )
 }
 
 /// Check `store`. `known` lists the classes that the application provides,
@@ -278,30 +386,22 @@ impl Walk {
 /// Walk every record key: check each record frame, each blob record and
 /// each blob file, and read the current record of each oid.
 fn records(store: &Store, report: &mut Verification, walk: &mut Walk) {
-    let mut from = Oid(0);
+    let mut keys = OidVersions::new(store);
     let mut oids = 0;
     loop {
-        let keys = match store.record_keys(from, KEY_CHUNK) {
-            Ok(keys) => keys,
+        match keys.next() {
+            Ok(Some(versions)) => {
+                oids += 1;
+                oid_versions(store, versions, report, walk);
+            }
+            Ok(None) => {
+                walk.oids = Some(oids);
+                return;
+            }
             Err(error) => {
                 // The walk cannot go on. `dangling` asks the store about
                 // each reference that it did not see.
                 report.checksums.push(frame_problem(None, error));
-                return;
-            }
-        };
-        let Some(&(last, _)) = keys.last() else {
-            walk.oids = Some(oids);
-            return;
-        };
-        for versions in keys.chunk_by(|a, b| a.0 == b.0) {
-            oids += 1;
-            oid_versions(store, versions, report, walk);
-        }
-        match last.0.checked_add(1) {
-            Some(next) => from = Oid(next),
-            None => {
-                walk.oids = Some(oids);
                 return;
             }
         }
@@ -388,10 +488,10 @@ const DAMAGED_BLOB_FILE: &str =
 /// Count the class of the current record `data` of `oid` at `tid`, and
 /// check its references.
 fn current(oid: Oid, tid: Tid, data: &[u8], report: &mut Verification, walk: &mut Walk) {
-    let class = match decode_class_name(data) {
-        Ok(Some((module, name))) => format!("{module}.{name}"),
-        Ok(None) | Err(_) => PackReport::UNKNOWN_CLASS.to_owned(),
-    };
+    let class = decode_class_key(data)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PackReport::UNKNOWN_CLASS.to_owned());
     *report.classes.entry(class).or_default() += 1;
 
     let ids = match persistent_ids(data) {
@@ -403,15 +503,15 @@ fn current(oid: Oid, tid: Tid, data: &[u8], report: &mut Verification, walk: &mu
         }
     };
     for id in ids {
-        let PersistentId::Oid(bytes) = id else {
-            continue;
+        let target = match id.oid_u64() {
+            None => continue,
+            Some(Ok(target)) => Oid(target),
+            Some(Err(len)) => {
+                let error = format!("a reference has an oid of {len} bytes, not 8");
+                report.pickles.push(PickleProblem { oid, tid, error });
+                continue;
+            }
         };
-        let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-            let error = format!("a reference has an oid of {} bytes, not 8", bytes.len());
-            report.pickles.push(PickleProblem { oid, tid, error });
-            continue;
-        };
-        let target = Oid(u64::from_be_bytes(bytes));
         if target > oid {
             walk.ahead.push((target, oid, tid));
         } else if !walk.has(target) {
@@ -470,6 +570,7 @@ mod tests {
     use zoe_core::vfs::MemVfs;
 
     use super::*;
+    use crate::testing::commit;
 
     /// A `PersistentMapping` record that refers to `refs`.
     fn mapping(refs: &[u64]) -> Vec<u8> {
@@ -482,16 +583,6 @@ mod tests {
         }
         pickle.extend_from_slice(b"s.");
         pickle
-    }
-
-    fn commit(store: &Store, writes: &[(u64, Option<Vec<u8>>)]) -> Tid {
-        let tid = Tid(store.last_transaction().0 + 1);
-        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
-        for (oid, data) in writes {
-            txn.restore(Oid(*oid), data.as_deref()).unwrap();
-        }
-        txn.vote().unwrap();
-        txn.finish().unwrap()
     }
 
     #[test]
@@ -747,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_of_format_1_has_no_count_and_no_finding() {
+    fn a_store_of_format_1_does_not_open_for_a_check() {
         let dir = std::env::temp_dir().join(format!("zoe-verify-format-1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
@@ -766,12 +857,11 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let store = Store::open_read_only(&dir).unwrap();
-        let report = verify(&store, None);
-        drop(store);
+        let error = Store::open_read_only(&dir).err();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(report.object_count, None);
-        assert_eq!(report.count, None);
-        assert_eq!(report.problems(), 0, "{report:?}");
+        assert!(
+            matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 1"),
+            "{error:?}"
+        );
     }
 }

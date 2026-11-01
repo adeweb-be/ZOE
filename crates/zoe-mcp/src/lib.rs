@@ -1,5 +1,5 @@
-//! The MCP server for ops and content agents. Specification: "AI-native:
-//! MCP server and retrieval".
+//! The MCP server for ops agents. Specification: "AI-native: MCP server
+//! and retrieval".
 //!
 //! [`serve_stdio`] opens a store folder for reads only, with the blob
 //! directory of the store, and speaks MCP on stdin and stdout, with the
@@ -11,10 +11,8 @@
 //! and `explain_conflict` reads the transactions with the iterator of the
 //! core. Each prompt carries the data that its tools give.
 //!
-//! The server runs as the ops principal of the local operator: the user
-//! who starts the process. That principal has the read-only role. So the
-//! server offers no tool that writes, and it does not offer `pack` or
-//! `backup`.
+//! The server runs as the user who starts the process. It offers no tool
+//! that writes, and it does not offer `pack` or `backup`.
 //!
 //! An error of a tool is a tool result with `isError`. The session goes
 //! on.
@@ -29,6 +27,7 @@ use std::path::{Path, PathBuf};
 use rmcp::service::ServerInitializeError;
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServiceExt};
+use zoe_core::Store;
 use zoe_loupe::Folder;
 
 /// An error of the server.
@@ -83,8 +82,8 @@ pub fn serve_stdio(path: &Path, blob_dir: Option<&Path>) -> Result<(), Error> {
         // failed write of the line does not stop the session.
         let _ = writeln!(
             std::io::stderr(),
-            "zoe mcp: {}: the store was not closed cleanly: repaired the store",
-            path.display()
+            "zoe mcp: {}",
+            Store::repair_message(path)
         );
     }
     // One thread runs the session. The tools run on the blocking pool.

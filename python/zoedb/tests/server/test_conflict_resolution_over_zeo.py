@@ -14,59 +14,18 @@ ZEO's server does this when `client-conflict-resolution` is on.
 again at the second vote with the same locks. A stale read-current serial
 is never resolved. A conflict that the class does not resolve raises
 `ConflictError` on the client.
+
+The native client of `zoe.zeo` resolves in the client too. The resolution
+of a counter runs through both kinds of client. After the resolved commit,
+a load of the oid through either client gives the resolved state, not the
+state that the client stored.
 """
 
-import io
-import pickle
 import threading
 
 import pytest
-
-from zoe.testing import ZoeServer
-
-ZERO = bytes(8)
-TIMEOUT = 30
-
-
-def counter(value):
-    """A record of ZODB's PCounter, whose _p_resolveConflict adds."""
-    meta = (("ZODB.tests.ConflictResolution", "PCounter"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
-
-
-def strict(value):
-    """A record of ZODB's PCounter2, whose _p_resolveConflict refuses."""
-    meta = (("ZODB.tests.ConflictResolution", "PCounter2"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"_value": value}, 3)
-
-
-def value_of(data):
-    unpickler = pickle.Unpickler(io.BytesIO(data))
-    unpickler.load()
-    return unpickler.load()["_value"]
-
-
-def client(server):
-    from ZEO.ClientStorage import ClientStorage
-
-    return ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
-
-
-def commit(storage, stores):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    resolved = storage.tpc_vote(txn)
-    return storage.tpc_finish(txn), resolved
-
-
-@pytest.fixture
-def server(tmp_path):
-    with ZoeServer(str(tmp_path / "store")) as server:
-        yield server
+from support import TIMEOUT, ZERO, client, counter, native, strict, value_of, wait_for
+from support import commit_resolving as commit
 
 
 @pytest.fixture
@@ -77,10 +36,34 @@ def clients(server):
         storage.close()
 
 
-def test_the_client_resolves_a_counter_through_the_vote(clients):
-    a, b = clients
+@pytest.fixture(params=["zeo-client", "native-client"])
+def resolvers(request, server):
+    """Two clients of `server` of one kind: two stock clients, or two
+    native clients, each under a DB of its own."""
+    import ZODB
+
+    if request.param == "zeo-client":
+        opened = [client(server), client(server)]
+        yield opened
+        for storage in opened:
+            storage.close()
+        return
+    dbs = []
+    try:
+        for _ in range(2):
+            dbs.append(ZODB.DB(native(server)))
+        yield [db.storage for db in dbs]
+    finally:
+        for db in dbs:
+            db.close()
+
+
+def test_the_client_resolves_a_counter_through_the_vote(resolvers):
+    a, b = resolvers
     oid = a.new_oid()
     base, _ = commit(a, [(oid, ZERO, counter(1))])
+    wait_for(lambda: b.lastTransaction() == base, "the base on the client b")
+    assert b.load(oid) == (counter(1), base)
     commit(a, [(oid, base, counter(2))])
 
     # b read the base and adds 4: the vote lists the conflict, the client
@@ -88,7 +71,14 @@ def test_the_client_resolves_a_counter_through_the_vote(clients):
     # additions. A resolution from the committed pickle would give 3.
     tid, resolved = commit(b, [(oid, base, counter(5))])
     assert oid in (resolved or [])
+
+    # The cache of b holds the resolved state, or nothing, but never the
+    # state that b stored.
     data, serial = b.load(oid)
+    assert serial == tid
+    assert value_of(data) == 6
+    wait_for(lambda: a.lastTransaction() == tid, "the resolved commit on the client a")
+    data, serial = a.load(oid)
     assert serial == tid
     assert value_of(data) == 6
 

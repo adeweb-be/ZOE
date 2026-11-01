@@ -64,32 +64,19 @@ scenario runs it. `just plone zoe backends` runs it, and `just plone zoe
 backends -t test_concurrent_creations` runs only this module.
 """
 
-import collections
-import shutil
-import tempfile
-import threading
 import unittest
 
 import transaction
 from Acquisition import aq_base
 from plone.app.testing import (
     PLONE_FUNCTIONAL_TESTING,
-    PLONE_SITE_ID,
     TEST_USER_ID,
     TEST_USER_NAME,
-    login,
-    logout,
     setRoles,
 )
-from Testing.makerequest import makerequest
-from ZODB.Connection import TransactionMetaData
-from ZODB.DB import DB
 from ZODB.POSException import ConflictError
-from ZODB.serialize import referencesf
-from ZODB.utils import get_pickle_metadata, load_current, z64
-from zope.component.hooks import getSite, setSite
-from zope.globalrequest import clearRequest, getRequest, setRequest
 
+from zoe.plone.tests import helpers
 from zoe.plone.tests.test_queued_indexing import (
     catalog_state,
     drain,
@@ -144,66 +131,9 @@ def mechanism_off(test):
     return {}
 
 
-def wire_ids(test):
-    """Give `portal_uidgenerator` its ids from a sequence of the store, as
-    `zoe.plone` does when Zope opens its database, until the end of
-    `test`."""
-    from Products.CMFUid.UniqueIdGeneratorTool import UniqueIdGeneratorTool
-
-    from zoe.plone import uidgenerator
-
-    stock = UniqueIdGeneratorTool.__call__
-    uidgenerator.install()
-    if UniqueIdGeneratorTool.__call__ is not stock:
-        test.addCleanup(setattr, UniqueIdGeneratorTool, "__call__", stock)
-
-
-def copy_records(source, target):
-    """Copy the current record of each object that the root of `source`
-    reaches to `target`, an empty storage.
-
-    Each record keeps its oid and its serial. The records of one serial go
-    in one restore transaction under that tid, in the order of the tids. So
-    the `_p_mtime` of each object stays the same, and Dexterity gives each
-    schema the name that the catalog holds.
-    """
-    records = collections.defaultdict(list)
-    seen = set()
-    todo = [z64]
-    while todo:
-        oid = todo.pop()
-        if oid in seen:
-            continue
-        seen.add(oid)
-        data, serial = load_current(source, oid)
-        records[serial].append((oid, data))
-        todo.extend(referencesf(data))
-    for serial in sorted(records):
-        meta = TransactionMetaData()
-        meta.note("copy of the site of the layer")
-        target.tpc_begin(meta, serial, " ")
-        try:
-            for oid, data in records[serial]:
-                if get_pickle_metadata(data) == ("ZODB.blob", "Blob"):
-                    blob = source.loadBlob(oid, serial)
-                    target.restoreBlob(oid, serial, data, blob, None, meta)
-                else:
-                    target.restore(oid, serial, data, "", None, meta)
-            target.tpc_vote(meta)
-        except BaseException:
-            target.tpc_abort(meta)
-            raise
-        target.tpc_finish(meta)
-
-
 def folder_id(turn):
     """Return the id of the folder of the creator `turn`."""
     return f"folder-{turn}"
-
-
-def describe(error):
-    """Return the text of `error` for a failure message."""
-    return f"{type(error).__name__}: {error}"
 
 
 class TestConcurrentCreations(unittest.TestCase):
@@ -215,7 +145,7 @@ class TestConcurrentCreations(unittest.TestCase):
         portal = self.layer["portal"]
         setRoles(portal, TEST_USER_ID, ["Manager"])
         switch_on(self)
-        wire_ids(self)
+        helpers.wire_ids(self)
         portal.portal_workflow.setChainForPortalTypes(
             ("Folder", "Document"), (WORKFLOW,)
         )
@@ -234,30 +164,9 @@ class TestConcurrentCreations(unittest.TestCase):
         """Copy the site of the layer to a new `zoe.Storage`, opened with
         the keyword arguments `options`. Return the site on that store, on
         a connection of this thread, until the end of the test."""
-        import zoe
-
-        directory = tempfile.mkdtemp(prefix="zoe-creations-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe", **options)
-        try:
-            copy_records(self.layer["zodbDB"].storage, storage)
-        except BaseException:
-            storage.close()
-            raise
-        self.db = DB(storage, pool_size=CREATORS + 2)
-        self.addCleanup(self.db.close)
-        connection = self.db.open()
-        self.addCleanup(connection.close)
-        self.addCleanup(setRequest, getRequest())
-        self.addCleanup(setSite, getSite())
-        self.addCleanup(transaction.abort)
-        app = makerequest(connection.root()["Application"])
-        setRequest(app.REQUEST)
-        portal = app[PLONE_SITE_ID]
-        setSite(portal)
-        login(portal, TEST_USER_NAME)
-        self.portal = portal
-        return portal
+        return helpers.open_site(
+            self, options, "zoe-creations-", CREATORS + 2, user=TEST_USER_NAME
+        )
 
     def create_round(self, number):
         """Run round `number`: `CREATORS` threads, each with a connection of
@@ -265,64 +174,21 @@ class TestConcurrentCreations(unittest.TestCase):
         one snapshot. Then they commit, one after the other, in the order
         of their turns. Return the error of each turn that raised, by turn.
         """
-        db = self.db
-        changed = threading.Barrier(CREATORS, timeout=TIMEOUT)
-        done = [threading.Event() for _ in range(CREATORS)]
-        errors = {}
 
-        def create(turn):
-            connection = db.open()
-            try:
-                app = makerequest(connection.root()["Application"])
-                setRequest(app.REQUEST)
-                site = app[PLONE_SITE_ID]
-                setSite(site)
-                login(site, TEST_USER_NAME)
-                site[folder_id(turn)].invokeFactory(
-                    "Document",
-                    f"document-{number}",
-                    title=f"Document {number} of creator {turn}",
-                    description=f"Round {number}, creator {turn}",
-                )
-                # Each creator changes the site from the snapshot of its
-                # connection. Then the creators commit.
-                changed.wait()
-                if turn:
-                    done[turn - 1].wait(TIMEOUT)
-                transaction.commit()
-            except BaseException as error:
-                errors[turn] = error
-            finally:
-                done[turn].set()
-                transaction.abort()
-                logout()
-                setSite(None)
-                clearRequest()
-                connection.close()
+        def create(site, turn):
+            site[folder_id(turn)].invokeFactory(
+                "Document",
+                f"document-{number}",
+                title=f"Document {number} of creator {turn}",
+                description=f"Round {number}, creator {turn}",
+            )
 
-        threads = [
-            threading.Thread(target=create, args=(turn,)) for turn in range(CREATORS)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(TIMEOUT)
-            self.assertFalse(thread.is_alive())
-        # The connection of this thread sees the commits of the round.
-        transaction.begin()
-        return errors
+        return helpers.run_round(self, CREATORS, create, TIMEOUT)
 
     def create_rounds(self):
         """Run each round. Return the errors of each round that had one, as
         text, by round and turn."""
-        failed = {}
-        for number in range(ROUNDS):
-            errors = self.create_round(number)
-            if errors:
-                failed[number] = {
-                    turn: describe(error) for turn, error in sorted(errors.items())
-                }
-        return failed
+        return helpers.round_errors(self.create_round, ROUNDS)
 
     def documents(self):
         """Return the Documents of the folders, by path."""
@@ -399,9 +265,9 @@ class TestConcurrentCreations(unittest.TestCase):
         for number in range(ROUNDS):
             for error in self.create_round(number).values():
                 if isinstance(error, ConflictError):
-                    conflicts.append(describe(error))
+                    conflicts.append(helpers.describe(error))
                 else:
-                    others.append(describe(error))
+                    others.append(helpers.describe(error))
             if conflicts or others:
                 break
         self.assertEqual(others, [])

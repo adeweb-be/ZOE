@@ -13,9 +13,9 @@
 //! `POSKeyError`, as FileStorage does. The error is a reply: the connection
 //! stays open.
 
-mod wire;
+mod common;
 
-use wire::{
+use common::{
     Conn, Fault, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record, u64_of,
 };
 

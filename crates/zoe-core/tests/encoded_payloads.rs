@@ -16,17 +16,13 @@
 //! thread of the test. With one transaction at a time, the finish runs on
 //! that thread.
 
-use std::path::{Path, PathBuf};
+mod support;
 
+use std::path::Path;
+
+use support::fresh_dir;
 use zoe_core::testing::{self, Key};
 use zoe_core::{Compression, Encoded, Oid, Options, Store, Tid, Txn};
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-encoded-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn open(dir: &Path, options: Options) -> Store {
     Store::open_with(dir, options).unwrap()
@@ -42,7 +38,7 @@ fn zstd() -> Options {
 }
 
 /// A pickle of `len` bytes that zstd compresses well.
-fn compressible(oid: u64, len: usize) -> Vec<u8> {
+fn compressible_item(oid: u64, len: usize) -> Vec<u8> {
     let mut data = b"\x80\x03cplone.app.content\nItem".to_vec();
     data.extend_from_slice(format!("{oid}\nq\x00.").as_bytes());
     while data.len() < len {
@@ -69,9 +65,9 @@ fn noise(len: usize) -> Vec<u8> {
 /// pickle that zstd does not shrink, and a pickle of one byte.
 fn records() -> Vec<(Oid, Vec<u8>)> {
     let mut records: Vec<(Oid, Vec<u8>)> = (1..=20)
-        .map(|oid| (Oid(oid), compressible(oid, 1024)))
+        .map(|oid| (Oid(oid), compressible_item(oid, 1024)))
         .collect();
-    records.push((Oid(21), compressible(21, 100 * 1024)));
+    records.push((Oid(21), compressible_item(21, 100 * 1024)));
     records.push((Oid(22), noise(5_000)));
     records.push((Oid(23), b"x".to_vec()));
     records
@@ -161,8 +157,10 @@ fn an_attached_payload_gives_the_frames_of_an_inline_compression() {
                 staging_memory,
                 ..Options::default()
             };
-            let inline = open(&fresh_dir(&format!("inline-{name}")), options.clone());
-            let attached = open(&fresh_dir(&format!("attached-{name}")), options);
+            let inline_dir = fresh_dir(&format!("inline-{name}"));
+            let inline = open(&inline_dir, options.clone());
+            let attached_dir = fresh_dir(&format!("attached-{name}"));
+            let attached = open(&attached_dir, options);
             for tid in [Tid(0x0300_0000_0000_0001), Tid(0x0300_0000_0000_0002)] {
                 restore(&inline, tid, &records, false);
                 assert_eq!(restore(&attached, tid, &records, true), 0);
@@ -183,7 +181,7 @@ fn an_attached_payload_gives_the_frames_of_an_inline_compression() {
 fn a_payload_of_other_bytes_or_another_compression_is_not_attached() {
     let dir = fresh_dir("refused");
     let store = open(&dir, zstd());
-    let data = compressible(1, 4096);
+    let data = compressible_item(1, 4096);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(Oid(1), Tid::ZERO, &data).unwrap();
     let mut other = data.clone();
@@ -209,7 +207,7 @@ fn a_payload_of_other_bytes_or_another_compression_is_not_attached() {
 fn a_later_store_of_the_oid_drops_its_attached_payload() {
     let dir = fresh_dir("restored");
     let store = open(&dir, zstd());
-    let (first, second) = (compressible(1, 4096), compressible(2, 4096));
+    let (first, second) = (compressible_item(1, 4096), compressible_item(2, 4096));
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(Oid(1), Tid::ZERO, &first).unwrap();
     let encoded = Encoded::encode(&first, store.compression());
@@ -224,7 +222,7 @@ fn a_later_store_of_the_oid_drops_its_attached_payload() {
 fn set_encoded_from_another_thread_fails() {
     let dir = fresh_dir("thread");
     let store = open(&dir, Options::default());
-    let data = compressible(1, 4096);
+    let data = compressible_item(1, 4096);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(Oid(1), Tid::ZERO, &data).unwrap();
     std::thread::scope(|scope| {

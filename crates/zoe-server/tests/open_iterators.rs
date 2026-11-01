@@ -8,9 +8,9 @@
 //! `iterator_gc` does, costs the server little memory, whatever the size of
 //! the transactions. Each record iterator still gives its records.
 
-mod wire;
+mod common;
 
-use wire::{Conn, Server, Value, bytes_of, commit, fresh_dir, items, new_oids, p64, u64_of};
+use common::{Conn, Server, Value, bytes_of, commit, fresh_dir, items, new_oids, p64, u64_of};
 
 /// The size of the pickle of each transaction.
 const RECORD: usize = 8 << 20;

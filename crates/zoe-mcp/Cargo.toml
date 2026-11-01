@@ -1,6 +1,6 @@
 [package]
 name = "zoe-mcp"
-description = "The MCP server for ops and content agents."
+description = "The MCP server for ops agents."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,6 +21,8 @@ zoe-pickle.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "rt", "time"] }
+# The record builders of `zoe_pickle::testing`.
+zoe-pickle = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

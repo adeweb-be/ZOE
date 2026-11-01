@@ -1,10 +1,13 @@
 //! Acceptance test of the walking skeleton: open a store, store one object,
 //! finish, reload, kill, reopen. The crash simulation is attached.
 
+mod support;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use support::fresh_dir;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, Tid, ZoeError};
 
@@ -23,14 +26,6 @@ fn commit_one(store: &Store) -> (Oid, Tid) {
     txn.vote().unwrap();
     let tid = txn.finish().unwrap();
     (oid, tid)
-}
-
-/// Return an empty directory for one test.
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 #[test]
@@ -105,7 +100,7 @@ fn an_acknowledged_commit_survives_sigkill() {
             "--exact",
             "--nocapture",
         ])
-        .env(WRITER, &dir)
+        .env(WRITER, dir.path())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

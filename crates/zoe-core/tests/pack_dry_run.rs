@@ -46,7 +46,7 @@ fn text(p: &mut Vec<u8>, s: &str) {
 
 /// Return a record: the class pickle `class`, then a dict state with a
 /// title and a `(oid, class)` reference for each of `refs`.
-fn record(class: Vec<u8>, title: &str, refs: &[(&str, Oid)]) -> Vec<u8> {
+fn titled_record(class: Vec<u8>, title: &str, refs: &[(&str, Oid)]) -> Vec<u8> {
     let mut p = class;
     p.extend_from_slice(b"\x80\x03}(");
     text(&mut p, "title");
@@ -62,11 +62,11 @@ fn record(class: Vec<u8>, title: &str, refs: &[(&str, Oid)]) -> Vec<u8> {
 }
 
 fn folder(title: &str, refs: &[(&str, Oid)]) -> Vec<u8> {
-    record(class("app.content", "Folder"), title, refs)
+    titled_record(class("app.content", "Folder"), title, refs)
 }
 
 fn document(title: &str) -> Vec<u8> {
-    record(class("app.content", "Document"), title, &[])
+    titled_record(class("app.content", "Document"), title, &[])
 }
 
 /// The pickle of a blob record.
@@ -139,12 +139,12 @@ const MAPPING: &str = "persistent.mapping.PersistentMapping";
 fn scenario(store: &Store) -> (Model, Vec<Tid>) {
     let [f, d1, d2, d3, k, blob] = [1, 2, 3, 4, 5, 6].map(Oid);
     let mut model = Model::default();
-    let root = record(
+    let root = titled_record(
         class("persistent.mapping", "PersistentMapping"),
         "root",
         &[("blob", blob), ("bucket", k), ("folder", f)],
     );
-    let bucket = |title| record(class_with_args("BTrees.OOBTree", "OOBucket"), title, &[]);
+    let bucket = |title| titled_record(class_with_args("BTrees.OOBTree", "OOBucket"), title, &[]);
 
     let t1 = model.commit(
         store,
@@ -166,7 +166,7 @@ fn scenario(store: &Store) -> (Model, Vec<Tid>) {
             // The same class in the class-only form.
             (
                 k,
-                record(class("BTrees.OOBTree", "OOBucket"), "k2", &[]),
+                titled_record(class("BTrees.OOBTree", "OOBucket"), "k2", &[]),
                 BUCKET,
             ),
         ],

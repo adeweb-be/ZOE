@@ -4,46 +4,15 @@
 
 How ZOE gets built: one human, a team of AI agents, cards gated by tests, worked in interactive sessions. The technical design lives in Doc.
 
-## Way of working: one human, a team of agents
+## Way of working
 
-ZOE is built by AI agents with one human as product owner and architect, so the process is designed around what agents are good at (fast, parallel, tireless, literal) and what they are bad at (judgement about scope, invariants nobody wrote down, and knowing when to stop). The rule that follows from this: nothing is a task until it has a test that decides it, and nothing merges on an agent's word.
+ZOE is built by AI agents with one human as product owner and architect. The human owns the technical specification and takes the big design decisions: a change to the on-disk format, the wire protocol or a public Python API, and a new ADR. The agents build and merge the rest. Nothing is a task until a test decides it.
 
-&#91;embedded content: card lifecycle · two agent approvals, two human gates\]
-
-The tinted boxes are the only two places the human is in the loop; a card that touches no red zone never waits on a person after it is approved.
-
-**Roles**
-
-| Role | Who | Does | Never does |
-| --- | --- | --- | --- |
-| Product owner and architect | the human | owns the technical specification and the ADRs, approves cards, reviews red zones, runs the batch review and the retro | writes code by hand except spikes and acceptance tests |
-| Planner | agent, fresh session per planning run | slices a roadmap phase into cards, orders them by dependency and risk, writes the acceptance test skeleton for each, keeps the board current | starts implementation |
-| Builder | agent, one or more Claude Code sessions per card, in the card's own git worktree | implements one card until its acceptance test is green, writes unit tests, opens the PR with a claims-and-evidence section | edits acceptance tests, CI configuration, or files outside the card's scope fence |
-| Reviewer | agent, fresh context, never the builder's session | reviews the diff against the card, the specification and the crate's invariants file; checks the claims against the evidence; requests changes or approves | merges |
-| Verifier | CI, plus an agent that reads the results | runs the harness tier for the PR, the benchmark quick set and the regression gate; posts numbers on the PR | approves on green alone when a red zone is touched |
-| Documenter | agent, after every merge | diffs code against the specification and the ADRs, proposes updates and new ADRs, maintains CONTEXT.md | changes a decision |
-| Release manager | agent, on tag | changelog from merged cards, version bump across crates and wheel, artifacts, signed binaries | tags without the human's go |
-
-**Cadence**
-
-| Rhythm | What happens | Human involvement |
-| --- | --- | --- |
-| continuous | a session builds a Ready card, a fresh reviewer and CI run on every PR, the human merges | the merge |
-| per batch | the planner's next batch of cards is approved, open questions answered, order re-ranked; batches are as frequent as the human wants them, not calendar-bound | the main touchpoint |
-| per red-zone PR | the human reviews the diff with the reviewer agent's report beside it | minutes per PR |
-| per phase gate | gate check against the testing harness; one `just tsan` run on `main`, where a reported race becomes a card; the documenter reconciles specification and code; ADRs for every decision taken in the phase | an hour or two |
-| retro, on the metrics | when rejection rate, cost per card or flaky tests cross a threshold, a retro happens; its output is changes to CLAUDE.md files, invariants files, skills and card templates: the retro improves the agents, not the people | the human reads the proposal |
-
-**Repository conventions that make agents reliable**
-
-- Root `CLAUDE.md`: how to build, test and bench, as just recipes; the red-zone list; the stop-and-ask rules; the claims-and-evidence PR template.
-- One `CLAUDE.md` per crate with its invariants in plain sentences ("locks are acquired in ascending oid order", "the backend never allocates tids"); the reviewer checks diffs against this file.
-- `docs/adr/`: one Architecture Decision Record per decision in the specification, numbered, with context, decision, consequences; new decisions go through a card of their own.
-- `CONTEXT.md`: the domain glossary (oid, tid, serial, ghost, vote, pack, intent lock) so agents and humans use one vocabulary.
-- Skills for the recurring procedures: run the conformance suite, run the benchmark set and compare to baseline, cut a release, write a handoff when a session ends unfinished.
-- Trunk-based: short-lived branch per card, one agent per worktree, squash merge, no force pushes, CI configuration changed only by a human.
-- Stacked pull requests: when several PRs are open at once, they form one merge train. Each branch merges the tail of the train before it is marked ready, PRs merge in train order, and the next branch merges `main` after each squash merge. The root `CLAUDE.md` gives the steps.
-- `CODEOWNERS` marks the red zones: the on-disk format, pack, and the process files (`.github/` and `loops/`). A red-zone PR needs the human's approval; everything else merges on the reviewer agent's approval (ADR 0022).
+- A card is a GitHub issue: one mechanism, one pull request (see "Cards" below).
+- A builder works on the branch `card/<id>` in its own git worktree and opens the pull request. The pull request merges by squash when CI is green. Trunk-based: short-lived branches, no force pushes.
+- The red zones need care: the on-disk format, pack, and the process files (`.github/` and `loops/`). `CODEOWNERS` lists them (ADR 0018). A change to them merges on green CI unless it carries a design decision; the process files stay human-only.
+- CI runs `check`, `test` and `docs` on each pull request. The conformance and Plone suites, the crash loop, the benchmarks and `just tsan` run when the human asks, as a rule at the end of a phase.
+- The root `CLAUDE.md` gives the recipes, the hard constraints and the stop-and-ask rules. Each crate has a `CLAUDE.md` with its invariants in plain sentences. `docs/adr/` holds one record per decision. `CONTEXT.md` is the glossary.
 
 **Tooling**
 
@@ -57,21 +26,14 @@ Two loops. The inner loop, on a laptop or in an agent session, is `devenv shell`
 | zc.buildout | the Plone instances the suites and benchmarks run against, under `plone/`: one `buildout.cfg` per scenario (in-process `<zoe>`, `<zeoclient>` against `zoe serve`, `FileStorage` and ZEO as baselines), `versions.cfg` pinned to a Plone release, `zoedb` from the wheel `uv build` just produced, installed into `target/plone/zoedb` and linked as a develop egg so that each build takes the current code, `plone.recipe.zope2instance` writing `zope.conf` and `bin/test`; no mxdev | buildout owns Plone, uv owns the project's own packages, nothing crosses that line; the Plone suites run from `bin/test` (zope.testrunner); the eggs and download caches are Dagger cache volumes |
 | pytest | the runner for the project's own Python tests: `zoedb`, `zoe.plone` and the ZODB and ZEO conformance suites (unittest-based, collected unchanged); `pytest-xdist` where the suites allow; run on 3.12, 3.13, 3.14 and 3.14t, Linux x86-64 | new Python tests are plain pytest; a card's Python-side acceptance tests are pytest files named on the card; the Plone suites are the one exception and stay on `bin/test` |
 | Dagger | CI as code in `ci/`: a Dagger module written in Python with the functions `check`, `test`, `conformance`, `plone`, `bench`, `crash`, `zoe-binary`, `server-image` and `release`, each running in containers built from the same `devenv` definition; one cache shared by the runners | CI logic lives here and nowhere else; reviewed like code; `just ci` runs it locally when a CI failure needs reproducing, never for the edit-test loop |
-| GitHub Actions | thin workflows, one per event (pull request, merge queue, nightly, release), each a few lines that call the Dagger module; the merge queue; the nightly bench on the self-hosted runner | a workflow holds no logic; one exception: a first step frees the disk of a hosted runner before Dagger runs; a workflow change is a human-only change |
+| GitHub Actions | thin workflows, one per event (pull request, merge queue, nightly, release), each a few lines that call the Dagger module | a workflow holds no logic; one exception: a first step frees the disk of a hosted runner before Dagger runs; a workflow change is a human-only change |
 | GitHub | the repository, Issues as cards, the Projects board, pull requests, Releases, Pages for the dashboard, `CODEOWNERS`, branch protection, secret scanning, Dependabot | the board holds the state of every card |
 
 Inner loop: `devenv shell`, then `just <recipe>`, which runs `cargo`, `uv run pytest` or `bin/buildout` natively, incremental, seconds per run (minutes for a fresh Plone instance, cached after). CI: a workflow calls `dagger call <function>`, containerised, reproducible, cached. An agent session lives in the inner loop and runs recipes only; it reaches Dagger through `just ci` and `just release` and nothing else.
 
-## Units of work
+## Cards
 
-The unit is the card: one card, one pull request, and a card carries everything a builder needs without the conversation that produced it. A card holds one whole mechanism: the core, the server, the client, `zoe.plone`, the tests, the benchmarks and the change of the specification or of an ADR that the mechanism needs. So the mechanism is tested end to end and reviewed once, and a phase needs few merges. Cut a mechanism into two cards only when each part ships and is measured on its own.
-
-- **Steps.** The card lists its steps in order. A step is one commit or more. The description of the pull request gives the evidence of each step, so a reviewer can read the commits in order.
-- **Sessions.** A card takes as many builder sessions as its budget gives. Each session ends with `docs/handoffs/<card>.md` up to date: the step reached, what failed, the next step.
-- **Checkpoints.** When a step changes the on-disk format, the wire protocol, a public Python API, a trait signature that another crate uses, or a behaviour that the specification states, the card names the change. The first commit of that step is the ADR. The builder stops and asks for the human's approval of the ADR on the pull request, then builds on it. A checkpoint is a planned stop-and-ask, not a card of its own.
-- **Unknowns.** An unknown that the card must answer is the first step of the card, and its finding goes into `docs/spikes/` in the same pull request.
-
-**The task card**
+A card carries everything a builder needs without the conversation that produced it. It holds one whole mechanism: the core, the server, the client, `zoe.plone`, the tests and the change of the specification or of an ADR that the mechanism needs. Cut a mechanism into two cards only when each part ships on its own.
 
 ```markdown
 # ZOE-142 — group commit: coalesce concurrent tpc_finish into one fsync
@@ -79,38 +41,18 @@ Phase 2 · crate zoe-core · red zone: no
 
 Requirement: N5
 Goal: 50 concurrent writers on a 10 ms fsync device reach ≥ 1,000 commits/s.
-Steps: 1. the batch and its leader; 2. one fsync for each batch, and a failed fsync fails every member; 3. the metrics of the batches and the contention benchmark
-Acceptance tests (do not edit): tests/commit/group_commit.rs, bench/contention.rs@n5
+Steps: 1. the batch and its leader; 2. one fsync for each batch, and a failed fsync fails every member; 3. the metrics of the batches
+Acceptance tests (do not edit): tests/commit/group_commit.rs
 Scope fence: crates/zoe-core/src/commit/**, crates/zoe-core/tests/commit/**
-Out of scope: lock manager, backend trait
 Invariants: locks held by members stay held until the batch is durable; a failed fsync fails every member
-Checkpoints: none
-Spike or build: build
-Budget: three sessions; a spent budget means stop and ask, not try harder
-Done when: acceptance green, bench posted, reviewer approved
+Done when: the acceptance test is green in CI
 ```
 
-Cards come from the roadmap phase and the requirements table of the specification, so every card cites a requirement id, and every requirement is closed by the set of cards that cite it.
+Every card cites a requirement id of the specification.
 
-**Definition of Ready.** A card has a requirement id, an acceptance test that fails today, its steps and its checkpoints, a scope fence, written invariants, a budget, and no dependency on an unmerged card.
-
-**Definition of Done.** Acceptance test green; unit tests added; the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
-
-**Stop-and-ask rules for builders.** A builder stops and writes a question on the card instead of guessing when a change would alter the on-disk format, the wire protocol, a public Python API, a trait signature used by another crate, or an acceptance test; when the budget is spent; and when the only way to make the test green is to weaken it.
-
-**Spikes.** A spike card ends in a written finding in `docs/spikes/` and no merged code. A spike is a card of its own only when its answer decides whether a build card exists; otherwise it is the first step of the build card (units of work, above). The big unknowns are spikes before they are builds: redb versus the append-only log, pickle round-trip on a production copy, the early-lock hook in ZODB.
-
-**Order of work inside a phase.** Walking skeleton first: the thinnest end-to-end slice (open store, store one object, finish, reload, kill, reopen) with the crash simulation attached, then widen. Hardest unknowns next, as spikes.
-
-**Process metrics**, on the same dashboard as the benchmarks: cards merged per batch, first-review rejection rate, red-zone PRs waiting on the human, flaky-test count, benchmark drift, cost in tokens per merged card. When rejection rate rises, the retro fixes the card template or the invariants file; when a card spends its budget before its last step, the retro cuts the card at a step or gives it a larger budget.
-
-## Sessions
-
-The work goes through interactive sessions: the human and an agent, with no automated loop and nothing running unattended. A session takes the roles of the table above in turn. As builder, it works on one card in its own worktree on the branch `card/<id>` and opens the pull request. For review, it starts a fresh reviewer session that never shares the builder's context. The human approves red zones, answers the questions on cards and merges. The briefs for each role are in `loops/prompts/<role>.md`.
-
-**Guardrails.** `.github/` (the workflows and `CODEOWNERS`) and `loops/` are human-only. Agents never hold production credentials or data (project organisation, below).
-
-**Handoffs.** A session that ends before its card is done (the end of the session, the budget, a crash, a stop-and-ask, a checkpoint) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The next session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
+- **Stop and ask.** A builder stops and writes a question on the card, instead of guessing, before a change to the on-disk format, the wire protocol, a public Python API, a trait signature that another crate uses or an acceptance test, and when the only way to make a test green is to weaken it. A change of that kind starts with its ADR.
+- **Spikes.** A spike ends in a written finding in `docs/spikes/` and no merged code.
+- **Handoffs.** A card that stops unfinished leaves `docs/handoffs/<card>.md`: the state and the next step. The next session starts from that file and the branch.
 
 ## Roadmap
 
@@ -212,17 +154,17 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 | repositories | `adeweb-be/ZOE`, the monorepo: `crates/`, `python/zoedb/`, `apps/loupe/`, `deploy/`, `docs/`, `bench/`, `loops/`; `adeweb-be/zoe-bench-results` for the published results of every benchmark family, which `just bench publish` copies into a checkout of it (ADR 0054), and the dashboard on GitHub Pages | Loupe stays in the monorepo through phase 7, which holds its last planned screens, and splits after it only if frontend contributors need their own cadence; the phase 0 patches to `persistent`, `BTrees` and `zodbpickle` go upstream to zopefoundation from forks in the `adeweb-be` organisation |
 | tags and versions | `v0.3.0` for the Cargo workspace and the `zoedb` wheel together; `loupe-v0.1.0` for Loupe | semantic versioning; the on-disk format version is independent of the release version |
 | licences | Apache-2.0 for everything, the Plone extra included | the Rust ecosystem's norm; keeps the door open to the Plone Foundation and to any adopter |
-| documentation site | GitHub Pages of `adeweb-be/ZOE`, built with mdBook from `docs/` by the Dagger `docs` function on every merge to trunk; the bench dashboard is the Pages site of `adeweb-be/zoe-bench-results` | `docs/` in git is the source of truth: the technical specification, this document and the ADRs are exported there once and maintained in git from then on, kept current by the documenter; nothing is hosted on a private domain |
-| data hygiene | test corpora in public CI come from a synthetic Plone site generator; production copies from an adopting site run only on that site's private runner, whose results are posted as numbers, never as data; secret scanning on every push; builders never hold production data | the one rule that survives every retro |
+| documentation site | GitHub Pages of `adeweb-be/ZOE`, built with mdBook from `docs/` by the Dagger `docs` function on every merge to trunk; the bench dashboard is the Pages site of `adeweb-be/zoe-bench-results` | `docs/` in git is the source of truth: the technical specification, this document and the ADRs are exported there once and maintained in git from then on, kept current by the pull requests that change behaviour; nothing is hosted on a private domain |
+| data hygiene | test corpora in public CI come from a synthetic Plone site generator; production copies from an adopting site run only on that site's private runner, whose results are posted as numbers, never as data; secret scanning on every push; builders never hold production data | the one rule that never changes |
 
 ## Process risks and open questions
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | The human becomes the bottleneck: batches and red-zone reviews wait | the project slows to the approver's pace | red zones are narrow and listed; the planner batches by dependency so one approval unlocks many cards |
-| Agents optimise for the test, not the goal | green acceptance tests on code that misses the point | acceptance tests written before the build and never editable by the builder; the reviewer checks claims against evidence; shadow runs and differential suites judge behaviour, not coverage |
-| Invariants nobody wrote down | reviewers approve changes that break an unstated rule | per-crate invariants files, grown by every retro and every incident |
-| Cost drift | token spend grows faster than merged work | cost per merged card on the dashboard; rising cost triggers the retro |
+| Agents optimise for the test, not the goal | green acceptance tests on code that misses the point | acceptance tests written before the build and never editable by the builder; shadow runs and differential suites judge behaviour, not coverage |
+| Invariants nobody wrote down | a change breaks an unstated rule | per-crate invariants files, grown by every incident |
+| Cost drift | token spend grows faster than merged work | lean cards and lean CI: the suites beyond `check` and `test` run only when the human asks |
 | Production data or credentials leak into a public repository or a CI log | a data breach, and the adopting site's trust | synthetic corpora in public CI; private runner for production copies; secret scanning; builders have no access to production data at all |
 | Single owner | bus factor | the specification, the harness, the ADRs and the role briefs are the handover; anyone with the repository can continue the work |
 

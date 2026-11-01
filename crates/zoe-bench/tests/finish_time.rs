@@ -1,0 +1,535 @@
+//! A measurement of `finish` at concurrency 1, as zodbshootout commits:
+//! 100 records of 1 KB in each transaction, in a store on the disk.
+//!
+//! The test is ignored, because its numbers mean something only in a
+//! release build on a real disk. Run it with:
+//!
+//! ```text
+//! cargo test -p zoe-bench --release --test finish_time -- --ignored --nocapture
+//! ```
+//!
+//! It runs four scenarios: `add` writes 100 new objects in each
+//! transaction, and `update` writes 100 existing objects again, each with
+//! compression off and with zstd, the default. Each scenario runs twice:
+//! first with the write-ahead log off (`WriteLog::enabled` false), the
+//! baseline, where each commit batch goes into the tables; then with the
+//! log on, the default (ADR 0056). For each run it prints the time of
+//! `finish`, the time of the span `fsync` (N17: the write and the sync of
+//! the commit batch), the time of the syncs and of the writes of the
+//! database file and of the files of the log, and `finish` less its syncs.
+//! Each number is the median, the 90th percentile and the mean of the
+//! transactions, in µs. It also prints the syncs, the writes and the bytes
+//! written of each finish, and the CPU time of the thread that finishes,
+//! user and system, per finish: the sum over the transactions, from
+//! `/proc/thread-self/stat`, so a busy disk weighs less on it than on the
+//! times. The syncs and the writes are those of the thread that finishes:
+//! the fold of the log writes the tables on a thread of its own, and its
+//! writes do not count.
+//!
+//! `ZOE_FINISH_TXNS` sets the number of transactions of each scenario,
+//! 500 by default. `ZOE_FINISH_SIZE` sets the size of a record in bytes,
+//! 1024 by default; 102400 gives the 100 KB records of zodbshootout.
+//! `ZOE_FINISH_DIR` sets the directory of the store, the temporary
+//! directory of cargo by default. With `ZOE_FINISH_ATTACH` set, each
+//! payload is encoded before the vote and attached (`Txn::set_encoded`),
+//! as `zoe serve` attaches the payloads of its compression pool. The
+//! encodes are not in the time of the finish.
+
+mod support;
+
+use std::cell::Cell;
+use std::fmt;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use redb::StorageBackend;
+use support::speedtest_record;
+use zoe_core::vfs::{DirLock, OsVfs, Vfs, WriteFile};
+use zoe_core::{Compression, Encoded, Oid, Options, Store, SystemClock, Tid, WriteLog};
+
+/// The records of a transaction.
+const RECORDS: usize = 100;
+
+/// The size of a record without `ZOE_FINISH_SIZE`.
+const DEFAULT_SIZE: usize = 1024;
+
+/// Return the size of a record: `ZOE_FINISH_SIZE`, or the default.
+fn size() -> usize {
+    std::env::var("ZOE_FINISH_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SIZE)
+}
+
+/// The transactions that run before each scenario and are not measured.
+const WARMUP: usize = 20;
+
+/// The name of the database file in the store directory.
+const DATABASE: &str = "zoe.redb";
+
+/// The directory of the write-ahead log in the store directory, with its
+/// `/`.
+const LOG: &str = "wal/";
+
+thread_local! {
+    /// True on the thread of the test while it runs `finish`.
+    static FINISHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The syncs and the writes of the database file and of the files of the
+/// log, by the thread that finishes: their time, their count and the
+/// bytes written.
+#[derive(Default)]
+struct Io {
+    sync_nanos: AtomicU64,
+    syncs: AtomicU64,
+    write_nanos: AtomicU64,
+    writes: AtomicU64,
+    written: AtomicU64,
+}
+
+/// What `Io::take` gives: the numbers since the last call.
+struct Taken {
+    sync: Duration,
+    syncs: u64,
+    write: Duration,
+    writes: u64,
+    written: u64,
+}
+
+impl Io {
+    /// Return the numbers since the last call, and start from zero.
+    fn take(&self) -> Taken {
+        let nanos = |counter: &AtomicU64| Duration::from_nanos(counter.swap(0, Ordering::SeqCst));
+        Taken {
+            sync: nanos(&self.sync_nanos),
+            syncs: self.syncs.swap(0, Ordering::SeqCst),
+            write: nanos(&self.write_nanos),
+            writes: self.writes.swap(0, Ordering::SeqCst),
+            written: self.written.swap(0, Ordering::SeqCst),
+        }
+    }
+}
+
+impl fmt::Debug for Io {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Io")
+    }
+}
+
+/// A file of the store. The database file and each file of the log count
+/// the syncs and the writes of the thread that finishes in `io`. Another
+/// file has no `io`.
+#[derive(Debug)]
+struct TimedFile {
+    file: zoe_core::vfs::OsFile,
+    io: Option<Arc<Io>>,
+}
+
+impl TimedFile {
+    /// Return the counts of the file, when the calling thread finishes.
+    fn io(&self) -> Option<&Io> {
+        self.io.as_deref().filter(|_| FINISHING.get())
+    }
+}
+
+/// Add the time since `start` to `nanos`, and 1 to `count`.
+fn count(nanos: &AtomicU64, count: &AtomicU64, start: Instant) {
+    nanos.fetch_add(start.elapsed().as_nanos() as u64, Ordering::SeqCst);
+    count.fetch_add(1, Ordering::SeqCst);
+}
+
+impl StorageBackend for TimedFile {
+    fn len(&self) -> io::Result<u64> {
+        self.file.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.file.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        let start = Instant::now();
+        let result = self.file.sync_data();
+        if let Some(io) = self.io() {
+            count(&io.sync_nanos, &io.syncs, start);
+        }
+        result
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let start = Instant::now();
+        let result = self.file.write(offset, data);
+        if let Some(io) = self.io() {
+            count(&io.write_nanos, &io.writes, start);
+            io.written.fetch_add(data.len() as u64, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.file.close()
+    }
+}
+
+/// A directory of the operating system whose database file and files of
+/// the log count their syncs and writes.
+struct TimedVfs {
+    vfs: OsVfs,
+    io: Arc<Io>,
+}
+
+impl TimedVfs {
+    fn timed(&self, name: &str, file: zoe_core::vfs::OsFile) -> TimedFile {
+        let io = (name == DATABASE || name.starts_with(LOG)).then(|| self.io.clone());
+        TimedFile { file, io }
+    }
+}
+
+impl Vfs for TimedVfs {
+    type File = TimedFile;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.vfs.exists(name)
+    }
+
+    fn open(&self, name: &str) -> io::Result<TimedFile> {
+        Ok(self.timed(name, self.vfs.open(name)?))
+    }
+
+    /// A segment of the log keeps the mode of `OsVfs::open_log`.
+    fn open_log(&self, name: &str) -> io::Result<TimedFile> {
+        Ok(self.timed(name, self.vfs.open_log(name)?))
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<TimedFile> {
+        Ok(self.timed(name, self.vfs.create_new(name)?))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.vfs.rename(from, to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        self.vfs.hard_link(from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.vfs.remove(name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        self.vfs.sync_dir()
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        self.vfs.sync_dir_at(dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        self.vfs.create_dir(name)
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.vfs.list_files(dir)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.vfs.list_entries(dir)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        self.vfs.create_file(name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        self.vfs.read_file(name)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.vfs.sync_file(name)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        self.vfs.set_read_only(name)
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        self.vfs.lock_dir(name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.vfs.path(name)
+    }
+}
+
+/// A subscriber of `tracing` that adds up the time of each span `fsync`.
+struct FsyncSpans {
+    next: AtomicU64,
+    /// The id of each open `fsync` span and the time it was entered.
+    open: Mutex<Vec<(u64, Option<Instant>)>>,
+    nanos: AtomicU64,
+}
+
+impl FsyncSpans {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            open: Mutex::new(Vec::new()),
+            nanos: AtomicU64::new(0),
+        }
+    }
+
+    fn take(&self) -> Duration {
+        Duration::from_nanos(self.nanos.swap(0, Ordering::SeqCst))
+    }
+}
+
+impl tracing::Subscriber for FsyncSpans {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_span() && metadata.name() == "fsync"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        self.open.lock().unwrap().push((id, None));
+        tracing::span::Id::from_u64(id)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, span: &tracing::span::Id) {
+        let mut open = self.open.lock().unwrap();
+        if let Some(entry) = open.iter_mut().find(|(id, _)| *id == span.into_u64()) {
+            entry.1 = Some(Instant::now());
+        }
+    }
+
+    fn exit(&self, span: &tracing::span::Id) {
+        let mut open = self.open.lock().unwrap();
+        if let Some(at) = open.iter().position(|(id, _)| *id == span.into_u64())
+            && let (_, Some(entered)) = open.swap_remove(at)
+        {
+            let nanos = entered.elapsed().as_nanos() as u64;
+            self.nanos.fetch_add(nanos, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The numbers of one scenario, one entry for each transaction.
+#[derive(Default)]
+struct Samples {
+    vote: Vec<Duration>,
+    finish: Vec<Duration>,
+    fsync: Vec<Duration>,
+    sync: Vec<Duration>,
+    write: Vec<Duration>,
+    syncs: u64,
+    writes: u64,
+    written: u64,
+    /// The CPU time of the thread of the test in all its finishes.
+    cpu: Duration,
+}
+
+/// The CPU time of the finishes since the last `take`, in nanoseconds.
+static FINISH_CPU: AtomicU64 = AtomicU64::new(0);
+
+/// Return the CPU time of the calling thread, user and system.
+fn thread_cpu() -> Duration {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+    // The name of the command is in parentheses and can hold spaces.
+    let rest = &stat[stat.rfind(')').unwrap() + 2..];
+    let fields: Vec<&str> = rest.split(' ').collect();
+    // `utime` and `stime` are the fields 14 and 15 of the line, so 11 and
+    // 12 after the state, in clock ticks of 10 ms.
+    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    Duration::from_millis(ticks * 10)
+}
+
+/// Return the median, the 90th percentile and the mean of `samples`, in
+/// µs.
+fn summary(samples: &[Duration]) -> String {
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    let micros = |d: Duration| d.as_secs_f64() * 1e6;
+    let median = micros(sorted[sorted.len() / 2]);
+    let p90 = micros(sorted[sorted.len() * 9 / 10]);
+    let mean = micros(sorted.iter().sum::<Duration>()) / sorted.len() as f64;
+    format!("median {median:6.0}  p90 {p90:6.0}  mean {mean:6.0}")
+}
+
+impl Samples {
+    fn print(&self, name: &str) {
+        let txns = self.finish.len() as u64;
+        println!(
+            "{name}: {txns} transactions; per finish {:.2} syncs, {} writes, {} bytes written",
+            self.syncs as f64 / txns as f64,
+            self.writes / txns,
+            self.written / txns
+        );
+        println!("  vote              {}", summary(&self.vote));
+        println!("  finish            {}", summary(&self.finish));
+        println!("  span fsync        {}", summary(&self.fsync));
+        println!("  sync of the file  {}", summary(&self.sync));
+        println!("  writes            {}", summary(&self.write));
+        let rest: Vec<Duration> = (self.finish.iter().zip(&self.sync))
+            .map(|(finish, sync)| finish.saturating_sub(*sync))
+            .collect();
+        println!("  finish less sync  {}", summary(&rest));
+        let cpu = self.cpu.as_secs_f64() * 1e6 / txns as f64;
+        println!("  CPU of the thread {cpu:6.0} µs per finish");
+    }
+}
+
+/// Commit one transaction that writes `oids` in `version`. Return the
+/// time of `vote`, the time of `finish` and the oids with their new
+/// serial. `io` counts only the syncs and the writes of `finish`.
+fn timed_commit(
+    store: &Store,
+    io: &Io,
+    oids: &[(Oid, Tid)],
+    version: u64,
+) -> (Duration, Duration, Vec<(Oid, Tid)>) {
+    let attach = std::env::var_os("ZOE_FINISH_ATTACH").is_some();
+    let mut txn = store.tpc_begin(b"user", b"finish time", b"").unwrap();
+    for &(oid, serial) in oids {
+        let data = speedtest_record(oid, version, size());
+        txn.store(oid, serial, &data).unwrap();
+        if attach {
+            let encoded = Encoded::encode(&data, store.compression());
+            assert!(txn.set_encoded(oid, encoded).unwrap());
+        }
+    }
+    let start = Instant::now();
+    txn.vote().unwrap();
+    let vote = start.elapsed();
+    io.take();
+    let cpu = thread_cpu();
+    FINISHING.set(true);
+    let start = Instant::now();
+    let tid = txn.finish();
+    let elapsed = start.elapsed();
+    FINISHING.set(false);
+    let tid = tid.unwrap();
+    let cpu = thread_cpu() - cpu;
+    FINISH_CPU.fetch_add(cpu.as_nanos() as u64, Ordering::SeqCst);
+    (
+        vote,
+        elapsed,
+        oids.iter().map(|&(oid, _)| (oid, tid)).collect(),
+    )
+}
+
+/// Run `txns` transactions of `scenario` in a new store in `dir` with
+/// `compression` and `write_log`, and return their numbers. `add` writes
+/// new oids, and `update` writes again the oids of the warmup, in turn.
+fn run(
+    dir: &Path,
+    compression: Compression,
+    write_log: WriteLog,
+    scenario: &str,
+    txns: usize,
+) -> Samples {
+    let _ = std::fs::remove_dir_all(dir);
+    let io = Arc::new(Io::default());
+    let vfs = TimedVfs {
+        vfs: OsVfs::new(dir).unwrap(),
+        io: io.clone(),
+    };
+    let options = Options {
+        compression,
+        write_log,
+        ..Options::default()
+    };
+    let store = Store::open_full(vfs, SystemClock, options).unwrap();
+    let spans = Arc::new(FsyncSpans::new());
+    let dispatch = tracing::Dispatch::from(spans.clone());
+    let new_oids = |store: &Store| -> Vec<(Oid, Tid)> {
+        (0..RECORDS)
+            .map(|_| (store.new_oid().unwrap(), Tid::ZERO))
+            .collect()
+    };
+
+    let mut samples = Samples::default();
+    // The subscriber is the default from the first span on, so the span
+    // `fsync` is never cached as a span that no subscriber wants.
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut written = Vec::new();
+        for _ in 0..WARMUP {
+            let (_, _, oids) = timed_commit(&store, &io, &new_oids(&store), 0);
+            written.push(oids);
+        }
+        spans.take();
+        FINISH_CPU.store(0, Ordering::SeqCst);
+        for i in 0..txns {
+            let (vote, finish) = if scenario == "add" {
+                let (vote, finish, _) = timed_commit(&store, &io, &new_oids(&store), 0);
+                (vote, finish)
+            } else {
+                let slot = i % written.len();
+                let (vote, finish, oids) = timed_commit(&store, &io, &written[slot], i as u64 + 1);
+                written[slot] = oids;
+                (vote, finish)
+            };
+            let taken = io.take();
+            assert!(taken.syncs >= 1, "the finish syncs the database file");
+            samples.vote.push(vote);
+            samples.finish.push(finish);
+            samples.fsync.push(spans.take());
+            samples.sync.push(taken.sync);
+            samples.write.push(taken.write);
+            samples.syncs += taken.syncs;
+            samples.writes += taken.writes;
+            samples.written += taken.written;
+        }
+        samples.cpu = Duration::from_nanos(FINISH_CPU.swap(0, Ordering::SeqCst));
+    });
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+    samples
+}
+
+#[test]
+#[ignore = "a measurement: run it in release on a real disk"]
+fn finish_time_at_concurrency_1_with_1_kb_records() {
+    let txns = std::env::var("ZOE_FINISH_TXNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500);
+    // The temporary directory of cargo is in the target directory, on
+    // the disk. `/tmp` can be a memory filesystem, whose sync costs
+    // nothing.
+    let dir = std::env::var_os("ZOE_FINISH_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
+        .join("finish-time");
+    // The log off is the baseline: each commit batch goes into the tables.
+    let baseline = WriteLog {
+        enabled: false,
+        ..WriteLog::default()
+    };
+    for (name, compression) in [
+        ("none", Compression::None),
+        ("zstd", Compression::default()),
+    ] {
+        for scenario in ["add", "update"] {
+            for (log, write_log) in [("off", baseline.clone()), ("on", WriteLog::default())] {
+                let samples = run(&dir, compression, write_log, scenario, txns);
+                samples.print(&format!(
+                    "{scenario}, {} bytes, compression {name}, log {log}",
+                    size()
+                ));
+            }
+        }
+    }
+}
