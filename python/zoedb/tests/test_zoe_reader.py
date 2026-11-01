@@ -310,6 +310,9 @@ def test_a_reference_into_another_database_takes_the_python_path():
         writer = one.open(transaction.TransactionManager())
         target = Child(1)
         writer.get_connection("two").root()["target"] = target
+        # A new object reachable from two databases does not commit, so the
+        # target commits first.
+        writer.transaction_manager.commit()
         holder = Holder()
         holder.target = target
         writer.root()["holder"] = holder
