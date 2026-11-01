@@ -247,6 +247,18 @@ impl Server {
             } else {
                 open(&storage.name, &storage.path, options.store_options(storage))?
             };
+            // The open cut the damaged last entry of the write-ahead log: a
+            // crash stopped its finish, or a damage of the disk destroyed
+            // it after its sync. Its commits are lost (ADR 0056).
+            if let Some((previous, last)) = store.cut_at_open() {
+                tracing::error!(
+                    storage = storage.name.as_str(),
+                    previous_tid = format_args!("{:016x}", previous.0),
+                    last_tid = format_args!("{:016x}", last.0),
+                    "the open cut the damaged last entry of the write-ahead log: \
+                     the commits after previous_tid up to last_tid are lost"
+                );
+            }
             // The blob directory gets its layout file before a client of
             // the shared directory creates the directory of an oid there.
             if options.shared_blob_dir && !read_only {

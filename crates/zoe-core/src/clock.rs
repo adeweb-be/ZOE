@@ -29,6 +29,18 @@ pub trait Clock: Send + Sync {
     fn waiter(&self) -> Arc<dyn Waiter> {
         Arc::new(ThreadWaiter::default())
     }
+
+    /// Start a thread named `name` that runs `work`. The fold of the
+    /// write-ahead log runs on such a thread (ADR 0056). The default starts
+    /// a thread of the operating system. A simulator gives its own, so the
+    /// work runs under its control. The caller waits for the end of the
+    /// work on a waiter, never on a join handle.
+    fn spawn(&self, name: &str, work: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(work)
+            .map(drop)
+    }
 }
 
 /// The wait of one thread. The thread waits on it, and another thread

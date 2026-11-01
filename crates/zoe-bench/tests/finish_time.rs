@@ -10,15 +10,21 @@
 //!
 //! It runs four scenarios: `add` writes 100 new objects in each
 //! transaction, and `update` writes 100 existing objects again, each with
-//! compression off and with zstd, the default. For each scenario it prints
-//! the time of `finish`, the time of the span `fsync` (N17: the write and
-//! the sync of the commit batch), the time of the syncs and of the writes
-//! of the database file, and `finish` less its syncs. Each number is the
-//! median, the 90th percentile and the mean of the transactions, in µs.
-//! It also prints the syncs, the writes and the bytes written of each
-//! finish, and the CPU time of the thread that finishes, user and system,
-//! per finish: the sum over the transactions, from `/proc/thread-self/stat`,
-//! so a busy disk weighs less on it than on the times.
+//! compression off and with zstd, the default. Each scenario runs twice:
+//! first with the write-ahead log off (`WriteLog::enabled` false), the
+//! baseline, where each commit batch goes into the tables; then with the
+//! log on, the default (ADR 0056). For each run it prints the time of
+//! `finish`, the time of the span `fsync` (N17: the write and the sync of
+//! the commit batch), the time of the syncs and of the writes of the
+//! database file and of the files of the log, and `finish` less its syncs.
+//! Each number is the median, the 90th percentile and the mean of the
+//! transactions, in µs. It also prints the syncs, the writes and the bytes
+//! written of each finish, and the CPU time of the thread that finishes,
+//! user and system, per finish: the sum over the transactions, from
+//! `/proc/thread-self/stat`, so a busy disk weighs less on it than on the
+//! times. The syncs and the writes are those of the thread that finishes:
+//! the fold of the log writes the tables on a thread of its own, and its
+//! writes do not count.
 //!
 //! `ZOE_FINISH_TXNS` sets the number of transactions of each scenario,
 //! 500 by default. `ZOE_FINISH_SIZE` sets the size of a record in bytes,
@@ -31,6 +37,7 @@
 
 mod support;
 
+use std::cell::Cell;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -41,7 +48,7 @@ use std::time::{Duration, Instant};
 use redb::StorageBackend;
 use support::speedtest_record;
 use zoe_core::vfs::{DirLock, OsVfs, Vfs, WriteFile};
-use zoe_core::{Compression, Encoded, Oid, Options, Store, SystemClock, Tid};
+use zoe_core::{Compression, Encoded, Oid, Options, Store, SystemClock, Tid, WriteLog};
 
 /// The records of a transaction.
 const RECORDS: usize = 100;
@@ -63,8 +70,18 @@ const WARMUP: usize = 20;
 /// The name of the database file in the store directory.
 const DATABASE: &str = "zoe.redb";
 
-/// The syncs and the writes of the database file: their time, their
-/// count and the bytes written.
+/// The directory of the write-ahead log in the store directory, with its
+/// `/`.
+const LOG: &str = "wal/";
+
+thread_local! {
+    /// True on the thread of the test while it runs `finish`.
+    static FINISHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The syncs and the writes of the database file and of the files of the
+/// log, by the thread that finishes: their time, their count and the
+/// bytes written.
 #[derive(Default)]
 struct Io {
     sync_nanos: AtomicU64,
@@ -103,12 +120,20 @@ impl fmt::Debug for Io {
     }
 }
 
-/// A file of the store. The database file counts its syncs and writes in
-/// `io`. Another file has no `io`.
+/// A file of the store. The database file and each file of the log count
+/// the syncs and the writes of the thread that finishes in `io`. Another
+/// file has no `io`.
 #[derive(Debug)]
 struct TimedFile {
     file: zoe_core::vfs::OsFile,
     io: Option<Arc<Io>>,
+}
+
+impl TimedFile {
+    /// Return the counts of the file, when the calling thread finishes.
+    fn io(&self) -> Option<&Io> {
+        self.io.as_deref().filter(|_| FINISHING.get())
+    }
 }
 
 /// Add the time since `start` to `nanos`, and 1 to `count`.
@@ -133,7 +158,7 @@ impl StorageBackend for TimedFile {
     fn sync_data(&self) -> io::Result<()> {
         let start = Instant::now();
         let result = self.file.sync_data();
-        if let Some(io) = &self.io {
+        if let Some(io) = self.io() {
             count(&io.sync_nanos, &io.syncs, start);
         }
         result
@@ -142,7 +167,7 @@ impl StorageBackend for TimedFile {
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
         let start = Instant::now();
         let result = self.file.write(offset, data);
-        if let Some(io) = &self.io {
+        if let Some(io) = self.io() {
             count(&io.write_nanos, &io.writes, start);
             io.written.fetch_add(data.len() as u64, Ordering::SeqCst);
         }
@@ -154,8 +179,8 @@ impl StorageBackend for TimedFile {
     }
 }
 
-/// A directory of the operating system whose database file counts its
-/// syncs and writes.
+/// A directory of the operating system whose database file and files of
+/// the log count their syncs and writes.
 struct TimedVfs {
     vfs: OsVfs,
     io: Arc<Io>,
@@ -163,7 +188,7 @@ struct TimedVfs {
 
 impl TimedVfs {
     fn timed(&self, name: &str, file: zoe_core::vfs::OsFile) -> TimedFile {
-        let io = (name == DATABASE).then(|| self.io.clone());
+        let io = (name == DATABASE || name.starts_with(LOG)).then(|| self.io.clone());
         TimedFile { file, io }
     }
 }
@@ -177,6 +202,11 @@ impl Vfs for TimedVfs {
 
     fn open(&self, name: &str) -> io::Result<TimedFile> {
         Ok(self.timed(name, self.vfs.open(name)?))
+    }
+
+    /// A segment of the log keeps the mode of `OsVfs::open_log`.
+    fn open_log(&self, name: &str) -> io::Result<TimedFile> {
+        Ok(self.timed(name, self.vfs.open_log(name)?))
     }
 
     fn create_new(&self, name: &str) -> io::Result<TimedFile> {
@@ -386,9 +416,12 @@ fn timed_commit(
     let vote = start.elapsed();
     io.take();
     let cpu = thread_cpu();
+    FINISHING.set(true);
     let start = Instant::now();
-    let tid = txn.finish().unwrap();
+    let tid = txn.finish();
     let elapsed = start.elapsed();
+    FINISHING.set(false);
+    let tid = tid.unwrap();
     let cpu = thread_cpu() - cpu;
     FINISH_CPU.fetch_add(cpu.as_nanos() as u64, Ordering::SeqCst);
     (
@@ -399,9 +432,15 @@ fn timed_commit(
 }
 
 /// Run `txns` transactions of `scenario` in a new store in `dir` with
-/// `compression`, and return their numbers. `add` writes new oids, and
-/// `update` writes again the oids of the warmup, in turn.
-fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Samples {
+/// `compression` and `write_log`, and return their numbers. `add` writes
+/// new oids, and `update` writes again the oids of the warmup, in turn.
+fn run(
+    dir: &Path,
+    compression: Compression,
+    write_log: WriteLog,
+    scenario: &str,
+    txns: usize,
+) -> Samples {
     let _ = std::fs::remove_dir_all(dir);
     let io = Arc::new(Io::default());
     let vfs = TimedVfs {
@@ -410,6 +449,7 @@ fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Sam
     };
     let options = Options {
         compression,
+        write_log,
         ..Options::default()
     };
     let store = Store::open_full(vfs, SystemClock, options).unwrap();
@@ -473,13 +513,23 @@ fn finish_time_at_concurrency_1_with_1_kb_records() {
     let dir = std::env::var_os("ZOE_FINISH_DIR")
         .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
         .join("finish-time");
+    // The log off is the baseline: each commit batch goes into the tables.
+    let baseline = WriteLog {
+        enabled: false,
+        ..WriteLog::default()
+    };
     for (name, compression) in [
         ("none", Compression::None),
         ("zstd", Compression::default()),
     ] {
         for scenario in ["add", "update"] {
-            let samples = run(&dir, compression, scenario, txns);
-            samples.print(&format!("{scenario}, {} bytes, compression {name}", size()));
+            for (log, write_log) in [("off", baseline.clone()), ("on", WriteLog::default())] {
+                let samples = run(&dir, compression, write_log, scenario, txns);
+                samples.print(&format!(
+                    "{scenario}, {} bytes, compression {name}, log {log}",
+                    size()
+                ));
+            }
         }
     }
 }

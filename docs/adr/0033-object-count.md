@@ -44,3 +44,4 @@ The naming table says that the format name bumps only with a migration tool. The
 - A flipped bit in the row is outside the bit-flip gate, as for `last_tid` and `next_oid`, because `meta` has no frames. `zoe verify` finds such a count. A later write adds to and subtracts from the damaged value; it never fails for it.
 - No tool takes a store back to format 1.
 - Only the redb backend counts. The trait method `Backend::object_count` has a default that gives `None`.
+- With the write-ahead log, the count in memory also takes the new oids of a log batch at its publication, the records whose written previous serial is `Tid::ZERO`, and each backend write adds its own change less the oids that the log counted for its records. The count in `meta` stays exact in each snapshot, because a slice of the fold counts as a batch write did (ADR 0056, section 19).

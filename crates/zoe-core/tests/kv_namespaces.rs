@@ -210,6 +210,8 @@ fn each_write_of_a_key_sets_its_ttl_again() {
     set_session(&store, b"s1", b"two", MINUTE);
     clock.advance(Duration::from_secs(50));
     assert_eq!(session(&store, b"s1").as_deref(), Some(&b"two"[..]));
+    // The sweep reads the tables only, so the commits fold first.
+    store.fold().unwrap();
     // The sweep takes the index key of the first expiry, and keeps the row
     // that the second write refreshed.
     let swept = store.sweep(1000).unwrap();
@@ -242,6 +244,8 @@ fn a_sweep_step_takes_at_most_its_limit_in_the_order_of_the_expiries() {
     }
     set_session(&store, b"late", b"v", Duration::from_secs(3600));
     clock.advance(Duration::from_secs(20));
+    // The sweep reads the tables only, so the commits fold first.
+    store.fold().unwrap();
     let swept = store.sweep(3).unwrap();
     assert_eq!((swept.taken, swept.removed), (3, 3));
     let swept = store.sweep(3).unwrap();

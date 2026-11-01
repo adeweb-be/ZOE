@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use super::staging::Staging;
 use super::{Finished, Observer, check_restore_tid, next_tid};
-use crate::backend::{TxnMeta, TxnStatus, WriteTxn};
+use crate::backend::{BatchPlan, TxnMeta, TxnStatus, WriteTxn};
 use crate::blob::PendingBlob;
 use crate::clock::{Waiter, timestamp};
 use crate::error::{Result, ZoeError};
@@ -281,7 +281,7 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
             tracing::info_span!("fsync", commits)
         };
-        match span.in_scope(|| write(store, &mut members, deferred, now_ms)) {
+        match span.in_scope(|| write(store, &mut members, deferred, now_ms, start)) {
             Ok(intents) => {
                 if deferred {
                     // A crash before the next durable commit loses this
@@ -339,16 +339,91 @@ pub(super) fn check_undone(store: &Store, undone: Option<Tid>) -> Result<()> {
     }
 }
 
-/// Place the blobs of the members that have a tid, then write these
-/// members in one backend write transaction and commit it, without a sync
-/// when `deferred` is true. `now_ms` is the time of the write, in
-/// milliseconds since the Unix epoch. Return the intent files of the blobs.
+/// The bytes of the fixed part of an op of an entry of the log, the frame
+/// header included, and of the indexes of an op in the backlog (ADR 0056,
+/// sections 3 and 7).
+const OP_FIXED: u64 = 1 + 8 + 4 + format::HEADER_LEN as u64 + 64;
+
+/// The bytes of the fixed part of an op of an entry on a namespace row,
+/// with the indexes of the op: the kind, the key length and the frame
+/// length and header.
+const KV_OP_FIXED: u64 = 1 + 2 + 4 + format::HEADER_LEN as u64 + 64;
+
+/// Return the plan of the batch of `members` (ADR 0056, section 4): its
+/// pickle bytes, the bytes of its large records and its size in the
+/// backlog, from the lengths that the index of the staging holds. A frame
+/// is never longer than its pickle and its header, so the estimate is
+/// never below the size. `previous` is the last tid of the store before
+/// the batch.
+fn plan(
+    store: &Store,
+    members: &[(Member, Result<Finished>)],
+    deferred: bool,
+    previous: Tid,
+) -> BatchPlan {
+    let large_record = store.write_log.large_record;
+    // The header of the entry and the zeros of its alignment.
+    let mut estimate: u64 = 56 + 7;
+    let (mut pickle_bytes, mut large_bytes) = (0u64, 0u64);
+    for (member, finished) in members {
+        if finished.is_err() {
+            continue;
+        }
+        // The transaction row: its status, its count and three lengths.
+        let fields = member.user.len() + member.description.len() + member.extension.len();
+        estimate += OP_FIXED + 1 + 8 + 12 + fields as u64;
+        for (oid, staged) in member.staged.iter() {
+            let len = staged.pickle_len() as u64;
+            pickle_bytes += len;
+            if len >= large_record {
+                large_bytes += len;
+            }
+            estimate += OP_FIXED + len;
+            if member.blobs.contains_key(&oid) {
+                estimate += OP_FIXED + format::blob::BLOB_RECORD_LEN as u64;
+            }
+        }
+        for (flavour, key, value, delete) in member.staged.kv_lens() {
+            let (key, value) = (key as u64, value as u64);
+            estimate += if delete {
+                1 + 2 + key + 64
+            } else {
+                KV_OP_FIXED + key + format::KV_U64_LEN as u64 + value
+            };
+            match flavour {
+                // The key of the index of the expiries.
+                Flavour::Ephemeral => estimate += 1 + 2 + format::KV_U64_LEN as u64 + key + 64,
+                // The generation row of the namespace, at most once for each
+                // write.
+                Flavour::Durable => estimate += KV_OP_FIXED + key + format::KV_U64_LEN as u64,
+            }
+        }
+    }
+    BatchPlan {
+        previous,
+        pickle_bytes,
+        large_bytes,
+        estimate,
+        deferred,
+    }
+}
+
+/// Write the members that have a tid in one write of the backend and commit
+/// it, without a sync when `deferred` is true. The write appends the batch
+/// to the log, or writes it into the tables, as `Backend::begin_batch`
+/// chooses after its waits. The blob files go into place before the write.
+/// `now_ms` is the time of the write, in milliseconds since the Unix epoch,
+/// and `previous` the last tid of the store before the batch. Return the
+/// intent files of the blobs.
 fn write(
     store: &Store,
     members: &mut [(Member, Result<Finished>)],
     deferred: bool,
     now_ms: u64,
+    previous: Tid,
 ) -> Result<Vec<Option<String>>> {
+    let plan = plan(store, members, deferred, previous);
+    let mut write = store.backend.begin_batch(&plan)?;
     let mut intents = Vec::new();
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
@@ -359,10 +434,19 @@ fn write(
         // commit, so a blob record never lacks its file.
         intents.push(store.blobs().place(finished.tid, &mut member.blobs)?);
     }
-    let mut write = store.backend.begin_write()?;
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
         let tid = finished.tid;
+        // The transaction row comes first: an entry of the log starts each
+        // commit with it.
+        write.put_txn(&TxnMeta {
+            tid,
+            user: mem::take(&mut member.user),
+            description: mem::take(&mut member.description),
+            extension: mem::take(&mut member.extension),
+            oid_count: member.staged.len() as u64,
+            status: TxnStatus::Committed,
+        })?;
         // An attached payload goes into its frame as it is. A spilled
         // pickle without one is read back here, one at a time. A record
         // merged onto a commit in flight comes after the record of that
@@ -383,14 +467,6 @@ fn write(
                 write.put_blob(oid, tid, blob.record())?;
             }
         }
-        write.put_txn(&TxnMeta {
-            tid,
-            user: mem::take(&mut member.user),
-            description: mem::take(&mut member.description),
-            extension: mem::take(&mut member.extension),
-            oid_count: member.staged.len() as u64,
-            status: TxnStatus::Committed,
-        })?;
         write_kv(&mut *write, &member.staged, tid, now_ms)?;
     }
     if deferred {

@@ -432,11 +432,18 @@ impl Store {
     /// included, in one backend write of its own, with a sync. A row of a
     /// key that has one already replaces it. A read-only store fails with
     /// `ReadOnly`.
+    ///
+    /// The call holds the commit sequencer from its wait for an empty
+    /// backlog of the log to its write (ADR 0056, section 18). So no older
+    /// write of the log lands over a restored row.
     pub fn kv_restore_durable(&self, rows: &[DurableRow]) -> Result<()> {
         self.writable()?;
         if rows.is_empty() {
             return Ok(());
         }
+        let sequencer = self.lock_sequencer();
+        let last = (*sequencer).unwrap_or_else(|| self.last_transaction());
+        self.backend.fold(last.max(self.last_transaction()))?;
         let mut write = self.backend.begin_write()?;
         for row in rows {
             check_name(&row.name)?;
@@ -446,7 +453,9 @@ impl Store {
             let key = format::kv_key(row.name.as_bytes(), &row.key);
             write.put_kv(Flavour::Durable, &key, &row.payload)?;
         }
-        write.commit()
+        write.commit()?;
+        drop(sequencer);
+        Ok(())
     }
 
     /// Check every row of the namespaces, for `zoe verify`.

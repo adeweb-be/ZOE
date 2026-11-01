@@ -23,7 +23,7 @@
 
 use std::ops::Bound::{self, Excluded};
 use std::ops::RangeBounds;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
@@ -249,10 +249,14 @@ impl Db {
 pub(crate) struct RedbBackend {
     db: Db,
     last_tid: AtomicU64,
-    /// The object count of the last write that changed records. Only
-    /// writes under the commit sequencer change records, so they store
-    /// it in their order.
+    /// The object count in memory. Each write that changes records adds
+    /// its change of the count after its commit, less the new oids that
+    /// the write-ahead log counted already for the records of the write.
+    /// The log adds the new oids of a batch when it publishes the batch
+    /// (ADR 0056, section 19).
     object_count: AtomicU64,
+    /// True while the tables hold a deferred commit that no sync covered.
+    unsynced: AtomicBool,
     /// How new records are written.
     compression: Compression,
 }
@@ -344,8 +348,27 @@ impl RedbBackend {
             db,
             last_tid: AtomicU64::new(last_tid),
             object_count: AtomicU64::new(object_count),
+            unsynced: AtomicBool::new(false),
             compression: Compression::default(),
         })
+    }
+
+    /// Tell if the tables hold a deferred commit that no sync covered yet.
+    pub(crate) fn unsynced(&self) -> bool {
+        self.unsynced.load(Ordering::Acquire)
+    }
+
+    /// Add `oids` new oids to the object count in memory. The log counts
+    /// the new oids of a batch with it.
+    pub(crate) fn add_objects(&self, oids: u64) {
+        if oids > 0 {
+            self.object_count.fetch_add(oids, Ordering::AcqRel);
+        }
+    }
+
+    /// Return the compression of the records that the backend writes.
+    pub(crate) fn compression(&self) -> Compression {
+        self.compression
     }
 
     /// Write new records with `compression`. The backend reads records of

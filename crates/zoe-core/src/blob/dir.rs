@@ -42,6 +42,10 @@ impl Dir for ReadOnlyDir {
         Err(self.refused(name))
     }
 
+    fn open_log(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>> {
+        Err(self.refused(name))
+    }
+
     fn rename(&self, from: &str, _to: &str) -> io::Result<()> {
         Err(self.refused(from))
     }
@@ -147,6 +151,11 @@ impl Dir for Relocated {
     fn create_new(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>> {
         let (dir, name) = self.locate(name);
         dir.create_new(&name)
+    }
+
+    fn open_log(&self, name: &str) -> io::Result<Box<dyn redb::StorageBackend>> {
+        let (dir, name) = self.locate(name);
+        dir.open_log(&name)
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {

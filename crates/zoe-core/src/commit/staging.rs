@@ -312,6 +312,20 @@ impl Staging {
         self.kv.get(&(flavour, row.to_vec()))
     }
 
+    /// Return the flavour, the length of the key of the row and the length
+    /// of the value of each staged namespace write: 0 for a delete, with
+    /// true for a delete. This reads no value.
+    pub(crate) fn kv_lens(&self) -> impl Iterator<Item = (Flavour, usize, usize, bool)> + '_ {
+        self.kv.iter().map(|((flavour, row), staged)| {
+            (
+                *flavour,
+                row.len(),
+                staged.value_len(),
+                staged.value.is_none(),
+            )
+        })
+    }
+
     /// Return the number of staged namespace writes.
     #[cfg(test)]
     pub(crate) fn kv_len(&self) -> usize {

@@ -5,9 +5,11 @@
 //! `zoe_convert::verify` and `zoe_convert::verify_backup` do the work. The
 //! command opens the store read-only, so it changes no byte of a store
 //! that was closed cleanly. It writes `zoe.redb` only when it repairs a
-//! store that a writer left open, and then says so on stderr. With
-//! `--backup`, it opens the store only after it built its copy of the
-//! dumps. It fails with a report that lists a finding.
+//! store that a writer left open, and then says so on stderr. A damaged
+//! write-ahead log is the finding `log`: the check then reads the tables
+//! alone (ADR 0056). With `--backup`, it opens the store only after it
+//! built its copy of the dumps. It fails with a report that lists a
+//! finding.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -15,9 +17,13 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
-use zoe_convert::{BackupCheck, IdForm, Verification};
+use zoe_convert::{BackupCheck, IdForm, LogProblem, Verification};
+use zoe_core::{Options, Store};
 
-use super::{Failure, closed_by_reader, open_with_blobs, write_counts};
+use super::{
+    Failure, blob_dir_failure, closed_by_reader, open_repairing, open_with_blobs, store_failure,
+    write_counts,
+};
 
 /// The width of the names of the counts of the report.
 const COUNTS: usize = 17;
@@ -101,8 +107,9 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     // `zoe.redb` only when it repairs a store that a writer left open. It
     // fails on a directory without a store. A wrong blob directory fails
     // here, so the report does not list each blob.
-    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
-    let report = zoe_convert::verify(&store, known.as_ref());
+    let (store, log) = open_checked(path, args.blob_dir.as_deref())?;
+    let mut report = zoe_convert::verify(&store, known.as_ref());
+    report.log = log;
     drop(store);
     let written = match args.format {
         Format::Text => write_text(out, path, &report),
@@ -110,6 +117,38 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     }
     .and_then(|()| out.flush());
     found(path, report.problems(), written)
+}
+
+/// Open the store in `path` for the check, as `open_with_blobs` does.
+///
+/// A damaged write-ahead log fails the open of the tools with `CorruptTxn`
+/// (ADR 0056). Then the call opens the tables alone with
+/// `Store::open_read_only_tables`, and returns the damage as the finding
+/// `log`. The open of the tools repaired `zoe.redb` before it read the log,
+/// so the strict open of the tables reads the file.
+fn open_checked(
+    path: &Path,
+    blob_dir: Option<&Path>,
+) -> Result<(Store, Option<LogProblem>), Failure> {
+    let options = Options {
+        blob_dir: blob_dir.map(Path::to_path_buf),
+        ..Options::default()
+    };
+    let (store, log) = match open_repairing(path, options.clone()) {
+        Ok(store) => (store, None),
+        Err(error) => match LogProblem::of(&error) {
+            Some(log) => {
+                let store = Store::open_read_only_tables(path, options)
+                    .map_err(|e| store_failure(path, e))?;
+                (store, Some(log))
+            }
+            None => return Err(store_failure(path, error)),
+        },
+    };
+    store
+        .check_blob_dir()
+        .map_err(|e| blob_dir_failure(path, e))?;
+    Ok((store, log))
 }
 
 /// Compare the dumps in `dumps` with the store of `args`, and write the
@@ -303,6 +342,19 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
             out,
             "    the store counts {} objects, and {} oids have records",
             c.stored, c.counted
+        )?;
+    }
+    writeln!(
+        out,
+        "  log              {}",
+        usize::from(report.log.is_some())
+    )?;
+    if let Some(log) = &report.log {
+        writeln!(
+            out,
+            "    tid {}: {}; the check read the tables alone",
+            log.tid.hex(),
+            log.error
         )?;
     }
     writeln!(out, "Classes: {}", report.classes.len())?;

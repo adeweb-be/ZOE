@@ -110,7 +110,17 @@ impl Vfs for OsVfs {
             .create(true)
             .truncate(false)
             .open(self.dir.join(name))?;
-        OsFile::new(file, true)
+        OsFile::new(file, Mode::Database)
+    }
+
+    fn open_log(&self, name: &str) -> io::Result<Self::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.dir.join(name))?;
+        OsFile::new(file, Mode::Log)
     }
 
     fn create_new(&self, name: &str) -> io::Result<Self::File> {
@@ -121,7 +131,7 @@ impl Vfs for OsVfs {
             .write(true)
             .create_new(true)
             .open(self.dir.join(name))?;
-        OsFile::new(file, false)
+        OsFile::new(file, Mode::Spill)
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -334,15 +344,28 @@ pub struct OsFile {
     /// True while `pending` holds a write. It turns false only after the
     /// writes are made. A read checks it without the mutex.
     has_pending: AtomicBool,
-    /// True for a database file, the file of `Vfs::open`: it holds its
-    /// writes and fills its growth with zeros. Another file, such as a
-    /// spill file of `Vfs::create_new`, makes each write at once and grows
-    /// sparse.
-    database: bool,
+    /// What the file holds, which tells how it writes and grows.
+    mode: Mode,
     /// A test stops a `make` after its first write here: it waits on the
     /// first barrier, then on the second.
     #[cfg(test)]
     pause: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+}
+
+/// What a file of an `OsVfs` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The database file, the file of `Vfs::open`. It holds its writes
+    /// until the next sync, read, change of the length or close, and fills
+    /// a growth of at most `ZERO_FILL_MAX` bytes with zeros.
+    Database,
+    /// A segment of the write-ahead log, the file of `Vfs::open_log`. It
+    /// makes each write at once, so it holds no copy of an entry, and fills
+    /// each growth with zeros.
+    Log,
+    /// A spill file of `Vfs::create_new`. It makes each write at once and
+    /// grows sparse.
+    Spill,
 }
 
 #[derive(Debug, Default)]
@@ -352,7 +375,7 @@ struct Pending {
 }
 
 impl OsFile {
-    fn new(file: File, database: bool) -> io::Result<Self> {
+    fn new(file: File, mode: Mode) -> io::Result<Self> {
         let clone = file.try_clone()?;
         let backend = redb::backends::FileBackend::new(file).map_err(io::Error::other)?;
         Ok(Self {
@@ -360,7 +383,7 @@ impl OsFile {
             file: clone,
             pending: Mutex::new(Pending::default()),
             has_pending: AtomicBool::new(false),
-            database,
+            mode,
             #[cfg(test)]
             pause: Mutex::new(None),
         })
@@ -434,7 +457,8 @@ impl redb::StorageBackend for OsFile {
     }
 
     /// Set the length of the file. A growth of a database file of at most
-    /// `ZERO_FILL_MAX` bytes gets zeros in its new bytes.
+    /// `ZERO_FILL_MAX` bytes gets zeros in its new bytes, and each growth of
+    /// a segment of the log.
     ///
     /// A write into a hole of a sparse file allocates the blocks of the
     /// hole, and the next sync then writes that metadata too. redb grows
@@ -449,7 +473,12 @@ impl redb::StorageBackend for OsFile {
         self.make(&mut pending)?;
         let old = self.backend.len()?;
         self.backend.set_len(len)?;
-        if self.database && len > old && len - old <= ZERO_FILL_MAX {
+        let zeros = match self.mode {
+            Mode::Database => len.saturating_sub(old) <= ZERO_FILL_MAX,
+            Mode::Log => true,
+            Mode::Spill => false,
+        };
+        if len > old && zeros {
             let zeros = vec![0; ZERO_CHUNK];
             let mut at = old;
             while at < len {
@@ -462,6 +491,11 @@ impl redb::StorageBackend for OsFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
+        // A segment of the log and a spill file hold no write, so their sync
+        // does not wait for a growth that another thread makes.
+        if self.mode != Mode::Database {
+            return sync_data(&self.file);
+        }
         // The mutex makes this sync wait for a `make` that another thread
         // runs: its writes can be writes of the commit that syncs.
         self.make(&mut self.lock())?;
@@ -469,7 +503,7 @@ impl redb::StorageBackend for OsFile {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        if !self.database {
+        if self.mode != Mode::Database {
             return self.backend.write(offset, data);
         }
         if data.is_empty() {

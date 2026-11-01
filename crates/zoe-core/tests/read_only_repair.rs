@@ -68,6 +68,9 @@ fn crash_image(root: &Path) -> (PathBuf, Tid) {
     // only a clean close writes the allocator state after it.
     let store = Store::open(&live).unwrap();
     let last = commit_as(&store, META, &[(Oid(0), first, b"second")]);
+    // The commit goes into the tables, so the copy of the database file
+    // alone holds it.
+    store.fold().unwrap();
     fs::create_dir_all(&image).unwrap();
     fs::copy(live.join(DATABASE), image.join(DATABASE)).unwrap();
     fs::write(image.join(LOCK), b"").unwrap();
