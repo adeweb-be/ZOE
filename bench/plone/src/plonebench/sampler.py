@@ -356,8 +356,10 @@ class Sampler:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the thread. A sampler that never started has nothing to stop."""
         self._stop.set()
-        self._thread.join()
+        if self._thread.ident is not None:
+            self._thread.join()
 
     def sample(self) -> dict:
         sample = {

@@ -5,15 +5,20 @@
 The interpreter of a buildout scenario has the eggs of the instance. This
 script configures Zope from ZOPE_CONF, opens the application, and runs
 SCRIPT with the application as `app`, as `bin/instance run` does. It puts
-the source directory of plonebench on sys.path, so SCRIPT can import
-`plonebench.corpus`, which needs only the standard library.
+the source directories of plonebench and of benchcommon on sys.path, so
+SCRIPT can import `plonebench.corpus` and `plonebench.stack`, which need
+only the standard library and benchcommon.
 """
 
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+# HERE is bench/plone/src/plonebench/inzope.
+SRC = os.path.dirname(os.path.dirname(HERE))
+BENCH = os.path.dirname(os.path.dirname(SRC))
+sys.path.insert(0, os.path.join(BENCH, "common", "src"))
+sys.path.insert(0, SRC)
 
 conf, script, *arguments = sys.argv[1:]
 
