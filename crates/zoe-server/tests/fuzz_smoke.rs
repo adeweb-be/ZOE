@@ -19,9 +19,9 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Conn, MAX, Server, Value, commit, fresh_dir, load, new_oids, p64, record, s};
+use common::{Conn, MAX, Server, Value, commit, fresh_dir, load, new_oids, p64, record, s};
 
 /// The splitmix64 generator: small, fast and the same on every machine.
 struct Rng(u64);

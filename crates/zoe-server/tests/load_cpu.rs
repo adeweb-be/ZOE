@@ -33,9 +33,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{Conn, MAX, Server, Value, ZOE, bytes_of, commit, fresh_dir, items, new_oids, p64, s};
+use common::{
+    Conn, Fresh, MAX, Server, Value, ZOE, bytes_of, commit, fresh_dir, items, new_oids, p64, s,
+};
 
 /// The samples of each row. The test prints their median.
 const SAMPLES: usize = 7;
@@ -124,7 +126,7 @@ fn record(records: Records, oid: u64) -> Vec<u8> {
 /// The clock ticks of `/proc` in one second.
 fn clock_ticks() -> u64 {
     let output = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         std::process::Command::new("getconf")
             .arg("CLK_TCK")
             .output()
@@ -200,6 +202,9 @@ struct Served {
     rows: Vec<Vec<Conn>>,
     /// The samples of each row.
     samples: Vec<Vec<Sample>>,
+    /// The directory of the store. It drops after `server`, so the server
+    /// stops before the drop removes the directory.
+    _dir: Fresh,
 }
 
 impl Served {
@@ -241,6 +246,7 @@ impl Served {
             oids,
             samples: vec![Vec::new(); rows.len()],
             rows,
+            _dir: dir,
         }
     }
 
@@ -297,7 +303,7 @@ fn print_core(records: Records) {
     use zoe_core::{Oid, Tid};
 
     let dir = fresh_dir(&format!("load-cpu-core-{}", records.name.replace(' ', "-")));
-    let store = wire::open_store(&dir.join("store"));
+    let store = common::open_store(&dir.join("store"));
     let oids: Vec<u64> = (1..=u64::try_from(records.objects).unwrap()).collect();
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     for oid in &oids {

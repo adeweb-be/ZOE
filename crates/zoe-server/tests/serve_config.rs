@@ -3,9 +3,9 @@
 //! add to the stores of the command line, the twin and the key of
 //! `--read-only`, and the file opens the admin port.
 
-mod wire;
+mod common;
 
-use wire::{Server, commit, fresh_dir, load, new_oids, open_store, record, s};
+use common::{Server, commit, fresh_dir, load, new_oids, open_store, record, s};
 
 #[test]
 fn the_twin_wins_over_the_file() {

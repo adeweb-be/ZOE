@@ -19,6 +19,7 @@
 #[cfg(feature = "serve")]
 mod admin;
 pub mod cli;
+mod defaults;
 #[cfg(all(feature = "serve", any(test, feature = "fuzz")))]
 pub use protocol::fuzz;
 #[cfg(feature = "serve")]

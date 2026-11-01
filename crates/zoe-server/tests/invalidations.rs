@@ -14,9 +14,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Server, Value, commit, fresh_dir, items, new_oids, p64, record, s, u64_of};
+use common::{Server, Value, commit, fresh_dir, items, new_oids, p64, record, s, u64_of};
 
 /// The time that a test waits for a message that must not come.
 const QUIET: Duration = Duration::from_millis(300);
@@ -38,7 +38,7 @@ fn every_other_client_gets_each_commit_in_order() {
     for reader in [&mut first, &mut second] {
         for (tid, oid) in tids.iter().zip(&oids) {
             let args = reader
-                .wait_for("invalidateTransaction", wire::TIMEOUT)
+                .wait_for("invalidateTransaction", common::TIMEOUT)
                 .expect("no invalidation came");
             let args = items(&args);
             assert_eq!(u64_of(&args[0]), *tid, "invalidations out of commit order");
@@ -62,7 +62,7 @@ fn a_transaction_of_several_oids_is_one_invalidation() {
 
     let args = items(
         &reader
-            .wait_for("invalidateTransaction", wire::TIMEOUT)
+            .wait_for("invalidateTransaction", common::TIMEOUT)
             .unwrap(),
     );
     assert_eq!(u64_of(&args[0]), tid);
@@ -84,7 +84,7 @@ fn get_invalidations_covers_the_gap_or_gives_nil() {
     }
     let last = *tids.last().unwrap();
 
-    let check = |conn: &mut wire::Conn| {
+    let check = |conn: &mut common::Conn| {
         // Two transactions after tids[2]: inside the queue size.
         let reply = conn.call("getInvalidations", vec![p64(tids[2])]).unwrap();
         let parts = items(&reply);

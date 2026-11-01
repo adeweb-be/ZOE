@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Conn, MAX, Server, Value, fresh_dir, p64, s};
+use common::{Conn, MAX, Server, Value, fresh_dir, p64, s};
 
 const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const PARENT: &str = "00f067aa0ba902b7";

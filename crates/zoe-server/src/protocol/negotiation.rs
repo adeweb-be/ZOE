@@ -15,18 +15,15 @@
 use rmpv::Value;
 use zoe_wire::extension::{KV, LOCK_INTENT, SEQUENCES, SERVER_WRITES, TRACE_CONTEXT};
 
-/// An extension that the server serves, and the methods that it adds.
-pub(crate) struct Extension {
-    pub(crate) name: &'static str,
-    pub(crate) methods: &'static [&'static str],
-}
+use super::method::Method;
 
-/// The extensions that the server serves. `sequences` adds
-/// `sequence_next(name)`, the next value of a sequence of the store (F29).
-/// `lock_intent` adds `lock_intent(oids)` and `unlock_intent()`, the early
-/// write-intent locks of the session (F7, ADR 0045). `kv` adds the calls
-/// of the KV namespaces (F31, ADR 0043): three reads, and two writes in
-/// the transaction of the connection. `trace_context` adds the trace
+/// The extensions that the server serves. The table of the methods
+/// (`method::METHODS`) gives the methods that each one adds. `sequences`
+/// adds `sequence_next(name)`, the next value of a sequence of the store
+/// (F29). `lock_intent` adds `lock_intent(oids)` and `unlock_intent()`, the
+/// early write-intent locks of the session (F7, ADR 0045). `kv` adds the
+/// calls of the KV namespaces (F31, ADR 0043): three reads, and two writes
+/// in the transaction of the connection. `trace_context` adds the trace
 /// context of a call (N17): a call of the connection can have a fifth
 /// element, a map with the W3C `traceparent` of the client.
 /// `server_writes` lets the split merge write the new bucket of the other
@@ -35,28 +32,7 @@ pub(crate) struct Extension {
 /// did not store, it ends the current entry of that oid in its cache, and
 /// gives every Connection of its process one invalidation with every oid
 /// of the commit before it publishes the tid. Neither adds a method.
-pub(crate) const SERVED: &[Extension] = &[
-    Extension {
-        name: SEQUENCES,
-        methods: &["sequence_next"],
-    },
-    Extension {
-        name: LOCK_INTENT,
-        methods: &["lock_intent", "unlock_intent"],
-    },
-    Extension {
-        name: KV,
-        methods: &["kv_get", "kv_scan", "kv_generation", "kv_set", "kv_delete"],
-    },
-    Extension {
-        name: TRACE_CONTEXT,
-        methods: &[],
-    },
-    Extension {
-        name: SERVER_WRITES,
-        methods: &[],
-    },
-];
+pub(crate) const SERVED: &[&str] = &[SEQUENCES, LOCK_INTENT, KV, TRACE_CONTEXT, SERVER_WRITES];
 
 /// Return the names of the declaration `value`, the third argument of
 /// `register`. A value that is not a list of strings is an error.
@@ -75,32 +51,31 @@ pub(crate) fn declared(value: &Value) -> Result<Vec<&str>, String> {
 
 /// Return the names of `declared` that `served` holds, once each, in the
 /// order of the declaration.
-pub(crate) fn accept(declared: &[&str], served: &[Extension]) -> Vec<&'static str> {
+pub(crate) fn accept(declared: &[&str], served: &[&'static str]) -> Vec<&'static str> {
     let mut accepted = Vec::new();
     for name in declared {
-        if let Some(extension) = served.iter().find(|e| e.name == *name)
-            && !accepted.contains(&extension.name)
+        if let Some(&extension) = served.iter().find(|served| *served == name)
+            && !accepted.contains(&extension)
         {
-            accepted.push(extension.name);
+            accepted.push(extension);
         }
     }
     accepted
 }
 
-/// Return the error text of a call to `method` when `method` belongs to an
-/// extension of `served` that is not in `accepted`. A connection that
-/// declared nothing has `accepted` none.
+/// Return the error text of a call to `method` when the row of `method` in
+/// `methods` names an extension that is not in `accepted`. A connection
+/// that declared nothing has `accepted` none.
 pub(crate) fn refused(
     method: &str,
     accepted: Option<&[&'static str]>,
-    served: &[Extension],
+    methods: &[Method],
 ) -> Option<String> {
-    let extension = served.iter().find(|e| e.methods.contains(&method))?;
+    let extension = methods.iter().find(|m| m.name == method)?.extension?;
     let accepted = accepted.unwrap_or_default();
-    (!accepted.contains(&extension.name)).then(|| {
+    (!accepted.contains(&extension)).then(|| {
         format!(
-            "{method} needs the extension {}, and the connection did not declare it in register",
-            extension.name
+            "{method} needs the extension {extension}, and the connection did not declare it in register"
         )
     })
 }
@@ -108,16 +83,16 @@ pub(crate) fn refused(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::method::{Lane, METHODS, Op};
 
-    const TEST_SERVED: &[Extension] = &[
-        Extension {
-            name: "first",
-            methods: &["first_call"],
-        },
-        Extension {
-            name: "second",
-            methods: &["second_call", "second_other_call"],
-        },
+    const TEST_SERVED: &[&str] = &["first", "second"];
+
+    /// The methods of the extensions of `TEST_SERVED`. The op and the lane
+    /// do not matter here.
+    const TEST_METHODS: &[Method] = &[
+        Method::new("first_call", Op::Ping, Lane::Read).of("first"),
+        Method::new("second_call", Op::Ping, Lane::Read).of("second"),
+        Method::new("second_other_call", Op::Ping, Lane::Read).of("second"),
     ];
 
     fn names(items: &[&str]) -> Value {
@@ -156,32 +131,32 @@ mod tests {
 
     #[test]
     fn a_method_of_an_extension_needs_its_declaration() {
-        assert!(refused("first_call", None, TEST_SERVED).is_some());
-        assert!(refused("first_call", Some(&[]), TEST_SERVED).is_some());
-        assert!(refused("first_call", Some(&["second"]), TEST_SERVED).is_some());
-        assert!(refused("first_call", Some(&["first"]), TEST_SERVED).is_none());
-        assert!(refused("second_other_call", Some(&["second"]), TEST_SERVED).is_none());
+        assert!(refused("first_call", None, TEST_METHODS).is_some());
+        assert!(refused("first_call", Some(&[]), TEST_METHODS).is_some());
+        assert!(refused("first_call", Some(&["second"]), TEST_METHODS).is_some());
+        assert!(refused("first_call", Some(&["first"]), TEST_METHODS).is_none());
+        assert!(refused("second_other_call", Some(&["second"]), TEST_METHODS).is_none());
     }
 
     #[test]
     fn the_calls_of_the_namespaces_need_the_declaration_of_kv() {
         for method in ["kv_get", "kv_scan", "kv_generation", "kv_set", "kv_delete"] {
-            assert!(refused(method, None, SERVED).is_some());
-            assert!(refused(method, Some(&["sequences"]), SERVED).is_some());
-            assert!(refused(method, Some(&["kv"]), SERVED).is_none());
+            assert!(refused(method, None, METHODS).is_some());
+            assert!(refused(method, Some(&["sequences"]), METHODS).is_some());
+            assert!(refused(method, Some(&["kv"]), METHODS).is_none());
         }
     }
 
     #[test]
     fn sequence_next_needs_the_declaration_of_sequences() {
-        assert!(refused("sequence_next", None, SERVED).is_some());
-        assert!(refused("sequence_next", Some(&[]), SERVED).is_some());
-        assert!(refused("sequence_next", Some(&["sequences"]), SERVED).is_none());
+        assert!(refused("sequence_next", None, METHODS).is_some());
+        assert!(refused("sequence_next", Some(&[]), METHODS).is_some());
+        assert!(refused("sequence_next", Some(&["sequences"]), METHODS).is_none());
     }
 
     #[test]
     fn a_method_of_no_extension_is_never_refused() {
-        assert!(refused("loadBefore", None, TEST_SERVED).is_none());
-        assert!(refused("first_call", None, SERVED).is_none());
+        assert!(refused("loadBefore", None, TEST_METHODS).is_none());
+        assert!(refused("first_call", None, METHODS).is_none());
     }
 }

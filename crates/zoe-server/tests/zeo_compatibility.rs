@@ -9,9 +9,9 @@
 //!   `iterator_next` for an iterator that it listed. The reader starts no
 //!   call before `iterator_gc` ends, so that call fails with `KeyError`.
 
-mod wire;
+mod common;
 
-use wire::{Conn, Fault, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record};
+use common::{Conn, Fault, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, record};
 
 const CONFLICT_ERROR: &str = "ZODB.POSException.ConflictError";
 const POS_KEY_ERROR: &str = "ZODB.POSException.POSKeyError";
@@ -39,7 +39,7 @@ fn commit_over(
         return voted.map(|_| 0);
     }
     let tid = conn.call("tpc_finish", vec![id])?;
-    Ok(wire::u64_of(&tid))
+    Ok(common::u64_of(&tid))
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn history_of_an_oid_that_is_not_bytes_is_a_poskeyerror() {
     let history = client
         .call("history", vec![p64(oid), Value::from(1)])
         .unwrap();
-    assert_eq!(wire::items(&history).len(), 1);
+    assert_eq!(common::items(&history).len(), 1);
 }
 
 #[test]

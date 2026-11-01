@@ -19,77 +19,12 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use zoe_core::{Store, Tid};
 
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+mod common;
 
-/// A spawned child keeps a copy of each file descriptor of the test
-/// process until `exec` closes them in the child, the lock of a store too.
-/// So each open of a store holds this mutex, and each spawn holds it until
-/// the child ends.
-static SPAWN: Mutex<()> = Mutex::new(());
-
-fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn open_store(dir: &Path) -> Store {
-    let _spawn = spawn_lock();
-    Store::open(dir).unwrap()
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-scratch-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-/// Run `zoe` with the arguments `args` and the variables `env`. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let _spawn = spawn_lock();
-    command.spawn().unwrap().wait_with_output().unwrap()
-}
-
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// A record that holds `value`.
-fn record(value: &[u8]) -> Vec<u8> {
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
-}
+use common::{Fresh, assert_exit, fresh_dir, open_store, record, s, zoe};
 
 const BLOB_RECORD: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
@@ -139,7 +74,7 @@ fn entries(dir: &Path) -> usize {
 
 /// A store with 20 transactions and a blob, and its dumps.
 struct Backup {
-    dir: PathBuf,
+    dir: Fresh,
     source: PathBuf,
     dumps: PathBuf,
 }

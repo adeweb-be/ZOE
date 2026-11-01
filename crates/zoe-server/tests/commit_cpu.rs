@@ -27,9 +27,9 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{Conn, Server, ZOE, commit, load, new_oids, s};
+use common::{Conn, Server, ZOE, commit, load, new_oids, s};
 
 /// The objects of each transaction.
 const OBJECTS: usize = 100;
@@ -59,7 +59,7 @@ fn record(oid: u64, size: usize) -> Vec<u8> {
 /// The clock ticks of `/proc` in one second.
 fn clock_ticks() -> u64 {
     let output = {
-        let _spawn = wire::spawn_lock();
+        let _spawn = common::spawn_lock();
         std::process::Command::new("getconf")
             .arg("CLK_TCK")
             .output()

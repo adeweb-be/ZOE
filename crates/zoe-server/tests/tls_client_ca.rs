@@ -24,9 +24,9 @@ use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use zoe_server::serve::{ServeOptions, Server, TlsOptions};
 
-mod wire;
+mod common;
 
-use wire::{PROTOCOL, TIMEOUT, Value, fresh_dir, spawn_lock};
+use common::{Fresh, PROTOCOL, TIMEOUT, Value, fresh_dir, spawn_lock};
 
 /// The extensions of a self-signed CA certificate.
 const CA: &[&str] = &[
@@ -199,13 +199,20 @@ fn certs() -> &'static Path {
             cas.extend(std::fs::read(dir.join(format!("{name}.pem"))).unwrap());
         }
         std::fs::write(dir.join("client-cas.pem"), cas).unwrap();
-        dir
+        // All the tests of this binary use the certificates. So the
+        // directory stays after the tests.
+        dir.keep()
     })
 }
 
 /// Start a server for the test `name` with the client CA file
 /// `client_ca` and the read-only client CA file `read_only_client_ca`.
-fn serve(name: &str, client_ca: Option<&str>, read_only_client_ca: Option<&str>) -> Server {
+/// Return the server and the directory of its store.
+fn serve(
+    name: &str,
+    client_ca: Option<&str>,
+    read_only_client_ca: Option<&str>,
+) -> (Server, Fresh) {
     let certs = certs();
     let mut tls = TlsOptions::new(certs.join("server.pem"), certs.join("server.key"));
     if let Some(ca) = client_ca {
@@ -214,8 +221,9 @@ fn serve(name: &str, client_ca: Option<&str>, read_only_client_ca: Option<&str>)
     if let Some(ca) = read_only_client_ca {
         tls = tls.read_only_client_ca(certs.join(ca));
     }
-    let store = fresh_dir(name).join("store");
-    Server::start(ServeOptions::new(store).tls(tls)).unwrap()
+    let dir = fresh_dir(name);
+    let server = Server::start(ServeOptions::new(dir.join("store")).tls(tls)).unwrap();
+    (server, dir)
 }
 
 /// A client of the ZEO port over TLS.
@@ -317,7 +325,7 @@ fn assert_refused(addr: SocketAddr, cert: &str, key: &str) {
 
 #[test]
 fn a_ca_certificate_of_the_client_ca_file_registers_read_write() {
-    let server = serve("tls-pinned", Some("client-ca.pem"), None);
+    let (server, _dir) = serve("tls-pinned", Some("client-ca.pem"), None);
     let mut client = Client::connect(server.addr(), "client-ca", "client-ca").unwrap();
     assert_eq!(client.register_to_write(), Ok(()));
     drop(client);
@@ -326,7 +334,7 @@ fn a_ca_certificate_of_the_client_ca_file_registers_read_write() {
 
 #[test]
 fn a_ca_certificate_of_the_client_ca_file_registers_read_write_with_a_read_only_ca() {
-    let server = serve(
+    let (server, _dir) = serve(
         "tls-pinned-read-only",
         Some("client-ca.pem"),
         Some("read-only-ca.pem"),
@@ -342,9 +350,9 @@ fn a_ca_certificate_of_the_client_ca_file_registers_read_write_with_a_read_only_
 
 #[test]
 fn a_ca_certificate_of_the_read_only_client_ca_file_is_refused() {
-    let server = serve("tls-read-only-ca", None, Some("read-only-ca.pem"));
+    let (server, _dir) = serve("tls-read-only-ca", None, Some("read-only-ca.pem"));
     assert_refused(server.addr(), "read-only-ca", "read-only-ca");
-    let server_2 = serve(
+    let (server_2, _dir_2) = serve(
         "tls-read-only-ca-2",
         Some("other-ca.pem"),
         Some("client-ca.pem"),
@@ -356,7 +364,7 @@ fn a_ca_certificate_of_the_read_only_client_ca_file_is_refused() {
 
 #[test]
 fn a_client_without_the_key_of_the_certificate_is_refused() {
-    let server = serve("tls-pinned-other-key", Some("client-ca.pem"), None);
+    let (server, _dir) = serve("tls-pinned-other-key", Some("client-ca.pem"), None);
     assert_refused(server.addr(), "client-ca", "other-ca");
     // The server goes on.
     let client = Client::connect(server.addr(), "client-ca", "client-ca").unwrap();
@@ -366,7 +374,7 @@ fn a_client_without_the_key_of_the_certificate_is_refused() {
 
 #[test]
 fn a_ca_certificate_that_is_in_no_file_or_chains_to_the_file_is_refused() {
-    let server = serve("tls-other-cas", Some("client-ca.pem"), None);
+    let (server, _dir) = serve("tls-other-cas", Some("client-ca.pem"), None);
     assert_refused(server.addr(), "other-ca", "other-ca");
     assert_refused(server.addr(), "sub-ca", "sub-ca");
     // A certificate that is not a CA and that chains to the file is
@@ -379,7 +387,7 @@ fn a_ca_certificate_that_is_in_no_file_or_chains_to_the_file_is_refused() {
 
 #[test]
 fn a_certificate_of_the_file_out_of_its_validity_period_is_refused() {
-    let server = serve("tls-pinned-period", Some("client-cas.pem"), None);
+    let (server, _dir) = serve("tls-pinned-period", Some("client-cas.pem"), None);
     assert_refused(server.addr(), "expired-ca", "expired-ca");
     assert_refused(server.addr(), "future-ca", "future-ca");
     // The other certificate of the same file is accepted.

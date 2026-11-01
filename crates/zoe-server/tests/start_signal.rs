@@ -15,9 +15,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-mod wire;
+mod common;
 
-use wire::{ZOE, fresh_dir, s, spawn_lock};
+use common::{ZOE, fresh_dir, s, spawn_lock};
 
 /// The number of the signal SIGTERM on Linux.
 const SIGTERM: i32 = 15;
@@ -44,12 +44,7 @@ fn a_sigterm_during_the_start_leaves_a_store_or_nothing() {
     for step in 0..60u64 {
         let path = dir.join(format!("store-{step}"));
         let mut command = Command::new(ZOE);
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("ZOE_") {
-                command.env_remove(name);
-            }
-        }
-        command
+        common::clear_zoe_env(&mut command)
             .args(["serve", "--path", s(&path), "--listen", "127.0.0.1:0"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

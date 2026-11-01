@@ -28,43 +28,33 @@
 //! its client sends after the stop, so its close is not a reset. It closes
 //! when the client closes, or a short time after its last frame. Then the
 //! stores close.
+//!
+//! `options` holds the settings of a server, and `listener` the ZEO port:
+//! its socket, the accept loop and the count of the connections.
+
+mod listener;
+mod options;
 
 use std::fmt;
-use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::num::{NonZeroU32, NonZeroUsize};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
-use zoe_core::{Compression, Options, Store, StructuralMerges, ZoeError};
+use zoe_core::{Options, Store, ZoeError};
 
 use crate::admin::{self, Health, StoreHealth};
-use crate::protocol::{
-    self, Connection, NamedStorage, Pool, Queues, ResolutionLog, Stopping, Storages,
-};
-use crate::runtime::Tokio;
+use crate::protocol::{self, NamedStorage, Pool, ResolutionLog, Stopping, Storages};
 use crate::tls::Tls;
 pub use crate::tls::TlsOptions;
-
-/// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
-/// frame holds a whole record, and the store sets no limit on a record by
-/// default. ZODB warns about a record of more than 16 MiB, and a blob chunk
-/// is less than 64 KiB. So a stock client stays far below this limit.
-pub const DEFAULT_MAX_FRAME_SIZE: NonZeroU32 = NonZeroU32::new(256 << 20).unwrap();
-
-/// The default of `--shutdown-timeout`: 30 seconds.
-pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The default of `--idle-timeout`: 300 seconds. A stock client sends a
-/// heartbeat every 60 seconds, so it keeps its connection.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+use listener::{Listener, SocketFile, Tasks, accept, bind_tcp};
+pub use options::{
+    Address, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, DEFAULT_SHUTDOWN_TIMEOUT, ServeOptions,
+    StorageOptions,
+};
 
 /// The last part of the shutdown timeout, in which a stop closes the
 /// connections that did not end and waits for their sessions. When the
@@ -76,411 +66,6 @@ const FORCED_CLOSE: Duration = Duration::from_secs(1);
 /// longer timeout counts as this one, so the deadline of a stop never
 /// overflows the clock.
 const LONGEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4_294_967_295);
-
-/// The address of the ZEO port.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Address {
-    /// A TCP address. A port of 0 takes a free port.
-    Tcp(SocketAddr),
-    /// The path of a unix domain socket. The server binds the path as it
-    /// is, so a relative path is relative to the current directory, and
-    /// the limit of 108 bytes of a socket address applies to the path as
-    /// given.
-    Unix(PathBuf),
-}
-
-impl From<SocketAddr> for Address {
-    fn from(addr: SocketAddr) -> Self {
-        Self::Tcp(addr)
-    }
-}
-
-impl fmt::Display for Address {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tcp(addr) => addr.fmt(f),
-            Self::Unix(path) => path.display().fmt(f),
-        }
-    }
-}
-
-/// A store that a server serves under a name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorageOptions {
-    name: String,
-    path: PathBuf,
-    blob_dir: Option<PathBuf>,
-    read_only: bool,
-    pack_gc: bool,
-}
-
-impl StorageOptions {
-    /// Serve the store in `path` under the storage name `name`. The blob
-    /// files go to `blobs` in the store directory.
-    pub fn new(name: impl Into<String>, path: impl AsRef<Path>) -> Self {
-        Self {
-            name: name.into(),
-            path: path.as_ref().to_path_buf(),
-            blob_dir: None,
-            read_only: false,
-            pack_gc: true,
-        }
-    }
-
-    /// Keep the blob files of the store in `dir`. Each open of the store
-    /// must give the same directory.
-    #[must_use]
-    pub fn blob_dir(mut self, dir: impl AsRef<Path>) -> Self {
-        self.blob_dir = Some(dir.as_ref().to_path_buf());
-        self
-    }
-
-    /// Serve the store for reads only, when `read_only` is true. The server
-    /// opens the existing store with `Store::open_read_only_repairing`: it
-    /// changes no byte of a store that was closed cleanly, and holds its
-    /// lock. It repairs a store that a writer left open, and logs a
-    /// warning. A store with blobs must get its blob directory, or the
-    /// start fails.
-    #[must_use]
-    pub fn read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
-        self
-    }
-
-    /// Pack the store without garbage collection, when `pack_gc` is false:
-    /// a pack keeps the objects that no reader can reach, and removes old
-    /// revisions only. The store gets `Options::pack_gc` false. Without
-    /// this call, a pack collects garbage.
-    #[must_use]
-    pub fn pack_gc(mut self, pack_gc: bool) -> Self {
-        self.pack_gc = pack_gc;
-        self
-    }
-}
-
-/// The settings of a server.
-#[derive(Debug, Clone)]
-pub struct ServeOptions {
-    storages: Vec<StorageOptions>,
-    listen: Address,
-    admin_listen: Option<SocketAddr>,
-    queues: Queues,
-    lock_timeout: Option<Duration>,
-    cache_size: Option<usize>,
-    compression: Option<Compression>,
-    lock_warn: Option<Duration>,
-    transaction_warn: Option<Duration>,
-    max_frame_size: NonZeroU32,
-    shutdown_timeout: Duration,
-    idle_timeout: Duration,
-    transaction_timeout: Duration,
-    blocking_threads: Option<NonZeroUsize>,
-    read_only: bool,
-    pack_gc: bool,
-    shared_blob_dir: bool,
-    tls: Option<TlsOptions>,
-    structural_merges: StructuralMerges,
-    resolution_log: Option<PathBuf>,
-}
-
-impl ServeOptions {
-    /// Serve the store in `path` under the storage name `1`, the default of
-    /// ZEO. Listen on a free port of 127.0.0.1, with frames of at most
-    /// [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue covers
-    /// 100,000 transactions, and 1,000 invalidations can wait for one
-    /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`]. A
-    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`], while
-    /// no call of the connection runs, closes.
-    /// The calls that read run on as many threads as the machine has
-    /// cores.
-    pub fn new(path: impl AsRef<Path>) -> Self {
-        Self::with_storages([StorageOptions::new(protocol::STORAGE_NAME, path)])
-    }
-
-    /// Serve `storages`, with the defaults of [`ServeOptions::new`]. The
-    /// names must differ, and one storage at least is necessary.
-    pub fn with_storages(storages: impl IntoIterator<Item = StorageOptions>) -> Self {
-        Self {
-            storages: storages.into_iter().collect(),
-            listen: Address::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-            admin_listen: None,
-            queues: Queues::DEFAULT,
-            lock_timeout: None,
-            cache_size: None,
-            compression: None,
-            lock_warn: None,
-            transaction_warn: None,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            transaction_timeout: Duration::ZERO,
-            blocking_threads: None,
-            read_only: false,
-            pack_gc: true,
-            shared_blob_dir: false,
-            tls: None,
-            structural_merges: StructuralMerges::default(),
-            resolution_log: None,
-        }
-    }
-
-    /// Listen on `addr`: a `SocketAddr`, or an [`Address`]. A port of 0
-    /// takes a free port. On a unix domain socket, the start removes a
-    /// socket file at the path on which no process accepts connections,
-    /// and the stop removes the socket file of the server.
-    #[must_use]
-    pub fn listen(mut self, addr: impl Into<Address>) -> Self {
-        self.listen = addr.into();
-        self
-    }
-
-    /// Open the admin port on `addr`: an HTTP port with `/healthz`,
-    /// `/readyz` and `/metrics`. A port of 0 takes a free port. Without this call, the
-    /// server opens no admin port.
-    #[must_use]
-    pub fn admin_listen(mut self, addr: SocketAddr) -> Self {
-        self.admin_listen = Some(addr);
-        self
-    }
-
-    /// Let `getInvalidations` cover at most `transactions` commits. A
-    /// client that is further behind gets nil and verifies its cache.
-    #[must_use]
-    pub fn invalidation_queue_size(mut self, transactions: usize) -> Self {
-        self.queues.invalidations = transactions;
-        self
-    }
-
-    /// Let `getInvalidations` cover every commit after a tid whose time is
-    /// less than `age` before the clock of the server, past the
-    /// invalidation queue size, as the key `invalidation-age` of ZEO.
-    /// Zero, the default, turns it off.
-    #[must_use]
-    pub fn invalidation_age(mut self, age: Duration) -> Self {
-        self.queues.invalidation_age = age;
-        self
-    }
-
-    /// Let at most `messages` invalidations wait for one client. Past it,
-    /// the server closes the connection of the client. A size of 0 lets 1
-    /// message wait.
-    #[must_use]
-    pub fn client_queue_size(mut self, messages: usize) -> Self {
-        self.queues.client = messages;
-        self
-    }
-
-    /// Fail a vote that waits longer than `timeout` for the lock of an
-    /// object with `ConflictError`. Without this call, the store keeps its
-    /// default.
-    #[must_use]
-    pub fn lock_timeout(mut self, timeout: Duration) -> Self {
-        self.lock_timeout = Some(timeout);
-        self
-    }
-
-    /// Let the page cache of each store hold at most `bytes`. Without this
-    /// call, each store keeps the default of the store, 1 GiB. The cache
-    /// does not grow with the size of the store.
-    #[must_use]
-    pub fn cache_size(mut self, bytes: usize) -> Self {
-        self.cache_size = Some(bytes);
-        self
-    }
-
-    /// Write the new records of each store with `compression`. Without this
-    /// call, each store keeps the default of the store, none. A store reads
-    /// every compression, whatever this setting.
-    #[must_use]
-    pub fn compression(mut self, compression: Compression) -> Self {
-        self.compression = Some(compression);
-        self
-    }
-
-    /// Log each lock held longer than `threshold`, with its oid, its client
-    /// and its storage, when the lock is released. Without this call, the
-    /// server logs no lock.
-    #[must_use]
-    pub fn lock_warn(mut self, threshold: Duration) -> Self {
-        self.lock_warn = Some(threshold);
-        self
-    }
-
-    /// Log each transaction open longer than `threshold`, with its client
-    /// and its storage, when it ends. Without this call, the server logs
-    /// no transaction.
-    #[must_use]
-    pub fn transaction_warn(mut self, threshold: Duration) -> Self {
-        self.transaction_warn = Some(threshold);
-        self
-    }
-
-    /// Close a connection that sends a frame longer than `bytes`, before
-    /// the server reserves memory for the frame.
-    #[must_use]
-    pub fn max_frame_size(mut self, bytes: NonZeroU32) -> Self {
-        self.max_frame_size = bytes;
-        self
-    }
-
-    /// Let a stop of the server take at most `timeout`. A stop first waits
-    /// for each connection to end by itself. At the end of the timeout less
-    /// 1 second, or less half the timeout when that is shorter, it drops
-    /// the connections that remain. Then it waits for their sessions until
-    /// the end of the timeout. A session that still runs then keeps the
-    /// store of that session open: that store does not close cleanly. The
-    /// other stores close.
-    #[must_use]
-    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
-        self.shutdown_timeout = timeout;
-        self
-    }
-
-    /// Close a connection that sends no frame for `timeout` while no call
-    /// of the connection runs. The time counts from the accept for the
-    /// protocol of the client. Then it counts from the later of two times:
-    /// the last frame that the server read, a heartbeat included, and the
-    /// end of the last call of the connection. A call runs until it puts
-    /// its reply, and a download until it ends. The close stops
-    /// the writer at once, as a close of the hub does. The calls that
-    /// arrived run, up to the first reply that cannot be queued, then the
-    /// open transaction aborts. A timeout of 0 closes no connection.
-    #[must_use]
-    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
-        self
-    }
-
-    /// Close the connection of a transaction that stays open for longer
-    /// than `timeout` after a vote that passed, as the key
-    /// `transaction-timeout` of ZEO does. The transaction holds its locks
-    /// from that vote until it ends. The close aborts it and releases its
-    /// locks, and the server logs one ERROR line. The calls of the
-    /// transaction that wait do not run. A connection without a voted
-    /// transaction stays open, whatever its idle time. A timeout of 0, the
-    /// default, closes no connection for this reason.
-    #[must_use]
-    pub fn transaction_timeout(mut self, timeout: Duration) -> Self {
-        self.transaction_timeout = timeout;
-        self
-    }
-
-    /// Run the calls that read, such as `loadBefore`, on at most `threads`
-    /// threads at once, for all the connections together. Without this
-    /// call, the server uses as many threads as the machine has cores. A
-    /// transaction, a download and a pack each run on a thread of their
-    /// own, so a vote that waits for a lock holds no thread of the pool.
-    #[must_use]
-    pub fn blocking_threads(mut self, threads: NonZeroUsize) -> Self {
-        self.blocking_threads = Some(threads);
-        self
-    }
-
-    /// The number of threads of the read pool: the option, or the number of
-    /// cores, or 1 when that number is not known.
-    fn pool_threads(&self) -> NonZeroUsize {
-        self.blocking_threads.unwrap_or_else(Pool::cores)
-    }
-
-    /// Serve every store for reads only, when `read_only` is true, as
-    /// [`StorageOptions::read_only`] does for one store.
-    #[must_use]
-    pub fn read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
-        self
-    }
-
-    /// Pack every store without garbage collection, when `pack_gc` is
-    /// false, as [`StorageOptions::pack_gc`] does for one store. A store
-    /// packs with garbage collection only when both are true.
-    #[must_use]
-    pub fn pack_gc(mut self, pack_gc: bool) -> Self {
-        self.pack_gc = pack_gc;
-        self
-    }
-
-    /// Accept `storeBlobShared` when `shared` is true: the clients share
-    /// the blob directory of each store, and give the name of a blob file
-    /// in the directory of its oid. `Server::start` then makes the blob
-    /// directory of each store that is not read-only ready: the layout file
-    /// and `tmp/`. So a client can create the directory of an oid before
-    /// the first blob of the store. Without this call, `storeBlobShared`
-    /// fails the vote with an error that names `shared-blob-dir`.
-    #[must_use]
-    pub fn shared_blob_dir(mut self, shared: bool) -> Self {
-        self.shared_blob_dir = shared;
-        self
-    }
-
-    /// Run the structural merges (tier 1) of each store with `merges`: the
-    /// mode of their classes and the rules of ADR 0042. Without this call,
-    /// tier 1 is on for every class and the rules are off.
-    #[must_use]
-    pub fn structural_merges(mut self, merges: StructuralMerges) -> Self {
-        self.structural_merges = merges;
-        self
-    }
-
-    /// Write one JSON line for each result of tier 1 to the file `path`, in
-    /// append mode (ADR 0042). The start creates the file, and fails when it
-    /// cannot open it. Without this call, the server writes no such line.
-    #[must_use]
-    pub fn resolution_log(mut self, path: impl AsRef<Path>) -> Self {
-        self.resolution_log = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Speak TLS on the ZEO port with the files of `tls`. `Server::start`
-    /// reads them before it listens, so a file that does not read creates
-    /// no store. TLS needs a TCP address: on a unix domain socket, the
-    /// start fails. Without this call, the ZEO port speaks plain TCP.
-    #[must_use]
-    pub fn tls(mut self, tls: TlsOptions) -> Self {
-        self.tls = Some(tls);
-        self
-    }
-
-    /// Tell if the server serves the store of `storage` for reads only.
-    fn is_read_only(&self, storage: &StorageOptions) -> bool {
-        self.read_only || storage.read_only
-    }
-
-    /// The options of the store of `storage`.
-    fn store_options(&self, storage: &StorageOptions) -> Options {
-        let mut options = Options::default();
-        if let Some(timeout) = self.lock_timeout {
-            options.lock_timeout = timeout;
-        }
-        options.cache_size = self.cache_size;
-        if let Some(compression) = self.compression {
-            options.compression = compression;
-        }
-        options.lock_warn = self.lock_warn;
-        options.transaction_warn = self.transaction_warn;
-        options.blob_dir.clone_from(&storage.blob_dir);
-        options.pack_gc = self.pack_gc && storage.pack_gc;
-        options.structural_merges = self.structural_merges.clone();
-        options.structural_merges.resolution_log = self.resolution_log.is_some();
-        options
-    }
-
-    /// Check that one storage at least is given, and that no name comes
-    /// twice.
-    fn check_storages(&self) -> Result<(), Error> {
-        if self.storages.is_empty() {
-            return Err(Error::Storages("no storage to serve".to_owned()));
-        }
-        for (n, storage) in self.storages.iter().enumerate() {
-            if self.storages[..n].iter().any(|s| s.name == storage.name) {
-                return Err(Error::Storages(format!(
-                    "the storage name {} comes twice",
-                    storage.name
-                )));
-            }
-        }
-        Ok(())
-    }
-}
 
 /// Why a server did not start.
 #[derive(Debug)]
@@ -563,7 +148,7 @@ impl Server {
     /// accepts connections. When a store does not open, close the stores
     /// that opened and fail.
     pub fn start(options: ServeOptions) -> Result<Self, Error> {
-        Self::start_with(options, open_writer)
+        Self::start_with(options, |_, path, options| open_writer(path, options))
     }
 
     /// Start as [`Server::start`] does, but handle SIGTERM and SIGINT
@@ -574,7 +159,9 @@ impl Server {
         options.check_storages()?;
         let runtime = new_runtime()?;
         let signals = Signals::handle(&runtime).map_err(Error::Runtime)?;
-        Self::start_on(runtime, Some(signals), options, open_writer)
+        Self::start_on(runtime, Some(signals), options, |_, path, options| {
+            open_writer(path, options)
+        })
     }
 
     /// Start as [`Server::start`] does, but open the store of each storage
@@ -848,7 +435,7 @@ fn new_runtime() -> Result<Runtime, Error> {
 
 /// Open the store in `path` for writes with `options`. Create a store that
 /// does not exist.
-fn open_writer(_name: &str, path: &Path, options: Options) -> Result<Arc<Store>, Error> {
+fn open_writer(path: &Path, options: Options) -> Result<Arc<Store>, Error> {
     Store::open_with(path, options)
         .map(Arc::new)
         .map_err(|error| Error::Store(path.to_path_buf(), error))
@@ -906,328 +493,13 @@ fn open_read_only(name: &str, path: &Path, options: Options) -> Result<Arc<Store
     Ok(Arc::new(store))
 }
 
-/// The listening socket of the ZEO port.
-enum Listener {
-    Tcp(TcpListener),
-    /// A unix domain socket, with its path as the options give it.
-    Unix(UnixListener, Arc<Path>),
-}
-
-/// A connection that the listener accepted.
-enum Accepted {
-    Tcp(TcpStream, SocketAddr),
-    /// A connection on a unix domain socket, with the path of the socket.
-    Unix(UnixStream, Arc<Path>),
-}
-
-impl Listener {
-    /// Listen on `address`. Return the socket file of a unix domain
-    /// socket too: its drop removes the file. The call must run in the
-    /// context of a runtime.
-    fn bind(address: &Address) -> io::Result<(Self, Option<SocketFile>)> {
-        match address {
-            Address::Tcp(addr) => Ok((Self::Tcp(bind_tcp(*addr)?), None)),
-            Address::Unix(path) => {
-                let (listener, file) = bind_unix(path)?;
-                Ok((Self::Unix(listener, Arc::from(path.as_path())), file))
-            }
-        }
-    }
-
-    /// The address of the listener: a TCP address with the port that it
-    /// took, or the path of the socket as the options give it.
-    fn address(&self) -> io::Result<Address> {
-        match self {
-            Self::Tcp(listener) => listener.local_addr().map(Address::Tcp),
-            Self::Unix(_, path) => Ok(Address::Unix(path.to_path_buf())),
-        }
-    }
-
-    /// Accept the next connection.
-    async fn accept(&self) -> io::Result<Accepted> {
-        match self {
-            Self::Tcp(listener) => {
-                let (stream, peer) = listener.accept().await?;
-                Ok(Accepted::Tcp(stream, peer))
-            }
-            Self::Unix(listener, path) => {
-                let (stream, _) = listener.accept().await?;
-                Ok(Accepted::Unix(stream, Arc::clone(path)))
-            }
-        }
-    }
-}
-
-/// The socket file of the unix domain socket of a server. Its drop removes
-/// the file, but only when the file at the path is still the one that the
-/// server bound. So it never removes the socket of another server that
-/// took the path meanwhile.
-struct SocketFile {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
-}
-
-impl SocketFile {
-    /// Return the socket file at `path`, which the server just bound.
-    fn bound(path: &Path) -> io::Result<Self> {
-        let metadata = fs::symlink_metadata(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-}
-
-impl Drop for SocketFile {
-    fn drop(&mut self) {
-        let same = fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode);
-        if same && let Err(error) = fs::remove_file(&self.path) {
-            tracing::warn!(
-                path = %self.path.display(),
-                "cannot remove the socket file: {error}"
-            );
-        }
-    }
-}
-
-/// Listen on the unix domain socket `path`. The call binds the path as it
-/// is, so a relative path is relative to the current directory. When a
-/// socket file is at the path, the call connects to it first, as runzeo
-/// does. When a process accepts the connection, the call fails with
-/// `AddrInUse`, and the file stays. When the connection is refused, the
-/// file is stale and goes. A path that is not a socket, a symbolic link
-/// included, fails with `AlreadyExists` and stays.
-fn bind_unix(path: &Path) -> io::Result<(UnixListener, Option<SocketFile>)> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            match std::os::unix::net::UnixStream::connect(path) {
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        "another process accepts connections on the socket",
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    match fs::remove_file(path) {
-                        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                            return Err(error);
-                        }
-                        _ => {}
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "the path exists and is not a socket",
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let listener = UnixListener::bind(path)?;
-    // Without its device and inode, the stop cannot tell that the file is
-    // still the socket of the server, so the file stays.
-    let file = SocketFile::bound(path).ok();
-    Ok((listener, file))
-}
-
-/// Listen on `addr`. The socket takes SO_REUSEADDR, so a restarted server
-/// binds the same port at once.
-fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    socket.listen(1024)
-}
-
-/// Accept clients until `stopping` tells that the server stops. Then drop
-/// the listener, so the server accepts no more connections. Each connection
-/// takes frames of at most
-/// `max_frame_size` bytes, closes after `idle_timeout` without a frame and
-/// without a call that runs, and
-/// counts in `tasks` while it runs. With `tls`, each connection on TCP
-/// starts with the TLS handshake.
-async fn accept(
-    listener: Listener,
-    storages: Arc<Storages>,
-    max_frame_size: u32,
-    idle_timeout: Option<Duration>,
-    mut stopping: Stopping,
-    tasks: Arc<Tasks>,
-    tls: Option<Arc<Tls>>,
-) {
-    loop {
-        let accepted = tokio::select! {
-            biased;
-            () = stopping.wait() => break,
-            accepted = listener.accept() => accepted,
-        };
-        match accepted {
-            Ok(Accepted::Unix(stream, path)) => {
-                let running = tasks.start();
-                let connection = protocol::serve_unix_connection(
-                    stream,
-                    path,
-                    Arc::clone(&storages),
-                    max_frame_size,
-                    idle_timeout,
-                    stopping.clone(),
-                );
-                tokio::spawn(async move {
-                    connection.await;
-                    drop(running);
-                });
-            }
-            Ok(Accepted::Tcp(stream, peer)) => {
-                let _ = stream.set_nodelay(true);
-                let running = tasks.start();
-                if let Some(tls) = &tls {
-                    let connection = serve_tls(
-                        stream,
-                        peer.to_string(),
-                        Arc::clone(tls),
-                        Arc::clone(&storages),
-                        max_frame_size,
-                        idle_timeout,
-                        stopping.clone(),
-                    );
-                    tokio::spawn(async move {
-                        connection.await;
-                        drop(running);
-                    });
-                    continue;
-                }
-                let connection = protocol::serve_connection(
-                    stream,
-                    Arc::clone(&storages),
-                    max_frame_size,
-                    idle_timeout,
-                    stopping.clone(),
-                );
-                tokio::spawn(async move {
-                    connection.await;
-                    drop(running);
-                });
-            }
-            Err(error) => {
-                tracing::warn!("accept failed: {error}");
-                tokio::task::yield_now().await;
-            }
-        }
-    }
-}
-
-/// Run the TLS handshake of `tls` on `stream`, then serve the client
-/// `peer` as `protocol::serve_connection` does. The handshake must end
-/// within `idle_timeout`, as the protocol of a plain client must. A stop
-/// ends it at once. A failed handshake closes only this connection.
-async fn serve_tls(
-    stream: TcpStream,
-    peer: String,
-    tls: Arc<Tls>,
-    storages: Arc<Storages>,
-    max_frame_size: u32,
-    idle_timeout: Option<Duration>,
-    mut stopping: Stopping,
-) {
-    let idle = async {
-        match idle_timeout {
-            Some(timeout) => tokio::time::sleep(timeout).await,
-            None => std::future::pending().await,
-        }
-    };
-    let handshake = tokio::select! {
-        biased;
-        () = stopping.wait() => return,
-        handshake = tls.accept(stream) => handshake,
-        () = idle => {
-            tracing::info!(client = peer.as_str(), "no TLS handshake within the idle timeout: closing the connection");
-            return;
-        }
-    };
-    let (stream, read_only) = match handshake {
-        Ok(accepted) => accepted,
-        Err(error) => {
-            tracing::warn!(client = peer.as_str(), "the TLS handshake failed: {error}");
-            return;
-        }
-    };
-    let socket = Some(stream.get_ref().0.as_raw_fd());
-    let (reader, writer) = tokio::io::split(stream);
-    let connection = Connection {
-        peer,
-        runtime: Arc::new(Tokio),
-        max_frame_size,
-        idle_timeout,
-        read_only,
-        socket,
-    };
-    protocol::serve_stream(reader, writer, connection, storages, stopping).await;
-}
-
-/// The count of the tasks that serve: the accept loop and one task for
-/// each connection. A stop waits until no task runs.
-#[derive(Default)]
-struct Tasks {
-    running: Mutex<usize>,
-    ended: Condvar,
-}
-
-/// The mark of a task that runs. Its drop counts the end of the task. When
-/// the stop of the runtime drops the task, it drops the mark too.
-struct Running(Arc<Tasks>);
-
-impl Tasks {
-    /// Count a task that starts.
-    fn start(self: &Arc<Self>) -> Running {
-        *self.lock() += 1;
-        Running(Arc::clone(self))
-    }
-
-    /// Wait at most `timeout` until no task runs. Return the number of
-    /// tasks that still run.
-    fn wait(&self, timeout: Duration) -> usize {
-        let (running, _) = self
-            .ended
-            .wait_timeout_while(self.lock(), timeout, |running| *running > 0)
-            .unwrap_or_else(PoisonError::into_inner);
-        *running
-    }
-
-    fn lock(&self) -> MutexGuard<'_, usize> {
-        self.running.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let mut running = self.0.lock();
-        *running -= 1;
-        if *running == 0 {
-            self.0.ended.notify_all();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+    use std::net::Ipv4Addr;
 
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-serve-lib-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
+    use super::*;
+    use crate::protocol::testing::{fresh_dir, read_frame};
 
     #[test]
     fn stop_closes_the_store_also_in_an_async_context() {
@@ -1369,14 +641,6 @@ mod tests {
     fn ruok_gives_the_status_as_json_and_closes() {
         use std::io::{Read, Write};
         use std::net::TcpStream;
-
-        fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
-            let mut len = [0u8; 4];
-            stream.read_exact(&mut len).unwrap();
-            let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
-            stream.read_exact(&mut payload).unwrap();
-            payload
-        }
 
         let server = Server::start(ServeOptions::new(fresh_dir("ruok"))).unwrap();
         let mut stream = TcpStream::connect(server.addr()).unwrap();

@@ -18,7 +18,6 @@
 //! (`check_logs`).
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -27,17 +26,12 @@ use zoe_client::{Client, Connect, Delivery, Error, Finished, Pool, PoolTransacti
 use zoe_core::{Oid, Tid};
 
 use super::client::record;
+use super::common::{self, ADDR, TRIES};
 use super::net;
 use super::rng::Rng;
 use super::server::SimRuntime;
 use super::world::{Acked, Owner, Shared, phase, sleep};
 use crate::protocol::STORAGE_NAME;
-
-/// The oids that the clients share.
-const OIDS: u64 = 6;
-
-/// The tries of one transaction.
-const TRIES: usize = 8;
 
 /// The chance that a finish with its reply breaks the listener, while the
 /// run has listener losses left.
@@ -46,9 +40,6 @@ const LOSS_CHANCE: f64 = 0.25;
 /// The longest time that a pool waits at its end for the tids that the
 /// store committed.
 const CATCH_UP: Duration = Duration::from_secs(10);
-
-/// The address of the server, as in `client.rs`.
-const ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8100);
 
 /// How a pool delivered a tid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,16 +117,8 @@ struct Run {
     left: Arc<Mutex<usize>>,
 }
 
-/// How one try of a transaction ends.
-enum Outcome {
-    Acked,
-    /// A conflict, or another error of the server: try again.
-    Retry,
-    /// The connection is lost. In the finish, the outcome is unknown.
-    Lost {
-        in_finish: bool,
-    },
-}
+/// The end of one try of a transaction of a pool.
+type Outcome = common::Outcome<()>;
 
 impl SimPoolClient {
     /// Run the transactions of the client on pools, then close the last
@@ -333,39 +316,13 @@ impl Run {
     /// Load the current serial of `oid`, and count a stale read, as the
     /// clients of `client.rs` do.
     async fn serial(&self, oid: u64) -> Result<Tid, Outcome> {
-        let known = self.shared.lock().known.get(&oid).copied().unwrap_or(0);
-        let serial = match self.pool.load(Oid(oid)).await {
-            Ok((_, serial)) => serial,
-            Err(Error::Server { class, .. }) if class.ends_with("POSKeyError") => Tid::ZERO,
-            Err(Error::Disconnected) => return Err(Outcome::Lost { in_finish: false }),
-            Err(_) => return Err(Outcome::Retry),
-        };
-        if serial.0 < known {
-            let mut state = self.shared.lock();
-            state.stale_reads += 1;
-            state.trace(format!(
-                "c{} reads a stale serial {:016x} of oid {oid}, after {known:016x}",
-                self.id, serial.0
-            ));
-        }
-        Ok(serial)
+        let loaded = common::load(&self.shared, self.id, oid, self.pool.load(Oid(oid))).await;
+        loaded.map(|(serial, _)| serial)
     }
 
     /// Try one transaction on the pool.
     async fn commit(&self, rng: &mut Rng, t: usize, attempt: usize) -> Outcome {
-        let first = if rng.chance(0.5) {
-            1
-        } else {
-            1 + rng.below(OIDS)
-        };
-        let mut oids = vec![first];
-        if rng.chance(0.5) {
-            let second = 1 + rng.below(OIDS);
-            if second != first {
-                oids.push(second);
-            }
-        }
-        oids.sort_unstable();
+        let oids = common::oids(rng);
         let mut records = Vec::new();
         for &oid in &oids {
             let serial = match self.serial(oid).await {
@@ -489,16 +446,12 @@ impl Run {
         });
         drop(state);
         self.reach(phase::ACKNOWLEDGED);
-        Outcome::Acked
+        Outcome::Acked(())
     }
 
     /// Tell the driver that a commit reached `phase`, as `client.rs` does.
     fn reach(&self, phase: &'static str) {
-        let mut state = self.shared.lock();
-        if state.crash_at(phase) {
-            state.trace(format!("c{} reaches the phase {phase}", self.id));
-            state.crash_now = Some(phase);
-        }
+        common::reach(&self.shared, self.id, phase);
     }
 }
 
@@ -510,7 +463,7 @@ async fn work(run: Arc<Run>, mut rng: Rng, ended: Arc<watch::Sender<usize>>) {
         t += 1;
         for attempt in 0..TRIES {
             match run.commit(&mut rng, t, attempt).await {
-                Outcome::Acked => continue 'transactions,
+                Outcome::Acked(()) => continue 'transactions,
                 Outcome::Retry => {
                     let backoff = rng.between(Duration::from_micros(100), Duration::from_millis(5));
                     sleep(&run.shared, backoff).await;

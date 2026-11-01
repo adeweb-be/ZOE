@@ -11,7 +11,7 @@ use clap::Args;
 use zoe_convert::Restored;
 use zoe_core::{Tid, civil_from_tid};
 
-use super::Failure;
+use super::{Failure, write_counts};
 
 /// The options of `zoe restore`.
 #[derive(Debug, Args)]
@@ -49,14 +49,20 @@ fn write_report(
         path.display(),
         from.display()
     )?;
-    writeln!(out, "  dumps         {}", report.dumps)?;
     let (last, time) = (report.last_tid.hex(), utc(report.last_tid));
-    writeln!(out, "  last tid      {last} ({time})")?;
-    writeln!(out, "  transactions  {}", report.transactions)?;
-    writeln!(out, "  records       {}", report.records)?;
-    writeln!(out, "  blobs         {}", report.blobs)?;
-    writeln!(out, "  sequences     {}", report.sequences)?;
-    writeln!(out, "  durable rows  {}", report.durable_rows)
+    write_counts(
+        out,
+        14,
+        &[
+            ("dumps", &report.dumps),
+            ("last tid", &format!("{last} ({time})")),
+            ("transactions", &report.transactions),
+            ("records", &report.records),
+            ("blobs", &report.blobs),
+            ("sequences", &report.sequences),
+            ("durable rows", &report.durable_rows),
+        ],
+    )
 }
 
 /// Return the time of `tid` in UTC, as `YYYY-MM-DD HH:MM:SS.mmm UTC`.

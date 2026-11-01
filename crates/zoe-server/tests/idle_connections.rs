@@ -8,9 +8,9 @@
 
 use std::time::Duration;
 
-mod wire;
+mod common;
 
-use wire::{Conn, Server, TIMEOUT, Value, commit, fresh_dir, load, new_oids, record};
+use common::{Conn, Server, TIMEOUT, Value, commit, fresh_dir, load, new_oids, record};
 
 /// The idle clients that registered.
 const REGISTERED: usize = 50;

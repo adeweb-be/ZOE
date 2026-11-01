@@ -22,55 +22,12 @@
 //! References come from zoe-pickle, never from an unpickler.
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use zoe_core::{Compression, Oid, Options, Store, Tid};
 
-/// A spawned child keeps a copy of each file descriptor of the test
-/// process until `exec` closes them in the child, the lock of a store too.
-/// `Command::spawn` can return before that: the kernel wakes the parent of
-/// a `vfork` before the child closes these copies. So each open of a store
-/// holds this mutex, and each spawn holds it until the child ends.
-static SPAWN: Mutex<()> = Mutex::new(());
+mod common;
 
-fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn open_store(dir: &Path) -> Store {
-    let _spawn = spawn_lock();
-    Store::open(dir).unwrap()
-}
-
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
-
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-verify-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-fn zoe(args: &[&str]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let _spawn = spawn_lock();
-    command.spawn().unwrap().wait_with_output().unwrap()
-}
+use common::{Fresh, fresh_dir, open_store, s, spawn_lock, zoe};
 
 /// A `PersistentMapping` record whose state holds references to `refs`.
 fn mapping(refs: &[u64]) -> Vec<u8> {
@@ -109,7 +66,7 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 }
 
 struct Corpus {
-    dir: std::path::PathBuf,
+    dir: Fresh,
     marker: Vec<u8>,
     marked: Oid,
     blob: (Oid, Tid),
@@ -162,7 +119,7 @@ fn corpus(name: &str) -> Corpus {
 fn report(dir: &Path, extra: &[&str]) -> (i32, serde_json::Value) {
     let mut args = vec!["verify", "--path", s(dir), "--format", "json"];
     args.extend_from_slice(extra);
-    let output = zoe(&args);
+    let output = zoe(&args, &[]);
     let json = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
             "no JSON report\nstdout:\n{}\nstderr:\n{}",
@@ -282,10 +239,10 @@ fn a_sound_store_passes_and_a_missing_store_is_an_error() {
     let (code, json) = report(&dir, &[]);
     assert_eq!(code, 0, "{json}");
 
-    let output = zoe(&["verify", "--path", s(&dir.join("nothing-here"))]);
+    let output = zoe(&["verify", "--path", s(&dir.join("nothing-here"))], &[]);
     assert_eq!(output.status.code(), Some(1));
     assert!(!dir.join("nothing-here").exists());
 
-    let output = zoe(&["verify"]);
+    let output = zoe(&["verify"], &[]);
     assert_eq!(output.status.code(), Some(2));
 }
