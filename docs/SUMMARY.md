@@ -103,6 +103,7 @@
   - [Byte-identical pickle round trip in zoe-pickle](spikes/pickle-round-trip.md)
   - [Free-threading in persistent, BTrees and zodbpickle](spikes/free-threading-upstream.md)
   - [Where a load spends its time between the ghost and the client cache](spikes/load-path.md)
+  - [A reader in Rust in place of `Connection._reader`](spikes/ghost-to-cache.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
   - [zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)
