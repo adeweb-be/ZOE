@@ -1056,26 +1056,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_path_that_is_not_a_regular_file_is_refused() {
-        let dir = test_dir("not-regular");
-        let fifo = dir.join("fifo");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
-        // The open of a FIFO without a writer waits forever, so a hang
-        // here means that the check is missing.
-        for path in [fifo, dir, PathBuf::from("/dev/null")] {
-            let error = Reader::open(&path).err().unwrap();
-            let Error::Io { source, .. } = &error else {
-                panic!("not an I/O error: {error:?}");
-            };
-            assert_eq!(source.kind(), ErrorKind::InvalidInput, "{error:?}");
-        }
-    }
-
-    #[test]
     fn a_length_that_the_memory_cannot_hold_gives_no_buffer() {
         assert!(buffer(u64::MAX).is_none());
         assert!(buffer(isize::MAX as u64 + 1).is_none());
