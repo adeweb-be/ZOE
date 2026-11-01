@@ -49,7 +49,8 @@
 //! A child of `os.fork()` has no thread of the runtime of its parent. A
 //! client of the parent raises `RuntimeError` at each call in the child,
 //! and its drop there frees nothing. A client that the child opens gets a
-//! runtime of the child.
+//! runtime of the child. A hook of `os.register_at_fork` counts the forks,
+//! so the check of the process makes no system call.
 //!
 //! `open` holds the open of a client on its addresses and its TLS, and the
 //! reconnect. `transaction` holds `zoe._zoe.Transaction`. `convert` holds
@@ -74,6 +75,7 @@ use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use tokio::runtime::Runtime;
 use zoe_client::{
@@ -105,6 +107,37 @@ const POOL_BOUND: usize = 64;
 /// The mode of a blob file of the cache: read-only for its owner, as
 /// `ZEO.ClientStorage` sets it (`stat.S_IREAD`).
 const BLOB_MODE: u32 = 0o400;
+
+/// The forks that led to this process from the first process that opened a
+/// client. The hook of `count_forks` adds one in each child of a fork.
+static FORKS: AtomicU64 = AtomicU64::new(0);
+
+/// Register the hook that counts the forks, once. The first open of a
+/// client registers it. A child of a fork keeps it.
+fn count_forks(py: Python<'_>) -> PyResult<()> {
+    static COUNTER: PyOnceLock<()> = PyOnceLock::new();
+    COUNTER.get_or_try_init(py, || {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("after_in_child", wrap_pyfunction!(forked, py)?)?;
+        py.import("os")?
+            .call_method("register_at_fork", (), Some(&kwargs))?;
+        Ok::<_, PyErr>(())
+    })?;
+    Ok(())
+}
+
+/// Count a fork. `os.fork()` calls it in the child.
+#[pyfunction]
+fn forked() {
+    FORKS.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// Return the id of the process that runs. Each child of a fork gets a new
+/// id. The read makes no system call.
+fn this_process() -> u64 {
+    FORKS.load(AtomicOrdering::Relaxed)
+}
+
 /// Return the runtime of the native clients of this process. The first
 /// call starts it. A child of `os.fork()` gets a runtime of its own: the
 /// threads of the runtime of the parent do not exist in the child. The
@@ -115,11 +148,11 @@ const BLOB_MODE: u32 = 0o400;
 /// then waits for ever. The mutex is held only while the runtime builds,
 /// at the first open of a process, so the window is short.
 fn runtime() -> std::io::Result<&'static Runtime> {
-    static RUNTIME: Mutex<Option<(u32, &'static Runtime)>> = Mutex::new(None);
-    let pid = std::process::id();
+    static RUNTIME: Mutex<Option<(u64, &'static Runtime)>> = Mutex::new(None);
+    let process = this_process();
     let mut slot = lock(&RUNTIME);
     if let Some((owner, runtime)) = *slot
-        && owner == pid
+        && owner == process
     {
         return Ok(runtime);
     }
@@ -129,7 +162,7 @@ fn runtime() -> std::io::Result<&'static Runtime> {
         .enable_all()
         .build()?;
     let runtime: &'static Runtime = Box::leak(Box::new(runtime));
-    *slot = Some((pid, runtime));
+    *slot = Some((process, runtime));
     Ok(runtime)
 }
 
@@ -138,7 +171,7 @@ fn runtime() -> std::io::Result<&'static Runtime> {
 #[pyclass(frozen, module = "zoe._zoe", name = "Client")]
 pub(crate) struct NativeClient {
     /// The process that opened the client.
-    pid: u32,
+    process: u64,
     runtime: &'static Runtime,
     /// The pool, until `close`.
     pool: Mutex<Option<Arc<Pool>>>,
@@ -307,6 +340,8 @@ impl NativeClient {
             client_label,
         };
         let upgrade = read_only_fallback && !read_only;
+        // A fork after this point makes the client one of a parent.
+        count_forks(py)?;
         let opened = py.detach(move || -> Result<_, Opening> {
             let secure = tls.as_ref().map(Secure::load).transpose()?.map(Arc::new);
             let runtime = runtime().map_err(Opening::Runtime)?;
@@ -356,7 +391,7 @@ impl NativeClient {
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
         Ok(Self {
-            pid: std::process::id(),
+            process: this_process(),
             runtime,
             read_only,
             opened_at: pool.last_transaction(),
@@ -576,7 +611,7 @@ impl NativeClient {
     /// Tell if the client is connected: not closed, and its listener is not
     /// lost.
     fn is_connected(&self) -> bool {
-        self.pid == std::process::id()
+        self.process == this_process()
             && lock(&self.pool)
                 .as_ref()
                 .is_some_and(|pool| pool.is_connected())
@@ -838,7 +873,7 @@ impl NativeClient {
     /// holds no lock and no connection.
     fn intents(&self) -> NativeIntents {
         NativeIntents {
-            pid: self.pid,
+            process: self.process,
             runtime: self.runtime,
             intents: tokio::sync::Mutex::new(None),
         }
@@ -945,7 +980,7 @@ impl NativeClient {
             open.push(Arc::downgrade(&slot));
         }
         Ok(NativeTransaction {
-            pid: self.pid,
+            process: self.process,
             runtime: self.runtime,
             txn: slot,
             turn: Mutex::new(None),
@@ -1135,7 +1170,7 @@ impl NativeClient {
 
     /// Return the listener of the pool, if the client is open and has one.
     fn listener(&self) -> Option<Arc<zoe_client::Client>> {
-        if self.pid != std::process::id() {
+        if self.process != this_process() {
             return None;
         }
         lock(&self.pool).as_ref().and_then(|pool| pool.listener())
@@ -1144,7 +1179,7 @@ impl NativeClient {
     /// Raise `RuntimeError` in a child of `os.fork()`: the threads of the
     /// client are in the parent only.
     fn check_process(&self) -> PyResult<()> {
-        check_process(self.pid)
+        check_process(self.process)
     }
 }
 
@@ -1155,7 +1190,7 @@ impl Drop for NativeClient {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if self.pid != std::process::id() {
+        if self.process != this_process() {
             // The threads and the locks of the parent are not here. Free
             // nothing of the connections.
             mem::forget(pool);
@@ -1174,7 +1209,7 @@ impl Drop for NativeClient {
 #[pyclass(frozen, module = "zoe._zoe", name = "Intents")]
 pub(crate) struct NativeIntents {
     /// The process that opened the client.
-    pid: u32,
+    process: u64,
     runtime: &'static Runtime,
     /// The locks, from the first `lock_intent`. An async mutex: a lock
     /// waits on the server with it held.
@@ -1184,7 +1219,7 @@ pub(crate) struct NativeIntents {
 impl Drop for NativeIntents {
     fn drop(&mut self) {
         let intents = self.intents.get_mut().take();
-        if self.pid != std::process::id() {
+        if self.process != this_process() {
             mem::forget(intents);
             return;
         }
@@ -1213,9 +1248,9 @@ fn traceparent(py: Python<'_>, traceparent: Option<&Py<PyAny>>) -> PyResult<Opti
     }
 }
 
-/// Raise `RuntimeError` in a child of `os.fork()` of the process `pid`.
-fn check_process(pid: u32) -> PyResult<()> {
-    if pid != std::process::id() {
+/// Raise `RuntimeError` in a child of `os.fork()` of the process `process`.
+fn check_process(process: u64) -> PyResult<()> {
+    if process != this_process() {
         return Err(PyRuntimeError::new_err(
             "the client was opened in another process, before a fork",
         ));
