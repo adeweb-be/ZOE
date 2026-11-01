@@ -21,6 +21,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"
 tokio-rustls.workspace = true
 xxhash-rust.workspace = true
 zoe-core.workspace = true
+# The persistent ids of a record, for the prefetch of its references.
+zoe-pickle.workspace = true
 # The bytes and the names of ZEO 6 that the client shares with the server.
 zoe-wire.workspace = true
 

@@ -50,18 +50,22 @@
 //! listener, unless the pool connects again: then the cache stays, and the
 //! verification keeps it, ends some of its entries, or drops them all.
 //!
+//! A pool with a cache can also prefetch the references of each record
+//! that a load fetches from the server (`set_prefetch_references`).
+//!
 //! `transaction` holds the transactions of the pool, their finishes and
 //! their turns, and the early write-intent locks of an owner. `dispatch`
-//! holds the dispatcher, and `reconnect` the reconnect and its
-//! verification.
+//! holds the dispatcher, `reconnect` the reconnect and its verification,
+//! and `references` the prefetch of the references of a record.
 
 mod dispatch;
 mod reconnect;
+mod references;
 mod transaction;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -76,6 +80,7 @@ use crate::runtime::{BoxFuture, Runtime};
 use crate::{Error, lock};
 use dispatch::dispatch;
 use reconnect::upgrade_forever;
+pub use references::{PREFETCH_REFERENCES, PREFETCH_SCAN_LIMIT};
 pub use transaction::{Finished, PoolIntents, PoolTransaction, Turn};
 
 /// A function that opens one more connection of the pool to the server of
@@ -231,6 +236,9 @@ struct Shared {
     cache: Option<Arc<Cache>>,
     /// How the pool connects again, if it does.
     reconnect: Option<Reconnect>,
+    /// A miss of `Pool::load_before` prefetches the references of its
+    /// record.
+    references: AtomicBool,
     /// The connections of the server. A load picks one of them. The lock is
     /// held only to pick or to change one. A writer takes `state` first.
     server: RwLock<Server>,
@@ -436,13 +444,44 @@ impl Shared {
             .ok_or(Error::Disconnected)
     }
 
-    /// Load as `Pool::load_before` does.
+    /// Load as `Pool::load_before` does, without the prefetch of the
+    /// references of the record.
     async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
         let (record, position) = self.any_connection()?.load_before_at(oid, tid).await?;
         if let (Some(cache), Some(record)) = (&self.cache, &record) {
             cache.store(oid, record.tid, record.end, &record.data, position);
         }
         Ok((record, position))
+    }
+
+    /// Prefetch as `Pool::prefetch` does, with at most `limit` loads: the
+    /// first oids of `oids` that the cache does not hold for `tid`.
+    fn prefetch(self: &Arc<Self>, oids: &[Oid], tid: Tid, limit: usize) -> Result<usize, Error> {
+        {
+            let state = self.lock();
+            if state.closed || state.lost {
+                return Err(Error::Disconnected);
+            }
+        }
+        let Some(cache) = &self.cache else {
+            return Ok(0);
+        };
+        let mut seen = HashSet::new();
+        let mut sent = 0;
+        for &oid in oids {
+            if sent == limit {
+                break;
+            }
+            if !seen.insert(oid) || cache.load_before_with(oid, tid, |_, _| Some(())).is_some() {
+                continue;
+            }
+            let shared = self.clone();
+            self.runtime.spawn(Box::pin(async move {
+                let _ = shared.load_before(oid, tid).await;
+            }));
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     /// Forget the connection `client`, which closed or which the pool
@@ -550,6 +589,7 @@ impl Pool {
             bound: bound.max(1),
             cache: cache.map(Arc::new),
             reconnect,
+            references: AtomicBool::new(false),
             server: RwLock::new(server),
             next_load: AtomicUsize::new(0),
             state: Mutex::new(state),
@@ -601,6 +641,14 @@ impl Pool {
         self.shared.cache.as_ref()
     }
 
+    /// Turn on or off the prefetch of the references of a record that
+    /// `load_before` fetches from the server. It is off when the pool
+    /// starts, and does nothing without a cache. With it off, a load makes
+    /// no other call.
+    pub fn set_prefetch_references(&self, on: bool) {
+        self.shared.references.store(on, Ordering::Relaxed);
+    }
+
     /// Return the counts of the hold.
     pub fn counters(&self) -> Counters {
         self.shared.lock().counters
@@ -648,8 +696,25 @@ impl Pool {
     /// It does not read the cache. It stores the record in the cache, if
     /// the pool has one: a current record only when `applied` of the cache
     /// is not above that position.
+    ///
+    /// With `set_prefetch_references(true)` and a cache, a task then reads
+    /// the persistent ids of the record, and prefetches as `prefetch` does
+    /// the oids of the same database that the cache does not hold for
+    /// `tid`: at most `PREFETCH_REFERENCES` of them, in the order of the
+    /// record. The record returns without a wait for the task. A record of
+    /// more than `PREFETCH_SCAN_LIMIT` bytes, or that does not decode,
+    /// prefetches nothing, and neither do weak references and references
+    /// into another database. The loads of the prefetch do not prefetch
+    /// the references of their records. A prefetch that fails changes
+    /// nothing.
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
-        self.shared.load_before(oid, tid).await
+        let loaded = self.shared.load_before(oid, tid).await?;
+        if let Some(record) = &loaded.0
+            && self.shared.references.load(Ordering::Relaxed)
+        {
+            references::prefetch_references(&self.shared, oid, tid, &record.data);
+        }
+        Ok(loaded)
     }
 
     /// Prefetch the records of `oids` before `tid` into the cache, as
@@ -665,29 +730,7 @@ impl Pool {
     /// or after the close, it fails with `Error::Disconnected` and loads
     /// nothing.
     pub fn prefetch(&self, oids: &[Oid], tid: Tid) -> Result<usize, Error> {
-        let shared = &self.shared;
-        {
-            let state = shared.lock();
-            if state.closed || state.lost {
-                return Err(Error::Disconnected);
-            }
-        }
-        let Some(cache) = &shared.cache else {
-            return Ok(0);
-        };
-        let mut seen = HashSet::new();
-        let mut sent = 0;
-        for &oid in oids {
-            if !seen.insert(oid) || cache.load_before_with(oid, tid, |_, _| Some(())).is_some() {
-                continue;
-            }
-            let shared = shared.clone();
-            shared.runtime.clone().spawn(Box::pin(async move {
-                let _ = shared.load_before(oid, tid).await;
-            }));
-            sent += 1;
-        }
-        Ok(sent)
+        self.shared.prefetch(oids, tid, usize::MAX)
     }
 
     /// Call `ping` on the listener, as `sync` of `ZEO.ClientStorage` does

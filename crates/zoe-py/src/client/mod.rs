@@ -231,12 +231,16 @@ impl NativeClient {
     /// raises `OtherProtocol` with the protocol: it does not log and does
     /// not wait. The caller can then open another client. A reconnect
     /// never does this.
+    ///
+    /// With `prefetch_references` and a cache, each load that the server
+    /// serves also prefetches the objects that its record refers to
+    /// (`Pool::set_prefetch_references`).
     #[new]
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
         disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None, dropping=None,
-        fall_back_on=Vec::new()
+        fall_back_on=Vec::new(), prefetch_references=false
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -257,6 +261,7 @@ impl NativeClient {
         cache_path: Option<PathBuf>,
         dropping: Option<Py<PyAny>>,
         fall_back_on: Vec<Vec<u8>>,
+        prefetch_references: bool,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -336,6 +341,7 @@ impl NativeClient {
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
+            pool.set_prefetch_references(prefetch_references);
             Ok((runtime, pool, servers))
         });
         let (runtime, pool, servers) = match opened {
