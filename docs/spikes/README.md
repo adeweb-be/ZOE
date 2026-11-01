@@ -13,6 +13,7 @@ These findings still describe the code and its dependencies.
 | [zeo-wire.md](zeo-wire.md) | What do a stock ZEO 6 server and an unmodified `ZEO.ClientStorage` send each other over msgpack, and where does the specification differ? The traces of `zeo-wire/` are the wire contract that the tests of `zoe-server` and its fuzz corpus read. |
 | [pickle-round-trip.md](pickle-round-trip.md) | Can zoe-pickle decode a ZODB record into a tree and encode it back to the same bytes, and which constructs must stay opaque? |
 | [free-threading-upstream.md](free-threading-upstream.md) | Can persistent, BTrees and zodbpickle declare that they need no GIL, and what must change first? |
+| [load-path.md](load-path.md) | Where does a load through ZODB on the native client spend its time between the ghost and the client cache, on a hit and on a miss, and which terms do a prefetch (ZOE-273) and a path in Rust (ZOE-274) remove? |
 
 ## Archive
 

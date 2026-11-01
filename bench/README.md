@@ -18,6 +18,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench test FILE...` | the tests of those files only |
 | `just bench client` | the client benchmark: `ZEO.ClientStorage` against the native client (see [The client benchmark](#the-client-benchmark)) |
 | `just bench client report FILE` | the rows of a result of the client benchmark and its verdict |
+| `just bench profile COMMAND` | the load path profile: where one load spends its time between the ghost and the client cache, on a hit and on a miss (see [The load path profile](#the-load-path-profile)) |
 | `just bench index DIR` | rewrites `index.json` of a results tree, in version 2 (see [The results repository](#the-results-repository)) |
 | `just bench publish [--main REF] SRC... CHECKOUT` | copies the result documents of every family into a checkout of the results repository and rewrites its `index.json`; it never commits and never pushes (see [Publishing](#publishing)) |
 | `just bench gate DIR` | the parity gate of phase 2: `zoe-server` against `zeo` in each cell of a results tree but `read_hot` (see [The gate](#the-gate)) |
@@ -155,6 +156,24 @@ just bench client report target/bench/client/<started>.json
 **The disk.** For each server and record size, the work directory holds the load store, the cache files of both clients for one shape, and one commit store: `disk_needed` in `shootout/client.py` bounds it, and the harness checks the free space before it starts. With 1000 objects and records of 100 KB, and 20 commits per worker, that is about 10.1 GB; with records of 1 KB, about 0.7 GB. The native client allocates its whole cache file at the open.
 
 The full run belongs on the reference machine, on CPython 3.14t with the 3.13 run beside it, as for the gate.
+
+## The load path profile
+
+`just bench profile` measures where one load spends its time between the ghost of a ZODB connection and the client cache: the harness of `docs/spikes/load-path.md`, `shootout/loadpath.py`. It is a measure, not a gate, and it writes no file unless `--out` asks for one.
+
+```sh
+just bench profile terms --out target/bench/profile/terms.json     # every row
+just bench profile terms --client native --size 1024 --rounds 10
+devenv --profile profiling shell -- just bench profile loop --kind miss --size 102400 --py-spy target/bench/profile/miss.txt
+just bench profile frames target/bench/profile/miss.txt
+just bench profile scan target/bench/plone/fixtures/<name>/store/filestorage/Data.fs
+devenv --profile profiling shell -- just bench profile plone --py-spy
+```
+
+- **`terms`.** For each client and record size, a new server on a new store: `zoe serve` for the native client (`zoe.zeo.ClientStorage`), a ZEO 6 server on a FileStorage for `ZEO.ClientStorage`. A `DB` on the client writes the corpus of zodbshootout, a `PersistentMapping` of its `PObject`s (1,000 of 1 KB, or 200 of 100 KB). Both clients get a client cache of 256 MB, which holds the corpus; no other setting of a client or a server changes. A hit round calls `cacheMinimize()`, then reads one attribute of each object, as `read_hot` does, then runs each layer of a load alone over the same objects: `MVCCAdapterInstance.load`, `ClientStorage.loadBefore`, the call of the client cache, `ObjectReader.getState` and its parts, `__setstate__` and the lines of `Connection.setstate` after the decode. A miss round empties the client cache before the read and before each layer that reaches it; on the native client, it also times a prefetch of every oid before the read. Each term is the difference of two layers of the same round, per load, in µs: the median and the range of the rounds (30 at 1 KB, 15 at 100 KB). `terms` also counts the Python calls of one load (`sys.setprofile`), the `persistent_load` callbacks of each record and, against `zoe serve`, the loads that the server counted per miss.
+- **`loop`.** One round, hit or miss, again and again for `--seconds`, for a profiler: `--py-spy FILE` runs the loop under `py-spy record --native` in its raw format, and `--cprofile FILE` under cProfile. py-spy is in the `profiling` profile of the shell, and it reads a process with a GIL only. `frames FILE` prints the share of each frame of a load in the samples under the timed loop, and the frames with the most own samples.
+- **`scan`.** Each current record of a FileStorage, by class: the records, their bytes and their references, which are the `persistent_load` callbacks of one load. It imports only ZODB, so the interpreter of a Plone instance runs the file by path, and `--classes` then says which classes have a `__setstate__` in Python.
+- **`plone`.** `plonebench/loadpath.py` copies the store of the `small` fixture of B5, starts `zoe serve` on it with the settings of B5, and runs `plonebench/inzope/loadpath.py` in the interpreter of the zoeclient scenario: one Zope thread that sends anonymous requests of a folder listing and of a document view through the publisher of Zope in its own process, 200 by default, with `cacheMinimize()` before each. For each request it records the time, the objects loaded and the loads that the server counted (the misses of the client cache); then it counts the `persistent_load` callbacks and the Python calls of each load, and the classes loaded. `--py-spy` samples the process, and `frames FILE --root _request_folder` (or `_request_document`) reads the samples of one kind. It needs `just plone zoeclient build` and the fixture (`just bench plone prepare`), and writes into `target/bench/plone/loadpath/`.
 
 ## The Plone end-to-end benchmark
 

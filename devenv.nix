@@ -156,12 +156,14 @@ in
   # Heap and CPU profiles for the spikes. Enter the profile with
   # `devenv --profile profiling shell`. The default shell and CI do not
   # fetch it, because heaptrack brings Qt. perf needs a
-  # `kernel.perf_event_paranoid` of 2 or less on the host. Both tools are
-  # Linux only, so the profile is empty on macOS.
+  # `kernel.perf_event_paranoid` of 2 or less on the host. py-spy samples
+  # a Python process with the GIL; `just bench profile` runs it. The three
+  # tools are Linux only, so the profile is empty on macOS.
   profiles.profiling.module = {
     packages = lib.optionals isLinux [
       pkgs.heaptrack
       pkgs.perf
+      pkgs.py-spy
     ];
   };
 
