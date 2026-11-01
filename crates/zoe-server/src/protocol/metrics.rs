@@ -4,15 +4,22 @@
 //! Each metric has the label `storage`, the storage name. A duration is a
 //! histogram in seconds, and a counter ends in `_total`. The counters and
 //! the histograms of a storage are atomics that all its connections
-//! share. The core reports the size of each sync batch, each lock wait and
-//! the lock hand-offs through its `Observer` trait. The gauges are read at
-//! each scrape.
+//! share. The core reports the size of each sync batch, each lock wait,
+//! the lock hand-offs, each slice of the fold and each wait for the fold
+//! through its `Observer` trait. The gauges are read at each scrape.
 //!
 //! - `zoe_loads_total`, `zoe_load_latency_seconds`: the `loadBefore` calls.
 //! - `zoe_commits_total`: the commits that `tpc_finish` made.
 //! - `zoe_vote_latency_seconds`, `zoe_finish_latency_seconds`: the `vote`
 //!   calls, and the `tpc_finish` calls that ended a transaction.
 //! - `zoe_fsync_batch_size`: the commits that one sync made durable.
+//! - `zoe_fold_seconds`, `zoe_fold_commits_total`: the slices of the fold,
+//!   which write the commits of the write-ahead log into the tables (ADR
+//!   0056), and the commits that they wrote.
+//! - `zoe_backlog_wait_seconds`: the time of each wait of a commit batch
+//!   for the fold.
+//! - `zoe_backlog_bytes`: the bytes of the backlog, the commits that the
+//!   log holds and the tables do not, from `Store::backlog_bytes`.
 //! - `zoe_lock_wait_seconds`: the time of each vote to take its locks.
 //! - `zoe_lock_handoffs_total`: the locks that a finish handed to the vote
 //!   at the head of their queues (ADR 0044).
@@ -43,8 +50,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
+
+use zoe_core::Store;
 
 use super::invalidation::Invalidations;
 use super::status::Stats;
@@ -150,6 +159,12 @@ pub(crate) struct Metrics {
     pub(crate) intent_locks: AtomicU64,
     /// The time of each `lock_intent` to take its locks.
     pub(crate) intent_lock_wait: Histogram,
+    /// The time of each slice of the fold.
+    pub(crate) fold_seconds: Histogram,
+    /// The commits that the slices of the fold wrote into the tables.
+    pub(crate) fold_commits: AtomicU64,
+    /// The time of each wait of a commit batch for the fold.
+    pub(crate) backlog_wait: Histogram,
     /// The conflicts that reached the client as `ConflictError`.
     pub(crate) conflicts_raised: AtomicU64,
     /// The records that the transactions of GET and HEAD requests
@@ -228,6 +243,9 @@ impl Default for Metrics {
             lock_handoffs: AtomicU64::new(0),
             intent_locks: AtomicU64::new(0),
             intent_lock_wait: Histogram::new(SECONDS),
+            fold_seconds: Histogram::new(SECONDS),
+            fold_commits: AtomicU64::new(0),
+            backlog_wait: Histogram::new(SECONDS),
             conflicts_raised: AtomicU64::new(0),
             writes_on_get: Mutex::new(BTreeMap::new()),
             conflicts_native: AtomicU64::new(0),
@@ -257,6 +275,16 @@ impl zoe_core::Observer for Metrics {
         self.intent_locks.fetch_add(locks as u64, Ordering::Relaxed);
         self.intent_lock_wait.observe_duration(wait);
     }
+
+    fn slice_folded(&self, commits: usize, _bytes: u64, duration: Duration) {
+        self.fold_commits
+            .fetch_add(commits as u64, Ordering::Relaxed);
+        self.fold_seconds.observe_duration(duration);
+    }
+
+    fn backlog_waited(&self, wait: Duration) {
+        self.backlog_wait.observe_duration(wait);
+    }
 }
 
 /// What the admin port reads for the metrics of one storage. It holds no
@@ -267,6 +295,19 @@ pub(crate) struct Exported {
     pub(crate) stats: Arc<Stats>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) hub: Arc<Invalidations>,
+    /// The store, for the gauge of its backlog. A weak reference does not
+    /// keep the store open.
+    pub(crate) store: Weak<Store>,
+}
+
+impl Exported {
+    /// Return the bytes of the backlog of the store, or 0 when the store
+    /// is closed.
+    fn backlog_bytes(&self) -> u64 {
+        self.store
+            .upgrade()
+            .map_or(0, |store| store.backlog_bytes())
+    }
 }
 
 /// Write the help line and the type line of the metric `name`.
@@ -336,6 +377,25 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         "zoe_fsync_batch_size",
         "The number of commits that one sync made durable, in commits.",
         &|m| &m.fsync_batch_size,
+    );
+    histogram(
+        &mut out,
+        "zoe_fold_seconds",
+        "The time of each slice of the fold, one durable write of commits of the write-ahead log into the tables, in seconds.",
+        &|m| &m.fold_seconds,
+    );
+    scalar(
+        &mut out,
+        "zoe_fold_commits_total",
+        "counter",
+        "The number of commits that the fold wrote from the write-ahead log into the tables.",
+        &|s| get(&s.metrics.fold_commits),
+    );
+    histogram(
+        &mut out,
+        "zoe_backlog_wait_seconds",
+        "The time of each wait of a commit batch for the fold: for room in the backlog, or for an empty backlog, in seconds.",
+        &|m| &m.backlog_wait,
     );
     histogram(
         &mut out,
@@ -448,6 +508,13 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         "The messages that wait in the deepest hub queue among the connections of the storage.",
         &|s| s.hub.deepest_queue() as u64,
     );
+    scalar(
+        &mut out,
+        "zoe_backlog_bytes",
+        "gauge",
+        "The commits that the write-ahead log holds and the tables do not hold yet, in bytes.",
+        &Exported::backlog_bytes,
+    );
     out
 }
 
@@ -474,6 +541,7 @@ mod tests {
             stats: Arc::new(Stats::new(SystemTime::UNIX_EPOCH)),
             metrics: Arc::new(Metrics::default()),
             hub: Arc::new(Invalidations::new(Tid::ZERO)),
+            store: Weak::new(),
         }
     }
 

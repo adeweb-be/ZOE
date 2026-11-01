@@ -267,6 +267,7 @@ impl NamedStorage {
             stats: Arc::clone(&self.stats),
             metrics: Arc::clone(&self.metrics),
             hub: Arc::clone(&self.invalidations),
+            store: Arc::downgrade(&self.store),
         }
     }
 
