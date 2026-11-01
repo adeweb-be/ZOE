@@ -583,7 +583,7 @@ mod tests {
         ]));
         one.metrics.locks_handed_off(2);
         let text = render(&[one, exported("a\"b")]);
-        assert_eq!(text.matches("# TYPE ").count(), 17);
+        assert_eq!(text.matches("# TYPE ").count(), 21);
         assert!(
             text.contains(
                 "zoe_writes_on_get_total{storage=\"1\",class=\"persistent.mapping.PersistentMapping\"} 3\n"
