@@ -48,7 +48,10 @@ key. It runs several transactions at once, each on its own connection of a
 pool, with one more connection that orders the invalidations (ADR 0036). It
 keeps a client cache of `cache_size` bytes, with the semantics of the cache
 of ZEO (ADR 0034): in memory, or in a file with `client` and `var`, or
-`cache`. It has blobs in both modes of ZEO: a blob cache in `blob_dir`, or
+`cache`. A load that the server serves also prefetches the objects that
+its record refers to, after the record went to the caller
+(`prefetch-references` of `<zoeclient>`, on by default). It has blobs in
+both modes of ZEO: a blob cache in `blob_dir`, or
 a blob directory that it shares with the server (`shared_blob_dir`). It
 resolves in the client the conflicts that a vote lists, as
 `ZEO.ClientStorage` does. When it loses its server, it connects again in

@@ -44,7 +44,7 @@ The keys `staging-memory`, `max-record-size`, `max-transaction-size` and `max-bl
 
 ## `<zoeclient>`
 
-A client of a ZOE server: `zoe.zeo.ClientStorage`, a subclass of `ZEO.ClientStorage` (see [Python API](python-api.md)). It extends `<zeoclient>` of ZODB, so it takes every key of `<zeoclient>` with the same values. It declares the ZOE extensions to the server (see [Protocol](protocol.md)), and works as a `<zeoclient>` against a stock ZEO server. It has no environment twins, as `<zeoclient>` has none.
+A client of a ZOE server: `zoe.zeo.ClientStorage`, a subclass of `ZEO.ClientStorage` (see [Python API](python-api.md)). It extends `<zeoclient>` of ZODB, so it takes every key of `<zeoclient>` with the same values. It declares the ZOE extensions to the server (see [Protocol](protocol.md)), and works as a `<zeoclient>` against a stock ZEO server. Only `prefetch-references` has an environment twin, `ZOE_PREFETCH_REFERENCES`; the other keys have none, as `<zeoclient>` has none.
 
 The keys of `<zeoclient>`: `server` (one for each address), `storage`, `cache-size`, `name`, `client`, `var`, `min-disconnect-poll`, `max-disconnect-poll`, `wait`, `read-only`, `read-only-fallback`, `drop-cache-rather-verify`, `username`, `password`, `realm`, `blob-dir`, `shared-blob-dir`, `blob-cache-size`, `blob-cache-size-check` and `client-label`. The keys that `<zoeclient>` adds:
 
@@ -54,6 +54,7 @@ The keys of `<zeoclient>`: `server` (one for each address), `storage`, `cache-si
 | `native` | not set | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, the client runs on the native client, built on the Rust crate `zoe-client`. Against a stock ZEO server, it needs `msgpack true` on the server. If false, the asyncio client of ZEO runs inside. When the key is not set, the client is native, but a stock ZEO server that speaks only the pickle protocol `Z5` at the open, with `wait`, gives the asyncio client of ZEO and one warning. |
 | `early-locks` | `false` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, an object of a class of `early-lock-classes` takes its early write-intent lock on the server when its state loads (ADR 0044, part B). It needs the native client: with `native false`, the open raises an error. A server that does not accept the extension `lock_intent` gives no early lock and one warning. |
 | `early-lock-classes` | none | The hot classes of `early-locks`, each as `module.name`, separated by spaces or commas, as in `<zoe>`. |
+| `prefetch-references` | `ZOE_PREFETCH_REFERENCES`, else `true` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, a load that the server serves also prefetches into the client cache the objects of the same database that its record refers to, one level deep: at most 256 objects, for a record of at most 16 KiB. The record goes to the application first. Only the native client reads it. The twin gives the value when the key is not set; an empty twin counts as not set. |
 
 ### `<ssl>`
 

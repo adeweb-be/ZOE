@@ -66,6 +66,7 @@ eggs +=
 
 - By default, the client runs in Rust: the native client. `native false` runs the asyncio client of ZEO inside. That client declares the extensions too, but it takes no early locks.
 - `wait-timeout` is the longest wait for a server, at the open and after a disconnection, 30 seconds by default.
+- When the native client loads an object from the server, it also loads the objects that the object refers to, at most 256, in the background. So a page that reads the children of a folder waits for the server about once for the folder, not once for each child. `prefetch-references off`, or `ZOE_PREFETCH_REFERENCES=off` in the environment, turns it off.
 - Against a stock ZEO server, the client works too, without the extensions. The native client needs `msgpack true` on that server. When `native` is not set and the server speaks only the pickle protocol of ZEO, the client takes the asyncio client of ZEO and logs a warning.
 
 plone.recipe.zope2instance cannot write a `<zoeclient>` section. Render `zope.conf` from a template, as for the `<zoe>` section (see [Run in-process](in-process.md#in-a-buildout)). The `zoeclient` scenario of the repository is a whole example: [`plone/zoeclient.cfg`](https://github.com/adeweb-be/ZOE/blob/main/plone/zoeclient.cfg) and [`plone/templates/zoeclient.conf.in`](https://github.com/adeweb-be/ZOE/blob/main/plone/templates/zoeclient.conf.in).

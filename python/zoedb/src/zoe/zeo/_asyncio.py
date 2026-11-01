@@ -295,6 +295,7 @@ class ClientStorage(ZEOClientStorage):
         early_lock_classes=None,
         _client_factory=_ClientThread,
         _ssl_section=None,
+        _prefetch_references=None,
         **kw,
     ):
         # The asyncio client of ZEO has one session and one commit lock for
@@ -302,6 +303,9 @@ class ClientStorage(ZEOClientStorage):
         if early_locks:
             raise ValueError("early-locks on needs the native client: native true")
         self.early_lock_classes = None
+        # The asyncio client of ZEO prefetches no references, so it ignores
+        # `_prefetch_references`, the key `prefetch-references` of
+        # `<zoeclient>`.
         # `_ssl_section` is the `<ssl>` section of `<zoeclient>`. ZEO's
         # client takes the context that it gives.
         if _ssl_section is not None:

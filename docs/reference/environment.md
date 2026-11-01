@@ -7,7 +7,7 @@ ZOE reads two kinds of `ZOE_*` variables:
 
 A twin gives a value only when its option or key is not set: the command line and the `<zoe>` section win over the environment. An empty twin of `<zoe>` counts as not set. A twin takes the same values as its option or key (see [Values](cli.md#values)). A boolean twin of the `zoe` command takes the words of clap, and a boolean twin of `<zoe>` the words of ZConfig, which do not include `1` and `0` (see [zope.conf sections](zope-conf.md)). `ZOE_READ_ONLY` and `ZOE_PACK_GC` have both readers, so give them `true` or `false`: both readers accept these.
 
-One twin can serve several readers. For example, `ZOE_PATH` gives the store of each `zoe` subcommand and of the `<zoe>` section in the same environment. `<zoeclient>` has no twins, as `<zeoclient>` has none. `python -m zoe.serve` removes from the environment of the server the twin of each key that its `<zoe-server>` section sets.
+One twin can serve several readers. For example, `ZOE_PATH` gives the store of each `zoe` subcommand and of the `<zoe>` section in the same environment. `<zoeclient>` has one twin, `ZOE_PREFETCH_REFERENCES`, which `zoe.zeo.ClientStorage` reads too; its other keys have none, as `<zeoclient>` has none. `python -m zoe.serve` removes from the environment of the server the twin of each key that its `<zoe-server>` section sets.
 
 ## Twins
 
@@ -19,6 +19,7 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_LOCK_TIMEOUT` | `zoe serve`, `<zoe>` | the longest lock wait of a vote, in whole seconds |
 | `ZOE_EARLY_LOCKS` | `<zoe>` | a boolean: early write-intent locks of the hot classes |
 | `ZOE_EARLY_LOCK_CLASSES` | `<zoe>` | the hot classes, each as `module.name`, separated by spaces or commas |
+| `ZOE_PREFETCH_REFERENCES` | `<zoeclient>`, `zoe.zeo.ClientStorage` | a boolean: the native client prefetches the objects that a record from the server refers to; `true` when not set |
 | `ZOE_READ_ONLY` | `zoe serve`, `<zoe>` | a boolean: serve or open read-only |
 | `ZOE_PACK_GC` | `zoe pack`, `zoe serve`, `<zoe>` | a boolean: pack with garbage collection |
 | `ZOE_COMPRESSION` | `zoe serve`, `<zoe>` | `none`, `zstd` or `zstd:LEVEL` |

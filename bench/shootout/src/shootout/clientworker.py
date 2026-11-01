@@ -5,6 +5,11 @@ workload, and writes one JSON line to stdout: the start and the end of the
 round on the monotonic clock, the client CPU in seconds, the calls, the
 objects, and the time of each call.
 
+The `traverse` workload runs through ZODB: one worker opens a `DB` on its
+client, calls `cacheMinimize()`, and walks the tree of the store depth
+first, through attribute access, as a Connection does. Its one call is the
+walk.
+
 In the threads mode, the workers are threads of this process on one
 client. In the processes mode, this process starts one process per worker,
 each with its own client, and waits for them. It opens no client itself.
@@ -96,7 +101,7 @@ def check_no_imports(before: set[str]) -> None:
 
 def open_client(spec: dict, worker: int, opener):
     """Open the client of the spec with opener, with the cache file of the
-    worker."""
+    worker. A commit or traverse round has a cache in memory."""
     host, port = spec["address"]
     kw = {
         "storage": "1",
@@ -104,7 +109,7 @@ def open_client(spec: dict, worker: int, opener):
         "wait": True,
         "wait_timeout": WAIT_TIMEOUT,
     }
-    if spec["workload"] != "commit":
+    if spec["workload"] in ("cold", "warm"):
         # The cache is a file. The cold round starts with none and writes
         # it. The warm round reopens it.
         kw["client"] = f"w{worker}"
@@ -185,6 +190,56 @@ def prepare(spec: dict, worker: int):
     if spec["workload"] == "commit":
         return records_of(spec["record_size"], worker)
     return oids_of(spec, worker)
+
+
+def walk(node) -> int:
+    """Touch `node` and each `PersistentMapping` below it, depth first.
+
+    The attribute `values` of a ghost loads its state, as ZODB loads an
+    object that the application touches. Return the number of nodes.
+    """
+    from persistent.mapping import PersistentMapping
+
+    count = 1
+    for value in node.values():
+        if isinstance(value, PersistentMapping):
+            count += walk(value)
+    return count
+
+
+def run_traverse(spec: dict) -> dict:
+    """Walk the tree of the store once, from a new client with an empty
+    cache, after `cacheMinimize()`. The clock covers the walk only."""
+    import ZODB
+
+    opener = client_class(spec)
+    importlib.import_module("persistent.mapping")
+    storage = open_client(spec, 0, opener)
+    db = ZODB.DB(storage)
+    try:
+        conn = db.open()
+        conn.cacheMinimize()
+        root = conn.root()
+        modules = set(sys.modules)
+        start, cpu_start = time.monotonic(), cpu()
+        clock = time.perf_counter()
+        objects = walk(root)
+        elapsed = time.perf_counter() - clock
+        end, cpu_end = time.monotonic(), cpu()
+        check_no_imports(modules)
+        conn.close()
+    finally:
+        db.close()
+    if objects != spec["objects"]:
+        raise RuntimeError(f"the walk touched {objects} objects of {spec['objects']}")
+    return {
+        "start": start,
+        "end": end,
+        "cpu_seconds": cpu_end - cpu_start,
+        "calls": 1,
+        "objects": objects,
+        "times": [elapsed],
+    }
 
 
 def run_threads(spec: dict) -> dict:
@@ -300,7 +355,10 @@ def main(argv: list[str]) -> int:
     logging.basicConfig(level=logging.WARNING)
     with open(argv[0]) as file:
         spec = json.load(file)
-    run = run_threads if spec["mode"] == "threads" else run_processes
+    if spec["workload"] == "traverse":
+        run = run_traverse
+    else:
+        run = run_threads if spec["mode"] == "threads" else run_processes
     print(json.dumps(run(spec)), flush=True)
     return 0
 

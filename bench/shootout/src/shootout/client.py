@@ -19,6 +19,12 @@ the same server state:
   of each client starts with no cache file and writes one. The warm round
   of the same client then reopens that file.
 - Each commit round runs on a fresh store.
+
+The `traverse` rows run through ZODB: the harness writes a tree of
+`PersistentMapping`s, and one worker walks it from a new client with an
+empty cache, for `ZEO.ClientStorage` and for the native client with its
+setting `prefetch-references` on and off (`ZOE_PREFETCH_REFERENCES`). A row
+gives the time of one walk and the loads that reached the server.
 """
 
 import datetime
@@ -77,6 +83,18 @@ CACHE_ENTRY_OVERHEAD = 512
 CACHE_EXTENSIONS = {ZEO_CLIENT: ".zec", NATIVE_CLIENT: ".zoec"}
 # The short name of each client in the work directory.
 TAGS = {ZEO_CLIENT: "zeo", NATIVE_CLIENT: "native"}
+# The tree of the traverse rows: the root, and BRANCHING children for each
+# node down to DEPTH levels below it. A leaf holds TRAVERSE_LEAF random
+# bytes.
+TRAVERSE_BRANCHING = 20
+TRAVERSE_DEPTH = 3
+TRAVERSE_LEAF = KB
+TRAVERSE_OBJECTS = sum(TRAVERSE_BRANCHING**level for level in range(TRAVERSE_DEPTH + 1))
+# The clients of the traverse rows, each with its setting
+# prefetch-references; None for the client of ZEO, which has none.
+TRAVERSE_CLIENTS = ((ZEO_CLIENT, None), (NATIVE_CLIENT, True), (NATIVE_CLIENT, False))
+# The variable that gives the setting to the native client of a round.
+PREFETCH_TWIN = "ZOE_PREFETCH_REFERENCES"
 
 
 def cache_size(objects: int, size: int) -> int:
@@ -129,6 +147,7 @@ def run(
     root = Path(tempfile.mkdtemp(prefix="client-", dir=workdir))
     rounds_of = defaultdict(list)
     workers_of = defaultdict(list)
+    walks_of = defaultdict(list)
     for server in servers:
         for size in SIZES:
             needed = disk_needed(objects, size, commits)
@@ -145,6 +164,10 @@ def run(
             _load_rounds(server, size, objects, rounds, base, rounds_of, workers_of)
             _commit_rounds(server, size, commits, rounds, base, rounds_of, workers_of)
             shutil.rmtree(base)
+        print(f"== {server}, traverse", flush=True)
+        base = root / f"{server}-traverse"
+        _traverse_rounds(server, rounds, base, walks_of)
+        shutil.rmtree(base)
     shutil.rmtree(root)
 
     rows = [
@@ -174,7 +197,21 @@ def run(
             }
         ),
         "rows": rows,
+        "traverse": [
+            _traverse_row(key, walks_of[key])
+            for key in _traverse_keys(servers)
+            if key in walks_of
+        ],
     }
+
+
+def _traverse_keys(servers) -> list[tuple]:
+    """Return the key of each traverse row, in the order of the report."""
+    return [
+        (client, prefetch, server)
+        for server in servers
+        for client, prefetch in TRAVERSE_CLIENTS
+    ]
 
 
 def _keys(servers) -> list[tuple]:
@@ -325,6 +362,72 @@ def _commit_rounds(server, size, commits, rounds, base, rounds_of, workers_of):
                 shutil.rmtree(directory)
 
 
+def _fill_tree(address: tuple) -> None:
+    """Commit the tree of the traverse rows through ZODB, as the root of the
+    store, with a client of ZEO. Then a new client of ZEO with an empty
+    cache walks it once, so the first round finds the server as warm as the
+    next ones. No round measures it."""
+    import random
+
+    import ZODB
+    from persistent.mapping import PersistentMapping
+    from ZEO.ClientStorage import ClientStorage
+
+    from shootout.clientworker import walk
+
+    rng = random.Random(0)
+
+    def node(level):
+        if level == TRAVERSE_DEPTH:
+            return PersistentMapping({"value": rng.randbytes(TRAVERSE_LEAF)})
+        return PersistentMapping(
+            {f"{n:02d}": node(level + 1) for n in range(TRAVERSE_BRANCHING)}
+        )
+
+    db = ZODB.DB(ClientStorage(address, wait=True, wait_timeout=120))
+    try:
+        with db.transaction() as conn:
+            root = conn.root()
+            for n in range(TRAVERSE_BRANCHING):
+                root[f"{n:02d}"] = node(1)
+    finally:
+        db.close()
+    db = ZODB.DB(ClientStorage(address, wait=True, wait_timeout=120))
+    try:
+        with db.transaction() as conn:
+            walk(conn.root())
+    finally:
+        db.close()
+
+
+def _traverse_rounds(server, rounds, base, walks_of):
+    """Run the traverse rounds of each client against one tree.
+
+    The rounds of the clients interleave, and the client that goes first
+    changes from one round to the next.
+    """
+    with _server(server, base / "server") as (address, admin):
+        _fill_tree(address)
+        for number in range(rounds):
+            order = TRAVERSE_CLIENTS if number % 2 == 0 else TRAVERSE_CLIENTS[::-1]
+            for client, prefetch in order:
+                spec = {
+                    "client": client,
+                    "address": list(address),
+                    "mode": "threads",
+                    "concurrency": 1,
+                    "workload": "traverse",
+                    "objects": TRAVERSE_OBJECTS,
+                    "prefetch_references": prefetch,
+                    "cache_size": cache_size(TRAVERSE_OBJECTS, TRAVERSE_LEAF),
+                }
+                tag = TAGS[client] + {None: "", True: "-on", False: "-off"}[prefetch]
+                before = server_loads(admin) if admin else None
+                result, workers = _round(spec, base / f"traverse-{number}-{tag}")
+                loads = server_loads(admin) - before if admin else None
+                walks_of[(client, prefetch, server)].append((result, loads, workers))
+
+
 def _check_cache_files(client: str, mode: str, concurrency: int, var: Path) -> None:
     """Fail a warm round whose client wrote no cache file in its cold round."""
     clients = concurrency if mode == "processes" else 1
@@ -363,11 +466,15 @@ def _round(spec: dict, directory: Path) -> tuple[dict, list[dict]]:
     path.write_text(json.dumps(spec))
     records = directory / "gil"
     records.mkdir()
+    env = gil.environ(records)
+    prefetch = spec.get("prefetch_references")
+    if prefetch is not None:
+        env[PREFETCH_TWIN] = "on" if prefetch else "off"
     done = subprocess.run(
         [sys.executable, "-m", "shootout.clientworker", str(path)],
         capture_output=True,
         text=True,
-        env=gil.environ(records),
+        env=env,
         check=False,
     )
     shape = f"{spec['mode']} {spec['concurrency']}"
@@ -407,10 +514,75 @@ def _row(key: tuple, results: list[dict], workers: list[dict]) -> dict:
     }
 
 
+def _traverse_row(key: tuple, walks: list[tuple]) -> dict:
+    """Turn the rounds of one client and server into a traverse row."""
+    client, prefetch, server = key
+    times = [result["times"][0] for result, _, _ in walks]
+    loads = [loads for _, loads, _ in walks]
+    median = statistics.median(times)
+    return {
+        "client": client,
+        "prefetch_references": prefetch,
+        "server": server,
+        "objects": walks[0][0]["objects"],
+        "walk_seconds": median,
+        "server_loads": None if None in loads else int(statistics.median(loads)),
+        "rounds": len(walks),
+        "spread": (max(times) - min(times)) / median,
+        "workers": [w for _, _, workers in walks for w in workers],
+    }
+
+
 ROW = (
     "{:<9} {:>2} {:<6} {:>6} {:<9} {:>10} {:>10} {:>6} {:>8} {:>8}"
     " {:>8} {:>8} {:>8} {:>8} {:>6}  {}"
 )
+TRAVERSE_ROW = "{:<9} {:>7} {:<9} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>6}"
+
+
+def report_traverse(result: dict, out) -> None:
+    """Print one traverse row per server: the time of one walk and the
+    loads that reached the server, for `ZEO.ClientStorage` and for the
+    native client with `prefetch-references` on and off. The rows do not
+    count in the verdict. A result without traverse rows prints nothing."""
+    rows = {
+        (row["client"], row["prefetch_references"], row["server"]): row
+        for row in result.get("traverse", ())
+    }
+    servers = [s for s in SERVERS if any(key[2] == s for key in rows)]
+    if not servers:
+        return
+    print(file=out)
+    print(
+        TRAVERSE_ROW.format(
+            "traverse",
+            "objects",
+            "server",
+            "ZEO ms",
+            "on ms",
+            "off ms",
+            "ZEO lds",
+            "on lds",
+            "off lds",
+            "spread",
+        ),
+        file=out,
+    )
+    for server in servers:
+        found = [rows.get((client, p, server)) for client, p in TRAVERSE_CLIENTS]
+        objects = next(row["objects"] for row in found if row)
+        times = [f"{row['walk_seconds'] * 1e3:.1f}" if row else "-" for row in found]
+        loads = [
+            str(row["server_loads"]) if row and row["server_loads"] is not None else "-"
+            for row in found
+        ]
+        spread = max(row["spread"] for row in found if row)
+        print(
+            TRAVERSE_ROW.format(
+                "traverse", objects, server, *times, *loads, f"{spread:.0%}"
+            ),
+            file=out,
+        )
 
 
 def report(result: dict, out) -> int:
@@ -503,6 +675,7 @@ def report(result: dict, out) -> int:
         if not counts and verdict != "missing":
             verdict += " (does not count)"
         print(ROW.format(*key, *numbers, verdict), file=out)
+    report_traverse(result, out)
 
     if not lose and not missing:
         print(

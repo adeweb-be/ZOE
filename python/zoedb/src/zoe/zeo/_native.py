@@ -31,6 +31,7 @@ from ZODB.POSException import (
 from ZODB.utils import z64
 
 from zoe import zodb
+from zoe.config import prefetch_references
 from zoe.zeo._asyncio import (
     _KV,
     _LOCK_INTENT,
@@ -63,6 +64,10 @@ _NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES)
 # takes the asyncio client of ZEO inside: the pickle protocol of a stock
 # ZEO server without `msgpack true`. The client of ZEO speaks it.
 _ZEO_PROTOCOLS = (b"Z5",)
+
+# The arguments of an open that the fall back to the client of ZEO does not
+# pass on as they are.
+_NOT_FOR_ZEO = ("self", "native", "_ssl_section", "_prefetch_references", "__class__")
 
 # The number of oids that the native client asks for at a time.
 _NEW_OIDS = 100
@@ -422,8 +427,18 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
 
     `prefetch(oids, tid)` loads each oid that the cache does not hold for
     `tid`, all at once, and returns before the replies, which fill the
-    cache. `sync()` with `server_sync` pings the listener, and returns when
-    the DB got each commit that the server published before the reply. Each
+    cache. A load that the server serves also prefetches by itself the
+    objects that its record refers to, as `prefetch` does, after the
+    record went to the caller: at most 256 of them, for a record of at
+    most 16 KB, and only the objects of the same database, not the weak
+    references. A record that this prefetch brings prefetches nothing. So a
+    Connection that touches the children of an object after its load finds
+    them in the cache. `_prefetch_references` false turns it off. None, the
+    default, takes the value of `ZOE_PREFETCH_REFERENCES`, else true. The
+    key `prefetch-references` of `<zoeclient>` gives it.
+
+    `sync()` with `server_sync` pings the listener, and returns when the
+    DB got each commit that the server published before the reply. Each
     connection sends `client_label` to the server. `new_addr` gives the
     addresses of the next connection: the client keeps its server until it
     loses it. `len()` and `getSize()` read the last sizes that the server
@@ -466,12 +481,15 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         early_locks=False,
         early_lock_classes=None,
         _ssl_section=None,
+        _prefetch_references=None,
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
         # A bad list of hot classes raises before the client connects.
         self._early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
         given = dict(locals())
+        # A bad twin raises before the client connects too.
+        prefetch = prefetch_references(_prefetch_references)
         fall_back = self.__dict__.pop("_fall_back", False) and wait
         cache_path = _native_cache_path(cache, var, client, storage)
         if ssl is not None:
@@ -558,6 +576,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
                 cache_path=cache_path,
                 dropping=_dropping_of(self),
                 fall_back_on=list(_ZEO_PROTOCOLS if fall_back else ()),
+                prefetch_references=prefetch,
             )
         except _zoe.OtherProtocol as error:
             self._open_zeo_client(given, error.args[0])
@@ -604,11 +623,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
             self.__name__,
             protocol,
         )
-        args = {
-            key: value
-            for key, value in given.items()
-            if key not in ("self", "native", "_ssl_section", "__class__")
-        }
+        args = {key: value for key, value in given.items() if key not in _NOT_FOR_ZEO}
         # The client of ZEO takes no early locks. The locks are advisory, so
         # the client goes on without them.
         if args.pop("early_locks") and args.pop("early_lock_classes"):

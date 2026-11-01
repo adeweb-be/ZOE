@@ -51,6 +51,7 @@ def test_the_zoeclient_section_takes_every_key_of_zeoclient():
         "native",
         "early-locks",
         "early-lock-classes",
+        "prefetch-references",
     }
 
 

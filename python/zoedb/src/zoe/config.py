@@ -7,9 +7,11 @@ as their storage. The `zoe` entry point of `zodburi.resolvers` names
 
 `<zoeclient>` opens a `zoe.zeo.ClientStorage`. It takes every key of
 `<zeoclient>`, with the same values, `wait-timeout`, `native`,
-`early-locks` and `early-lock-classes`, and an
+`early-locks`, `early-lock-classes` and `prefetch-references`, and an
 `<ssl>` section with the keys of the `<ssl>` section of ZEO's
-`<clientstorage>`. It has no environment twins, as `<zeoclient>` has none.
+`<clientstorage>`. Only `prefetch-references` has an environment twin,
+`ZOE_PREFETCH_REFERENCES`, which `zoe.zeo.ClientStorage` reads too; the
+other keys have none, as `<zeoclient>` has none.
 
 The keys are in kebab-case. The query of the URI takes the same keys with
 the same values. Each key has an environment variable, its twin: `ZOE_` and
@@ -142,6 +144,25 @@ def convert(key, text, source):
         raise ValueError(f"{source}: {error}") from None
 
 
+def prefetch_references(value):
+    """Return the setting `prefetch-references` of the native client.
+
+    `value` is the boolean of the section or of the caller, or None when
+    neither sets it. Then the twin gives the value, and without the twin
+    the setting is true. An empty twin counts as not set.
+    """
+    if value is not None:
+        return bool(value)
+    name = twin("prefetch-references")
+    text = os.environ.get(name, "")
+    if not text:
+        return True
+    try:
+        return stock_datatypes["boolean"](text)
+    except ValueError as error:
+        raise ValueError(f"{name}={text!r}: {error}") from None
+
+
 def open_storage(settings):
     """Open a `zoe.Storage` with settings, a dict of converted values.
 
@@ -230,9 +251,11 @@ class ZoeClient(BaseConfig):
     """The `<zoeclient>` section. `open` opens its `zoe.zeo.ClientStorage`.
 
     It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
-    `wait-timeout` as `wait_timeout`, `native` as `native`, and
+    `wait-timeout` as `wait_timeout`, `native` as `native`,
     `early-locks` and `early-lock-classes` as `early_locks` and
-    `early_lock_classes`. It gives the
+    `early_lock_classes`, and `prefetch-references` as
+    `_prefetch_references`, None when the section does not set it. It gives
+    the
     `<ssl>` section as it is: the native client reads its files, and ZEO's
     client gets the context that ZEO's `<ssl>` section gives.
     """
@@ -275,5 +298,6 @@ class ZoeClient(BaseConfig):
             early_locks=config.early_locks,
             early_lock_classes=class_names(config.early_lock_classes or ""),
             _ssl_section=config.ssl,
+            _prefetch_references=config.prefetch_references,
             **options,
         )
