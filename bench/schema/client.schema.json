@@ -118,6 +118,26 @@
           "workers": { "$ref": "#/$defs/workers" }
         }
       }
+    },
+    "traverse": {
+      "description": "The traverse rows: one entry per client and server. The harness writes a tree of PersistentMappings through ZODB, the root of the store with 20 children for each node over 3 levels, and leaves of 1 KB of random bytes. Each round, a new process opens a DB on a client with an empty cache, calls cacheMinimize() and walks the tree depth first. Optional: results without it stay valid.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["client", "prefetch_references", "server", "objects", "walk_seconds", "server_loads", "rounds", "spread"],
+        "properties": {
+          "client": { "enum": ["ZEO.ClientStorage", "zoe.zeo.ClientStorage"] },
+          "prefetch_references": { "description": "The setting prefetch-references of the native client; null for ZEO.ClientStorage.", "type": ["boolean", "null"] },
+          "server": { "enum": ["zoe-serve", "zeo"] },
+          "objects": { "description": "The objects of one walk.", "type": "integer", "minimum": 1 },
+          "walk_seconds": { "description": "The time of one walk; the median of the rounds.", "type": "number", "exclusiveMinimum": 0 },
+          "server_loads": { "description": "The loads that zoe serve counted in a round, from the open of the client to its close; the median of the rounds. null against the ZEO server, which counts no loads.", "type": ["integer", "null"], "minimum": 0 },
+          "rounds": { "description": "The number of rounds. The rounds of the three clients interleave.", "type": "integer", "minimum": 3 },
+          "spread": { "description": "The longest minus the shortest walk of the rounds, divided by their median.", "type": "number", "minimum": 0 },
+          "workers": { "$ref": "#/$defs/workers" }
+        }
+      }
     }
   }
 }
