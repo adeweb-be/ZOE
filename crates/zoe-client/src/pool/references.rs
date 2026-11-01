@@ -15,13 +15,12 @@
 //! another database are not prefetched. A record that does not decode
 //! prefetches nothing.
 //!
-//! `persistent_ids` costs about 0.8 µs per reference, and 17 to 26 µs per
-//! KB of a record of small items, on the reference machine. The two caps
-//! keep a scan and its prefetch small: `PREFETCH_SCAN_LIMIT` holds one scan
-//! below about 0.4 ms of a thread of the runtime, and
-//! `PREFETCH_REFERENCES` holds the loads of one record below the size of
-//! the largest bucket of BTrees and of a container of a few hundred
-//! children.
+//! In release, `persistent_ids` costs about 0.8 µs per reference, and 17
+//! to 26 µs per KB of a record of small items. Two caps keep a scan and
+//! its prefetch small. `PREFETCH_SCAN_LIMIT` holds one scan below about
+//! 0.4 ms of a thread of the runtime. `PREFETCH_REFERENCES` bounds the
+//! loads of one record, and still covers a bucket of BTrees, a node of an
+//! `OOBTree` and a container of a few hundred children.
 
 use std::sync::Arc;
 
