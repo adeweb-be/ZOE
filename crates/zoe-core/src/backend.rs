@@ -7,9 +7,11 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::Arc;
 
+use crate::commit::Observer;
 use crate::error::{Result, ZoeError};
-use crate::format::Codec;
+use crate::format::{self, Codec, KeySpace};
 use crate::kv::{Flavour, Swept};
 use crate::types::{Oid, Tid};
 
@@ -93,13 +95,23 @@ pub struct TxnMeta {
     pub status: TxnStatus,
 }
 
-/// What a pack removed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PackStats {
-    /// The number of record versions that the pack removed.
-    pub records_removed: u64,
-    /// The number of bytes that the pack removed.
-    pub bytes_removed: u64,
+/// The plan of a commit batch: what the leader knows of the batch before it
+/// encodes anything (ADR 0056). The lengths come from the index of the
+/// staging of each member, so the plan reads no pickle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchPlan {
+    /// The last tid of the store before the batch.
+    pub(crate) previous: Tid,
+    /// The bytes of the pickles of the records of the batch.
+    pub(crate) pickle_bytes: u64,
+    /// The bytes of the pickles of its large records.
+    pub(crate) large_bytes: u64,
+    /// The size of the batch in the backlog of the log. It is never below
+    /// the size that the batch takes there.
+    pub(crate) estimate: u64,
+    /// True when each member of the batch with a tid is a deferred
+    /// restore.
+    pub(crate) deferred: bool,
 }
 
 /// A durable store of records and transactions.
@@ -110,23 +122,16 @@ pub trait Backend: Send + Sync {
     /// Return the newest version of `oid` with a tid lower than `tid`.
     fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>>;
 
-    /// Return the current version of each oid of `oids`, in the order of
-    /// `oids`, as `load_before` at `Tid::MAX` does. A backend can read
-    /// them all in one snapshot.
-    fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
-        oids.map(|oid| self.load_before(oid, Tid::MAX)).collect()
-    }
-
     /// Return the serial of the current version of each oid of `oids`, in
     /// the order of `oids`: the tid of its newest record, or `None` for an
     /// oid without a record. A backend can read them all in one snapshot,
     /// from the keys of the records alone, so the call decodes no record.
+    ///
+    /// This default loads each current record with `load_before` at
+    /// `Tid::MAX`.
     fn current_serials(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
-        let records = self.load_current(oids)?;
-        Ok(records
-            .into_iter()
-            .map(|record| record.map(|record| record.tid))
-            .collect())
+        oids.map(|oid| Ok(self.load_before(oid, Tid::MAX)?.map(|record| record.tid)))
+            .collect()
     }
 
     /// Return the pickle that `tid` wrote for `oid`.
@@ -144,8 +149,65 @@ pub trait Backend: Send + Sync {
     /// Return the tid of the last committed transaction.
     fn last_tid(&self) -> Tid;
 
-    /// Open a write transaction. The core opens one for each `tpc_finish`.
+    /// Open a write transaction of the tables. A pack batch, `sync`, a
+    /// sequence reservation, a sweep step and a restore of durable rows
+    /// open one.
     fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>>;
+
+    /// Return the write of the commit batch that `plan` describes. The
+    /// leader calls it under the commit sequencer, after it gave the tids
+    /// and before it places the blob files.
+    ///
+    /// A backend with a write-ahead log chooses the path of the batch and
+    /// runs its waits for the fold (ADR 0056): the write appends the batch
+    /// to the log, or writes it into the tables. This default returns
+    /// `begin_write`: each batch goes into the tables.
+    fn begin_batch(&self, plan: &BatchPlan) -> Result<Box<dyn WriteTxn + '_>> {
+        let _ = plan;
+        self.begin_write()
+    }
+
+    /// Fold each commit up to `tid` into the tables, and wait until no
+    /// commit up to `tid` is left in the log alone (ADR 0056). A failed
+    /// fold gives `Halted`. This default has no log: it returns at once.
+    fn fold(&self, tid: Tid) -> Result<()> {
+        let _ = tid;
+        Ok(())
+    }
+
+    /// Return the bytes of the backlog of the log (ADR 0056). This default
+    /// has no log: it gives 0.
+    fn backlog_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Return the previous tid and the last tid of the entry of the log
+    /// that the open cut while its header passed (ADR 0056, section 12).
+    /// This default has no log: it gives `None`.
+    fn cut_at_open(&self) -> Option<(Tid, Tid)> {
+        None
+    }
+
+    /// Tell if the fold of the log failed. The store then halts at the next
+    /// lock of the commit sequencer. This default has no log: it gives
+    /// false.
+    fn fold_failed(&self) -> bool {
+        false
+    }
+
+    /// Give the backend the observer of the store, for the metrics of the
+    /// fold. This default keeps nothing.
+    fn set_observer(&self, observer: Arc<dyn Observer>) {
+        let _ = observer;
+    }
+
+    /// Close the log before the database closes (ADR 0056, section 13).
+    /// With `fold`, fold the whole backlog and mark each segment spare;
+    /// without it, as for a halted store, leave the log to the next open.
+    /// This default has no log: it does nothing.
+    fn close(&self, fold: bool) {
+        let _ = fold;
+    }
 
     /// Iterate over the transactions from `from` to `to`, both included,
     /// in tid order. A row that does not decode gives its error, and the
@@ -209,12 +271,6 @@ pub trait Backend: Send + Sync {
     /// Return the first oid at or after `from` that has a version, with
     /// its newest version.
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>>;
-
-    /// Remove the versions older than `before` that `reachable` rejects.
-    ///
-    /// The core does not call this method: pack removes records through
-    /// the removal methods of `WriteTxn`, in batches.
-    fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>;
 
     /// Return the tid of the last pack, from `pack_watermark` in `meta`.
     /// A store that was never packed gives `Tid::ZERO`.
@@ -307,7 +363,7 @@ pub trait Backend: Send + Sync {
     /// Remove the key `(tid, oid)` of the transaction index and keep the
     /// record. A test uses it to damage a store. Fail with `NotFound` when
     /// the key does not exist.
-    #[doc(hidden)]
+    #[cfg(feature = "testing")]
     fn remove_index_key_for_test(&self, _tid: Tid, _oid: Oid) -> Result<()> {
         Err(ZoeError::Backend("this backend has no test hooks".into()))
     }
@@ -315,7 +371,7 @@ pub trait Backend: Send + Sync {
     /// Remove the record of `oid` at `tid` and keep its key in the
     /// transaction index. A test uses it to damage a store. Fail with
     /// `NotFound` when the record does not exist.
-    #[doc(hidden)]
+    #[cfg(feature = "testing")]
     fn remove_record_for_test(&self, _oid: Oid, _tid: Tid) -> Result<()> {
         Err(ZoeError::Backend("this backend has no test hooks".into()))
     }
@@ -376,10 +432,25 @@ pub enum Payload<'a> {
 /// version and the payload.
 pub type NewPayload<'a> = (Oid, Tid, Payload<'a>);
 
+/// A row that a write stores as a frame that is ready: the frame that
+/// the tables store under the key of the row, byte for byte (ADR 0056).
+#[derive(Clone, Copy, Debug)]
+pub enum Framed<'a> {
+    /// The transaction row of a tid.
+    Txn(Tid, &'a [u8]),
+    /// The record of an oid at a tid.
+    Record(Oid, Tid, &'a [u8]),
+    /// The blob record of an oid at a tid.
+    Blob(Oid, Tid, &'a [u8]),
+    /// A row of the namespaces of a flavour, under the key of the row.
+    Kv(Flavour, &'a [u8], &'a [u8]),
+}
+
 /// One backend write transaction. It holds the records, their keys in
 /// the transaction index, the blob records, the transaction rows, the
 /// namespace writes and the meta update of the commits of one commit
-/// batch, or the sequence row of one reservation, or one sweep step.
+/// batch or of one slice of the fold, or the sequence row of one
+/// reservation, or one sweep step.
 pub trait WriteTxn {
     /// Stage the version of `oid` that `tid` writes, and its key
     /// `(tid, oid)` in the transaction index. `prev` is the serial of the
@@ -436,6 +507,43 @@ pub trait WriteTxn {
     /// It has no key of its own in the transaction index: the record of
     /// the same version has it.
     fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()>;
+
+    /// Stage `row`, a frame that is ready, as it is: a record with its key
+    /// in the transaction index, a blob record, a transaction row or a
+    /// namespace row. The fold of the log writes its frames with it.
+    ///
+    /// The default checks and decodes the frame, then calls `put_record`,
+    /// `put_blob`, `put_txn` or `put_kv`. A frame that fails its check
+    /// gives the corruption error of its key space.
+    fn put_frame(&mut self, row: Framed<'_>) -> Result<()> {
+        match row {
+            Framed::Txn(tid, bytes) => {
+                let key = format::txn_key(tid);
+                let meta = format::decode_frame(KeySpace::Txns, &key, bytes)
+                    .and_then(|frame| format::decode_txn(tid, &frame.data))
+                    .map_err(|_| ZoeError::CorruptTxn { tid })?;
+                self.put_txn(&meta)
+            }
+            Framed::Record(oid, tid, bytes) => {
+                let key = format::record_key(oid, tid);
+                let frame = format::decode_frame(KeySpace::Records, &key, bytes)
+                    .map_err(|_| ZoeError::CorruptRecord { oid, tid })?;
+                self.put_record(oid, tid, frame.prev, &frame.data)
+            }
+            Framed::Blob(oid, tid, bytes) => {
+                let key = format::record_key(oid, tid);
+                let blob = format::decode_frame(KeySpace::Blobs, &key, bytes)
+                    .and_then(|frame| format::blob::decode_blob(&frame.data))
+                    .map_err(|_| ZoeError::CorruptBlob { oid, tid })?;
+                self.put_blob(oid, tid, &blob)
+            }
+            Framed::Kv(flavour, row, bytes) => {
+                let frame = format::decode_frame(flavour.space(), row, bytes)
+                    .map_err(|_| crate::kv::corrupt(flavour, row))?;
+                self.put_kv(flavour, row, &frame.data)
+            }
+        }
+    }
 
     /// Stage the transaction row.
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
@@ -615,10 +723,6 @@ mod tests {
 
         fn current_from(&self, _: Oid) -> Result<Option<(Oid, Record)>> {
             Ok(None)
-        }
-
-        fn pack(&self, _: Tid, _: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
-            Ok(PackStats::default())
         }
 
         fn pack_watermark(&self) -> Result<Tid> {

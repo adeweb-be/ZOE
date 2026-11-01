@@ -3,9 +3,9 @@
 //!
 //! One thread runs at a time. The driver polls the tasks and hands the
 //! baton to one thread at a time. A thread gives the baton back when it
-//! waits on a waiter (for a channel or for a lock), when it syncs the
-//! database file, and when it ends. So the schedule depends only on the
-//! seed.
+//! waits on a waiter (for a channel, for a lock or for the work of the
+//! fold), when it syncs the database file or a file of the write-ahead
+//! log, and when it ends. So the schedule depends only on the seed.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,9 +40,10 @@ pub(crate) enum Owner {
 pub(crate) enum Why {
     /// It waits on the waiter `waiter` until a wake or the deadline.
     Parked { waiter: u64, deadline: Duration },
-    /// It syncs the database file. `grows` is true when the sync follows a
-    /// change of the length of the file with no write between: redb grows
-    /// the file under a lock of its own, so other threads must not run.
+    /// It syncs the database file or a file of the write-ahead log. `grows`
+    /// is true when the sync follows a change of the length of the file
+    /// with no write between: redb grows the file under a lock of its own,
+    /// so other threads must not run.
     Sync { grows: bool },
     /// It ended.
     Exited,
@@ -66,6 +67,9 @@ pub(crate) struct ThreadState {
     pub(crate) generation: u32,
     /// The client of the connection of the thread, for the trace.
     pub(crate) client: Option<usize>,
+    /// The name of a thread of the store, which `Clock::spawn` started.
+    /// Such a thread waits for its work, not for a lock.
+    pub(crate) name: Option<String>,
     pub(crate) wait: Wait,
 }
 
@@ -76,8 +80,8 @@ pub(crate) enum Wait {
     Ready,
     /// It waits on a waiter until a wake or the deadline.
     Parked { waiter: u64, deadline: Duration },
-    /// It syncs the database file until `until`, and then goes on with
-    /// `resume`. Other tasks and threads run meanwhile.
+    /// It syncs the database file or a file of the log until `until`, and
+    /// then goes on with `resume`. Other tasks and threads run meanwhile.
     Syncing { until: Duration, resume: Resume },
 }
 
@@ -164,7 +168,8 @@ pub(crate) mod phase {
     /// The vote passed: the server holds the locks, and the client did not
     /// send `tpc_finish` yet.
     pub(crate) const LOCKED: &str = "locked";
-    /// The server syncs the database file in `tpc_finish`.
+    /// The server syncs the database file or a file of the log: in
+    /// `tpc_finish`, or in a slice of the fold.
     pub(crate) const FINISHING: &str = "finishing";
     /// The client got the reply of `tpc_finish`.
     pub(crate) const ACKNOWLEDGED: &str = "acknowledged";
@@ -573,7 +578,10 @@ pub(crate) fn give_back(why: Why) -> Resume {
         let context = context
             .as_ref()
             .expect("only a thread of the simulation gives the baton back");
-        if context.killed.get() {
+        // A thread of a dead process syncs nothing. Its waits still give the
+        // baton back, so the other threads of the process run until each
+        // ends: the close of a store waits for the end of its fold.
+        if context.killed.get() && !matches!(why, Why::Parked { .. }) {
             return Resume::Killed;
         }
         let resume = match context.yields.send((context.id, why)) {
@@ -607,24 +615,25 @@ pub(crate) fn handed_off(locks: usize) {
 }
 
 /// Tell if the driver told the thread that calls it that its process is
-/// dead. From then on, the thread gives the baton back no more: each of
-/// its waits ends at once.
+/// dead. From then on, each sync of the thread fails at once, and each of
+/// its waits ends when the driver resumes it, after the other threads of
+/// the process ran.
 pub(crate) fn killed() -> bool {
     BATON.with_borrow(|context| context.as_ref().is_some_and(|context| context.killed.get()))
 }
 
 /// Start a thread of the server generation `generation` for the
-/// connection `conn` of `client`. The thread waits for the baton before
-/// it runs `work`. It waits for its channels on a waiter of the
-/// simulation. When `work` returns, the thread tells the driver that it
-/// ended.
+/// connection `conn` of `client`, and return its id. The thread waits for
+/// the baton before it runs `work`. It waits for its channels on a waiter
+/// of the simulation. When `work` returns, the thread tells the driver
+/// that it ended.
 pub(crate) fn spawn_thread(
     shared: &Arc<Shared>,
     generation: u32,
     client: Option<usize>,
     conn: Option<u64>,
     work: Box<dyn FnOnce() + Send>,
-) {
+) -> u64 {
     let weak = Arc::downgrade(shared);
     let mut state = shared.lock();
     state.next_thread += 1;
@@ -637,6 +646,7 @@ pub(crate) fn spawn_thread(
         ThreadState {
             generation,
             client,
+            name: None,
             wait: Wait::Ready,
         },
     );
@@ -683,4 +693,19 @@ pub(crate) fn spawn_thread(
             join,
         },
     ));
+    id
+}
+
+/// Start the thread `name` of the store of the server generation
+/// `generation`, as `spawn_thread` does. It serves no connection.
+pub(crate) fn spawn_store_thread(
+    shared: &Arc<Shared>,
+    generation: u32,
+    name: &str,
+    work: Box<dyn FnOnce() + Send>,
+) {
+    let id = spawn_thread(shared, generation, None, None, work);
+    if let Some(thread) = shared.lock().threads.get_mut(&id) {
+        thread.name = Some(name.to_owned());
+    }
 }

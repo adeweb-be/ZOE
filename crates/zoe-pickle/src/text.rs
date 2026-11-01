@@ -2,6 +2,9 @@
 //! newline, and of the UTF-8 of BINUNICODE. Each check accepts a subset of
 //! what Python's unpickler accepts. It accepts all that Python's picklers
 //! write.
+//!
+//! [`unquote`] and [`raw_unicode`] decode the texts of STRING and UNICODE
+//! that the checks accept, for a reader such as Loupe.
 
 /// Checks the text of INT or LONG: an optional sign, then decimal digits.
 /// A number with two digits or more does not start with 0, unless all its
@@ -109,6 +112,110 @@ pub fn is_raw_unicode(text: &[u8]) -> bool {
         rest = &rest[at + 2 + digits..];
     }
     true
+}
+
+/// Decodes the text of STRING, as [`ByteString::Text`] keeps it, without
+/// its quotes: the escapes of `codecs.escape_decode`. An unknown escape
+/// stays as it is. Stops after `limit` bytes, and tells if the bytes are
+/// all of the text.
+///
+/// [`ByteString::Text`]: crate::ByteString::Text
+pub fn unquote(quoted: &[u8], limit: usize) -> (Vec<u8>, bool) {
+    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(inner.len().min(limit));
+    let mut i = 0;
+    while i < inner.len() && out.len() < limit {
+        let byte = inner[i];
+        i += 1;
+        if byte != b'\\' || i == inner.len() {
+            out.push(byte);
+            continue;
+        }
+        let escape = inner[i];
+        i += 1;
+        match escape {
+            b'\\' | b'\'' | b'"' => out.push(escape),
+            b'\n' => {}
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'v' => out.push(0x0b),
+            b'x' => match inner.get(i..i + 2).and_then(hex_byte) {
+                Some(value) => {
+                    out.push(value);
+                    i += 2;
+                }
+                None => out.extend(*b"\\x"),
+            },
+            b'0'..=b'7' => {
+                let mut value = u32::from(escape - b'0');
+                for _ in 0..2 {
+                    match inner.get(i) {
+                        Some(digit @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(digit - b'0');
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(value as u8);
+            }
+            other => out.extend([b'\\', other]),
+        }
+    }
+    let whole = i >= inner.len() && out.len() <= limit;
+    out.truncate(limit);
+    (out, whole)
+}
+
+/// Returns the value of two hex digits.
+fn hex_byte(digits: &[u8]) -> Option<u8> {
+    u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+}
+
+/// Decodes the text of UNICODE, as [`Unicode::Text`] keeps it:
+/// raw-unicode-escape. Each byte is a Latin-1 character, except `\uXXXX`
+/// and `\UXXXXXXXX` after an odd count of backslashes. A surrogate or a
+/// code point out of range gives U+FFFD. Stops after `limit` bytes of
+/// UTF-8, at a character boundary, and tells if the text is whole.
+///
+/// [`Unicode::Text`]: crate::Unicode::Text
+pub fn raw_unicode(raw: &[u8], limit: usize) -> (String, bool) {
+    let mut out = String::with_capacity(raw.len().min(limit));
+    let mut i = 0;
+    while i < raw.len() && out.len() < limit {
+        if raw[i] != b'\\' {
+            out.push(char::from(raw[i]));
+            i += 1;
+            continue;
+        }
+        let run = raw[i..].iter().take_while(|&&b| b == b'\\').count();
+        i += run;
+        let width = match raw.get(i) {
+            Some(b'u') if run % 2 == 1 => 4,
+            Some(b'U') if run % 2 == 1 => 8,
+            _ => 0,
+        };
+        let digits = raw
+            .get(i + 1..i + 1 + width)
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
+        match digits {
+            Some(digits) if width > 0 => {
+                out.extend(std::iter::repeat_n('\\', run - 1));
+                let code = u32::from_str_radix(digits, 16).unwrap_or(0xfffd);
+                out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                i += 1 + width;
+            }
+            _ => out.extend(std::iter::repeat_n('\\', run)),
+        }
+    }
+    let whole = i >= raw.len() && out.len() <= limit;
+    out.truncate(out.floor_char_boundary(limit));
+    (out, whole)
 }
 
 /// Reads the text of PUT or GET: a memo index in decimal, with no sign and
@@ -238,6 +345,26 @@ mod tests {
         for text in [&b"\\u12"[..], b"\\u12zz", b"\\U00110000", b"a\nb"] {
             assert!(!is_raw_unicode(text), "{text:?}");
         }
+    }
+
+    #[test]
+    fn string_escapes_decode() {
+        assert_eq!(unquote(br"'a\'b'", usize::MAX).0, b"a'b");
+        assert_eq!(unquote(br#""a\nb\x00\\""#, usize::MAX).0, b"a\nb\x00\\");
+        assert_eq!(unquote(br"'\101\7\q'", usize::MAX).0, b"A\x07\\q");
+        assert_eq!(unquote(br"'\xg0'", usize::MAX).0, b"\\xg0");
+    }
+
+    #[test]
+    fn raw_unicode_escapes_decode() {
+        assert_eq!(raw_unicode(b"caf\\u00e9", usize::MAX).0, "caf\u{e9}");
+        assert_eq!(raw_unicode(br"\U0001f600", usize::MAX).0, "\u{1f600}");
+        assert_eq!(raw_unicode(b"\xe9", usize::MAX).0, "\u{e9}");
+        // An even count of backslashes is no escape.
+        assert_eq!(raw_unicode(br"\\u0041", usize::MAX).0, r"\\u0041");
+        assert_eq!(raw_unicode(br"\\\u0041", usize::MAX).0, r"\\A");
+        assert_eq!(raw_unicode(br"\ud800", usize::MAX).0, "\u{fffd}");
+        assert_eq!(raw_unicode(br"\u12", usize::MAX).0, r"\u12");
     }
 
     #[test]

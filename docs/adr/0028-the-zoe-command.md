@@ -1,30 +1,24 @@
-# 0028. The zoe command: one binary in zoe-server, one code path for the console script
+# 0028. The zoe command: one binary in zoe-server, one code path for the console script, and tools that repair what they read
 
-Status: accepted
+Status: accepted.
 
 ## Context
 
-The naming table asks for one CLI, `zoe`, as one binary and one console script of the same name. F14 asks for `zoe convert`, F8 and F26 for `zoe pack` and its dry run. `zoe serve` joins the same command in phase 2. Every option has a `ZOE_*` environment twin.
+The naming table asks for one CLI, `zoe`: one binary and one console script. The crate names are fixed. `zoe serve` and `zoe mcp` use tokio. The extension links tokio only through `zoe-client`, and never links rmcp (ADR 0001).
 
-The crate names are fixed: `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py` and the others of the naming table. `zoe-server` holds `zoe serve` and `zoe mcp`, which use tokio. The extension module `zoe._zoe` of the `zoedb` wheel must not link tokio. ADR 0035 supersedes this rule: the extension links tokio through `zoe-client`, for the native client, and still never links rmcp.
-
-Three places can hold the binary: a `[[bin]]` in `zoe-server`, a thin binary crate, or a `main` inside the extension module that the console script calls. The wheel can ship a compiled binary beside the extension, or a console script that calls the extension.
+redb clears its recovery flag and writes its allocator state only at a clean close. After a kill, every acknowledged commit is in the file, but the read-only open of redb fails with `RepairAborted` (`NotClosedCleanly` in the core). Only a writer open repairs the file. So after a crash, when the operator most needs to inspect a store, a strict read-only open refuses it.
 
 ## Decision
 
-**One binary in `zoe-server`.** `crates/zoe-server` declares `[[bin]] name = "zoe"`. No new crate is added, because the crate names are fixed, and `zoe serve` joins the same binary in phase 2.
+### One binary, one code path
 
-**The CLI is a library module.** `zoe_server::cli::main(args: Vec<OsString>) -> i32` parses the arguments with clap, runs one subcommand and returns the exit code. The `main` of the binary only calls it and exits with its code. The function never exits the process, so a caller in another process, such as the extension, can call it.
+`crates/zoe-server` declares `[[bin]] name = "zoe"`. `zoe_server::cli::main(args: Vec<OsString>) -> i32` parses with clap, runs one subcommand and returns the exit code. It never exits the process; the `main` of the binary only calls it. `zoe._zoe.main(argv) -> int` runs it with the GIL released, and `zoe/__main__.py` calls that with `sys.argv`. The console script is `zoe = "zoe.__main__:main"`. So the binary, the console script and `python -m zoe` run the same code. The Python entry point restores the default handler of SIGINT first, so Ctrl-C stops the process.
 
-**The console script goes through the extension.** The extension exposes `zoe._zoe.main(argv) -> int`, which runs `zoe_server::cli::main` with the GIL released. `zoe/__main__.py` calls it with `sys.argv`, and the wheel declares the console script `zoe = "zoe.__main__:main"`. So the binary, the console script and `python -m zoe` run the same code. The entry point restores the default handler of SIGINT before the call, because Python handles a signal only when it runs Python code: Ctrl-C then stops the process, as it stops the binary.
+### `serve` sits behind a feature
 
-**`serve` sits behind a feature.** `zoe-server` has the cargo feature `serve`, on by default. The server code and the MCP server of `zoe mcp` compile only with it, and only it may bring in tokio. `zoe mcp` brings in tokio and rmcp through `zoe-mcp`. Without the feature, `zoe serve` and `zoe mcp` still parse, and fail with 1 and a message that names the `zoe` binary. The workspace dependency on `zoe-server` turns the default features off, and `zoe-py` uses it without `serve`. So the extension holds the CLI and the converters, and never links the server or rmcp. `cargo tree -p zoe-py -e normal` shows it. ADR 0035 brings tokio into the extension through `zoe-client`, not through `zoe-server`.
+`zoe-server` has the cargo feature `serve`, on by default. Only with it do the server and `zoe mcp` (tokio and rmcp, through `zoe-mcp`) compile. Without it, `zoe serve` and `zoe mcp` fail with 1 and a message that names the `zoe` binary. The workspace dependency on `zoe-server` turns the default features off, and `zoe-py` uses it without `serve`. So the extension holds the CLI and the converters, not the server or rmcp. `cargo tree -p zoe-py -e normal` shows it.
 
-**`--path` everywhere.** The store is `--path` in every subcommand, with the twin `ZOE_PATH`, as in `zoe serve --path`.
-
-**`--data-fs-blob-dir` for the blob directory of a `Data.fs`, `--blob-dir` for the one of the store.** The blob directory of the store belongs to the store and to `zoe serve`. It is `--blob-dir` with the twin `ZOE_BLOB_DIR`, the twin of the key `blob-dir` of the `<zoe>` section, and `<path>/blobs` by default. The blob directory of the `Data.fs` gets its own name, `--data-fs-blob-dir` with the twin `ZOE_DATA_FS_BLOB_DIR`. The store does not record its blob directory (ADR 0027), so `zoe verify` and `zoe convert --to-data-fs` refuse a store with blob records whose blob directory has no layout file: they fail with 1 before they walk the store, write nothing, and name the blob directory and `--blob-dir`. `zoe convert --from-data-fs` puts the blobs of the store into `--blob-dir`.
-
-**The command line.**
+### The command line
 
 ```
 zoe convert --from-data-fs FILE [--data-fs-blob-dir DIR] --path STORE [--blob-dir DIR]
@@ -37,35 +31,66 @@ zoe backup --path STORE --to DIR
 zoe restore --from DIR --path STORE
 ```
 
-The twins are `ZOE_PATH`, `ZOE_BLOB_DIR`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, `ZOE_DATA_FS_BLOB_DIR`, `ZOE_DAYS`, `ZOE_DRY_RUN`, `ZOE_FORMAT`, `ZOE_CLASSES`, `ZOE_BACKUP`, `ZOE_SCRATCH`, `ZOE_TO` and `ZOE_FROM`. clap reads them, and the help of each option names its twin. An option on the command line wins over its twin. `ZOE_DRY_RUN` takes `true` or `false`, and the other words that clap reads as a boolean. `--dry-run` alone means true, and `--dry-run=false` turns off a dry run that the twin asks for. A conversion takes exactly one direction: two directions are a usage error, also when one of them comes from a twin. `--backup` and `--classes` together are a usage error too, and so is `--scratch` without `--backup`.
+The store is `--path` in every subcommand. `--blob-dir` is its blob directory (`<path>/blobs` by default), `--data-fs-blob-dir` the one of the `Data.fs`. Each option has a `ZOE_*` twin: `ZOE_PATH`, `ZOE_BLOB_DIR`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, `ZOE_DATA_FS_BLOB_DIR`, `ZOE_DAYS`, `ZOE_DRY_RUN`, `ZOE_FORMAT`, `ZOE_CLASSES`, `ZOE_BACKUP`, `ZOE_SCRATCH`, `ZOE_TO` and `ZOE_FROM`. The help of each option names its twin, and the command line wins over the twin. A boolean twin takes the words that clap reads as a boolean. `--dry-run` alone means true, and `--dry-run=false` overrides the twin. Usage errors: two directions of a conversion, also from a twin; `--backup` with `--classes`; `--scratch` without `--backup`. Later options follow these rules.
 
-**`zoe mcp`.** `zoe mcp --path STORE` serves the read-only ops tools of the store to an agent, over MCP on stdin and stdout (F20). `zoe-mcp` holds the server. Most tools call Loupe's functions. `verify` calls `zoe_convert::verify`, and `explain_conflict` and the prompts read the transactions with the iterator of the core, both on the read-only store of Loupe's `Folder`. stdout carries only MCP messages, so the command writes no report. It ends with 0 when the client closes stdin, also before the `initialize` request. A request before `initialize` gets a reply, and the session waits for `initialize`. It ends with 1 when the store does not open, or when the first message is a notification. `cli::main` does not hold the lock of stdout, because the MCP transport writes to stdout from another thread.
+The options of each command: specification, "Loupe: desktop inspector and editor", "Converters, `zoe convert` and a Loupe screen", "`zoe verify`" and "`zoe backup` and `zoe restore`: dumps (N15)"; and "AI-native: MCP server and retrieval", "MCP server, `zoe mcp`". ADR 0030 gives the layout of a dump.
 
-**`zoe backup`, `zoe restore` and `zoe verify --backup`.** `zoe backup` writes a dump of the store into the backup directory `--to`: the full dump the first time, then the transactions after the last dump. With nothing new, it writes nothing and exits with 0. `zoe restore` rebuilds a store at `--path` from the dumps of `--from`. `zoe verify --backup DIR` compares the dumps with the store, in place of the check of the store, and a difference is a finding. It builds its copy of the dumps in `--scratch` (the temporary directory by default) before it opens the store. ADR 0030 gives the layout of a dump and the rules of the three commands. `zoe-convert` holds the library: `backup`, `restore` and `verify_backup`.
+`zoe mcp` also ends with 0 when stdin closes before `initialize`, and with 1 when the first message is a notification. A request before `initialize` gets a reply, and the session waits. `cli::main` does not hold the lock of stdout, because the MCP transport writes to it from another thread.
 
-**Exit codes and output.** The exit code is 0 on success, 1 on a failure, and 2 on a usage error. A conversion whose report lists a problem fails: this covers a store that does not match its `Data.fs`, and the `Mismatch` of `zoe-convert`. A verification whose report lists a finding fails too, after the report goes out, and so does a comparison of dumps that lists a difference. A damaged or missing dump fails `zoe restore` and `zoe verify --backup`. The report goes to stdout, a message to stderr. The help and the version go to stdout with the code 0. A reader that closes stdout before the end of the report, as `head` does, does not change the code, because the work is done before the report goes out. The command parses all its arguments before it opens a file, so a usage error changes nothing on disk.
+### Exit codes and output
 
-**`python -m zoe.serve` runs the binary.** The wheel ships no server binary: users install the static `zoe` binary, or run the image. For buildout users, `python -m zoe.serve -C FILE` reads the `<zoe-server>` section of a ZConfig file and runs `zoe serve` with it. The binary is the key `binary` of the section, else `ZOE_BINARY`, else the `zoe` binary on the PATH, without a script such as the console script. `zoe.serve` writes the section as a configuration file of `zoe serve` into a memory file and replaces itself with `zoe serve --config` on that file. So the TOML file stays the only configuration of the server, no Python stays in its process, and no value of the section goes into its arguments.
+The exit code is 0 on success, 1 on a failure, and 2 on a usage error. A conversion that reports a problem (`Mismatch` included), a verification that reports a finding and a comparison of dumps that reports a difference fail with 1 after the report. A damaged or missing dump fails `zoe restore` and `zoe verify --backup`. The report goes to stdout, a message to stderr, the help and the version to stdout with 0. A reader that closes stdout early does not change the code. The command parses all its arguments before it opens a file.
 
-**The pack tid.** `--days N` gives the tid of the time of the clock minus N days of 86,400 seconds, by ZODB's `TimeStamp` rule (`zoe_core::timestamp`), as ZODB's `DB.pack(days=N)` computes it. The command reads the system clock through the `Clock` trait, not the clock of the store, which is not public. A test gives its own clock. A time before the Unix epoch gives the tid of the epoch.
+### `python -m zoe.serve` runs the binary
 
-**The opens.** A command that only reads opens the store read-only: `zoe convert --to-data-fs`, `zoe pack --dry-run`, `zoe verify`, `zoe backup` and `zoe mcp`. `zoe mcp` opens it through Loupe's `Folder`, and holds the lock of the store while it runs. On a store that was closed cleanly, such an open changes no byte and creates nothing. A store that a writer left open gets its repair first, and the command says so on stderr: ADR 0032 records it, and supersedes this part of the decision. `zoe convert --from-data-fs` opens the store for writes and creates it, after it checks that the source is a regular file that starts with `FS30`. So a wrong source creates no store. `zoe pack` opens an existing store for writes: a directory without `zoe.redb` fails, and the command creates nothing. `zoe restore` creates a store only in a new or an empty directory, and checks every dump before it writes anything.
+The wheel ships no server binary. `python -m zoe.serve -C FILE` writes the `<zoe-server>` section as a configuration file with no name on disk, and replaces itself with `zoe serve --config` on it. So no Python stays in the server process, and no value goes into its arguments (specification, "Server mode", "The `<zoe-server>` section").
+
+### The pack tid
+
+`--days N` gives the tid of the clock minus N days of 86,400 seconds, by ZODB's `TimeStamp` rule (`zoe_core::timestamp`), as `DB.pack(days=N)` does. The command reads the system clock through the `Clock` trait. A time before the Unix epoch gives the tid of the epoch.
+
+### The opens
+
+These commands only read, and use the repairing open of the next section: `zoe convert --to-data-fs`, `zoe pack --dry-run`, `zoe verify`, `zoe backup` and `zoe mcp`. `zoe mcp` opens the store through Loupe's `Folder`, and holds the lock of the store while it runs. `zoe convert --from-data-fs` creates the store, after it checks that the source is a regular file that starts with `FS30`. `zoe pack` opens an existing store and creates nothing. `zoe restore` creates a store only in a new or empty directory, after it checks every dump.
+
+### A tool that reads a store repairs it
+
+**The rule.** When a writer left the store open, a tool that reads it repairs it, then opens it read-only. On a store that was closed cleanly, it changes no byte and creates nothing.
+
+**`Store::open_read_only_repairing(dir, options)`.** It holds the lock of the store from its start to its end. On a clean store, it is `Store::open_read_only_with`. Only on `RepairAborted`, it opens `zoe.redb` for writes with `redb::Builder::open`, which creates no file, drops it, then opens it read-only. `Store::repaired` tells the caller.
+
+**`Store::open_read_only` stays strict.** It refuses a store that a writer left open with `NotClosedCleanly`. The tests of a clean stop use it.
+
+**The repair writes only `zoe.redb`.** It runs no recovery of the store: it removes no file, replays no intent file and writes nothing in the blob directory. It keeps every durable commit and changes no part of the format.
+
+**A failed repair is `RepairFailed`.** Its text says that the store was not closed cleanly, that the repair failed, and gives the error of the system. The open for writes fails before redb writes a byte. zoe-py maps `RepairFailed` to `StorageError`.
+
+**Each tool says that it repaired the store.** The core logs nothing. A tool that repaired a store writes one line with the stable phrase `repaired the store`, for example `zoe verify: /srv/store: the store was not closed cleanly: repaired the store`: the commands and `zoe mcp` on stderr, `zoe serve` as a WARN log line that names the storage, Loupe in its window. On `RepairFailed`, the commands, `zoe serve` and `zoe mcp` exit with 1, and Loupe gives `notRepaired`.
 
 ## Consequences
 
-- The wheel carries clap, `zoe-convert` and the CLI module inside the extension. The extension grows by that code.
-- `zoe-py` depends on `zoe-server`. A server dependency that is not optional behind `serve` would reach the extension. The feature split and the `cargo tree` check guard this.
-- In the console script, `zoe mcp` fails with 1 and names the `zoe` binary, because the extension compiles without `serve`. An agent runs the binary `zoe`.
-- A workspace build, such as `cargo test --workspace`, unifies the features, so there `zoe-py` compiles with `serve`. maturin builds `zoe-py` alone, without it.
-- The console script writes to the file descriptors of the process, not to `sys.stdout` and `sys.stderr`. A Python caller that replaces `sys.stdout` does not capture the report.
-- Ctrl-C stops a conversion or a pack at once. The converters resume after the last copied transaction, and a pack that stops leaves a store that opens without repair (ADR 0025).
-- A store that a crash left open gets its repair at the read-only open of `zoe convert --to-data-fs`, the dry run, `zoe verify`, `zoe verify --backup`, `zoe backup` and `zoe mcp`, which say so on stderr. ADR 0032 records it, and supersedes the refusal with `NotClosedCleanly` that this record gave.
+- The extension grows by clap, `zoe-convert` and the CLI.
+- A workspace build unifies the features, so there `zoe-py` has `serve`. maturin builds `zoe-py` alone, without it.
+- The console script writes to the file descriptors: a replaced `sys.stdout` does not capture the report.
+- A repair reads every page, shows no progress and cannot stop. It needs write access to `zoe.redb`.
+- The kill loop runs `zoe verify`, which repairs, so it does not prove a clean stop. The tests with `Store::open_read_only` prove it.
+- The scratch copy of `zoe verify --backup` uses the strict open, because the command closes it itself.
+- The repair of the open of the tools also folds the write-ahead log into `zoe.redb` when it holds a commit after the folded tid, slice by slice, and still writes only `zoe.redb`; on a damaged log it fails with `CorruptTxn` and folds nothing. The strict read-only open refuses a store whose log holds a commit after the folded tid with `NotClosedCleanly` (ADR 0056, section 14).
 
 ## Alternatives
 
-- **A thin binary crate.** It needs a crate name outside the fixed list, and `zoe serve` would move into it or call into `zoe-server` in phase 2.
-- **The binary in the wheel through maturin's binary packaging.** maturin packages the targets of the crate that it builds, `zoe-py`. The binary is in another crate, so the wheel would need a second build step, and it would hold a second compiled copy of the code.
-- **A Python CLI.** An argparse parser in `zoe/__main__.py` would be a second parser, with its own options, twins and exit codes, beside the one of the binary.
-- **`zoe.serve` as the parent of the server.** A Python process that starts the binary and waits for it must pass on each signal, and stays in the process tree of the supervisor. `execve` needs neither.
-- **The settings as options of the command line.** Each value would be visible in the arguments of the process. The configuration file keeps them out.
-- **No feature for `serve`.** The extension would link tokio as soon as phase 2 adds it.
+- **A thin binary crate.** Its name is outside the fixed list.
+- **The binary in the wheel through maturin.** A second build and compiled copy.
+- **A Python CLI.** A second parser with its own options and exit codes.
+- **`zoe.serve` as the parent of the server.** It must pass on each signal.
+- **The settings as arguments.** The process list shows them.
+- **No feature for `serve`.** The extension links the server and rmcp.
+- **A strict read-only open in every tool.** Every tool refuses the store after a crash.
+- **A repairing `Store::open_read_only`.** The tests of a clean stop pass on an unclean store.
+- **A writer open, a close, then a read-only open.** It runs the whole recovery and drops the lock between the opens.
+- **A save of the allocator state at each commit.** Each commit writes more. The human declined it.
+- **A rebuild of the allocator state in memory.** It needs a change to redb.
+
+## Merged ADRs
+
+- ADR 0032, a tool that reads a store repairs it when a writer left it open: Decision, "A tool that reads a store repairs it", with the list of tools in "The opens"; its consequences and alternatives are in Consequences and Alternatives.

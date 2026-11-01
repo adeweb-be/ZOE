@@ -32,6 +32,41 @@ use std::path::Path;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use zoe_core::{Clock, Options, Store, SystemClock, ZoeError};
 
+/// A boolean option of the command line: `--NAME` is true, `--NAME=BOOL`
+/// takes `true`, `false`, `yes`, `no`, `on`, `off`, `1` or `0`, and so does
+/// its twin. A field takes it with the attribute `boolish = DEFAULT`.
+trait Boolish {
+    /// Make the option a boolean option whose value is `default` when
+    /// neither the command line nor the twin gives it.
+    fn boolish(self, default: bool) -> Self;
+}
+
+impl Boolish for clap::Arg {
+    fn boolish(self, default: bool) -> Self {
+        self.value_name("BOOL")
+            .num_args(0..=1)
+            .require_equals(true)
+            .default_missing_value("true")
+            .default_value(if default { "true" } else { "false" })
+            .value_parser(clap::builder::BoolishValueParser::new())
+            .action(clap::ArgAction::Set)
+    }
+}
+
+/// Write each row of `rows` as a line of counts of a report: two spaces,
+/// the name of the row padded to `width` characters, then its value. A
+/// report keeps one width for its rows, so its values form a column.
+fn write_counts(
+    out: &mut dyn Write,
+    width: usize,
+    rows: &[(&str, &dyn fmt::Display)],
+) -> io::Result<()> {
+    for (name, value) in rows {
+        writeln!(out, "  {name:<width$}{value}")?;
+    }
+    Ok(())
+}
+
 /// The exit code of a command that succeeds.
 pub const SUCCESS: i32 = 0;
 
@@ -148,8 +183,13 @@ fn store_failure(path: &Path, error: ZoeError) -> Failure {
 /// the failure, which says that the store was not closed cleanly and gives
 /// the error of the system.
 fn open_read_only(path: &Path, options: Options) -> Result<Store, Failure> {
-    let store =
-        Store::open_read_only_repairing(path, options).map_err(|e| store_failure(path, e))?;
+    open_repairing(path, options).map_err(|e| store_failure(path, e))
+}
+
+/// Open the existing store in `path` read-only, with `options`, as
+/// `open_read_only` does, and give the error of the store.
+fn open_repairing(path: &Path, options: Options) -> Result<Store, ZoeError> {
+    let store = Store::open_read_only_repairing(path, options)?;
     if store.repaired() {
         let mut stderr = io::stderr().lock();
         let _ = writeln!(stderr, "{}", repair_line(path));
@@ -161,11 +201,7 @@ fn open_read_only(path: &Path, options: Options) -> Result<Store, Failure> {
 /// Return the line of a repair of the store in `path`, for the subcommand
 /// that runs on this thread.
 fn repair_line(path: &Path) -> String {
-    format!(
-        "zoe {}: {}: the store was not closed cleanly: repaired the store",
-        COMMAND.get(),
-        path.display()
-    )
+    format!("zoe {}: {}", COMMAND.get(), Store::repair_message(path))
 }
 
 /// Open the store in `path` read-only, with its blob files in `blob_dir`
@@ -193,10 +229,9 @@ fn open_with_blobs(path: &Path, blob_dir: Option<&Path>) -> Result<Store, Failur
 fn blob_dir_failure(path: &Path, error: ZoeError) -> Failure {
     match error {
         ZoeError::MissingBlobDir { path: blobs } => Failure::Message(format!(
-            "{}: the store has blobs, but the blob directory {} has no layout file: \
-             give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
+            "{}: {}",
             path.display(),
-            blobs.display()
+            zoe_convert::missing_blob_dir(&blobs)
         )),
         e => store_failure(path, e),
     }

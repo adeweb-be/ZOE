@@ -3,8 +3,9 @@
 //! the writes that change no record, and the opens that refuse a store.
 
 use zoe_core::testing;
+use zoe_core::testing::commit_txn;
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Options, Store, SystemClock, Tid, ZoeError};
+use zoe_core::{Oid, Options, Store, SystemClock, Tid, Txn, ZoeError};
 
 /// A `PersistentMapping` record with no reference.
 const PICKLE: &[u8] = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
@@ -31,14 +32,13 @@ fn serial(store: &Store, oid: Oid) -> Tid {
         .unwrap_or(Tid::ZERO)
 }
 
-/// Commit a store of `PICKLE` for each oid of `oids`.
-fn commit(store: &Store, oids: &[Oid]) -> Tid {
+/// Begin a transaction that stores `PICKLE` for each oid of `oids`.
+fn writing<'s>(store: &'s Store, oids: &[Oid]) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     for &oid in oids {
         txn.store(oid, serial(store, oid), PICKLE).unwrap();
     }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
+    txn
 }
 
 /// Commit the root and `n` objects that nothing refers to.
@@ -46,7 +46,7 @@ fn root_and_orphans(store: &Store, n: usize) -> Vec<Oid> {
     let oids: Vec<Oid> = (0..n).map(|_| store.new_oid().unwrap()).collect();
     let mut all = vec![ROOT];
     all.extend(&oids);
-    commit(store, &all);
+    commit_txn(writing(store, &all));
     oids
 }
 
@@ -101,8 +101,11 @@ fn a_pack_between_the_vote_and_the_finish_keeps_the_count_exact() {
     // one that the voted transaction writes.
     store.pack(store.last_transaction()).unwrap();
     assert_eq!(store.object_count(), Some(1));
-    // The finish writes the first object again, as a new object.
+    // The finish writes the first object again, as a new object. The log
+    // counts no new oid for a record with a previous serial, so the count
+    // is exact again when the slice of that commit folds it.
     txn.finish().unwrap();
+    store.fold().unwrap();
     assert_eq!(store.object_count(), Some(2));
     assert_exact(&store);
 }
@@ -171,24 +174,28 @@ fn a_count_that_is_not_8_bytes_does_not_open() {
 fn another_format_name_does_not_open() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
-    testing::write_meta(&store, "format", b"ZOE format 3").unwrap();
+    testing::write_meta(&store, "format", b"ZOE format 4").unwrap();
     drop(store);
     let error = Store::open_vfs(vfs).err();
     assert!(
-        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 3"),
+        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 4"),
         "{error:?}"
     );
 }
 
 #[test]
-fn the_upgrade_replaces_a_count_that_format_1_left() {
+fn a_store_of_format_1_with_a_count_does_not_open() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
     root_and_orphans(&store, 2);
-    // A store of format 1 with a stale row: the upgrade counts again.
+    // A store of format 1 with a row of 8 bytes: the name refuses it, as
+    // another format name.
     testing::write_meta(&store, "object_count", &99u64.to_be_bytes()).unwrap();
     testing::write_meta(&store, "format", b"ZOE format 1").unwrap();
     drop(store);
-    let store = Store::open_vfs(vfs).unwrap();
-    assert_eq!(store.object_count(), Some(3));
+    let error = Store::open_vfs(vfs).err();
+    assert!(
+        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 1"),
+        "{error:?}"
+    );
 }

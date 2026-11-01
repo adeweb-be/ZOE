@@ -33,105 +33,37 @@ while the server is down goes through `zoe.Storage` on the store.
 """
 
 import logging
-import os
-import socket
-import subprocess
-import threading
-import time
-import urllib.request
 
 import pytest
+from client_support import AdminServer
+from support import TIMEOUT, ZERO, commit, free_address, wait_for
 from ZEO.Exceptions import ClientDisconnected
 from ZODB.POSException import POSKeyError, ReadOnlyError
 from ZODB.utils import p64
 
 import zoe
 import zoe.testing
-from zoe.testing import ZoeServer
 
-ZERO = bytes(8)
-TIMEOUT = 30
 # The wait of a call while the client has no server.
 DOWN = 2
 # An oid that no test stores, so no cache holds it.
 ABSENT = p64(1 << 40)
 
 
-class Server:
+class Server(AdminServer):
     """A `zoe serve` process with an admin port.
 
-    `zoe.testing.ZoeServer` keeps only the line `listening ADDRESS` of the
-    server. This class also keeps the line `admin ADDRESS` before it, so
-    the test reads `/metrics`. A start after a stop listens on the same
-    address and serves the store of `path`. Each start has a new admin
-    port.
+    A start after a stop listens on the same address and serves the store
+    of `path`. Each start has a new admin port.
     """
 
     def __init__(self, path, args=(), address=None):
-        self.path = path
-        self.args = list(args)
+        super().__init__(path, args)
         self.address = address
-        self.admin = None
-        self._process = None
-
-    def start(self):
-        listen = "127.0.0.1:0"
-        if self.address is not None:
-            listen = "{}:{}".format(*self.address)
-        command = [
-            ZoeServer.binary(), "serve", "--path", str(self.path),
-            "--listen", listen, "--admin-listen", "127.0.0.1:0", *self.args,
-        ]  # fmt: skip
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-        )
-        # The kill closes stdout, so the read below ends.
-        timer = threading.Timer(TIMEOUT, process.kill)
-        timer.start()
-        try:
-            for line in process.stdout:
-                word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
-                    host, port = value.rsplit(":", 1)
-                    self.address = (host.strip("[]"), int(port))
-                    self._process = process
-                    return self
-        finally:
-            timer.cancel()
-        code = process.wait()
-        process.stdout.close()
-        raise RuntimeError(f"zoe serve stopped with {code} before it listened")
 
     def stop(self):
         """Stop the server with SIGTERM, as an operator does."""
-        process, self._process = self._process, None
-        process.terminate()
-        assert process.wait(TIMEOUT) == 0
-        process.stdout.close()
-
-    def kill(self):
-        process, self._process = self._process, None
-        if process is not None:
-            process.kill()
-            process.wait()
-            process.stdout.close()
-
-    def loads(self):
-        """Return the number of `loadBefore` calls since the start."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
-        for line in text.splitlines():
-            if line.startswith('zoe_loads_total{storage="1"} '):
-                return int(line.split()[-1])
-        raise AssertionError(f"/metrics has no zoe_loads_total:\n{text}")
+        assert super().stop(TIMEOUT) == 0
 
 
 class Recorder:
@@ -154,25 +86,6 @@ class Recorder:
         return data
 
 
-def commit(storage, stores):
-    """Commit the stores and return the tid.
-
-    A failed step aborts the transaction and raises.
-    """
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-        return storage.tpc_finish(txn)
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-
-
 def commit_in_process(path, records):
     """Commit each record in its own transaction through `zoe.Storage`.
 
@@ -189,21 +102,6 @@ def commit_in_process(path, records):
     finally:
         storage.close()
     return tid
-
-
-def wait_for(condition):
-    """Wait until condition() is true. Fail after TIMEOUT."""
-    deadline = time.monotonic() + TIMEOUT
-    while not condition():
-        assert time.monotonic() < deadline, "timed out"
-        time.sleep(0.01)
-
-
-def free_address():
-    """Return a TCP address where nothing listens."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()
 
 
 @pytest.fixture

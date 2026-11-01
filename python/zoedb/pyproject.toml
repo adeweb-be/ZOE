@@ -11,8 +11,9 @@ requires-python = ">=3.12"
 dynamic = ["version"]
 dependencies = ["ZConfig>=4", "ZODB>=6"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "Framework :: ZODB",
+    "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -26,7 +27,7 @@ classifiers = [
 # needs msgpack for it.
 plone = ["Products.CMFPlone>=6.1", "msgpack>=1"]
 # zoe:// URIs through zodburi, which needs ZEO.
-uri = ["zodb>=6.4"]
+uri = ["zodburi>=3"]
 
 # zodburi opens a zoe:// URI with this resolver. The uri extra installs
 # zodburi.

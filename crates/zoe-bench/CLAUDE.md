@@ -4,12 +4,16 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 
 ## Layout
 
-- `src/main.rs`: the command, with clap: `conflicts`, `load` and `saturate`.
+- `src/main.rs`: the command, with clap: `conflicts`, `hot`, `load` and `saturate`.
+- `src/lib.rs`: the modules, and `Error`, the error of a run of `hot`, `load` or `saturate`.
 - `src/conflicts.rs`: the ranking of the ConflictErrors of Zope logs.
-- `src/load.rs`: `load` and `saturate` on `zoe-client`, and their reports.
+- `src/hot.rs`: `hot`, the writers of one hot object (F7, N5). Each writer increments a `BTrees.Length`, which tier 1 merges, or a `PersistentMapping`, which no tier merges, with vote-time locks or with early write-intent locks (`--early-locks`, ADR 0045). The report gives the commits, the `ConflictError`s, the transactions that gave up, and from `GET /metrics` of the admin port the syncs, the lock hand-offs and the intent locks of the run.
+- `src/load.rs`: `load` and `saturate` on `zoe-client`, and their reports. `Report` is the form of the report of `load`, `saturate` and `hot`.
 - `src/schedule.rs`: the seeded generator, the Zipf law and the schedule of a client.
 - `src/machine.rs`: the description of the machine and of the run.
 - `bench/schema/zoe-bench.schema.json`: the JSON schema of the reports of `load` and `saturate`. A unit test in `src/load.rs` checks that the schema requires each key of a report.
+- `tests/finish_time.rs` and `tests/load_time.rs`: two measurements of the core in the process, `finish` and `load_before`, on a store on the disk. They are ignored tests, and no recipe runs them: run them in release with `--ignored --nocapture`. They print text for a person, not a report of `zoe-bench`.
+- `tests/shrink_ratio.rs`: the shrink ratio and the time of each zstd level on a synthetic record set with the shape of a Plone store, through the codec of the record frames (`zoe_core::testing::encode_payload`). The measurement is an ignored test, as the two above. A test that is not ignored checks that the set goes through the codec unchanged and shrinks.
 
 ## Invariants
 

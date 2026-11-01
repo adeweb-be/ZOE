@@ -24,8 +24,8 @@ from plone.app.testing import TEST_USER_ID, setRoles
 from plone.folder.default import DefaultOrdering
 from ZODB.POSException import ConflictError
 
+from zoe.plone.tests import helpers
 from zoe.plone.tests import test_creations_in_one_folder as accept
-from zoe.plone.tests.test_concurrent_creations import wire_ids
 from zoe.plone.tests.test_queued_indexing import drain, path_of
 
 
@@ -73,7 +73,7 @@ class TestWithTheStockIndexing(accept.TestCreationsInOneFolder):
         # The setup of the acceptance test, without queued indexing.
         portal = self.layer["portal"]
         setRoles(portal, TEST_USER_ID, ["Manager"])
-        wire_ids(self)
+        helpers.wire_ids(self)
         portal.portal_workflow.setChainForPortalTypes(
             ("Folder", "Document"), (accept.WORKFLOW,)
         )
@@ -88,7 +88,7 @@ class TestWithTheStockIndexing(accept.TestCreationsInOneFolder):
         portal = self.open_site(accept.mechanism_on(self))
         errors = self.create_round(0)
         others = {
-            turn: accept.describe(error)
+            turn: helpers.describe(error)
             for turn, error in errors.items()
             if not isinstance(error, ConflictError)
         }

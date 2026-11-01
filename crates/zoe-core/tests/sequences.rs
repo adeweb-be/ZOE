@@ -5,12 +5,14 @@
 //! leaves a gap of at most 100 values. An allocation takes no per-OID lock
 //! and is not part of a transaction.
 
+mod support;
+
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use support::fresh_dir;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, Tid};
 
@@ -19,13 +21,6 @@ const MAX_GAP: u64 = 100;
 
 const PICKLE: &[u8] =
     b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datag\x01s.";
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-sequences-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn next(store: &Store, name: &str) -> u64 {
     store.sequence(name).next().unwrap()

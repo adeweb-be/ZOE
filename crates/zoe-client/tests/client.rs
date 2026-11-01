@@ -11,39 +11,16 @@
 //! The test runs `zoe serve` in its own process with
 //! `zoe_server::serve::Server`.
 
+mod common;
+
 use std::time::Duration;
 
+use common::{commit, fresh_dir, record};
 use zoe_client::{Client, Error};
-use zoe_core::{Oid, Tid};
+use zoe_core::Tid;
 use zoe_server::serve::{ServeOptions, Server};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-client-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// A ZODB record of a `PersistentMapping` that holds `value`.
-fn record(value: &[u8]) -> Vec<u8> {
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
-}
-
-async fn commit(client: &Client, stores: &[(Oid, Tid, Vec<u8>)]) -> Result<Tid, Error> {
-    let mut txn = client.begin(b"user", b"description", b"").await?;
-    for (oid, serial, data) in stores {
-        txn.store(*oid, *serial, data).await?;
-    }
-    txn.vote().await?;
-    txn.finish().await
-}
 
 #[tokio::test]
 async fn a_client_registers_commits_and_loads() {

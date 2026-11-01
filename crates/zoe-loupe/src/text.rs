@@ -1,6 +1,6 @@
 //! The text forms of pickle values: str, Python 2 str, bytes and ints.
 
-use zoe_pickle::{ByteString, Int, Node, Resolver, Unicode};
+use zoe_pickle::{ByteString, Int, Node, Resolver, Unicode, raw_unicode, unquote};
 
 /// Return the bytes of a Python 2 `str`.
 pub(crate) fn byte_string(string: &ByteString) -> Vec<u8> {
@@ -84,105 +84,6 @@ pub(crate) fn oid_bytes<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<u
     Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
-/// Decode the text of STRING without its quotes: the escapes of
-/// `codecs.escape_decode`. An unknown escape stays as it is. Stop after
-/// `limit` bytes, and tell if the bytes are all of the text.
-fn unquote(quoted: &[u8], limit: usize) -> (Vec<u8>, bool) {
-    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or(&[]);
-    let mut out = Vec::with_capacity(inner.len().min(limit));
-    let mut i = 0;
-    while i < inner.len() && out.len() < limit {
-        let byte = inner[i];
-        i += 1;
-        if byte != b'\\' || i == inner.len() {
-            out.push(byte);
-            continue;
-        }
-        let escape = inner[i];
-        i += 1;
-        match escape {
-            b'\\' | b'\'' | b'"' => out.push(escape),
-            b'\n' => {}
-            b'n' => out.push(b'\n'),
-            b't' => out.push(b'\t'),
-            b'r' => out.push(b'\r'),
-            b'a' => out.push(0x07),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b'v' => out.push(0x0b),
-            b'x' => match inner.get(i..i + 2).and_then(hex_byte) {
-                Some(value) => {
-                    out.push(value);
-                    i += 2;
-                }
-                None => out.extend(*b"\\x"),
-            },
-            b'0'..=b'7' => {
-                let mut value = u32::from(escape - b'0');
-                for _ in 0..2 {
-                    match inner.get(i) {
-                        Some(digit @ b'0'..=b'7') => {
-                            value = value * 8 + u32::from(digit - b'0');
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                out.push(value as u8);
-            }
-            other => out.extend([b'\\', other]),
-        }
-    }
-    let whole = i >= inner.len() && out.len() <= limit;
-    out.truncate(limit);
-    (out, whole)
-}
-
-/// Return the value of two hex digits.
-fn hex_byte(digits: &[u8]) -> Option<u8> {
-    u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
-}
-
-/// Decode raw-unicode-escape: each byte is a Latin-1 character, except
-/// `\uXXXX` and `\UXXXXXXXX` after an odd count of backslashes. A
-/// surrogate or a code point out of range gives U+FFFD. Stop after
-/// `limit` bytes of UTF-8, at a character boundary, and tell if the text
-/// is whole.
-fn raw_unicode(raw: &[u8], limit: usize) -> (String, bool) {
-    let mut out = String::with_capacity(raw.len().min(limit));
-    let mut i = 0;
-    while i < raw.len() && out.len() < limit {
-        if raw[i] != b'\\' {
-            out.push(char::from(raw[i]));
-            i += 1;
-            continue;
-        }
-        let run = raw[i..].iter().take_while(|&&b| b == b'\\').count();
-        i += run;
-        let width = match raw.get(i) {
-            Some(b'u') if run % 2 == 1 => 4,
-            Some(b'U') if run % 2 == 1 => 8,
-            _ => 0,
-        };
-        let digits = raw
-            .get(i + 1..i + 1 + width)
-            .and_then(|digits| std::str::from_utf8(digits).ok())
-            .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
-        match digits {
-            Some(digits) if width > 0 => {
-                out.extend(std::iter::repeat_n('\\', run - 1));
-                let code = u32::from_str_radix(digits, 16).unwrap_or(0xfffd);
-                out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
-                i += 1 + width;
-            }
-            _ => out.extend(std::iter::repeat_n('\\', run)),
-        }
-    }
-    let whole = i >= raw.len() && out.len() <= limit;
-    out.truncate(out.floor_char_boundary(limit));
-    (out, whole)
-}
-
 /// Return the size of a character in a JSON string, as serde_json writes
 /// it: a quote and a backslash take two bytes, a control character two or
 /// six.
@@ -257,12 +158,13 @@ pub(crate) enum IntValue {
 /// `limit` bytes, and the call reads no more of the int than that needs.
 pub(crate) fn int(int: &Int, limit: usize) -> IntValue {
     match int {
-        Int::U8(value) => IntValue::Small(i128::from(*value)),
-        Int::U16(value) => IntValue::Small(i128::from(*value)),
-        Int::I32(value) => IntValue::Small(i128::from(*value)),
         Int::Long { bytes, .. } => long(bytes, limit),
         Int::Text(text) => decimal(text, limit),
         Int::LongText(text) => decimal(text.strip_suffix('L').unwrap_or(text), limit),
+        // BININT1, BININT2 and BININT always fit.
+        Int::U8(_) | Int::U16(_) | Int::I32(_) => {
+            IntValue::Small(int.to_i128().unwrap_or_default())
+        }
     }
 }
 
@@ -287,13 +189,10 @@ fn decimal(text: &str, limit: usize) -> IntValue {
 /// than 16 bytes give the hex text of the value, from its most
 /// significant digits.
 fn long(bytes: &[u8], limit: usize) -> IntValue {
-    let negative = bytes.last().is_some_and(|byte| byte & 0x80 != 0);
-    if bytes.len() <= 16 {
-        let fill = if negative { 0xff } else { 0 };
-        let mut wide = [fill; 16];
-        wide[..bytes.len()].copy_from_slice(bytes);
-        return IntValue::Small(i128::from_le_bytes(wide));
+    if let Some(value) = Int::long_to_i128(bytes) {
+        return IntValue::Small(value);
     }
+    let negative = bytes.last().is_some_and(|byte| byte & 0x80 != 0);
     let cut = |start: String| IntValue::Large {
         start,
         length: bytes.len(),
@@ -342,26 +241,6 @@ fn long(bytes: &[u8], limit: usize) -> IntValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn string_escapes_decode() {
-        assert_eq!(unquote(br"'a\'b'", usize::MAX).0, b"a'b");
-        assert_eq!(unquote(br#""a\nb\x00\\""#, usize::MAX).0, b"a\nb\x00\\");
-        assert_eq!(unquote(br"'\101\7\q'", usize::MAX).0, b"A\x07\\q");
-        assert_eq!(unquote(br"'\xg0'", usize::MAX).0, b"\\xg0");
-    }
-
-    #[test]
-    fn raw_unicode_escapes_decode() {
-        assert_eq!(raw_unicode(b"caf\\u00e9", usize::MAX).0, "caf\u{e9}");
-        assert_eq!(raw_unicode(br"\U0001f600", usize::MAX).0, "\u{1f600}");
-        assert_eq!(raw_unicode(b"\xe9", usize::MAX).0, "\u{e9}");
-        // An even count of backslashes is no escape.
-        assert_eq!(raw_unicode(br"\\u0041", usize::MAX).0, r"\\u0041");
-        assert_eq!(raw_unicode(br"\\\u0041", usize::MAX).0, r"\\A");
-        assert_eq!(raw_unicode(br"\ud800", usize::MAX).0, "\u{fffd}");
-        assert_eq!(raw_unicode(br"\u12", usize::MAX).0, r"\u12");
-    }
 
     #[test]
     fn a_start_stops_at_the_limit() {

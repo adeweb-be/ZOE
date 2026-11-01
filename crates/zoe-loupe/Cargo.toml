@@ -1,6 +1,6 @@
 [package]
 name = "zoe-loupe"
-description = "The Rust side of Loupe, the desktop inspector and editor."
+description = "The Rust side of Loupe, the desktop inspector."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 zoe-core.workspace = true
 zoe-pickle.workspace = true
+
+[dev-dependencies]
+# The test directories of `zoe_core::testing`, which the drop removes.
+zoe-core = { workspace = true, features = ["testing"] }
+# The record builders of `zoe_pickle::testing`.
+zoe-pickle = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

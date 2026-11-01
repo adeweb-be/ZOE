@@ -104,6 +104,55 @@ in
     ZOE_CXX_LIBS = lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ];
   };
 
+  # The link check of `just docs`. It reads SUMMARY.md and the pages that
+  # it lists. It fails on a link to a file that does not exist, and on a
+  # link to a .md file of the book that SUMMARY.md does not list. It skips
+  # code, anchors, footnotes and links with a scheme.
+  scripts.docs-linkcheck = {
+    description = "Check the links of the book";
+    package = pkgs.python313;
+    exec = ''
+      import re
+      import sys
+      from pathlib import Path
+      from urllib.parse import unquote
+
+      root = Path(sys.argv[1] if len(sys.argv) > 1 else "docs").resolve()
+      summary = root / "SUMMARY.md"
+      fence = re.compile(r"^[ \t]*(```+|~~~+).*?^[ \t]*\1", re.M | re.S)
+      code = re.compile(r"(`+).+?\1", re.S)
+      inline = re.compile(r"\]\(\s*<?([^\s)>]+)")
+      definition = re.compile(r"^ {0,3}\[(?!\^)[^\]]+\]:\s*<?([^\s>]+)", re.M)
+      scheme = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+      def links(page):
+          text = code.sub("", fence.sub("", page.read_text(encoding="utf-8")))
+          for target in inline.findall(text) + definition.findall(text):
+              if not target.startswith("#") and not scheme.match(target):
+                  yield target, unquote(target.split("#", 1)[0])
+
+
+      listed = {(root / path).resolve() for _, path in links(summary)}
+      errors = []
+      for page in [summary, *sorted(listed)]:
+          # The check of the links of SUMMARY.md reports a missing page.
+          if not page.is_file():
+              continue
+          for target, path in links(page):
+              where = f"{page.relative_to(root)}: {target}"
+              dest = (page.parent / path).resolve()
+              if not dest.exists():
+                  errors.append(f"{where}: no such file")
+              elif dest.suffix == ".md" and dest.is_relative_to(root) and dest not in listed:
+                  errors.append(f"{where}: SUMMARY.md does not list it")
+      for error in errors:
+          print(error, file=sys.stderr)
+      print(f"docs-linkcheck: {len(errors)} broken links", file=sys.stderr)
+      sys.exit(1 if errors else 0)
+    '';
+  };
+
   # Heap and CPU profiles for the spikes. Enter the profile with
   # `devenv --profile profiling shell`. The default shell and CI do not
   # fetch it, because heaptrack brings Qt. perf needs a

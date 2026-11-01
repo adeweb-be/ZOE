@@ -15,22 +15,16 @@
 
 use std::time::SystemTime;
 
+use zoe_core::testing::{commit_txn, new_oid, record, root};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Mode, Oid, Options, Resolution, Resolved, Store, SystemClock, Tid, Txn, ZoeError};
 use zoe_pickle::btrees::{BucketState, TreeState, bucket_state, new_bucket_state, tree_state};
-use zoe_pickle::python::{Heap, Pickler, Value};
+use zoe_pickle::python::{Heap, Value};
 
 const MODULE: &str = "BTrees.IIBTree";
 const BUCKET: &str = "IIBucket";
 const TREE: &str = "IIBTree";
 const TREE_CLASS: &str = "BTrees.IIBTree.IIBTree";
-
-fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-    let mut pickler = Pickler::new(heap);
-    pickler.dump(class).unwrap();
-    pickler.dump(state).unwrap();
-    pickler.into_bytes()
-}
 
 /// Returns a reference to `oid` of the class `name`.
 fn reference(heap: &mut Heap, oid: Oid, name: &str) -> Value {
@@ -70,18 +64,6 @@ fn node(first: Oid, children: &[(i128, Oid)]) -> Vec<u8> {
     record(&heap, class, state)
 }
 
-/// The root of ZODB, a `PersistentMapping` that names the policy at
-/// `policy`, as ZODB writes it.
-fn root(policy: Oid) -> Vec<u8> {
-    [
-        &b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00\
-           dataq\x02}q\x03X\x10\x00\x00\x00zoe.merge_policyq\x04C\x08"[..],
-        &policy.0.to_be_bytes(),
-        b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
-    ]
-    .concat()
-}
-
 /// Returns the record of a policy that sets `split_merges` to `mode`, when
 /// it is given.
 fn policy(mode: Option<&str>) -> Vec<u8> {
@@ -111,18 +93,9 @@ fn open(mode: Option<&str>) -> Store {
     };
     let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
     let oid = new_oid(&store);
-    commit(&store, &[(oid, Tid::ZERO, policy(mode))]);
-    commit(&store, &[(Oid(0), Tid::ZERO, root(oid))]);
+    commit_txn(writing(&store, &[(oid, Tid::ZERO, policy(mode))]));
+    commit_txn(writing(&store, &[(Oid(0), Tid::ZERO, root(oid))]));
     store
-}
-
-fn new_oid(store: &Store) -> Oid {
-    loop {
-        let oid = store.new_oid().unwrap();
-        if oid != Oid(0) {
-            return oid;
-        }
-    }
 }
 
 /// Begins a transaction that stores `writes`, each with the serial that
@@ -133,13 +106,6 @@ fn writing<'s>(store: &'s Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Txn<&'s Stor
         txn.store(*oid, *serial, data).unwrap();
     }
     txn
-}
-
-/// Commits `writes` in one transaction.
-fn commit(store: &Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-    let mut txn = writing(store, writes);
-    txn.vote().unwrap();
-    txn.finish().unwrap()
 }
 
 fn oid_of(heap: &Heap, value: Value) -> Oid {
@@ -227,7 +193,7 @@ fn three_buckets(store: &Store) -> Tree {
         new_oid(store),
         new_oid(store),
     );
-    let tid = commit(
+    let tid = commit_txn(writing(
         store,
         &[
             (root, Tid::ZERO, node(a, &[(30, y), (50, b)])),
@@ -235,7 +201,7 @@ fn three_buckets(store: &Store) -> Tree {
             (y, Tid::ZERO, bucket(&[30, 40], Some(b))),
             (b, Tid::ZERO, bucket(&[50, 60], None)),
         ],
-    );
+    ));
     Tree { root, a, y, b, tid }
 }
 
@@ -246,14 +212,14 @@ fn three_buckets(store: &Store) -> Tree {
 /// and the tid of the commit.
 fn replace_y(store: &Store, tree: &Tree) -> (Oid, Tid) {
     let x = new_oid(store);
-    let tid = commit(
+    let tid = commit_txn(writing(
         store,
         &[
             (tree.root, tree.tid, node(tree.a, &[(30, x), (50, tree.b)])),
             (tree.a, tree.tid, bucket(&[10, 20], Some(x))),
             (x, Tid::ZERO, bucket(&[30, 35, 40], Some(tree.b))),
         ],
-    );
+    ));
     (x, tid)
 }
 
@@ -288,10 +254,6 @@ fn line_of(txn: &Txn<&Store>, oid: Oid) -> String {
     line.clone()
 }
 
-fn hex(tid: Tid) -> String {
-    format!("0x{:016x}", tid.0)
-}
-
 #[test]
 fn a_replaced_child_off_the_path_passes_rule_1_in_mode_on() {
     let store = open(Some("on"));
@@ -323,14 +285,14 @@ fn a_replaced_last_child_off_the_path_passes_rule_1_in_mode_on() {
     let store = open(Some("on"));
     let tree = three_buckets(&store);
     let x = new_oid(&store);
-    commit(
+    commit_txn(writing(
         &store,
         &[
             (tree.root, tree.tid, node(tree.a, &[(30, tree.y), (50, x)])),
             (tree.y, tree.tid, bucket(&[30, 40], Some(x))),
             (x, Tid::ZERO, bucket(&[50, 60, 70], None)),
         ],
-    );
+    ));
     let mut txn = writing(
         &store,
         &[(tree.a, tree.tid, bucket(&[10, 15, 20], Some(tree.y)))],
@@ -406,8 +368,8 @@ fn check_read_conflict_line(txn: &Txn<&Store>, oid: Oid, read: Tid, current: Tid
     let line = line_of(txn, oid);
     for field in [
         format!("\"class\":\"{TREE_CLASS}\""),
-        format!("\"read\":\"{}\"", hex(read)),
-        format!("\"committed\":\"{}\"", hex(current)),
+        format!("\"read\":\"{}\"", read.hex()),
+        format!("\"committed\":\"{}\"", current.hex()),
         "\"split\":1".to_owned(),
         "\"outcome\":\"undecided\"".to_owned(),
         format!("\"reason\":\"{why}\""),
@@ -444,14 +406,14 @@ fn a_replaced_child_with_another_separator_fails_and_the_vote_logs_why() {
     let store = open(Some("on"));
     let tree = three_buckets(&store);
     let x = new_oid(&store);
-    let current = commit(
+    let current = commit_txn(writing(
         &store,
         &[
             (tree.root, tree.tid, node(tree.a, &[(25, x), (50, tree.b)])),
             (tree.a, tree.tid, bucket(&[10, 20], Some(x))),
             (x, Tid::ZERO, bucket(&[25, 30, 40], Some(tree.b))),
         ],
-    );
+    ));
     let mut txn = insert_into_b(&store, &tree);
     let voted = txn.vote();
     assert!(
@@ -485,7 +447,7 @@ fn a_read_current_node_whose_path_child_split_fails_and_the_vote_logs_why() {
     let tree = three_buckets(&store);
     // The other side splits `b`.
     let y2 = new_oid(&store);
-    let current = commit(
+    let current = commit_txn(writing(
         &store,
         &[
             (
@@ -496,7 +458,7 @@ fn a_read_current_node_whose_path_child_split_fails_and_the_vote_logs_why() {
             (tree.b, tree.tid, bucket(&[50], Some(y2))),
             (y2, Tid::ZERO, bucket(&[60, 70], None)),
         ],
-    );
+    ));
     // The transaction marks the node and `b` read-current.
     let other = new_oid(&store);
     let mut txn = writing(&store, &[(other, Tid::ZERO, bucket(&[1], None))]);

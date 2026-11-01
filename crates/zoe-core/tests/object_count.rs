@@ -8,35 +8,29 @@
 //! records, so every snapshot and every crash image holds the count of
 //! its records.
 //!
-//! The format becomes `ZOE format 2`. The first writer open of a store of
-//! `ZOE format 1`, which has no count, counts the oids of `records` once
-//! and writes the count and the new format name in one backend write. A
-//! read-only open of such a store writes nothing and has no count.
+//! The format is `ZOE format 2`. An open refuses a store of `ZOE format
+//! 1`, which has no count, with the error of any other format name. The
+//! refused open writes no row, so the store keeps its format name.
 //!
-//! The test makes a store of format 1 with the test hook
-//! `zoe_core::testing::{remove_meta, write_meta}`, which this card adds.
-//! It checks the count against the oids of `Store::record_keys` after
-//! each step, and on every crash image of commits, of a pack and of the
-//! upgrade.
+//! The test makes a store of format 1 with the test hooks
+//! `zoe_core::testing::{remove_meta, write_meta}`. It checks the count
+//! against the oids of `Store::record_keys` after each step, and on every
+//! crash image of commits and of a pack. It checks the refusal of a store
+//! of format 1 on every crash image of the refused open.
 
-use std::path::PathBuf;
+mod support;
 
+use support::fresh_dir;
 use zoe_core::testing;
+use zoe_core::testing::commit_txn;
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Store, Tid};
+use zoe_core::{Oid, Store, Tid, Txn, ZoeError};
 
 /// A `PersistentMapping` record with no reference.
 const PICKLE: &[u8] =
     b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datah\x01s.";
 
 const ROOT: Oid = Oid(0);
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-object-count-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// Return the number of oids that have a record in `store`, deletions
 /// included, from the keys of `records`.
@@ -71,9 +65,9 @@ fn assert_exact(store: &Store, context: &str) {
     );
 }
 
-/// Commit `writes`, each a store of a pickle or a deletion (`None`), with
-/// the serial that the store holds for the oid. Return the tid.
-fn commit(store: &Store, writes: &[(Oid, Option<&[u8]>)]) -> Tid {
+/// Begin a transaction that writes `writes`, each a store of a pickle or
+/// a deletion (`None`), with the serial that the store holds for the oid.
+fn writing<'s>(store: &'s Store, writes: &[(Oid, Option<&[u8]>)]) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"someone", b"count test", b"").unwrap();
     for &(oid, data) in writes {
         let serial = match store.history(oid, 1) {
@@ -85,8 +79,7 @@ fn commit(store: &Store, writes: &[(Oid, Option<&[u8]>)]) -> Tid {
             None => txn.delete(oid, serial).unwrap(),
         }
     }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
+    txn
 }
 
 /// Commit the root and `n` objects that nothing refers to. Return their
@@ -95,15 +88,23 @@ fn root_and_orphans(store: &Store, n: usize) -> Vec<Oid> {
     let oids: Vec<Oid> = (0..n).map(|_| store.new_oid().unwrap()).collect();
     let mut writes = vec![(ROOT, Some(PICKLE))];
     writes.extend(oids.iter().map(|&oid| (oid, Some(PICKLE))));
-    commit(store, &writes);
+    commit_txn(writing(store, &writes));
     oids
 }
 
 /// Make `store` a store of format 1: no `object_count`, and the format
-/// name of before this card. A close writes no count, so the change stays.
+/// name `ZOE format 1`. A close writes no count, so the change stays.
 fn downgrade(store: &Store) {
     testing::remove_meta(store, "object_count").unwrap();
     testing::write_meta(store, "format", b"ZOE format 1").unwrap();
+}
+
+/// Check that `error` is the refusal of the format name `name`.
+fn assert_refused(error: Option<ZoeError>, name: &str, context: &str) {
+    assert!(
+        matches!(&error, Some(ZoeError::Format(text)) if text == name),
+        "{context}: {error:?}"
+    );
 }
 
 #[test]
@@ -118,11 +119,14 @@ fn a_commit_counts_its_new_oids_once() {
     let oids = root_and_orphans(&store, 3);
     assert_eq!(store.object_count(), Some(4));
     // A new revision is no new object.
-    commit(&store, &[(oids[0], Some(PICKLE)), (ROOT, Some(PICKLE))]);
+    commit_txn(writing(
+        &store,
+        &[(oids[0], Some(PICKLE)), (ROOT, Some(PICKLE))],
+    ));
     assert_eq!(store.object_count(), Some(4));
     // A transaction that stores an oid twice counts it once.
     let new = store.new_oid().unwrap();
-    commit(&store, &[(new, Some(PICKLE)), (new, Some(PICKLE))]);
+    commit_txn(writing(&store, &[(new, Some(PICKLE)), (new, Some(PICKLE))]));
     assert_eq!(store.object_count(), Some(5));
     assert_exact(&store, "after the commits");
 }
@@ -131,7 +135,7 @@ fn a_commit_counts_its_new_oids_once() {
 fn a_deletion_counts_until_a_pack_removes_the_object() {
     let store = Store::open_vfs(MemVfs::new()).unwrap();
     let oids = root_and_orphans(&store, 2);
-    commit(&store, &[(oids[0], None)]);
+    commit_txn(writing(&store, &[(oids[0], None)]));
     // The deletion is a record: the object still counts.
     assert_eq!(store.object_count(), Some(3));
     assert_exact(&store, "after the deletion");
@@ -144,9 +148,9 @@ fn a_deletion_counts_until_a_pack_removes_the_object() {
 #[test]
 fn a_pack_that_removes_old_revisions_only_keeps_the_count() {
     let store = Store::open_vfs(MemVfs::new()).unwrap();
-    commit(&store, &[(ROOT, Some(PICKLE))]);
+    commit_txn(writing(&store, &[(ROOT, Some(PICKLE))]));
     for _ in 0..5 {
-        commit(&store, &[(ROOT, Some(PICKLE))]);
+        commit_txn(writing(&store, &[(ROOT, Some(PICKLE))]));
     }
     store.pack(store.last_transaction()).unwrap();
     assert_eq!(store.object_count(), Some(1));
@@ -164,32 +168,26 @@ fn the_count_survives_a_reopen() {
 }
 
 #[test]
-fn the_first_writer_open_of_a_store_of_format_1_counts_once() {
-    let dir = fresh_dir("upgrade");
+fn a_store_of_format_1_does_not_open() {
+    let dir = fresh_dir("format-1");
     let store = Store::open(&dir).unwrap();
     let oids = root_and_orphans(&store, 4);
-    commit(&store, &[(oids[1], None)]);
+    commit_txn(writing(&store, &[(oids[1], None)]));
     downgrade(&store);
     drop(store);
 
-    // A read-only open writes nothing and has no count.
+    // A read-only open refuses the store and writes nothing.
     let database = dir.join("zoe.redb");
     let before = std::fs::read(&database).unwrap();
-    let reader = Store::open_read_only(&dir).unwrap();
-    assert_eq!(reader.object_count(), None);
-    drop(reader);
+    let refused = Store::open_read_only(&dir).err();
+    assert_refused(refused, "ZOE format 1", "the read-only open");
     assert_eq!(std::fs::read(&database).unwrap(), before);
 
-    // The first writer open counts and writes the count.
-    let store = Store::open(&dir).unwrap();
-    assert_eq!(store.object_count(), Some(5));
-    assert_exact(&store, "after the upgrade");
-    drop(store);
-
-    // Then a read-only open reads it.
-    let reader = Store::open_read_only(&dir).unwrap();
-    assert_eq!(reader.object_count(), Some(5));
-    drop(reader);
+    // A writer open refuses it too and counts nothing, so the next open
+    // refuses it again.
+    assert_refused(Store::open(&dir).err(), "ZOE format 1", "the writer open");
+    let refused = Store::open_read_only(&dir).err();
+    assert_refused(refused, "ZOE format 1", "the next open");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -206,7 +204,7 @@ fn every_crash_image_of_commits_holds_the_count_of_its_records() {
             .map(|_| (store.new_oid().unwrap(), Some(PICKLE)))
             .collect();
         writes.push((ROOT, Some(PICKLE)));
-        commit(&store, &writes);
+        commit_txn(writing(&store, &writes));
     }
     drop(store);
 
@@ -222,7 +220,7 @@ fn every_crash_image_of_a_pack_holds_the_count_of_its_records() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
     let oids = root_and_orphans(&store, 30);
-    commit(&store, &[(oids[0], None), (oids[1], None)]);
+    commit_txn(writing(&store, &[(oids[0], None), (oids[1], None)]));
     drop(store);
     let vfs = vfs.durable_copy();
     let store = Store::open_vfs(vfs.clone()).unwrap();
@@ -240,23 +238,20 @@ fn every_crash_image_of_a_pack_holds_the_count_of_its_records() {
 }
 
 #[test]
-fn every_crash_image_of_the_upgrade_opens_with_an_exact_count() {
+fn every_crash_image_of_a_refused_open_of_format_1_is_refused() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
     let oids = root_and_orphans(&store, 6);
-    commit(&store, &[(oids[2], None)]);
+    commit_txn(writing(&store, &[(oids[2], None)]));
     downgrade(&store);
     drop(store);
     let vfs = vfs.durable_copy();
-    let store = Store::open_vfs(vfs.clone()).unwrap();
-    assert_eq!(store.object_count(), Some(7));
-    drop(store);
+    let refused = Store::open_vfs(vfs.clone()).err();
+    assert_refused(refused, "ZOE format 1", "the writer open");
 
     for image in vfs.crash_images() {
-        // A crash before the write of the upgrade leaves format 1, and
-        // this open counts again.
-        let reopened =
-            Store::open_vfs(image.vfs()).unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
-        assert_eq!(reopened.object_count(), Some(7), "{image:?}");
+        // The refused open changes no row, so each image stays format 1.
+        let refused = Store::open_vfs(image.vfs()).err();
+        assert_refused(refused, "ZOE format 1", &format!("{image:?}"));
     }
 }

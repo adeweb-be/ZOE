@@ -295,6 +295,37 @@ pub enum Int {
     LongText(String),
 }
 
+impl Int {
+    /// Returns the value of the int, or `None` when it does not fit 128
+    /// bits. A LONG1 or LONG4 of more than 16 bytes does not fit.
+    pub fn to_i128(&self) -> Option<i128> {
+        match self {
+            Int::U8(value) => Some(i128::from(*value)),
+            Int::U16(value) => Some(i128::from(*value)),
+            Int::I32(value) => Some(i128::from(*value)),
+            Int::Long { bytes, .. } => Int::long_to_i128(bytes),
+            Int::Text(text) => text.trim().parse().ok(),
+            Int::LongText(text) => text.trim().trim_end_matches('L').parse().ok(),
+        }
+    }
+
+    /// Returns the int of the bytes of LONG1 or LONG4: two's complement,
+    /// little-endian. Returns `None` for more than 16 bytes.
+    pub fn long_to_i128(bytes: &[u8]) -> Option<i128> {
+        if bytes.len() > 16 {
+            return None;
+        }
+        let fill = if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+            0xff
+        } else {
+            0
+        };
+        let mut le = [fill; 16];
+        le[..bytes.len()].copy_from_slice(bytes);
+        Some(i128::from_le_bytes(le))
+    }
+}
+
 /// A float, with the opcode that holds it.
 #[derive(Clone, Debug)]
 pub enum Float {
@@ -384,6 +415,24 @@ pub struct Dict {
     pub initial: Option<Vec<(Node, Node)>>,
     /// The items that SETITEM or SETITEMS add, one batch per opcode.
     pub batches: Vec<Batch<(Node, Node)>>,
+}
+
+impl List {
+    /// Returns the items of the list, in order: the initial items, then
+    /// the items of each batch.
+    pub fn items(&self) -> impl Iterator<Item = &Node> {
+        let batches = self.batches.iter().flat_map(|batch| &batch.items);
+        self.initial.iter().flatten().chain(batches)
+    }
+}
+
+impl Dict {
+    /// Returns the entries of the dict, in order: the initial entries, then
+    /// the entries of each batch.
+    pub fn entries(&self) -> impl Iterator<Item = &(Node, Node)> {
+        let batches = self.batches.iter().flat_map(|batch| &batch.items);
+        self.initial.iter().flatten().chain(batches)
+    }
 }
 
 /// The items that one opcode adds to a list or a dict.
@@ -499,13 +548,9 @@ impl Node {
     pub(crate) fn children<'a>(&'a self, out: &mut Vec<&'a Node>) {
         match self {
             Node::Tuple(tuple) => out.extend(&tuple.items),
-            Node::List(list) => {
-                out.extend(list.initial.iter().flatten());
-                out.extend(list.batches.iter().flat_map(|batch| &batch.items));
-            }
+            Node::List(list) => out.extend(list.items()),
             Node::Dict(dict) => {
-                let batches = dict.batches.iter().flat_map(|batch| &batch.items);
-                for (key, value) in dict.initial.iter().flatten().chain(batches) {
+                for (key, value) in dict.entries() {
                     out.push(key);
                     out.push(value);
                 }

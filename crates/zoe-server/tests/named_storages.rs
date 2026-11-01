@@ -10,31 +10,13 @@
 //! twice, a storage without a path, an unknown key and a file that does not
 //! parse are usage errors: the command exits with 2 and creates nothing.
 
-use std::process::{Command, Output, Stdio};
+mod common;
 
-mod wire;
-
-use wire::{Server, ZOE, commit, fresh_dir, load, new_oids, record, s, spawn_lock};
-
-fn zoe(args: &[&str]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let _spawn = spawn_lock();
-    command.spawn().unwrap().wait_with_output().unwrap()
-}
+use common::{Server, commit, fresh_dir, load, new_oids, record, s, zoe};
 
 #[test]
 fn the_help_names_the_options_and_their_twins() {
-    let output = zoe(&["serve", "--help"]);
+    let output = zoe(&["serve", "--help"], &[]);
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     for name in ["--storage", "ZOE_STORAGE", "--config", "ZOE_CONFIG"] {
@@ -135,7 +117,7 @@ fn bad_storage_settings_are_usage_errors_and_create_nothing() {
         all.extend(args.clone());
         all.extend(["--listen".into(), "127.0.0.1:0".into()]);
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let output = zoe(&all);
+        let output = zoe(&all, &[]);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
     }
 
@@ -146,7 +128,10 @@ fn bad_storage_settings_are_usage_errors_and_create_nothing() {
     ] {
         let config = dir.join(format!("{name}.toml"));
         std::fs::write(&config, text).unwrap();
-        let output = zoe(&["serve", "--config", s(&config), "--listen", "127.0.0.1:0"]);
+        let output = zoe(
+            &["serve", "--config", s(&config), "--listen", "127.0.0.1:0"],
+            &[],
+        );
         assert_eq!(output.status.code(), Some(2), "{name}");
     }
     assert!(!store.exists(), "a usage error created the store");

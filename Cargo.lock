@@ -2414,13 +2414,17 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "futures",
+ "redb",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "zoe-client",
  "zoe-core",
  "zoe-server",
+ "zoe-wire",
+ "zstd",
 ]
 
 [[package]]
@@ -2443,6 +2447,7 @@ dependencies = [
  "zoe-core",
  "zoe-pickle",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2451,6 +2456,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "redb",
+ "serde_json",
  "thiserror",
  "xxhash-rust",
  "zoe-core",
@@ -2516,6 +2522,7 @@ dependencies = [
  "zoe-client",
  "zoe-core",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2543,11 +2550,20 @@ dependencies = [
  "zoe-mcp",
  "zoe-pickle",
  "zoe-server",
+ "zoe-wire",
 ]
 
 [[package]]
 name = "zoe-vectors"
 version = "0.0.0"
+
+[[package]]
+name = "zoe-wire"
+version = "0.0.0"
+dependencies = [
+ "rmpv",
+ "rustls",
+]
 
 [[package]]
 name = "zstd"

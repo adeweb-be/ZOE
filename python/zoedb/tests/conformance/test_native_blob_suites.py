@@ -25,6 +25,8 @@ which the native client does not have.
 import doctest
 import unittest
 
+from suite_support import cases_and_layers, defining_class, name_of
+
 import zoe.testing
 
 # The classes whose tests the run takes, and the classes that define them.
@@ -44,36 +46,9 @@ DOCTESTS = {"zeo_blob_cache_test"}
 INSIDE = {}
 
 
-def defining_class(test):
-    """Return the class that defines the method of test."""
-    method = getattr(test, "_testMethodName", "runTest")
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return cls
-    raise AssertionError(f"no class defines {test.id()}")
-
-
-def name_of(test):
-    if isinstance(test, doctest.DocTestCase):
-        return test.id().rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-    return f"{defining_class(test).__name__}.{test._testMethodName}"
-
-
-def walk(suite, layers=()):
-    """Yield each test of suite with the layers that it runs in."""
-    layer = getattr(suite, "layer", None)
-    if layer is not None and layer not in layers:
-        layers = layers + (layer,)
-    if isinstance(suite, unittest.TestSuite):
-        for item in suite:
-            yield from walk(item, layers)
-    else:
-        yield suite, layers
-
-
 def chosen(test):
     if isinstance(test, doctest.DocTestCase):
-        return name_of(test) in DOCTESTS
+        return name_of(test, strict=True) in DOCTESTS
     return (
         type(test).__name__ in CLASSES and defining_class(test).__name__ in DEFINED_BY
     )
@@ -85,7 +60,7 @@ def blob_tests(layers):
 
     return [
         (test, test_layers)
-        for test, test_layers in walk(testZEO.test_suite(), layers)
+        for test, test_layers in cases_and_layers(testZEO.test_suite(), layers)
         if chosen(test)
     ]
 
@@ -100,7 +75,7 @@ def run(tests):
     started, ran, left_out = [], 0, 0
     try:
         for test, layers in tests:
-            name = name_of(test)
+            name = name_of(test, strict=True)
             if name in INSIDE:
                 left_out += 1
                 continue
@@ -130,7 +105,7 @@ def test_the_blob_tests_of_zeo_pass_with_the_native_client():
 
     # The selection finds the tests of both classes and the doctest.
     found = {type(test).__name__ for test, _ in tests}
-    names = {name_of(test) for test, _ in tests}
+    names = {name_of(test, strict=True) for test, _ in tests}
     assert found >= CLASSES, f"the run misses {CLASSES - found}"
     assert names >= DOCTESTS, f"the run misses {DOCTESTS - names}"
     assert set(INSIDE) <= names, f"INSIDE names no test: {set(INSIDE) - names}"

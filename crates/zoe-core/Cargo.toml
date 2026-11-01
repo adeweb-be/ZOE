@@ -19,8 +19,10 @@ zoe-pickle = { path = "../zoe-pickle" }
 zstd.workspace = true
 
 [features]
-# The test hook `zoe_core::testing`, which rewrites stored bytes. Only the
-# dev-dependency below turns it on, so only test builds have it.
+# The test hook `zoe_core::testing`, which rewrites stored bytes, and the
+# test hooks of `Store`. Only dev-dependencies turn it on: the one below,
+# and those of zoe-server, zoe-convert and zoe-bench. So only test builds
+# have it.
 testing = []
 
 [dev-dependencies]

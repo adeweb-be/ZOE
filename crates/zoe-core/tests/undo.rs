@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
+use zoe_core::testing::commit;
 use zoe_core::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
 use zoe_core::{Oid, Options, Store, SystemClock, Tid, ZoeError, undo_id, undo_tid};
 use zoe_pickle::python::{Heap, Pickler, Value};
@@ -25,13 +26,6 @@ fn length(value: i128) -> Vec<u8> {
     pickler.dump(class).unwrap();
     pickler.dump(Value::Int(value)).unwrap();
     pickler.into_bytes()
-}
-
-fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(oid, serial, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
 }
 
 /// Undoes `tid` in a transaction of its own, and returns the tid of the

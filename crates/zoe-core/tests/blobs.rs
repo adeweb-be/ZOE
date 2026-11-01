@@ -3,20 +3,16 @@
 //! BLAKE3 hash in the blob record. The blob file and its record become
 //! durable together.
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+mod support;
 
+use std::io::{Read, Write};
+use std::path::Path;
+
+use support::fresh_dir;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, Tid, ZoeError};
 
 const PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-blobs-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn content(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + 3) as u8).collect()
@@ -55,7 +51,8 @@ fn a_committed_blob_reads_back_after_reopen() {
 
 #[test]
 fn each_revision_keeps_its_own_file() {
-    let store = Store::open(fresh_dir("revisions")).unwrap();
+    let dir = fresh_dir("revisions");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let t1 = commit_blob(&store, oid, Tid::ZERO, b"first");
     let t2 = commit_blob(&store, oid, t1, b"second");

@@ -2,18 +2,21 @@
 //! `Vfs` that the core reads.
 //!
 //! The clock gives the simulated time, and its waiters make a wait give
-//! the baton back to the driver: the lock wait of the core, and the wait
-//! of a thread for its channels. The disk is a `MemVfs`. A sync of the
-//! database file gives the baton back too, so the driver can crash the
-//! server in the middle of a commit.
+//! the baton back to the driver: the lock wait of the core, the wait of a
+//! thread for its channels, and the waits of the fold of the write-ahead
+//! log. The fold is a thread of the simulation (`Clock::spawn`). The disk
+//! is a `MemVfs`. A sync of the database file or of a file of the log
+//! gives the baton back too, so the driver can crash the server in the
+//! middle of a commit or of a fold.
 //!
-//! The writes to the database file wait in a cache until the next sync of
-//! the file, as in the page cache of the system. A read sees them. A sync
-//! writes them to the `MemVfs` in order, then syncs the file. At a power
-//! loss, the driver lets a seeded subset of them land, some of them torn,
-//! in any order. So a crash image keeps what was synced, and of the rest
-//! only what a disk can keep.
+//! The writes to the database file and to each file of the log wait in a
+//! cache of the file until its next sync, as in the page cache of the
+//! system. A read sees them. A sync writes them to the `MemVfs` in order,
+//! then syncs the file. At a power loss, the driver lets a seeded subset
+//! of them land, some of them torn, in any order. So a crash image keeps
+//! what was synced, and of the rest only what a disk can keep.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -28,6 +31,15 @@ use super::world::{self, Resume, Shared, State, Why};
 
 /// The name of the database file of a store.
 pub(crate) const DATABASE: &str = "zoe.redb";
+
+/// The directory of the write-ahead log of a store, with its `/`.
+const LOG: &str = "wal/";
+
+/// Tell if the writes to the file `name` wait in a cache until its sync:
+/// the database file and each file of the write-ahead log.
+fn cached(name: &str) -> bool {
+    name == DATABASE || name.starts_with(LOG)
+}
 
 /// The wall-clock time when a run starts: 2026-01-01T00:00:00Z.
 pub(crate) const START: Duration = Duration::from_secs(1_767_225_600);
@@ -56,6 +68,31 @@ impl Clock for SimClock {
     fn waiter(&self) -> Arc<dyn Waiter> {
         let mut state = self.0.lock();
         Arc::new(SimWaiter::new(&mut state, &self.0))
+    }
+
+    /// A thread of the store, such as the fold, is a thread of the
+    /// simulation in the server generation of the store. It runs under the
+    /// baton, and a crash ends it with the other threads of the process.
+    fn spawn(&self, name: &str, work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+        // The driver opens the store, so the thread belongs to the server
+        // that starts.
+        let generation =
+            world::thread_generation().unwrap_or_else(|| self.0.lock().server.generation);
+        world::spawn_store_thread(&self.0, generation, name, work);
+        Ok(())
+    }
+}
+
+/// The clock of the check after a run: the simulated wall-clock time, and
+/// the monotonic time, the waiters and the threads of the system. No
+/// thread of the simulation runs during the check, so the fold of the
+/// store that the check opens runs on a thread of the system, and the
+/// close of that store waits for it there.
+pub(crate) struct CheckClock(pub(crate) Arc<Shared>);
+
+impl Clock for CheckClock {
+    fn now(&self) -> SystemTime {
+        UNIX_EPOCH + START + self.0.now()
     }
 }
 
@@ -101,17 +138,17 @@ impl Waiter for SimWaiter {
     }
 }
 
-/// A write to the database file that waits for the next sync.
+/// A write to a cached file that waits for the next sync of the file.
 #[derive(Clone, Debug)]
 enum Cached {
     Write { offset: u64, data: Vec<u8> },
     SetLen(u64),
 }
 
-/// The writes to the database file since its last sync, in order. The
+/// The writes to one cached file since its last sync, in order. The
 /// handles of the file share it, and the driver reads it at a crash.
 #[derive(Debug, Default)]
-pub(crate) struct Cache(Mutex<Vec<Cached>>);
+struct Cache(Mutex<Vec<Cached>>);
 
 impl Cache {
     fn lock(&self) -> MutexGuard<'_, Vec<Cached>> {
@@ -119,7 +156,7 @@ impl Cache {
     }
 
     /// Write the cached writes to `file` in order, then sync `file`.
-    pub(crate) fn flush(&self, file: &MemFile) -> io::Result<()> {
+    fn flush(&self, file: &MemFile) -> io::Result<()> {
         let mut cached = self.lock();
         for op in cached.drain(..) {
             match op {
@@ -130,25 +167,26 @@ impl Cache {
         file.sync_data()
     }
 
-    /// Apply to the database file of `disk` what a crash keeps of the
-    /// cached writes, and empty the cache. With `power_loss`, each write
-    /// lands whole, does not land, or lands torn: only its first half or
-    /// only its second half. `rng` chooses. Without it, every write lands,
-    /// as the page cache keeps them after a kill. A write to a file whose
-    /// creation is not on disk is lost. Return how many writes landed whole
-    /// or torn, and how many there were.
-    pub(crate) fn crash(
+    /// Apply to the file `name` of `disk` what a crash keeps of the cached
+    /// writes, and empty the cache. With `power_loss`, each write lands
+    /// whole, does not land, or lands torn: only its first half or only its
+    /// second half. `rng` chooses. Without it, every write lands, as the
+    /// page cache keeps them after a kill. A write to a file whose creation
+    /// is not on disk is lost. Return how many writes landed whole or torn,
+    /// and how many there were.
+    fn crash(
         &self,
         disk: &MemVfs,
+        name: &str,
         power_loss: bool,
         rng: &mut Rng,
     ) -> io::Result<(usize, usize)> {
         let cached = std::mem::take(&mut *self.lock());
         let total = cached.len();
-        if total == 0 || !Vfs::exists(disk, DATABASE)? {
+        if total == 0 || !Vfs::exists(disk, name)? {
             return Ok((0, total));
         }
-        let file = disk.file(DATABASE);
+        let file = disk.file(name);
         let mut landed = 0;
         for op in cached {
             let draw = if power_loss { rng.below(8) } else { 0 };
@@ -170,18 +208,83 @@ impl Cache {
     }
 }
 
-/// The disk of the server: a `MemVfs` whose database file gives the
-/// baton back at each sync, and keeps its writes in `cache` until then.
+/// The caches of the cached files of one disk, by the name of the file.
+/// The driver reads them at a crash.
+#[derive(Debug, Default)]
+pub(crate) struct Caches(Mutex<BTreeMap<String, Arc<Cache>>>);
+
+impl Caches {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Arc<Cache>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Return the cache of the file `name`. The handles of one file share
+    /// it.
+    fn of(&self, name: &str) -> Arc<Cache> {
+        Arc::clone(self.lock().entry(name.to_owned()).or_default())
+    }
+
+    /// Give the cache of `from` to `to`: a rename keeps the cached writes
+    /// with the file. The cache of a file that `to` replaces goes.
+    fn rename(&self, from: &str, to: &str) {
+        let mut caches = self.lock();
+        let moved = caches.remove(from);
+        caches.remove(to);
+        if let Some(cache) = moved {
+            caches.insert(to.to_owned(), cache);
+        }
+    }
+
+    /// Forget the cache of the removed file `name`. A crash loses its
+    /// cached writes.
+    fn remove(&self, name: &str) {
+        self.lock().remove(name);
+    }
+
+    /// Write the cached writes of each file of `disk` to the file in order,
+    /// then sync the file: the late sync of the deliberate durability bug.
+    pub(crate) fn flush(&self, disk: &MemVfs) -> io::Result<()> {
+        for (name, cache) in self.lock().iter() {
+            if Vfs::exists(disk, name)? {
+                cache.flush(&disk.file(name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply to `disk` what a crash keeps of the cached writes of each
+    /// file, in the order of the names, as `Cache::crash` does, and empty
+    /// the caches. Return how many writes landed whole or torn, and how
+    /// many there were.
+    pub(crate) fn crash(
+        &self,
+        disk: &MemVfs,
+        power_loss: bool,
+        rng: &mut Rng,
+    ) -> io::Result<(usize, usize)> {
+        let mut landed = (0, 0);
+        for (name, cache) in self.lock().iter() {
+            let (n, total) = cache.crash(disk, name, power_loss, rng)?;
+            landed = (landed.0 + n, landed.1 + total);
+        }
+        Ok(landed)
+    }
+}
+
+/// The disk of the server: a `MemVfs` whose database file and files of
+/// the write-ahead log give the baton back at each sync, and keep their
+/// writes in `caches` until then.
 pub(crate) struct SimVfs {
     pub(crate) disk: MemVfs,
-    pub(crate) cache: Arc<Cache>,
+    pub(crate) caches: Arc<Caches>,
 }
 
 /// A file of the disk of the server.
 #[derive(Debug)]
 pub(crate) struct SimFile {
     inner: MemFile,
-    /// The cache of the database file. Other files have none.
+    /// The cache of the file, for the database file and the files of the
+    /// write-ahead log. Other files have none.
     cache: Option<Arc<Cache>>,
 }
 
@@ -219,7 +322,7 @@ impl StorageBackend for SimFile {
         if end > cached_len(base, &cached) {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("read past the end of {DATABASE}"),
+                "read past the end of the file",
             ));
         }
         out.fill(0);
@@ -260,9 +363,10 @@ impl StorageBackend for SimFile {
         }
     }
 
-    /// A sync of the database file on a thread of the server is a point where
-    /// the driver can crash the server. With the deliberate bug, the sync
-    /// does not happen now: the driver syncs later.
+    /// A sync of the database file or of a file of the log on a thread of
+    /// the server is a point where the driver can crash the server. With
+    /// the deliberate bug, the sync does not happen now: the driver syncs
+    /// later.
     fn sync_data(&self) -> io::Result<()> {
         let Some(cache) = &self.cache else {
             return self.inner.sync_data();
@@ -293,18 +397,18 @@ impl StorageBackend for SimFile {
 }
 
 impl SimVfs {
-    /// Return a disk on `disk` with an empty cache.
+    /// Return a disk on `disk` with empty caches.
     pub(crate) fn new(disk: MemVfs) -> Self {
         Self {
             disk,
-            cache: Arc::default(),
+            caches: Arc::default(),
         }
     }
 
     fn file(&self, name: &str, inner: MemFile) -> SimFile {
         SimFile {
             inner,
-            cache: (name == DATABASE).then(|| Arc::clone(&self.cache)),
+            cache: cached(name).then(|| self.caches.of(name)),
         }
     }
 }
@@ -325,7 +429,9 @@ impl Vfs for SimVfs {
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.disk.rename(from, to)
+        self.disk.rename(from, to)?;
+        self.caches.rename(from, to);
+        Ok(())
     }
 
     fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
@@ -333,7 +439,9 @@ impl Vfs for SimVfs {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        self.disk.remove(name)
+        self.disk.remove(name)?;
+        self.caches.remove(name);
+        Ok(())
     }
 
     fn sync_dir(&self) -> io::Result<()> {

@@ -50,6 +50,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use super::compress::Compressor;
 use super::message::Call;
+use super::method;
 use super::outbox::{Outbox, Room, Turn};
 use super::session::{self, Reply, Session, Transaction};
 use super::{QUEUE, Stopping, Storages};
@@ -575,7 +576,7 @@ impl Calls {
     /// `outbox::WAITING` bytes wait, then room for its reply. The future
     /// holds no borrow of `self`.
     pub(crate) fn ticket(&self, call: &Call) -> impl Future<Output = Ticket> + Send + 'static {
-        let reads = self.session.is_some() && session::on_read_pool(&call.method);
+        let reads = self.session.is_some() && method::on_read_pool(&call.method);
         let slots = Arc::clone(&self.slots);
         let ends = Arc::clone(&self.ends);
         let outbox = self.outbox.clone();
@@ -674,7 +675,8 @@ impl Calls {
     }
 
     /// Start `call`, which took `ticket`. Wait for the end of `register`
-    /// and of each call of `session::ends_before_next`.
+    /// and of each call whose lane ends before the next call
+    /// (`method::Lane::ends_before_next`).
     pub(crate) async fn start(&mut self, call: Call, ticket: Ticket) {
         let Some(session) = self.session.clone() else {
             self.register(call, ticket).await;
@@ -682,7 +684,8 @@ impl Calls {
         };
         let ended = self.ended.clone();
         let peer = Arc::clone(&self.peer);
-        if session::ends_before_next(&call.method) {
+        let lane = method::lane(&call.method);
+        if lane.ends_before_next() {
             // The calls that start after a label log with it, and so does
             // the end of the transaction. The calls that start after
             // `iterator_gc` do not find the iterators that it removed.
@@ -698,7 +701,7 @@ impl Calls {
             return;
         }
         let mark = self.running.start();
-        if session::in_transaction(&call.method) {
+        if lane == method::Lane::Transaction {
             if self.lane.push(call, ticket) {
                 let lane = Arc::clone(&self.lane);
                 let compress = (self.compressor.clone(), Arc::clone(&self.runtime));
@@ -707,7 +710,7 @@ impl Calls {
                     run_lane(&session, &lane, &ended, &peer, compress);
                 }));
             }
-        } else if session::runs_long(&call.method) {
+        } else if lane == method::Lane::Own {
             self.runtime.spawn_blocking(Box::new(move || {
                 let _mark = mark;
                 run_call(&session, &call, ticket, &ended, &peer);
@@ -753,19 +756,20 @@ impl Calls {
                 let Ticket {
                     slot: _slot, room, ..
                 } = ticket;
+                // The call and its reply log in one span, with the peer:
+                // the connection has no storage and no label yet.
+                let _entered = tracing::info_span!("connection", client = &*peer).entered();
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
                         let session = Session::new(storage, outbox.clone(), stopping)
                             .read_only_client(read_only);
-                        let _entered = tracing::info_span!("connection", client = &*peer).entered();
                         let _request = session.request(&call).entered();
                         let outcome = session.call(&call, &mut reply);
                         (outcome, Some(session).filter(Session::is_registered))
                     }
                     Err(outcome) => (outcome, None),
                 };
-                let _entered = tracing::info_span!("connection", client = &*peer).entered();
                 if !reply.send(&call, outcome, &outbox) {
                     ended.end();
                 }
@@ -822,9 +826,10 @@ mod tests {
 
     use rmpv::Value;
     use zoe_core::{Store, Tid};
+    use zoe_wire::p64;
 
     use super::*;
-    use crate::protocol::session::p64;
+    use crate::protocol::testing::never_stops;
     use crate::protocol::{NamedStorage, Queues};
     use crate::runtime::Tokio;
 
@@ -918,7 +923,7 @@ mod tests {
                 outbox,
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let limit = Duration::from_secs(30);
             // No call runs, so the connection is quiet at once.
@@ -956,7 +961,7 @@ mod tests {
             outbox,
             Arc::new(Tokio),
             "test".into(),
-            Stopping::new().1,
+            never_stops(),
         );
         let register = vec![Value::from("1"), Value::Boolean(false)];
         start(&mut connection, vec![call(1, "register", register)]).await;
@@ -1006,7 +1011,7 @@ mod tests {
                 outbox,
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let limit = Duration::from_secs(30);
             let ping = call(1, "ping", Vec::new());
@@ -1108,7 +1113,7 @@ mod tests {
                 outbox.clone(),
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let register = vec![Value::from("1"), Value::Boolean(false)];
             start(&mut connection, vec![call(1, "register", register)]).await;
@@ -1151,7 +1156,7 @@ mod tests {
                 outbox.clone(),
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let register = vec![Value::from("1"), Value::Boolean(false)];
             // The vote takes the lock of oid 1 and waits for oid 2, longer
@@ -1187,7 +1192,7 @@ mod tests {
                 outbox.clone(),
                 Arc::new(Tokio),
                 "test".into(),
-                Stopping::new().1,
+                never_stops(),
             );
             let ended = connection.ended();
             let register = vec![Value::from("1"), Value::Boolean(false)];

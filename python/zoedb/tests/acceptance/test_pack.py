@@ -19,17 +19,15 @@ module collects before these packages are installed.
 
 import contextlib
 import os
-import pickle
 import threading
 import time
 import unittest
 
 import pytest
+from support import ZERO, record
 
 import zoe
 
-# The tid and the serial of an object that has no record yet.
-ZERO = bytes(8)
 # The longest time that a test waits for another thread.
 TIMEOUT = 60
 # The smallest time, in seconds, between a commit and a pack time. It is
@@ -42,12 +40,6 @@ GARBAGE = 20_000
 GARBAGE_PER_TXN = 5_000
 # The number of unreachable records that a test reads to follow a pack.
 PROBES = 9
-
-
-def record(value):
-    """Return a ZODB record of a persistent mapping that holds value."""
-    meta = (("persistent.mapping", "PersistentMapping"), None)
-    return pickle.dumps(meta, 3) + pickle.dumps({"data": {"value": value}}, 3)
 
 
 def after(tid):

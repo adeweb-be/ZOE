@@ -38,8 +38,6 @@ this module.
 
 import contextlib
 import io
-import shutil
-import tempfile
 import unittest
 import urllib.parse
 
@@ -57,14 +55,12 @@ from ZODB.DB import DB
 from ZODB.POSException import Unsupported
 from ZODB.serialize import referencesf
 from ZODB.utils import load_current
-from zope.component.hooks import getSite, setSite
 
-from zoe.plone.tests.test_concurrent_creations import copy_records
+from zoe.plone.tests import helpers
+from zoe.plone.tests.helpers import TITLE, copied_store, opened
 
 # The id of the second site of a database.
 OTHER_SITE_ID = "other"
-# The record that the tests write.
-TITLE = "plone.site_title"
 
 
 def backend_on(test):
@@ -146,20 +142,6 @@ def stored_bytes(obj):
     return total
 
 
-@contextlib.contextmanager
-def opened(db):
-    """Yield the Zope root of a new connection of `db`, with a transaction
-    manager of its own. Abort and close the connection at the end."""
-    manager = transaction.TransactionManager()
-    connection = db.open(transaction_manager=manager)
-    try:
-        manager.begin()
-        yield connection.root()["Application"], manager
-    finally:
-        manager.abort()
-        connection.close()
-
-
 class TestRegistryBackend(unittest.TestCase):
     layer = PLONE_FUNCTIONAL_TESTING
     maxDiff = None
@@ -171,15 +153,7 @@ class TestRegistryBackend(unittest.TestCase):
 
     def add_site(self, site_id):
         """Add a second Plone site to the Zope root, and commit."""
-        from Products.CMFPlone.factory import addPloneSite
-
-        site = getSite()
-        try:
-            addPloneSite(self.app, site_id)
-        finally:
-            setSite(site)
-        transaction.commit()
-        return self.app[site_id]
+        return helpers.add_site(self.app, site_id)
 
     def test_a_moved_registry_reads_each_record_and_leaves_its_pickles(self):
         registry = self.portal.portal_registry
@@ -222,8 +196,6 @@ class TestRegistryBackend(unittest.TestCase):
     def test_a_copy_into_another_store_raises_unsupported_until_its_rows_come_back(
         self,
     ):
-        import zoe
-
         registry = self.portal.portal_registry
         move(registry)
         transaction.commit()
@@ -231,14 +203,9 @@ class TestRegistryBackend(unittest.TestCase):
         transaction.commit()
         expected = records(registry)
 
-        directory = tempfile.mkdtemp(prefix="zoe-registry-copy-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe")
-        try:
-            copy_records(self.layer["zodbDB"].storage, storage)
-        except BaseException:
-            storage.close()
-            raise
+        storage, _ = copied_store(
+            self, self.layer["zodbDB"].storage, "zoe-registry-copy-"
+        )
         db = DB(storage)
         self.addCleanup(db.close)
 

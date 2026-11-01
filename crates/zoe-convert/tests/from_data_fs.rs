@@ -12,16 +12,12 @@ use std::path::PathBuf;
 use zoe_convert::from_datafs;
 use zoe_core::{Oid, Store, Tid};
 
+mod support;
+use support::fresh_dir;
+
 /// The fixture directory.
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data-fs")
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-from-data-fs-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// One transaction of `expected.txt`.
@@ -196,7 +192,8 @@ fn the_fixture_holds_what_the_tests_need() {
 #[test]
 fn a_data_fs_with_bushy_blobs_converts_with_everything_in_it() {
     let expected = expected();
-    let store = Store::open(fresh_dir("bushy")).unwrap();
+    let dir = fresh_dir("bushy");
+    let store = Store::open(&dir).unwrap();
     let report = from_datafs(
         &fixture().join("Data.fs"),
         Some(&fixture().join("blobs-bushy")),
@@ -224,7 +221,8 @@ fn a_data_fs_with_bushy_blobs_converts_with_everything_in_it() {
 #[test]
 fn a_data_fs_with_lawn_blobs_converts_the_same() {
     let expected = expected();
-    let store = Store::open(fresh_dir("lawn")).unwrap();
+    let dir = fresh_dir("lawn");
+    let store = Store::open(&dir).unwrap();
     let report = from_datafs(
         &fixture().join("Data.fs"),
         Some(&fixture().join("blobs-lawn")),
@@ -273,7 +271,8 @@ fn a_conversion_resumes_after_the_last_tid_of_the_store() {
 #[test]
 fn the_report_names_a_missing_blob() {
     let expected = expected();
-    let store = Store::open(fresh_dir("missing-blob")).unwrap();
+    let dir = fresh_dir("missing-blob");
+    let store = Store::open(&dir).unwrap();
     let blobs = fixture().join("blobs-bushy");
     from_datafs(&fixture().join("Data.fs"), Some(&blobs), &store).unwrap();
 
@@ -288,7 +287,8 @@ fn the_report_names_a_missing_blob() {
 
 #[test]
 fn a_store_with_other_transactions_does_not_verify() {
-    let store = Store::open(fresh_dir("other")).unwrap();
+    let dir = fresh_dir("other");
+    let store = Store::open(&dir).unwrap();
     let oid = store.new_oid().unwrap();
     let mut txn = store.tpc_begin(b"", b"not from the Data.fs", b"").unwrap();
     txn.store(

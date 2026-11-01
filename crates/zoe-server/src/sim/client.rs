@@ -23,25 +23,20 @@
 //! stores the bucket with the node as read-current, or, when the bucket is
 //! full, the node, the bucket and a new bucket of the split.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use zoe_client::{Client, Error, Options};
 use zoe_core::{Oid, Tid};
+use zoe_wire::extension::SERVER_WRITES;
 
+pub(crate) use super::common::HOT;
+use super::common::{self, ADDR, OIDS, TRIES};
 use super::rng::Rng;
 use super::server::SimRuntime;
 use super::tree::{self, MAX_KEYS};
 use super::world::{Acked, Shared, TreeCommit, phase, sleep};
 use crate::protocol::STORAGE_NAME;
-use crate::protocol::negotiation::SERVER_WRITES;
-
-/// The oids that the clients share.
-const OIDS: u64 = 6;
-
-/// The hot oid: half of the transactions write it.
-pub(crate) const HOT: u64 = 1;
 
 /// The class pickle of a `BTrees.Length.Length` and the start of its state
 /// pickle, as the pickler of tier 1 writes them.
@@ -61,23 +56,8 @@ const MAX_BLOB: u64 = 70_000;
 /// The pickle of a `ZODB.blob.Blob`.
 const BLOB_PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
-/// The tries of one transaction.
-const TRIES: usize = 8;
-
-/// The address of the server. The network of the simulation has one
-/// server, so the address is only a name.
-const ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8100);
-
-/// How one try of a transaction ends.
-enum Outcome {
-    Acked(Acked),
-    /// A conflict, or another error of the server: try again.
-    Retry,
-    /// The connection is lost. In `tpc_finish`, the outcome is unknown.
-    Lost {
-        in_finish: bool,
-    },
-}
+/// The end of one try of a transaction of a client.
+type Outcome = common::Outcome<Acked>;
 
 /// One client of a run.
 pub(crate) struct SimClient {
@@ -202,11 +182,7 @@ impl SimClient {
     /// planned crash comes there, the driver crashes the server after this
     /// step of the client.
     fn reach(&self, phase: &'static str) {
-        let mut state = self.shared.lock();
-        if state.crash_at(phase) {
-            state.trace(format!("c{} reaches the phase {phase}", self.id));
-            state.crash_now = Some(phase);
-        }
+        common::reach(&self.shared, self.id, phase);
     }
 
     /// Load the current serial of `oid`. Count a stale read: a serial
@@ -219,22 +195,7 @@ impl SimClient {
     /// Load the current serial and the current record of `oid`, as
     /// `serial` does. A new oid gives `Tid::ZERO` and no record.
     async fn load(&self, client: &Client, oid: u64) -> Result<(Tid, Option<Vec<u8>>), Outcome> {
-        let known = self.shared.lock().known.get(&oid).copied().unwrap_or(0);
-        let (serial, data) = match client.load(Oid(oid)).await {
-            Ok((data, serial)) => (serial, Some(data)),
-            Err(Error::Server { class, .. }) if class.ends_with("POSKeyError") => (Tid::ZERO, None),
-            Err(Error::Disconnected) => return Err(Outcome::Lost { in_finish: false }),
-            Err(_) => return Err(Outcome::Retry),
-        };
-        if serial.0 < known {
-            let mut state = self.shared.lock();
-            state.stale_reads += 1;
-            state.trace(format!(
-                "c{} reads a stale serial {:016x} of oid {oid}, after {known:016x}",
-                self.id, serial.0
-            ));
-        }
-        Ok((serial, data))
+        common::load(&self.shared, self.id, oid, client.load(Oid(oid))).await
     }
 
     /// Try one transaction: read the current serials of one or two oids,
@@ -245,19 +206,7 @@ impl SimClient {
         }
         // Half of the transactions write oid 1, a hot object as a catalog
         // or a counter is.
-        let first = if self.rng.chance(0.5) {
-            HOT
-        } else {
-            1 + self.rng.below(OIDS)
-        };
-        let mut oids = vec![first];
-        if self.rng.chance(0.5) {
-            let second = 1 + self.rng.below(OIDS);
-            if second != first {
-                oids.push(second);
-            }
-        }
-        oids.sort_unstable();
+        let oids = common::oids(&mut self.rng);
         let mut records = Vec::new();
         for &oid in &oids {
             let (serial, data) = match self.load(client, oid).await {

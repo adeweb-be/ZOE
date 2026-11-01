@@ -13,10 +13,10 @@ use zoe_pickle::btrees::{
     BucketState, Class, Family, KeyType, Shape, TreeState, ValueType, bucket_state,
     new_bucket_state, new_tree_state, tree_state,
 };
-use zoe_pickle::python::{Heap, Object, Pickler, Undecided, Value};
+use zoe_pickle::python::{Heap, Object, Undecided, Value};
 
 use super::posting;
-use super::{MAX_KEYS, Merge, Mode, Outcome, Reason, Trees};
+use super::{MAX_KEYS, Merge, Mode, Outcome, Reason, Trees, pickle};
 
 /// Merges the three records of a conflict of `class`, and notes in `merge`
 /// the keys that the new record changed.
@@ -97,11 +97,7 @@ fn merge_once(trees: &Trees, class: Class, rules: bool, merge: &mut Merge) -> (O
     };
     let outcome = match state {
         Ok(state) => {
-            let mut pickler = Pickler::new(&heap);
-            match pickler.dump(class_value).and_then(|()| pickler.dump(state)) {
-                Ok(()) => Outcome::Merged(pickler.into_bytes()),
-                Err(unsupported) => Outcome::Undecided(unsupported.0),
-            }
+            pickle(&heap, class_value, state).map_or_else(Outcome::Undecided, Outcome::Merged)
         }
         Err(outcome) => outcome,
     };

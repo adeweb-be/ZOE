@@ -4,14 +4,13 @@
 //! against its twin, and `--force` with `--from-data-fs`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 use zoe_core::{Flavour, Oid};
 
 mod common;
 
-/// The binary under test.
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+use common::{assert_exit, fresh_dir, s, zoe};
 
 /// The namespace of a moved registry.
 const NAMESPACE: &str = "zoe.plone.registry:0123456789abcdef0123456789abcdef";
@@ -19,35 +18,6 @@ const NAMESPACE: &str = "zoe.plone.registry:0123456789abcdef0123456789abcdef";
 /// The `Data.fs` fixture of the zoe-convert tests.
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zoe-convert/tests/data-fs")
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-convert-guard-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-/// Run `zoe` with the arguments `args` and the variables `env`. No other
-/// `ZOE_*` variable reaches it.
-fn zoe(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    common::output(&mut command)
 }
 
 fn stdout(output: &Output) -> String {
@@ -58,21 +28,10 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// Check the exit code, and show the output if it is not the one expected.
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
 /// Make a store in `dir` with a root and the marker `marker` in the
 /// namespace of a registry.
 fn store_with_marker(dir: &Path, marker: &[u8]) {
-    let store = common::open(dir);
+    let store = common::open_store(dir);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     let root = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}.";
     txn.store(Oid(0), zoe_core::Tid::ZERO, root).unwrap();

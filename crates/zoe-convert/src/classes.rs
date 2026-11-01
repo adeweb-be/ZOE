@@ -7,10 +7,9 @@
 //! unpickler runs.
 
 use zoe_core::{Oid, Store, ZoeError};
-use zoe_pickle::{Int, Node, decode_class_name, decode_record};
+use zoe_pickle::{Int, Node, decode_class_key, decode_record};
 
-/// The number of record keys that one read of the walk takes.
-const KEY_CHUNK: usize = 1024;
+use crate::walk::OidVersions;
 
 /// A current record of one of the classes of a walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,38 +30,28 @@ pub struct ClassRecord {
 /// report it.
 pub fn records_of_classes(store: &Store, classes: &[&str]) -> zoe_core::Result<Vec<ClassRecord>> {
     let mut found = Vec::new();
-    let mut from = Oid(0);
-    loop {
-        let keys = store.record_keys(from, KEY_CHUNK)?;
-        let Some(&(last, _)) = keys.last() else {
-            return Ok(found);
+    let mut walk = OidVersions::new(store);
+    while let Some(versions) = walk.next()? {
+        let Some(&(oid, tid)) = versions.last() else {
+            continue;
         };
-        for versions in keys.chunk_by(|a, b| a.0 == b.0) {
-            let Some(&(oid, tid)) = versions.last() else {
-                continue;
-            };
-            let data = match store.load_serial(oid, tid) {
-                Ok(data) => data,
-                // A deletion: the oid has no current record.
-                Err(ZoeError::NotFound { .. }) => continue,
-                Err(error) => return Err(error),
-            };
-            if let Some(class) = class_of(&data, classes) {
-                found.push(ClassRecord { oid, class });
-            }
-        }
-        match last.0.checked_add(1) {
-            Some(next) => from = Oid(next),
-            None => return Ok(found),
+        let data = match store.load_serial(oid, tid) {
+            Ok(data) => data,
+            // A deletion: the oid has no current record.
+            Err(ZoeError::NotFound { .. }) => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(class) = class_of(&data, classes) {
+            found.push(ClassRecord { oid, class });
         }
     }
+    Ok(found)
 }
 
 /// Return the class of the record `data` when it is one of `classes` and
 /// the record is not retired.
 fn class_of(data: &[u8], classes: &[&str]) -> Option<String> {
-    let (module, name) = decode_class_name(data).ok()??;
-    let class = format!("{module}.{name}");
+    let class = decode_class_key(data).ok()??;
     if !classes.contains(&class.as_str()) || retired(data) {
         return None;
     }
@@ -78,11 +67,7 @@ fn retired(data: &[u8]) -> bool {
     let Some(Node::Dict(dict)) = tree.resolve(tree.state()) else {
         return false;
     };
-    let mut items = dict
-        .initial
-        .iter()
-        .flatten()
-        .chain(dict.batches.iter().flat_map(|batch| batch.items.iter()));
+    let mut items = dict.entries();
     let (Some((key, _)), None) = (items.next(), items.next()) else {
         return false;
     };
@@ -96,32 +81,13 @@ fn retired(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use zoe_core::vfs::MemVfs;
-    use zoe_core::{Oid, Store, Tid};
+    use zoe_core::{Oid, Store};
+    use zoe_pickle::testing::record_with_put as pickle;
 
     use super::{ClassRecord, records_of_classes};
+    use crate::testing::commit;
 
     const LIVE: &str = "zoe.plone.properties.PrincipalProperties";
-
-    /// A pickle of an object of `module.name` whose state is the dict
-    /// that the bytes `state` build.
-    fn pickle(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let mut data = b"\x80\x03c".to_vec();
-        data.extend_from_slice(format!("{module}\n{name}\n").as_bytes());
-        data.extend_from_slice(b"q\x00.\x80\x03");
-        data.extend_from_slice(state);
-        data.push(b'.');
-        data
-    }
-
-    fn commit(store: &Store, records: &[(u64, Option<Vec<u8>>)]) {
-        let tid = Tid(store.last_transaction().0 + 1);
-        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
-        for (oid, data) in records {
-            txn.restore(Oid(*oid), data.as_deref()).unwrap();
-        }
-        txn.vote().unwrap();
-        txn.finish().unwrap();
-    }
 
     #[test]
     fn the_walk_finds_the_live_records_of_the_classes() {

@@ -26,11 +26,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zoe_client::{Client, Error as ClientError, Options, Tokio};
 use zoe_core::{Oid, Tid};
 
-use crate::load::Error;
-use crate::machine::{Machine, Run};
-
-/// The version of the report.
-pub const SCHEMA_VERSION: u32 = 1;
+use crate::Error;
+use crate::load::Report;
+use crate::machine::Run;
 
 /// The class pickle of a `BTrees.Length.Length` and the start of its
 /// state pickle, as the pickler of tier 1 writes them.
@@ -138,26 +136,6 @@ pub struct Hot {
     pub intent_locks: Option<f64>,
 }
 
-/// A report of a `hot` run.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct HotReport {
-    /// `SCHEMA_VERSION`.
-    pub schema_version: u32,
-    /// `hot`.
-    pub command: &'static str,
-    /// The version of `zoe-bench`.
-    pub version: &'static str,
-    /// The machine of the clients.
-    pub machine: Machine,
-    /// When the run started, and the commit.
-    pub run: Run,
-    /// The settings of the run.
-    pub settings: HotSettings,
-    /// The numbers of the run.
-    #[serde(flatten)]
-    pub result: Hot,
-}
-
 /// The counters of `/metrics` that the report reads.
 #[derive(Clone, Copy, Debug, Default)]
 struct Counters {
@@ -173,10 +151,10 @@ pub async fn hot(
     addr: SocketAddr,
     admin: Option<SocketAddr>,
     settings: HotSettings,
-) -> Result<HotReport, Error> {
+) -> Result<Report<HotSettings, Hot>, Error> {
     let run = Run::now();
     let options = Options {
-        extensions: vec!["lock_intent".to_owned()],
+        extensions: vec![zoe_wire::extension::LOCK_INTENT.to_owned()],
         ..Options::default()
     };
     let setup = Client::open(Arc::new(Tokio), addr, &settings.storage, &options).await?;
@@ -248,15 +226,7 @@ pub async fn hot(
         lock_handoffs: delta.map(|d| d.handoffs),
         intent_locks: delta.map(|d| d.intents),
     };
-    Ok(HotReport {
-        schema_version: SCHEMA_VERSION,
-        command: "hot",
-        version: env!("CARGO_PKG_VERSION"),
-        machine: Machine::describe(),
-        run,
-        settings,
-        result,
-    })
+    Ok(Report::new("hot", run, settings, result))
 }
 
 /// What one writer did.

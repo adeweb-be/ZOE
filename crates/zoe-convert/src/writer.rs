@@ -20,6 +20,7 @@ use zoe_core::{Oid, Tid, TxnInfo};
 
 use crate::Error;
 use crate::filestorage::{Cut, DATA_HEADER_LEN, End, MAGIC, NUMBER_LEN, Reader, TXN_HEADER_LEN};
+use crate::fsutil::io_error;
 
 /// What a writer needs to append to an existing file.
 #[derive(Debug)]
@@ -205,13 +206,6 @@ fn data(data: &Option<Vec<u8>>) -> Option<&[u8]> {
 /// Return the length of a data record with `data`.
 fn record_len(data: Option<&[u8]>) -> u64 {
     DATA_HEADER_LEN + data.map_or(NUMBER_LEN, |data| data.len() as u64)
-}
-
-fn io_error(path: &Path, source: io::Error) -> Error {
-    Error::Io {
-        path: path.to_owned(),
-        source,
-    }
 }
 
 #[cfg(test)]

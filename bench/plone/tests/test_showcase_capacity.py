@@ -409,8 +409,10 @@ def test_a_stack_refuses_a_zope_cpu_list_shorter_than_its_instances(
         raise Started(" ".join(map(str, command)))
 
     fake = types.SimpleNamespace(Popen=popen, STDOUT=subprocess.STDOUT)
-    monkeypatch.setattr(stack, "subprocess", fake)
-    monkeypatch.setattr(stack, "zope_serve_script", lambda: tmp_path / "serve.py")
+    monkeypatch.setattr(stack.processes, "subprocess", fake)
+    monkeypatch.setattr(
+        stack.processes, "zope_serve_script", lambda: tmp_path / "serve.py"
+    )
     config = stack.STACKS["zeo"]
 
     with pytest.raises(Exception) as caught:

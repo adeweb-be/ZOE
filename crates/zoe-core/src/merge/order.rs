@@ -27,12 +27,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zoe_pickle::Limits;
 use zoe_pickle::btrees::{TreeState, bucket_state, new_bucket_state, new_tree_state, tree_state};
-use zoe_pickle::python::{Heap, Object, Pickler, Value};
+use zoe_pickle::python::{Object, Value};
 
-use super::{Reason, budget, tier1_class};
-use crate::error::{Result, ZoeError};
+use super::step::{self, Loader, Stop, no};
+use super::{Reason, Records, pickle, tier1_class};
+use crate::error::Result;
 use crate::types::{Oid, Tid};
 
 /// The class of the order list, as `module.name`.
@@ -55,13 +55,11 @@ pub(crate) const POS_CLASSES: [&str; 2] = ["BTrees.OIBTree.OIBTree", "BTrees.OIB
 /// Tells if `record` is of the class of the order list. Reads the class
 /// pickle alone.
 pub(crate) fn is_list(record: &[u8]) -> bool {
-    class_of(record).as_deref() == Some(LIST_CLASS)
-}
-
-/// Returns the class of `record` as `module.name`, from its class pickle.
-fn class_of(record: &[u8]) -> Option<String> {
-    let (module, name) = zoe_pickle::decode_class_name(record).ok()??;
-    Some(format!("{module}.{name}"))
+    zoe_pickle::decode_class_key(record)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(LIST_CLASS)
 }
 
 /// Tells if the class pickle of `record` names `class`.
@@ -73,19 +71,7 @@ fn is_class(record: &[u8], class: (&str, &str)) -> bool {
 }
 
 /// The records that the merge reads.
-pub(crate) trait Source {
-    /// Returns the serial that the transaction read and the pickle that it
-    /// stored for `oid`, or `None` when it stored none, restored it or
-    /// deleted it.
-    fn staged(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>>;
-
-    /// Returns the serial and the pickle of the current record of `oid`, or
-    /// `None` when it has none or is deleted.
-    fn current(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>>;
-
-    /// Returns the pickle of the record of `oid` at `serial`.
-    fn at(&self, oid: Oid, serial: Tid) -> Result<Option<Vec<u8>>>;
-
+pub(crate) trait Source: Records {
     /// Returns the serial at which the transaction marked `oid`
     /// read-current, if it did.
     fn read_current(&self, oid: Oid) -> Option<Tid>;
@@ -133,70 +119,13 @@ pub(crate) enum Planned {
     Undecided { why: &'static str, ids: Vec<String> },
 }
 
-/// Why a step of the merge stops.
-enum Stop {
-    /// No answer, for this reason.
-    No(&'static str),
-    /// An error of the store.
-    Store(ZoeError),
-}
+/// The result of a step of the merge: no answer stops it with a reason.
+type Step<T> = step::Step<T, &'static str>;
 
-impl From<ZoeError> for Stop {
-    fn from(error: ZoeError) -> Self {
-        Stop::Store(error)
-    }
-}
+/// The reason of a value that is not a persistent reference.
+const NOT_REFERENCE: &str = "a value that is not a persistent reference";
 
-type Step<T> = std::result::Result<T, Stop>;
-
-fn no<T>(why: &'static str) -> Step<T> {
-    Err(Stop::No(why))
-}
-
-/// A heap that loads records within the step budget of their bytes.
-struct Reader {
-    heap: Heap,
-    len: usize,
-}
-
-impl Reader {
-    fn new() -> Self {
-        Reader {
-            heap: Heap::with_instances(),
-            len: 0,
-        }
-    }
-
-    /// Decodes and loads `record`: its class and its state.
-    fn load(&mut self, record: &[u8]) -> Step<(Value, Value)> {
-        let limits = Limits {
-            node_budget: record.len(),
-        };
-        let Ok(tree) = zoe_pickle::decode_record_with(record, limits) else {
-            return no("a record that does not decode");
-        };
-        self.len = self.len.saturating_add(record.len());
-        self.heap.set_budget(budget(self.len));
-        self.heap
-            .load(&tree)
-            .map_err(|unsupported| Stop::No(unsupported.0))
-    }
-
-    /// Returns the oid of a persistent reference to an object of the same
-    /// database.
-    fn oid(&self, value: Value) -> Step<Oid> {
-        let Some(reference) = self.heap.reference(value) else {
-            return no("a value that is not a persistent reference");
-        };
-        if reference.database.is_some() || reference.weak {
-            return no("a reference to another database, or a weak reference");
-        }
-        let Ok(oid) = <[u8; 8]>::try_from(&reference.oid[..]) else {
-            return no("an oid that is not 8 bytes");
-        };
-        Ok(Oid(u64::from_be_bytes(oid)))
-    }
-
+impl Loader {
     /// Returns the value of the str key `key` of the dict `state`.
     fn field(&self, state: Value, key: &str) -> Option<Value> {
         self.heap
@@ -225,7 +154,7 @@ impl Reader {
 
 /// Reads the ids of a record of the order list: `{'data': [str, ...]}`.
 fn list_ids(record: &[u8]) -> Step<Vec<String>> {
-    let mut reader = Reader::new();
+    let mut reader = Loader::new();
     let (_, state) = reader.load(record)?;
     let Some(items) = reader.heap.dict(state) else {
         return no("a list state that is not a dict");
@@ -251,7 +180,7 @@ fn list_ids(record: &[u8]) -> Step<Vec<String>> {
 /// Returns the merged record of the list: the class pickle of `new` and
 /// `{'data': ids}`.
 fn list_record(new: &[u8], ids: &[String]) -> Step<Vec<u8>> {
-    let mut reader = Reader::new();
+    let mut reader = Loader::new();
     let (class, state) = reader.load(new)?;
     let Some(&[(key, _)]) = reader.heap.dict(state) else {
         return no("a list state with another key than data");
@@ -259,16 +188,7 @@ fn list_record(new: &[u8], ids: &[String]) -> Step<Vec<u8>> {
     let items = ids.iter().map(|id| reader.heap.new_str(id)).collect();
     let list = reader.heap.new_list(items);
     let state = reader.heap.new_dict(vec![(key, list)]);
-    pickle(&reader.heap, class, state)
-}
-
-/// Returns the pickle of `class` and `state`.
-fn pickle(heap: &Heap, class: Value, state: Value) -> Step<Vec<u8>> {
-    let mut pickler = Pickler::new(heap);
-    match pickler.dump(class).and_then(|()| pickler.dump(state)) {
-        Ok(()) => Ok(pickler.into_bytes()),
-        Err(unsupported) => no(unsupported.0),
-    }
+    Ok(pickle(&reader.heap, class, state)?)
 }
 
 /// Decides the stale order `list` of a transaction. The transaction stored
@@ -278,7 +198,7 @@ pub(crate) fn plan(source: &dyn Source, list: Oid) -> Result<Planned> {
         Ok(Some(positions)) => positions,
         Ok(None) => return Ok(Planned::NotOrder),
         Err(Stop::Store(error)) => return Err(error),
-        Err(Stop::No(why)) => {
+        Err(Stop::Answer(why)) => {
             return Ok(Planned::Undecided {
                 why,
                 ids: Vec::new(),
@@ -288,7 +208,7 @@ pub(crate) fn plan(source: &dyn Source, list: Oid) -> Result<Planned> {
     match merge(source, list, positions) {
         Ok(planned) => Ok(planned),
         Err(Stop::Store(error)) => Err(error),
-        Err(Stop::No(why)) => Ok(Planned::Undecided {
+        Err(Stop::Answer(why)) => Ok(Planned::Undecided {
             why,
             ids: Vec::new(),
         }),
@@ -347,10 +267,10 @@ fn holds(bytes: &[u8], part: &[u8]) -> bool {
 /// Returns the oid of the annotations that the state of `record` names
 /// under `__annotations__`, or `None`.
 fn annotations_of(record: &[u8]) -> Option<Oid> {
-    let mut reader = Reader::new();
+    let mut reader = Loader::new();
     let (_, state) = reader.load(record).ok()?;
     let value = reader.field(state, ANNOTATIONS)?;
-    reader.oid(value).ok()
+    reader.oid(value, NOT_REFERENCE).ok()
 }
 
 /// Returns the oids of the order and of the positions that the record of
@@ -360,7 +280,7 @@ fn names(record: &[u8]) -> Option<(Oid, Oid)> {
     if !is_class(record, ANNOTATIONS_CLASS) {
         return None;
     }
-    let mut reader = Reader::new();
+    let mut reader = Loader::new();
     let (_, state) = reader.load(record).ok()?;
     let Some(TreeState::Inline(bucket)) = tree_state(&reader.heap, state) else {
         return None;
@@ -370,8 +290,8 @@ fn names(record: &[u8]) -> Option<(Oid, Oid)> {
     let mut pos = None;
     for pair in items.chunks(2) {
         match reader.heap.str(pair[0]) {
-            Some(ORDER_KEY) => order = Some(reader.oid(pair[1]).ok()?),
-            Some(POS_KEY) => pos = Some(reader.oid(pair[1]).ok()?),
+            Some(ORDER_KEY) => order = Some(reader.oid(pair[1], NOT_REFERENCE).ok()?),
+            Some(POS_KEY) => pos = Some(reader.oid(pair[1], NOT_REFERENCE).ok()?),
             _ => {}
         }
     }
@@ -452,7 +372,7 @@ fn check_positions(
     len: usize,
     ids: &[String],
 ) -> Step<(BTreeSet<Oid>, BTreeSet<Oid>)> {
-    let mut reader = Reader::new();
+    let mut reader = Loader::new();
     let mut positions = BTreeSet::from([pos]);
     let mut stored = BTreeSet::new();
     let mut new_items: Vec<(String, i128)> = Vec::new();
@@ -573,7 +493,7 @@ fn unique(items: Vec<(String, i128)>) -> Step<BTreeMap<String, i128>> {
 
 /// Reads the states of the node `oid` of the positions: the old one, the
 /// new one when the transaction stored it, and the committed one.
-fn node_states(source: &dyn Source, reader: &mut Reader, oid: Oid, root: bool) -> Step<States> {
+fn node_states(source: &dyn Source, reader: &mut Loader, oid: Oid, root: bool) -> Step<States> {
     let mut load = |record: &[u8]| -> Step<Value> {
         if !is_class(record, POS_TREE) {
             return no("positions that are not an OIBTree");
@@ -614,7 +534,7 @@ fn node_states(source: &dyn Source, reader: &mut Reader, oid: Oid, root: bool) -
 }
 
 /// Returns the oids of the children of a node state of the positions.
-fn node_children(reader: &Reader, state: Value) -> Step<Vec<Oid>> {
+fn node_children(reader: &Loader, state: Value) -> Step<Vec<Oid>> {
     let Some(&[children, _first]) = reader.heap.tuple(state) else {
         return no("a node state of another shape");
     };
@@ -624,7 +544,7 @@ fn node_children(reader: &Reader, state: Value) -> Step<Vec<Oid>> {
     items
         .iter()
         .step_by(2)
-        .map(|&child| reader.oid(child))
+        .map(|&child| Ok(reader.oid(child, NOT_REFERENCE)?))
         .collect()
 }
 
@@ -665,7 +585,7 @@ pub(crate) fn renumber(
                 });
             }
             Ok(None) => {}
-            Err(Stop::No(why)) => return Err(why),
+            Err(Stop::Answer(why)) => return Err(why),
             Err(Stop::Store(_)) => return Err("a record of the positions that does not read"),
         }
     }
@@ -683,7 +603,7 @@ fn renumber_record(
     record: &[u8],
     target: &BTreeMap<&str, i128>,
 ) -> Step<Option<(Vec<u8>, Vec<String>)>> {
-    let mut reader = Reader::new();
+    let mut reader = Loader::new();
     let bucket = is_class(record, POS_BUCKET);
     if !bucket && !is_class(record, POS_TREE) {
         return no("a record of the positions of another class");
@@ -733,7 +653,7 @@ fn self_check(
 ) -> std::result::Result<(), &'static str> {
     const FAILED: &str = "a self-check that failed";
     let read = |record: &[u8]| -> Option<Vec<(String, i128)>> {
-        let mut reader = Reader::new();
+        let mut reader = Loader::new();
         let (_, state) = reader.load(record).ok()?;
         let bucket = match tree_state(&reader.heap, state) {
             Some(TreeState::Inline(inline)) if is_class(record, POS_TREE) => inline,
@@ -772,11 +692,10 @@ fn self_check(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use zoe_pickle::python::Heap;
 
-    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-        pickle(heap, class, state).ok().unwrap()
-    }
+    use super::*;
+    use crate::testing::record;
 
     fn list(items: &[&str]) -> Vec<u8> {
         let mut heap = Heap::new();
@@ -815,7 +734,7 @@ mod tests {
     }
 
     fn items_of(record: &[u8]) -> Vec<(String, i128)> {
-        let mut reader = Reader::new();
+        let mut reader = Loader::new();
         let (_, state) = reader.load(record).ok().unwrap();
         let Some(TreeState::Inline(bucket)) = tree_state(&reader.heap, state) else {
             panic!("an inline tree")
@@ -833,7 +752,7 @@ mod tests {
         let state = heap.new_dict(vec![(key, data)]);
         assert!(matches!(
             list_ids(&record(&heap, class, state)),
-            Err(Stop::No("an item of the order that is not a str"))
+            Err(Stop::Answer("an item of the order that is not a str"))
         ));
         assert!(is_list(&list(&[])));
     }
@@ -879,7 +798,7 @@ mod tests {
         let items = vec![("a".to_owned(), 0), ("a".to_owned(), 1)];
         assert!(matches!(
             unique(items),
-            Err(Stop::No("an id twice in the positions"))
+            Err(Stop::Answer("an id twice in the positions"))
         ));
     }
 }

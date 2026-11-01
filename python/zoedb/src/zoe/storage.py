@@ -13,7 +13,6 @@ import contextlib
 import os
 import shutil
 import tempfile
-import threading
 import time
 
 import zope.interface
@@ -68,7 +67,7 @@ _CHANGED_LATER = "Some data were modified by a later transaction"
     IStorageUndoable,
     IExternalGC,
 )
-class Storage(_zoe.Storage, ConflictResolvingStorage):
+class Storage(_zoe.Storage, zodb._IntentOwners, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
     `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None,
@@ -188,29 +187,20 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         # A read-only storage writes nothing, so it takes no early lock.
         classes = zodb.hot_classes(early_locks, early_lock_classes)
         self.early_lock_classes = None if self.isReadOnly() else classes
-        self._default_intents = self._intents()
-        self._bound_intents = threading.local()
+        self._init_intents()
         if self.early_lock_classes:
             zodb.install()
 
-    def new_intent_owner(self):
-        """Return a new owner of early write-intent locks."""
+    # The owners of the intent locks of `zodb._IntentOwners`.
+
+    def _new_owner(self):
         return self._intents()
 
-    def lock_intent(self, oids, owner=None):
-        """Take the early write-intent lock of each oid of `oids`, in
-        ascending order, and return the current serial of each one.
+    def _take_intents(self, owner, oids):
+        return self._lock_intent(owner, oids)
 
-        An oid at or below an oid that the owner holds raises
-        `StorageTransactionError` and takes nothing. A wait past the lock
-        timeout raises `ConflictError`.
-        """
-        owner = self._default_intents if owner is None else owner
-        return self._lock_intent(owner, list(oids))
-
-    def unlock_intent(self, owner=None):
-        """Release every early write-intent lock of the owner."""
-        self._unlock_intent(self._default_intents if owner is None else owner)
+    def _release_intents(self, owner):
+        self._unlock_intent(owner)
 
     def close(self):
         """Release the intent locks of the default owner, which hold a share
@@ -220,18 +210,11 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
             self._unlock_intent(default)
         super().close()
 
-    def bind_intent_owner(self, owner):
-        """Make `owner` the owner of the intent locks that the next
-        `tpc_begin` of the calling thread adopts, or the default owner again
-        when `owner` is None."""
-        self._bound_intents.owner = owner
-
     def tpc_begin(self, transaction, tid=None, status=None):
         """Begin a two-phase commit of `transaction`, as the extension does.
         The transaction adopts the early write-intent locks of the owner that
         the calling thread bound, or of the default owner."""
-        owner = getattr(self._bound_intents, "owner", None) or self._default_intents
-        return super().tpc_begin(transaction, tid, status, owner)
+        return super().tpc_begin(transaction, tid, status, self._begin_owner())
 
     def cleanup(self):
         """Close the storage and remove the files of the store.

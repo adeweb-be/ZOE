@@ -25,70 +25,12 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use zoe_core::{Oid, Store, Tid, TxnInfo};
 
-const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
+mod common;
 
-static SPAWN: Mutex<()> = Mutex::new(());
-
-fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn open_store(dir: &Path) -> Store {
-    let _spawn = spawn_lock();
-    Store::open(dir).unwrap()
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-backup-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
-
-fn zoe(args: &[&str]) -> Output {
-    let mut command = Command::new(ZOE);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ZOE_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let _spawn = spawn_lock();
-    command.spawn().unwrap().wait_with_output().unwrap()
-}
-
-fn assert_exit(output: &Output, code: i32, what: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(code),
-        "{what}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// A record that holds `value`.
-fn record(value: &[u8]) -> Vec<u8> {
-    let mut pickle = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
-    pickle.extend_from_slice(b"\x80\x03}q\x00X\x01\x00\x00\x00vq\x01C");
-    pickle.push(value.len() as u8);
-    pickle.extend_from_slice(value);
-    pickle.extend_from_slice(b"q\x02s.");
-    pickle
-}
+use common::{assert_exit, fresh_dir, open_store, record, s, zoe};
 
 const BLOB_RECORD: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
@@ -198,7 +140,7 @@ fn a_full_then_an_incremental_dump_restore_the_same_store() {
         }
     }
     assert_exit(
-        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)]),
+        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &[]),
         0,
         "full",
     );
@@ -211,7 +153,7 @@ fn a_full_then_an_incremental_dump_restore_the_same_store() {
         last_value = store.sequence("intids").next().unwrap();
     }
     assert_exit(
-        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)]),
+        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &[]),
         0,
         "incremental",
     );
@@ -224,14 +166,14 @@ fn a_full_then_an_incremental_dump_restore_the_same_store() {
 
     // Nothing new: nothing written.
     assert_exit(
-        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)]),
+        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &[]),
         0,
         "nothing new",
     );
     assert_eq!(files_of(&dumps), both);
 
     assert_exit(
-        &zoe(&["restore", "--from", s(&dumps), "--path", s(&target)]),
+        &zoe(&["restore", "--from", s(&dumps), "--path", s(&target)], &[]),
         0,
         "restore",
     );
@@ -255,11 +197,16 @@ fn verify_compares_the_dumps_with_the_store() {
         round(&store, 1);
     }
     assert_exit(
-        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)]),
+        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &[]),
         0,
         "backup",
     );
-    let check = || zoe(&["verify", "--path", s(&source), "--backup", s(&dumps)]);
+    let check = || {
+        zoe(
+            &["verify", "--path", s(&source), "--backup", s(&dumps)],
+            &[],
+        )
+    };
     assert_exit(&check(), 0, "fresh dumps");
 
     // A commit after the last dump is not a difference.
@@ -289,7 +236,7 @@ fn a_bad_restore_leaves_no_store_and_never_overwrites_one() {
         round(&store, 1);
     }
     assert_exit(
-        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)]),
+        &zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &[]),
         0,
         "backup",
     );
@@ -297,7 +244,7 @@ fn a_bad_restore_leaves_no_store_and_never_overwrites_one() {
     // A target that holds a store is refused, and stays as it is.
     let before = files_of(&source);
     assert_exit(
-        &zoe(&["restore", "--from", s(&dumps), "--path", s(&source)]),
+        &zoe(&["restore", "--from", s(&dumps), "--path", s(&source)], &[]),
         1,
         "overwrite",
     );
@@ -313,7 +260,7 @@ fn a_bad_restore_leaves_no_store_and_never_overwrites_one() {
     std::fs::write(&largest, bytes).unwrap();
     let target = dir.join("target");
     assert_exit(
-        &zoe(&["restore", "--from", s(&dumps), "--path", s(&target)]),
+        &zoe(&["restore", "--from", s(&dumps), "--path", s(&target)], &[]),
         1,
         "damaged",
     );
@@ -322,13 +269,16 @@ fn a_bad_restore_leaves_no_store_and_never_overwrites_one() {
     // An empty directory is no backup.
     let empty = fresh_dir("refusals-empty");
     assert_exit(
-        &zoe(&[
-            "restore",
-            "--from",
-            s(&empty),
-            "--path",
-            s(&dir.join("other")),
-        ]),
+        &zoe(
+            &[
+                "restore",
+                "--from",
+                s(&empty),
+                "--path",
+                s(&dir.join("other")),
+            ],
+            &[],
+        ),
         1,
         "no dump",
     );

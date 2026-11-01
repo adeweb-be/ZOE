@@ -189,106 +189,14 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// A `tracing` subscriber that captures the events of one thread, for the
-/// tests of the crate.
-#[cfg(test)]
-pub(crate) mod capture {
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex, PoisonError};
-
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Level, Metadata, Subscriber};
-
-    /// One captured event: its level, and each field as text. The message
-    /// is the field `message`.
-    #[derive(Clone, Debug)]
-    pub(crate) struct Captured {
-        pub(crate) level: Level,
-        pub(crate) fields: BTreeMap<String, String>,
-    }
-
-    impl Captured {
-        pub(crate) fn message(&self) -> &str {
-            self.fields.get("message").map_or("", String::as_str)
-        }
-
-        pub(crate) fn number(&self, field: &str) -> Option<u64> {
-            self.fields.get(field)?.parse().ok()
-        }
-    }
-
-    #[derive(Default)]
-    struct Fields(BTreeMap<String, String>);
-
-    impl Visit for Fields {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.0.insert(field.name().to_owned(), format!("{value:?}"));
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            self.0.insert(field.name().to_owned(), value.to_owned());
-        }
-
-        fn record_u64(&mut self, field: &Field, value: u64) {
-            self.0.insert(field.name().to_owned(), value.to_string());
-        }
-    }
-
-    struct Capture(Arc<Mutex<Vec<Captured>>>);
-
-    impl Subscriber for Capture {
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut fields = Fields::default();
-            event.record(&mut fields);
-            let captured = Captured {
-                level: *event.metadata().level(),
-                fields: fields.0,
-            };
-            self.0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(captured);
-        }
-
-        fn enter(&self, _: &Id) {}
-
-        fn exit(&self, _: &Id) {}
-    }
-
-    /// Run `f` with the capturing subscriber on this thread. Return the
-    /// result of `f` and the events of this thread.
-    pub(crate) fn events_of<R>(f: impl FnOnce() -> R) -> (R, Vec<Captured>) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let result = tracing::subscriber::with_default(Capture(Arc::clone(&events)), f);
-        let events = events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        (result, events)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::UNIX_EPOCH;
 
     use tracing::Level;
 
-    use super::capture::events_of;
     use super::*;
+    use crate::testing::events_of;
 
     const LIMITS: [SizeLimit; 3] = [SizeLimit::Record, SizeLimit::Transaction, SizeLimit::Blob];
 

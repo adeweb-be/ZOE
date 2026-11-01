@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from benchcommon import provenance
+
 from plonebench import stack
 
 EGGS = (
@@ -26,32 +28,11 @@ EGGS = (
 )
 
 
-def sysctl(name: str) -> str | None:
-    try:
-        out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True)
-    except OSError:
-        return None
-    return out.stdout.strip() or None
-
-
-def slug(text: str) -> str:
-    """Return the CPU model as a machine name, as the harness of zodbshootout
-    does: intel-core-ultra-7-155h."""
-    text = re.sub(r"\((r|tm)\)", "", text.lower())
-    return re.sub(r"[^a-z0-9]+", "-", text).strip("-") or "unknown"
-
-
-def cpu_model() -> str:
-    if sys.platform == "darwin":
-        return sysctl("machdep.cpu.brand_string") or "unknown"
-    try:
-        with open("/proc/cpuinfo") as file:
-            for line in file:
-                if line.startswith("model name"):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return platform.processor() or "unknown"
+# The CPU model, its slug and the sysctl of macOS are those of every
+# harness.
+sysctl = provenance.sysctl
+slug = provenance.slug
+cpu_model = provenance.cpu_model
 
 
 def memory_bytes() -> int | None:
@@ -166,38 +147,14 @@ def zoe_version() -> str | None:
 
 
 def git(*args: str) -> str | None:
-    try:
-        out = subprocess.run(
-            ["git", *args], cwd=stack.REPO, capture_output=True, text=True
-        )
-        return out.stdout.strip() or None
-    except OSError:
-        return None
+    """Run git in the repository. Return its output without the spaces at
+    its ends, or None when git fails or prints nothing."""
+    return (provenance.git(*args) or "").strip() or None
 
 
-def dirty() -> bool | None:
-    """True when the tree holds changes that the commit does not, false
-    when it holds none, None when git fails. None also when
-    ZOE_BENCH_COMMIT names another commit than the tree: the tree is then
-    no record of that commit."""
-    head = git("rev-parse", "HEAD")
-    if not head:
-        return None
-    named = os.environ.get("ZOE_BENCH_COMMIT")
-    if named and not head.startswith(named.lower()):
-        return None
-    try:
-        out = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=stack.REPO,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if out.returncode != 0:
-        return None
-    return bool(out.stdout.strip())
+# Whether the tree differs from the commit of the run, as every harness
+# records it.
+dirty = provenance.dirty
 
 
 def zope_python() -> dict:
@@ -267,6 +224,6 @@ def record(store_dir: Path, zeo_fsync: str = "plain") -> dict:
             "zoe": zoe_version(),
             "locust": locust_version,
         },
-        "commit": os.environ.get("ZOE_BENCH_COMMIT") or git("rev-parse", "HEAD"),
+        "commit": provenance.commit(),
         "dirty": dirty(),
     }

@@ -10,12 +10,12 @@
 //! the client CA file is also valid, within its validity period, also when
 //! it is a CA certificate. OpenSSL accepts such a certificate, and ZEO's
 //! tests use one. A certificate of the read-only client CA file never
-//! matches by its bytes.
+//! matches by its bytes. `zoe_wire::tls` reads the PEM files and the
+//! validity period of the pinned certificates.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
@@ -23,12 +23,11 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{
-    CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,
-};
+use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+use zoe_wire::tls::{Pinned, Validity, certificates, der};
 
 /// The files of TLS on the ZEO port, as PEM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,9 +104,10 @@ impl Tls {
         let writers = options.client_ca.as_deref().map(ca).transpose()?;
         let readers = options.read_only_client_ca.as_deref().map(ca).transpose()?;
         // Only a certificate of the client CA file matches by its bytes.
-        let pinned = writers
-            .as_ref()
-            .map_or_else(|| Arc::from([]), |writers| pinned(&writers.certs));
+        let pinned = writers.as_ref().map_or_else(
+            || Arc::new(Pinned::default()),
+            |writers| pinned(&writers.certs),
+        );
         let (builder, access) = match (writers, readers) {
             (None, None) => (builder.with_no_client_auth(), Access::AsAsked),
             (Some(writers), None) => (
@@ -161,20 +161,6 @@ impl Tls {
     }
 }
 
-/// Read the certificates in the PEM file `path`. One at least is
-/// necessary.
-fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let failed = |error: rustls::pki_types::pem::Error| format!("{}: {error}", path.display());
-    let certs = CertificateDer::pem_file_iter(path)
-        .map_err(failed)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(failed)?;
-    if certs.is_empty() {
-        return Err(format!("{}: no certificate", path.display()));
-    }
-    Ok(certs)
-}
-
 /// A client CA file: its certificates, its trust anchors and its path.
 struct Ca<'a> {
     certs: Vec<CertificateDer<'static>>,
@@ -201,7 +187,7 @@ fn ca(path: &Path) -> Result<Ca<'_>, String> {
 fn verifier(
     ca: Ca<'_>,
     provider: &Arc<CryptoProvider>,
-    pinned: &Arc<[Pinned]>,
+    pinned: &Arc<Pinned<Validity>>,
 ) -> Result<Arc<dyn ClientCertVerifier>, String> {
     let webpki =
         WebPkiClientVerifier::builder_with_provider(Arc::new(ca.roots), Arc::clone(provider))
@@ -213,29 +199,11 @@ fn verifier(
     }))
 }
 
-/// A certificate of the client CA file, with its validity period.
-#[derive(Debug)]
-struct Pinned {
-    der: CertificateDer<'static>,
-    not_before: UnixTime,
-    not_after: UnixTime,
-}
-
 /// Return the certificates of the client CA file `certs` that a client
-/// certificate can match by its bytes. A certificate whose validity period
-/// does not read never matches.
-fn pinned(certs: &[CertificateDer<'static>]) -> Arc<[Pinned]> {
-    certs
-        .iter()
-        .filter_map(|der| {
-            let (not_before, not_after) = validity(der)?;
-            Some(Pinned {
-                der: der.clone(),
-                not_before,
-                not_after,
-            })
-        })
-        .collect()
+/// certificate can match by its bytes, with their validity periods. A
+/// certificate whose validity period does not read never matches.
+fn pinned(certs: &[CertificateDer<'static>]) -> Arc<Pinned<Validity>> {
+    Arc::new(Pinned::read(certs, der::validity))
 }
 
 /// The verifier of the client certificates of a server.
@@ -249,7 +217,7 @@ fn pinned(certs: &[CertificateDer<'static>]) -> Arc<[Pinned]> {
 #[derive(Debug)]
 struct ClientCa {
     webpki: Arc<dyn ClientCertVerifier>,
-    pinned: Arc<[Pinned]>,
+    pinned: Arc<Pinned<Validity>>,
 }
 
 impl ClientCertVerifier for ClientCa {
@@ -271,29 +239,12 @@ impl ClientCertVerifier for ClientCa {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let pinned = self
-            .pinned
-            .iter()
-            .find(|pinned| pinned.der.as_ref() == end_entity.as_ref());
-        let Some(pinned) = pinned else {
+        let Some(validity) = self.pinned.find(end_entity) else {
             return self
                 .webpki
                 .verify_client_cert(end_entity, intermediates, now);
         };
-        if now < pinned.not_before {
-            return Err(CertificateError::NotValidYetContext {
-                time: now,
-                not_before: pinned.not_before,
-            }
-            .into());
-        }
-        if now > pinned.not_after {
-            return Err(CertificateError::ExpiredContext {
-                time: now,
-                not_after: pinned.not_after,
-            }
-            .into());
-        }
+        validity.check(now)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -324,140 +275,17 @@ impl ClientCertVerifier for ClientCa {
     }
 }
 
-/// The DER tags that [`validity`] reads.
-const SEQUENCE: u8 = 0x30;
-const INTEGER: u8 = 0x02;
-const VERSION: u8 = 0xa0;
-const UTC_TIME: u8 = 0x17;
-const GENERALIZED_TIME: u8 = 0x18;
-
-/// Read the validity period of the DER certificate `der` (RFC 5280,
-/// 4.1.2.5): its notBefore and its notAfter. Return `None` when the
-/// certificate does not read, when a time is before 1970, or when
-/// notBefore is after notAfter.
-fn validity(der: &[u8]) -> Option<(UnixTime, UnixTime)> {
-    let (certificate, rest) = element(der, SEQUENCE)?;
-    if !rest.is_empty() {
-        return None;
-    }
-    let (tbs, _) = element(certificate, SEQUENCE)?;
-    // The version is optional.
-    let tbs = element(tbs, VERSION).map_or(tbs, |(_, rest)| rest);
-    let (_serial, tbs) = element(tbs, INTEGER)?;
-    let (_signature, tbs) = element(tbs, SEQUENCE)?;
-    let (_issuer, tbs) = element(tbs, SEQUENCE)?;
-    let (validity, _) = element(tbs, SEQUENCE)?;
-    let (not_before, rest) = time(validity)?;
-    let (not_after, rest) = time(rest)?;
-    if !rest.is_empty() || not_before > not_after {
-        return None;
-    }
-    Some((
-        UnixTime::since_unix_epoch(Duration::from_secs(not_before)),
-        UnixTime::since_unix_epoch(Duration::from_secs(not_after)),
-    ))
-}
-
-/// Read the DER element with the tag `tag` at the start of `input`.
-/// Return its contents and the bytes after it.
-fn element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
-    let (&first, input) = input.split_first()?;
-    if first != tag {
-        return None;
-    }
-    let (&length, input) = input.split_first()?;
-    let (length, input) = if length < 0x80 {
-        (usize::from(length), input)
-    } else {
-        // The long form: the low bits give the count of the length bytes.
-        let count = usize::from(length & 0x7f);
-        if count == 0 || count > 4 {
-            return None;
-        }
-        let (bytes, input) = input.split_at_checked(count)?;
-        let length = bytes
-            .iter()
-            .fold(0, |length, &byte| length << 8 | usize::from(byte));
-        (length, input)
-    };
-    input.split_at_checked(length)
-}
-
-/// Read the UTCTime or the GeneralizedTime at the start of `input`, in the
-/// form of RFC 5280: seconds, no fraction, and `Z`. Return it in seconds
-/// since the Unix epoch, and the bytes after it. A time before 1970 does
-/// not read.
-fn time(input: &[u8]) -> Option<(u64, &[u8])> {
-    let (year, digits, rest) = if let Some((value, rest)) = element(input, UTC_TIME) {
-        let (year, digits) = value.split_at_checked(2)?;
-        let year = number(year)?;
-        // A two-digit year from 50 is in the 1900s, else in the 2000s.
-        let year = if year >= 50 { 1900 + year } else { 2000 + year };
-        (year, digits, rest)
-    } else {
-        let (value, rest) = element(input, GENERALIZED_TIME)?;
-        let (year, digits) = value.split_at_checked(4)?;
-        (number(year)?, digits, rest)
-    };
-    let digits = digits.strip_suffix(b"Z")?;
-    if digits.len() != 10 {
-        return None;
-    }
-    let field = |at: usize| number(&digits[at..at + 2]);
-    let (month, day) = (field(0)?, field(2)?);
-    let (hour, minute, second) = (field(4)?, field(6)?, field(8)?);
-    if year < 1970
-        || !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let days = days_since_epoch(year, month, day);
-    Some((((days * 24 + hour) * 60 + minute) * 60 + second, rest))
-}
-
-/// Read the decimal number in the ASCII digits `digits`.
-fn number(digits: &[u8]) -> Option<u64> {
-    digits.iter().try_fold(0, |number, &digit| {
-        digit
-            .is_ascii_digit()
-            .then(|| number * 10 + u64::from(digit - b'0'))
-    })
-}
-
-/// Return the count of the days of the month `month` of the year `year`.
-fn days_in_month(year: u64, month: u64) -> u64 {
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// Return the count of the days from 1970-01-01 to the date
-/// `year`-`month`-`day`. The year is 1970 or later.
-fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
-    // The days from 0001-01-01 to the first day of a year.
-    let days_before = |year: u64| {
-        let past = year - 1;
-        past * 365 + past / 4 - past / 100 + past / 400
-    };
-    let days_before_month: u64 = (1..month).map(|month| days_in_month(year, month)).sum();
-    days_before(year) - days_before(1970) + days_before_month + day - 1
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rustls::CertificateError;
 
-    fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-tls-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    use super::*;
+    use crate::protocol::testing::{self, Fresh};
+
+    /// Return a new empty directory for the test `name`.
+    #[track_caller]
+    fn fresh_dir(name: &str) -> Fresh {
+        let dir = testing::fresh_dir(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -538,19 +366,21 @@ mod tests {
     }
 
     fn at(secs: u64) -> UnixTime {
-        UnixTime::since_unix_epoch(Duration::from_secs(secs))
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(secs))
     }
 
     /// A verifier that pins the bytes 1, 2, 3 from the time 100 to the
     /// time 200, and refuses each other certificate.
     fn pinned_123() -> ClientCa {
+        let validity = Validity {
+            not_before: at(100),
+            not_after: at(200),
+        };
         ClientCa {
             webpki: Arc::new(Refuse),
-            pinned: Arc::from([Pinned {
-                der: CertificateDer::from(vec![1, 2, 3]),
-                not_before: at(100),
-                not_after: at(200),
-            }]),
+            pinned: Arc::new(Pinned::read(&[CertificateDer::from(vec![1, 2, 3])], |_| {
+                Some(validity)
+            })),
         }
     }
 
@@ -597,152 +427,9 @@ mod tests {
         // Without a client CA file, no certificate is pinned.
         let verifier = ClientCa {
             webpki: Arc::new(Refuse),
-            pinned: Arc::from([]),
+            pinned: Arc::new(Pinned::default()),
         };
         let cert = CertificateDer::from(vec![1, 2, 3]);
         assert!(verifier.verify_client_cert(&cert, &[], at(150)).is_err());
-    }
-
-    /// Encode the DER element with the tag `tag` and the contents
-    /// `contents`.
-    fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
-        let mut out = vec![tag];
-        let length = contents.len();
-        if length < 0x80 {
-            out.push(u8::try_from(length).unwrap());
-        } else {
-            let bytes = length.to_be_bytes();
-            let first = bytes.iter().position(|&byte| byte != 0).unwrap();
-            out.push(0x80 | u8::try_from(bytes.len() - first).unwrap());
-            out.extend_from_slice(&bytes[first..]);
-        }
-        out.extend_from_slice(contents);
-        out
-    }
-
-    fn utc(text: &str) -> Vec<u8> {
-        der(UTC_TIME, text.as_bytes())
-    }
-
-    fn generalized(text: &str) -> Vec<u8> {
-        der(GENERALIZED_TIME, text.as_bytes())
-    }
-
-    /// Encode a certificate with the times `not_before` and `not_after`,
-    /// a version when `version` is true, and an issuer of `issuer` bytes.
-    fn certificate(not_before: &[u8], not_after: &[u8], version: bool, issuer: usize) -> Vec<u8> {
-        let mut tbs = Vec::new();
-        if version {
-            tbs.extend(der(VERSION, &der(INTEGER, &[2])));
-        }
-        tbs.extend(der(INTEGER, &[1]));
-        tbs.extend(der(SEQUENCE, &[]));
-        tbs.extend(der(SEQUENCE, &vec![0; issuer]));
-        tbs.extend(der(SEQUENCE, &[not_before, not_after].concat()));
-        tbs.extend(der(SEQUENCE, &[]));
-        let mut cert = der(SEQUENCE, &tbs);
-        cert.extend(der(SEQUENCE, &[]));
-        cert.extend(der(0x03, &[0]));
-        der(SEQUENCE, &cert)
-    }
-
-    fn seconds(validity: Option<(UnixTime, UnixTime)>) -> Option<(u64, u64)> {
-        validity.map(|(not_before, not_after)| (not_before.as_secs(), not_after.as_secs()))
-    }
-
-    fn time_of(input: &[u8]) -> Option<u64> {
-        time(input).map(|(time, _)| time)
-    }
-
-    #[test]
-    fn the_validity_reads_from_a_utc_time_and_a_generalized_time() {
-        // The validity period of the client certificate of ZEO's tests.
-        let cert = certificate(
-            &utc("190426085809Z"),
-            &generalized("30041218085809Z"),
-            true,
-            8,
-        );
-        assert_eq!(
-            seconds(validity(&cert)),
-            Some((1_556_269_089, 32_660_269_089))
-        );
-    }
-
-    #[test]
-    fn the_validity_reads_without_a_version_and_with_long_lengths() {
-        let cert = certificate(&utc("700101000000Z"), &utc("491231235959Z"), false, 300);
-        assert_eq!(seconds(validity(&cert)), Some((0, 2_524_607_999)));
-    }
-
-    #[test]
-    fn a_certificate_that_does_not_read_has_no_validity() {
-        let good = certificate(&utc("190426085809Z"), &utc("200426085809Z"), true, 8);
-        assert!(validity(&good).is_some());
-        for end in 0..good.len() {
-            assert_eq!(validity(&good[..end]), None, "{end}");
-        }
-        let mut trailing = good.clone();
-        trailing.push(0);
-        assert_eq!(validity(&trailing), None);
-        // The indefinite length is not DER.
-        let mut indefinite = good.clone();
-        indefinite[1] = 0x80;
-        assert_eq!(validity(&indefinite), None);
-        let reversed = certificate(&utc("200426085809Z"), &utc("190426085809Z"), true, 8);
-        assert_eq!(validity(&reversed), None);
-        let before_1970 = certificate(&utc("690101000000Z"), &utc("200426085809Z"), true, 8);
-        assert_eq!(validity(&before_1970), None);
-        assert_eq!(validity(b"no"), None);
-    }
-
-    #[test]
-    fn a_two_digit_year_from_50_is_in_the_1900s() {
-        assert_eq!(time_of(&utc("491231235959Z")), Some(2_524_607_999));
-        assert_eq!(
-            time_of(&generalized("20500101000000Z")),
-            Some(2_524_608_000)
-        );
-        assert_eq!(time_of(&utc("700101000000Z")), Some(0));
-        // 1950 is before 1970.
-        assert_eq!(time_of(&utc("500101000000Z")), None);
-    }
-
-    #[test]
-    fn the_days_count_the_leap_years() {
-        assert_eq!(days_since_epoch(1970, 1, 1), 0);
-        assert_eq!(days_since_epoch(2000, 3, 1) * 86_400, 951_868_800);
-        assert_eq!(days_since_epoch(2024, 2, 29) * 86_400, 1_709_164_800);
-        assert_eq!(days_since_epoch(2100, 3, 1) * 86_400, 4_107_542_400);
-        assert_eq!(time_of(&generalized("20000229000000Z")), Some(951_782_400));
-        assert_eq!(
-            time_of(&generalized("20240229000000Z")),
-            Some(1_709_164_800)
-        );
-        assert_eq!(time_of(&generalized("20230229000000Z")), None);
-        assert_eq!(time_of(&generalized("21000229000000Z")), None);
-    }
-
-    #[test]
-    fn a_time_out_of_the_form_of_rfc_5280_does_not_read() {
-        for text in [
-            "190426085809",
-            "1904260858Z",
-            "19042608580Z",
-            "190426085809.5Z",
-            "190426085809+0100",
-            "1904260858a9Z",
-            "191326085809Z",
-            "190400085809Z",
-            "190431085809Z",
-            "190426245809Z",
-            "190426086009Z",
-            "190426085860Z",
-        ] {
-            assert_eq!(time_of(&utc(text)), None, "{text}");
-        }
-        assert_eq!(time_of(&generalized("20190426085809.5Z")), None);
-        assert_eq!(time_of(&generalized("190426085809Z")), None);
-        assert_eq!(time_of(&der(INTEGER, b"190426085809Z")), None);
     }
 }

@@ -1,70 +1,43 @@
 # 0026. The transaction index: a `(tid, oid)` key space
 
-Status: accepted. The human confirmed the choice of a key space over an oid list in the `txns` row, with the signature change of `Backend::txn_records` below.
+Status: accepted. It changes the signature of `Backend::txn_records`.
 
 ## Context
 
-F1 asks for `IStorageIteration`, and F10 for the iterator that backup, verification and `zodbconvert` use. The iterator gives each transaction with its records. Undo, `lastInvalidations` and replication tailing read one transaction at a time.
-
-A record key is `(oid, tid)`, so the records of one transaction are spread over the whole `records` key space. No key space mapped a tid to its oids, so `Backend::txn_oids` scanned every key of `records`. Each start of an iterator read every record key of the store, also for a range of one transaction.
-
-Phase 1 writes the first real stores with `zodbconvert`. A key space that comes after them needs a migration of every store. No store exists outside the tests yet.
+F1 asks for `IStorageIteration`, and F10 for the iterator that backup, verification and `zodbconvert` use. Undo, `lastInvalidations` and replication tailing read one transaction at a time. A record key is `(oid, tid)`, so the records of one transaction spread over the whole `records` key space, and the oids of a transaction come only from a scan of every record key. A key space added later needs a migration of every store, and no real store exists yet.
 
 ## Decision
 
-**The key space.** The transaction index is a new redb table, `txn_oids`. It has one key for each record, a deletion included. The key is 16 bytes:
+**The key space.** `txn_oids` is a redb table with one 16-byte key for each record, a deletion included: the tid, then the oid, each a big-endian `u64`. It is the `records` key with its halves swapped. So a range scan over one tid gives its oids in ascending order, and a scan over a tid range gives its transactions in tid order. The value is the unit type `()` of redb, with a fixed width of 0. The row: specification, "Storage core", "Data model".
 
-| Bytes | Field |
-| --- | --- |
-| 0 to 7 | the tid, as a big-endian `u64` |
-| 8 to 15 | the oid, as a big-endian `u64` |
+**Writes.** `WriteTxn::put_record` stages the record and its index key in one write transaction, for a commit and for a restore, so a crash leaves both or neither. A blob record has no key of its own: the record of the same `(oid, tid)` has it.
 
-So the key is the `records` key with its two halves swapped. For example, the record of oid `0x1234` at tid `0x03f6db4f24444444` has the index key `03 f6 db 4f 24 44 44 44 00 00 00 00 00 00 12 34`. The byte order of the keys is the numeric order of `(tid, oid)`. A range scan over the keys of one tid gives the oids of that transaction in ascending order. A range scan over a tid range gives its transactions in tid order.
+**Reads.** `Backend::txn_oids(from, to)` and `Backend::indexed_tids(from, to, limit)` scan only the index keys. The iterator reads the rows of its range and the tids of the index a slice at a time, each slice one snapshot of at most 1,024 tids, and never reads the index of a tid before its rows. `Backend::txn_records(tid)` reads the row, the index keys and the records of one transaction in one snapshot. No read path scans `records` for the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
 
-The value is empty. The value type of the table is the unit type `()` of redb, with a fixed width of 0.
+**A trait signature changes.** `Backend::txn_records(tid, oids)` becomes `Backend::txn_records(tid)`: it reads the oids from the index, in the snapshot of the row and the records. Nothing outside `zoe-core` implements `Backend`.
 
-**Writes.** `WriteTxn::put_record` stages the record and its index key in the same backend write transaction. A normal commit and a restore both write their records through it in `finish`. So both index each record, and a crash leaves a record and its key together, or neither. The signature of `put_record` does not change: its contract now includes the key. A blob record (ADR 0023) has no index key of its own. The core stages each blob record with the record of the same `(oid, tid)`, and that record has the key.
+**Corruption.** The index has no frame and no checksum: the checksum of each record frame covers its `(oid, tid)` key. The iterator gives `CorruptTxn` for a transaction when:
 
-**Reads.** `Backend::txn_oids(from, to)` scans the index keys from `(from, 0)` to `(to, u64::MAX)`, both included, and reads nothing else. `Backend::indexed_tids(from, to, limit)` scans the same keys and gives each tid once, at most `limit` of them. The iterator reads the rows of its range a slice at a time (`Backend::iter_txns`). Then it reads the tids of the index that these rows cover, a slice at a time (`Backend::indexed_tids`). A slice holds at most 1,024 tids, and each slice is one snapshot. The iterator never reads the index of a tid before the rows of that tid. Then `Backend::txn_records(tid)` reads the row of each transaction, the index keys of its tid and their records, in one snapshot. No read path scans `records` to find the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
+- its index keys do not match the oid count of its row;
+- an index key has no record, also when the oid count went down with the record;
+- index keys of its tid have no row, and the range of the iterator has a row;
+- a scan gives a key outside its range, or not after the key before it: a damaged branch page of redb can move a seek.
 
-**A trait signature changes.** `Backend::txn_records(tid, oids)` becomes `Backend::txn_records(tid)`. It reads the oids of the transaction from the index, in the snapshot of the row and the records, and no longer takes the oids of an earlier read. Pack added the method, and nothing outside `zoe-core` implements `Backend`. The rule of the crate makes every change of an existing signature a decision of the human, so the human confirms this one at merge.
+A failed scan of the index gives its error once. The iterator then reads the rest of its range without the check for keys of a tid that has no row, and `txn_records` still checks each transaction. A record that no row counts and no key names is outside what the iterator reads: only a scan of `records`, such as a scrub, finds it.
 
-**Corruption.** The index has no frame and no checksum of its own. The checksum of each record frame covers the `(oid, tid)` key of the record. The iterator checks the index against the rows and the records:
+**Open.** A store without the `txn_oids` table fails to open with `Format`. No migration exists: the converters write the first real stores, with the index.
 
-- The index keys of a transaction must match the oid count of its row. A record without its index key breaks this rule, and the iterator gives `CorruptTxn` for its transaction.
-- Each index key must have its record. An index key without its record is `CorruptTxn` for its transaction, never `NotFound`. The row, the keys and the records of a transaction come from one snapshot. So a key that a removal left behind is `CorruptTxn` also when the oid count of its row went down with the record.
-- Index keys of a tid that has no row give `CorruptTxn` for that tid, when the range of the iterator has a row.
-- Each scan of the index checks that each key is inside its range and after the key before it. A damaged branch page of redb can move the seek of a scan, and the scan then gives a key of another transaction, or a key twice. Such a key is `CorruptTxn` with its tid.
-- A failed scan of the index gives its error once. The iterator then gives the transactions of the rest of its range without the check for index keys of a tid that has no row. `txn_records` still checks the index keys of each transaction.
+**Pack.** `WriteTxn::remove_record` removes the index key with the record, in the batch write of ADR 0025. It refuses a record without its index key with `CorruptTxn`. The batch write then fails and removes nothing, and the store halts until it reopens, so pack never erases the evidence of a damaged store. The crash simulation checks this on every crash image of a pack.
 
-A record that no row counts and that no index key names is outside what the iterator reads. Only a scan of `records` finds it. A scrub that reads every record can check the index key of each record at the same time.
-
-**Open.** A store without the `txn_oids` table fails to open with `Format`. No migration exists, because no real store exists yet: the converters of phase 1 write the first real stores, with the index. So the format name stays `ZOE format 1`.
-
-**Pack.** Pack removes records with `WriteTxn::remove_record`, which removes the index key with the record. Each batch of a pack is one backend write transaction that removes records, their index keys and their blob records, lowers the oid count of their rows, and removes a row that keeps no record (ADR 0025). So a row that pack removes has no index key left, and in every snapshot the index keys of a transaction match its row and its records. `remove_record` refuses a record without its index key with `CorruptTxn`. The batch write then fails and removes nothing, so pack never erases the evidence of a damaged store; as after any failed batch write, the store halts until it is reopened. The crash simulation checks this on every crash image of a pack.
-
-## Why the value is empty
-
-- The key holds everything that the index knows. A value would repeat what the record holds.
-- A frame (ADR 0020) on each key would add a 32-byte header to a 16-byte key, and its checksum would cover only that key. The record frame already covers the oid and the tid, and the iterator checks each key against its record.
-- With the unit type, a leaf page of redb stores no value bytes and no value offset, so an entry costs its 16 key bytes. With a byte-slice value, each entry also costs a 4-byte value offset.
-
-## Why not an oid list in the `txns` row
-
-The other choice was to write the oids of a transaction into the payload of its row, after the extension.
-
-- A transaction that writes many objects, for example a large copied transaction or a catalog reindex, would get a row of 8 bytes for each oid. Readers that list transactions, such as `undoLog` and `undoInfo`, read the rows, so they would read every oid list too. The key space keeps the row small.
-- `put_record` writes each key next to its record, so the index cannot miss a record of the commit. An oid list must be built from the staged records and written once, by `put_txn`.
-- Pack removes single records. With the key space, it removes one key for each record. With a list, it rewrites the whole list of each transaction that it changes.
-- RelStorage does the same: it indexes its `object_state` table by tid, so the objects of one transaction come from an index scan.
+**Why the value is empty.** The key holds all that the index knows. A frame would add a 32-byte header to a 16-byte key, and its checksum would cover only that key. With the unit type, a leaf entry of redb costs its 16 key bytes; a byte-slice value adds a 4-byte offset.
 
 ## Consequences
 
-- A read of one transaction, or of a tid range, reads the index keys, the rows and the records of the range. It reads nothing that grows with the rest of the store, except a deeper tree. In the acceptance test, a read of one commit of 8 records reads 124 KiB in a store, and 160 KiB in a store with 8 times more records.
-- Each record costs 16 bytes more in a leaf page, and its part of the branch pages. In a measured store of 500,000 records of about 270 bytes of pickle each, the index takes 2,003 pages of 4 KiB: 13% more pages than the store without it.
-- A commit writes one more key for each record, in the same write transaction.
-- The iterator holds one transaction with its records, one slice of the tids of the rows and one slice of the tids of the index. Its memory does not grow with the range or with the store. A slice of rows ends only after a row that reads, so a run of rows that do not read stays in one slice. Only then does the memory grow, with the length of that run.
-- The iterator does not see a record that no row counts and that no index key names.
-- A pack removes one index key with each record.
-- Every backend writes the key in `put_record`, removes it in `remove_record`, and reads the index in `txn_oids`, `indexed_tids` and `txn_records`. The trait default of `indexed_tids` goes through `txn_oids`, which holds every oid of the range. So a backend overrides `indexed_tids` to bound the memory of the iterator. The redb backend does.
-- A store written without the index does not open. No such store exists outside the tests.
+- A read of one transaction or of a tid range reads nothing that grows with the rest of the store, except a deeper tree. In the acceptance test, `crates/zoe-core/tests/txn_index.rs`, a read of one commit of 8 records reads 124 KiB, and 160 KiB in a store with 8 times more records.
+- Each record costs 16 bytes more in a leaf page. In a store of 500,000 records of about 270 bytes, the index takes 2,003 pages of 4 KiB: 13% more pages.
+- The iterator holds one transaction, one slice of row tids and one slice of index tids. Only a run of rows that do not read stays in one slice and grows the memory.
+- Every backend writes the key in `put_record`, removes it in `remove_record`, and reads it in `txn_oids`, `indexed_tids` and `txn_records`. The trait default of `indexed_tids` holds every oid of the range, so a backend overrides it to bound the memory of the iterator. The redb backend does.
+
+## Alternatives
+
+- **An oid list in the `txns` row.** A large transaction gets 8 bytes per oid in its row, which `undoLog` and `undoInfo` read. The list must be built from the staged records, and pack rewrites the whole list. RelStorage also indexes its objects by tid.

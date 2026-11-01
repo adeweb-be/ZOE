@@ -28,6 +28,8 @@ whole suite (`test_zeo_suites.py`).
 
 import unittest
 
+from suite_support import defining_class
+
 import zoe.testing
 
 # The mixins whose tests this harness runs, by module and class name.
@@ -41,15 +43,6 @@ MIXINS = {
 
 # The tests of these mixins that the harness does not run, and why.
 SKIPS = {}
-
-
-def defining_class(test):
-    """Return the class that defines the method of test."""
-    method = test._testMethodName
-    for cls in type(test).__mro__:
-        if method in vars(cls):
-            return cls
-    raise AssertionError(f"no class defines {test.id()}")
 
 
 def selected(suite):

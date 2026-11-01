@@ -15,33 +15,11 @@ r"""Acceptance test: `zoe serve` answers as ZEO's server where ZEO's suites look
 """
 
 import pytest
+from support import client, commit
 
 from zoe.testing import ZoeServer
 
-TIMEOUT = 30
 STR_ZERO = "\0" * 8
-
-
-def client(server, **kw):
-    from ZEO.ClientStorage import ClientStorage
-
-    kw.setdefault("wait_timeout", TIMEOUT)
-    return ClientStorage(server.address, storage="1", **kw)
-
-
-def commit(storage, stores):
-    from ZODB.Connection import TransactionMetaData
-
-    txn = TransactionMetaData()
-    storage.tpc_begin(txn)
-    try:
-        for oid, serial, data in stores:
-            storage.store(oid, serial, data, "", txn)
-        storage.tpc_vote(txn)
-    except BaseException:
-        storage.tpc_abort(txn)
-        raise
-    return storage.tpc_finish(txn)
 
 
 @pytest.fixture

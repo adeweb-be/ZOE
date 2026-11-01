@@ -24,6 +24,7 @@
 use std::ops::Deref;
 use std::time::{Duration, SystemTime};
 
+use super::observer::Stopwatch;
 use crate::error::{Result, ZoeError};
 use crate::lock::{Held, LockCancel, Mode, Refused};
 use crate::store::Store;
@@ -78,20 +79,18 @@ impl<S: Deref<Target = Store>> IntentLocks<S> {
         }
         let store: &Store = &self.store;
         let requests: Vec<(Oid, Mode)> = oids.iter().map(|&oid| (oid, Mode::Intent)).collect();
-        let started = store.observer().map(|_| store.clock.monotonic());
+        let watch = Stopwatch::start(store);
         let acquired = store.locks.acquire_cancellable(
             &requests,
             store.lock_timeout,
             &*store.clock,
             self.lock_cancel.as_ref(),
         );
-        let wait = started.map(|started| store.clock.monotonic().saturating_sub(started));
+        let wait = watch.elapsed();
         let locks = match acquired {
             Ok(locks) => locks.keep(),
             Err(Refused { error, released }) => {
-                store
-                    .guardrails
-                    .locks_released(&released, store.clock.now());
+                store.log_released(&released);
                 if let (Some(observer), Some(wait)) = (store.observer(), wait) {
                     observer.intent_locks_acquired(0, wait);
                 }
@@ -104,8 +103,7 @@ impl<S: Deref<Target = Store>> IntentLocks<S> {
         let serials = match store.backend.current_serials(&mut oids.iter().copied()) {
             Ok(serials) => serials,
             Err(error) => {
-                store.locks.release(&locks);
-                store.guardrails.locks_released(&locks, store.clock.now());
+                store.release_locks(&locks);
                 if let (Some(observer), Some(wait)) = (store.observer(), wait) {
                     observer.intent_locks_acquired(0, wait);
                 }
@@ -128,9 +126,7 @@ impl<S: Deref<Target = Store>> IntentLocks<S> {
             return;
         }
         let held = std::mem::take(&mut self.held);
-        let now = self.store.clock.now();
-        self.store.locks.release(&held);
-        self.store.guardrails.locks_released(&held, now);
+        self.store.release_locks(&held);
     }
 
     /// Return the oids that the owner holds, in ascending order.

@@ -260,6 +260,10 @@ impl Store {
             (at.min(last), last, watermark)
         };
         let _noting = Noting(&self.packing);
+        // The tables hold each commit up to the last tid, and the table of
+        // the write-ahead log none of them, before the mark: the pack
+        // removes rows of the tables only (ADR 0056, section 15).
+        self.backend.fold(last)?;
         let mut pack = Pack::new(self, tid, (tid > watermark).then_some(tid));
         pack.mark_roots(last)?;
         loop {
@@ -1106,7 +1110,8 @@ mod tests {
         // The root links the object, so the pack keeps its record.
         let last = commit(&store, &[(ROOT, record(&[Oid(1)]))]);
         // The row of `tid` says that it keeps no record, but its record and
-        // its index key stay.
+        // its index key stay. The fold puts the row into the tables first.
+        store.fold().unwrap();
         let row = store.backend.iter_txns(tid, tid).next().unwrap().unwrap();
         let mut write = store.backend.begin_write().unwrap();
         write

@@ -26,7 +26,8 @@
 //! by a common name of its subject that is the DNS name, as OpenSSL checks
 //! it for Python's `ssl`. In a directory, the client reads each file,
 //! while OpenSSL reads only the files whose names are the hashes of
-//! `openssl rehash`.
+//! `openssl rehash`. `zoe_wire::tls` reads the PEM files, and the validity
+//! period and the names of the pinned certificates.
 
 use std::fmt;
 use std::io;
@@ -41,12 +42,11 @@ use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_t
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::ParsedCertificate;
-use rustls::{CertificateError, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio_rustls::TlsConnector;
+use zoe_wire::tls::{Parts, Pinned, certificates, der};
 
 use crate::runtime::Stream;
-
-mod der;
 
 /// The files and the checks of TLS to a server, as the `<ssl>` section of
 /// a ZEO client gives them. The files are PEM.
@@ -241,26 +241,11 @@ fn roots(authenticate: Option<&Path>) -> Result<Roots, String> {
     Ok((roots, source, pinned))
 }
 
-/// A certificate of `authenticate` that a server certificate can match by
-/// its bytes, with its validity period and its names.
-#[derive(Debug)]
-struct Pinned {
-    der: CertificateDer<'static>,
-    parts: der::Parts,
-}
-
 /// Return the certificates of `certs` that a server certificate can match
-/// by its bytes. A certificate whose parts do not read never matches.
-fn pinned_of(certs: &[CertificateDer<'static>]) -> Arc<[Pinned]> {
-    certs
-        .iter()
-        .filter_map(|der| {
-            Some(Pinned {
-                parts: der::parts(der)?,
-                der: der.clone(),
-            })
-        })
-        .collect()
+/// by its bytes, with their validity periods and their names. A
+/// certificate whose parts do not read never matches.
+fn pinned_of(certs: &[CertificateDer<'static>]) -> Arc<Pinned<Parts>> {
+    Arc::new(Pinned::read(certs, der::parts))
 }
 
 /// The verifier of the server certificate.
@@ -275,7 +260,7 @@ fn pinned_of(certs: &[CertificateDer<'static>]) -> Arc<[Pinned]> {
 #[derive(Debug)]
 struct ServerCa {
     chain: Arc<dyn ServerCertVerifier>,
-    pinned: Arc<[Pinned]>,
+    pinned: Arc<Pinned<Parts>>,
     check_hostname: bool,
 }
 
@@ -288,11 +273,7 @@ impl ServerCertVerifier for ServerCa {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let pinned = self
-            .pinned
-            .iter()
-            .find(|pinned| pinned.der.as_ref() == end_entity.as_ref());
-        let Some(pinned) = pinned else {
+        let Some(parts) = self.pinned.find(end_entity) else {
             return self.chain.verify_server_cert(
                 end_entity,
                 intermediates,
@@ -301,21 +282,7 @@ impl ServerCertVerifier for ServerCa {
                 now,
             );
         };
-        let parts = &pinned.parts;
-        if now < parts.not_before {
-            return Err(CertificateError::NotValidYetContext {
-                time: now,
-                not_before: parts.not_before,
-            }
-            .into());
-        }
-        if now > parts.not_after {
-            return Err(CertificateError::ExpiredContext {
-                time: now,
-                not_after: parts.not_after,
-            }
-            .into());
-        }
+        parts.validity().check(now)?;
         if self.check_hostname {
             check_name(end_entity, parts, server_name)?;
         }
@@ -351,7 +318,7 @@ impl ServerCertVerifier for ServerCa {
 /// without regard to case, as OpenSSL checks it.
 fn check_name(
     cert: &CertificateDer<'_>,
-    parts: &der::Parts,
+    parts: &Parts,
     name: &ServerName<'_>,
 ) -> Result<(), rustls::Error> {
     let by_alt_names = verify_server_name(&ParsedCertificate::try_from(cert)?, name);
@@ -370,20 +337,6 @@ fn check_name(
         return Ok(());
     }
     by_alt_names
-}
-
-/// Read the certificates in the PEM file `path`. One at least is
-/// necessary.
-fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let failed = |error: rustls::pki_types::pem::Error| format!("{}: {error}", path.display());
-    let certs = CertificateDer::pem_file_iter(path)
-        .map_err(failed)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(failed)?;
-    if certs.is_empty() {
-        return Err(format!("{}: no certificate", path.display()));
-    }
-    Ok(certs)
 }
 
 /// A verifier that checks the chain of the server certificate against

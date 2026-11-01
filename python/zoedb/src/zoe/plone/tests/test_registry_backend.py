@@ -8,10 +8,7 @@ the backend themselves. The tests through `zoe serve` need the `zoe` binary
 of `zoe.testing.ZoeServer.binary()`.
 """
 
-import contextlib
-import shutil
 import sys
-import tempfile
 import unittest
 
 import transaction
@@ -31,29 +28,22 @@ from ZODB.POSException import ConflictError, ReadConflictError, Unsupported
 import zoe.kv
 from zoe.plone import registry as backend
 from zoe.plone.registry_rows import MARKER, decode_marker, dumps, encode_marker
-from zoe.plone.tests.test_concurrent_creations import copy_records
+from zoe.plone.tests.helpers import (
+    TITLE,
+    RegistryBackend,
+    copied_store,
+    copy_into,
+    namespace,
+    new_directory,
+    opened,
+)
 
-TITLE = "plone.site_title"
 OTHER = "plone.email_from_name"
 TIMEOUT = 30
 
 
 class GoneField(TextLine):
     """A field whose class a test takes away, as an add-on that is gone."""
-
-
-@contextlib.contextmanager
-def opened(db):
-    """Yield the Zope root of a new connection of `db` and its transaction
-    manager. Abort and close the connection at the end."""
-    manager = transaction.TransactionManager()
-    connection = db.open(transaction_manager=manager)
-    try:
-        manager.begin()
-        yield connection.root()["Application"], manager
-    finally:
-        manager.abort()
-        connection.close()
 
 
 class Wrapper:
@@ -84,27 +74,8 @@ def buckets(tree):
     return count
 
 
-def namespace(registry):
-    """Return the namespace of the moved `registry`."""
-    registry = aq_base(registry)
-    return zoe.kv.Namespace(registry._p_jar, "durable", registry._records.name)
-
-
-class TestRegistryBackend(unittest.TestCase):
+class TestRegistryBackend(RegistryBackend, unittest.TestCase):
     layer = PLONE_FUNCTIONAL_TESTING
-
-    def setUp(self):
-        backend.install()
-        self.addCleanup(backend.uninstall)
-        self.portal = self.layer["portal"]
-        self.db = self.layer["zodbDB"]
-        self.registry = self.portal.portal_registry
-
-    def moved(self):
-        """Move the registry of the site and commit. Return it."""
-        backend.move(self.registry)
-        transaction.commit()
-        return self.registry
 
     def set_marker(self, registry, oid, counter):
         """Write the marker of `registry` beside the backend, and drop the
@@ -204,17 +175,7 @@ class TestRegistryBackend(unittest.TestCase):
     def served_copy(self):
         """Copy the site to a new `zoe.Storage`, move its registry there and
         commit. Return the path of the store, closed."""
-        import zoe
-
-        directory = tempfile.mkdtemp(prefix="zoe-registry-served-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        path = f"{directory}/zoe"
-        storage = zoe.Storage(path)
-        try:
-            copy_records(self.db.storage, storage)
-        except BaseException:
-            storage.close()
-            raise
+        storage, path = copied_store(self, self.db.storage, "zoe-registry-served-")
         db = DB(storage)
         try:
             with opened(db) as (app, manager):
@@ -573,9 +534,7 @@ class TestRegistryBackend(unittest.TestCase):
 
         zoe.policy.install(self.portal._p_jar, {"classes": {}, "split_merges": "on"})
         transaction.commit()
-        directory = tempfile.mkdtemp(prefix="zoe-registry-log-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        log = f"{directory}/resolution.log"
+        log = f"{new_directory(self, 'zoe-registry-log-')}/resolution.log"
         db = self.copy(resolution_log=log)
         # Two writes from one snapshot split two buckets in two ranges of
         # names. Rule 2 of the split merge merges the second commit. With
@@ -740,16 +699,9 @@ class TestRegistryBackend(unittest.TestCase):
     def copy(self, **options):
         """Copy the records of the site to a new `zoe.Storage`, opened with
         `options`. Return its database."""
-        import zoe
-
-        directory = tempfile.mkdtemp(prefix="zoe-registry-copy-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe", **options)
-        try:
-            copy_records(self.db.storage, storage)
-        except BaseException:
-            storage.close()
-            raise
+        storage, _ = copied_store(
+            self, self.db.storage, "zoe-registry-copy-", **options
+        )
         db = DB(storage)
         self.addCleanup(db.close)
         return db
@@ -829,14 +781,8 @@ class TestRegistryBackend(unittest.TestCase):
         # A FileStorage has no namespaces and is no ZEO client: it holds
         # no rows, so reset goes on.
         self.moved()
-        directory = tempfile.mkdtemp(prefix="zoe-registry-file-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = FileStorage(f"{directory}/Data.fs")
-        try:
-            copy_records(self.db.storage, storage)
-        except BaseException:
-            storage.close()
-            raise
+        directory = new_directory(self, "zoe-registry-file-")
+        storage = copy_into(self.db.storage, FileStorage(f"{directory}/Data.fs"))
         db = DB(storage)
         self.addCleanup(db.close)
         with opened(db) as (app, manager):
@@ -853,17 +799,9 @@ class TestRegistryBackend(unittest.TestCase):
     def served_copy_without_rows(self):
         """Move the registry of the site, and copy the site without its rows
         to a new `zoe.Storage`. Return the path of the store, closed."""
-        import zoe
-
         self.moved()
-        directory = tempfile.mkdtemp(prefix="zoe-registry-norows-")
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        path = f"{directory}/zoe"
-        storage = zoe.Storage(path)
-        try:
-            copy_records(self.db.storage, storage)
-        finally:
-            storage.close()
+        storage, path = copied_store(self, self.db.storage, "zoe-registry-norows-")
+        storage.close()
         return path
 
     def test_reset_goes_on_for_a_zoe_zeo_client_with_kv(self):

@@ -14,25 +14,19 @@
 //! `zoe_pickle::python`: a node is `((child, key, child, ...), first)`, a
 //! bucket `(items,)` or `(items, next)`, and a reference `(oid, class)`.
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
-use zoe_client::{Cache, Client, Connect, Delivery, Options, Pool, Tokio};
+use common::{commit, open_cached, start};
+use zoe_client::{Client, Delivery, Options, Pool};
 use zoe_core::{Oid, Tid};
 use zoe_pickle::btrees::new_bucket_state;
 use zoe_pickle::python::{Heap, Pickler, Value};
-use zoe_server::serve::{ServeOptions, Server};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 const MODULE: &str = "BTrees.IIBTree";
-
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-client-split-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn pickled(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
     let mut pickler = Pickler::new(heap);
@@ -110,30 +104,6 @@ fn declaring() -> Options {
     }
 }
 
-/// Open a pool of at most `bound` connections that declare
-/// `server_writes`, with a client cache of 1 MB.
-async fn open_cached(server: &Server, bound: usize) -> Pool {
-    let addr = server.addr();
-    let listener = Client::open(Arc::new(Tokio), addr, "1", &declaring())
-        .await
-        .unwrap();
-    let connect: Connect = Arc::new(move || {
-        Box::pin(async move { Client::open(Arc::new(Tokio), addr, "1", &declaring()).await })
-    });
-    let cache = Cache::new(1 << 20).unwrap();
-    Pool::with_cache(Arc::new(Tokio), listener, connect, bound, Some(cache))
-}
-
-/// Commit `writes` through `client`, as another client.
-async fn commit_other(client: &Client, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-    let mut txn = client.begin(b"", b"", b"").await.unwrap();
-    for (oid, serial, data) in writes {
-        txn.store(*oid, *serial, data).await.unwrap();
-    }
-    txn.vote().await.unwrap();
-    txn.finish().await.unwrap()
-}
-
 /// Deliver the next tid of another client to the consumer of `pool`.
 async fn deliver(pool: &Pool) {
     let delivery = tokio::time::timeout(TIMEOUT, pool.next_delivery())
@@ -146,18 +116,22 @@ async fn deliver(pool: &Pool) {
 
 #[tokio::test]
 async fn a_node_resolved_without_a_record_enters_the_cache_at_its_next_load() {
-    let server = Server::start(ServeOptions::new(fresh_dir("node").join("store"))).unwrap();
-    let pool = open_cached(&server, 2).await;
+    let server = start("node");
+    let pool = open_cached(&server, 2, Some(declaring())).await;
     let cache = pool.cache().unwrap().clone();
     let other = Client::connect(server.addr(), "1").await.unwrap();
     let oids = other.new_oids(6).await.unwrap();
     let (policy_oid, n, b0, b1, y) = (oids[1], oids[2], oids[3], oids[4], oids[5]);
-    commit_other(&other, &[(policy_oid, Tid::ZERO, policy())]).await;
+    commit(&other, &[(policy_oid, Tid::ZERO, policy())])
+        .await
+        .unwrap();
     deliver(&pool).await;
-    commit_other(&other, &[(Oid(0), Tid::ZERO, root(policy_oid))]).await;
+    commit(&other, &[(Oid(0), Tid::ZERO, root(policy_oid))])
+        .await
+        .unwrap();
     deliver(&pool).await;
     // The node n holds the buckets b0 [10, 20, 30] and b1 [40, 50, 60].
-    let read = commit_other(
+    let read = commit(
         &other,
         &[
             (n, Tid::ZERO, node(b0, &[(40, b1)])),
@@ -165,10 +139,11 @@ async fn a_node_resolved_without_a_record_enters_the_cache_at_its_next_load() {
             (b1, Tid::ZERO, bucket(&[40, 50, 60], None)),
         ],
     )
-    .await;
+    .await
+    .unwrap();
     deliver(&pool).await;
     // S1 splits b1 into b1 and y.
-    let s1 = commit_other(
+    let s1 = commit(
         &other,
         &[
             (n, read, node(b0, &[(40, b1), (60, y)])),
@@ -176,7 +151,8 @@ async fn a_node_resolved_without_a_record_enters_the_cache_at_its_next_load() {
             (y, Tid::ZERO, bucket(&[60, 70], None)),
         ],
     )
-    .await;
+    .await
+    .unwrap();
     deliver(&pool).await;
     // The cache holds the node of S1.
     let (committed, serial) = pool.load(n).await.unwrap();

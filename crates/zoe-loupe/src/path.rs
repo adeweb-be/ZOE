@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use zoe_core::{Oid, ZoeError};
+use zoe_core::Oid;
 use zoe_pickle::{Node, Resolver, Tree};
 
 use crate::state::{dict_entries, target};
@@ -87,7 +87,7 @@ pub(crate) fn items(
     read: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<(String, Oid)>> {
     let mut items = Named::default();
-    let Some(tree) = readable_tree(view, oid)? else {
+    let Some(tree) = view.readable_tree(oid)? else {
         return Ok(Vec::new());
     };
     if let Some(kind) = btree_kind(&tree) {
@@ -109,7 +109,7 @@ pub(crate) fn items(
     let folder = attribute(&resolver, state, "_tree").and_then(|value| reference(&resolver, value));
     if let Some(folder) = folder {
         read()?;
-        if let Some(folder_tree) = readable_tree(view, folder)?
+        if let Some(folder_tree) = view.readable_tree(folder)?
             && let Some(kind) = btree_kind(&folder_tree)
         {
             btree_items(view, folder, folder_tree, kind, &mut items, read)?;
@@ -183,20 +183,6 @@ impl Named {
     }
 }
 
-/// Return the record of `oid`, decoded, or `None` when it does not decode
-/// or when `oid` has no record in the view.
-fn readable_tree(view: &Snapshot<'_>, oid: Oid) -> Result<Option<Tree>> {
-    match view.tree(oid) {
-        Ok(tree) => Ok(Some(tree)),
-        Err(
-            Error::Refused { .. }
-            | Error::NoRecordAsOf { .. }
-            | Error::Store(ZoeError::NotFound { .. }),
-        ) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 /// Add the keys and the values of the BTree whose root is the record
 /// `oid`, decoded as `tree`, to `items`, in key order. The first entry of
 /// a key wins, as in a lookup. Each node is read once, so a cycle in a
@@ -223,7 +209,7 @@ fn btree_items(
                     continue;
                 }
                 read()?;
-                match readable_tree(view, next)? {
+                match view.readable_tree(next)? {
                     Some(tree) => match btree_kind(&tree) {
                         Some((kind, _)) => (tree, kind),
                         None => continue,
@@ -491,33 +477,17 @@ fn reference<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<Oid> {
 
 #[cfg(test)]
 mod tests {
+    use zoe_core::testing::TempDir;
     use zoe_core::{Store, Tid};
 
+    use zoe_pickle::testing::{record, reference, text};
+
     use super::*;
-    use crate::Folder;
-
-    /// A record of the class `module.name` with the state pickle `state`.
-    fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n.");
-        [b"\x80\x03", class.as_bytes(), b"\x80\x03", state, b"."].concat()
-    }
-
-    /// A persistent reference to `oid` with the class `module.name`.
-    fn reference(oid: u64, module: &str, name: &str) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n");
-        [
-            &b"C\x08"[..],
-            &oid.to_be_bytes(),
-            class.as_bytes(),
-            b"\x86Q",
-        ]
-        .concat()
-    }
+    use crate::{Folder, fresh_dir};
 
     /// Write a store whose application holds an `IOBTree` with the key 7.
-    fn int_tree_store() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-loupe-int-keys-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn int_tree_store() -> TempDir {
+        let dir = fresh_dir("int-keys");
         let records = [
             record(
                 "persistent.mapping",
@@ -575,12 +545,6 @@ mod tests {
         }
     }
 
-    /// A text in a pickle.
-    fn text(value: &str) -> Vec<u8> {
-        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
-        [&b"X"[..], &length, value.as_bytes()].concat()
-    }
-
     /// A dict state with the text keys and the pickled values of
     /// `entries`, in order.
     fn dict(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
@@ -606,9 +570,8 @@ mod tests {
 
     /// Write a store whose application holds a folder with a BTree of two
     /// buckets, a mapping, an `IOBTree` and a record that does not decode.
-    fn items_store() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("zoe-loupe-items-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn items_store() -> TempDir {
+        let dir = fresh_dir("items");
         let item = |oid| reference(oid, "m", "Item");
         let bucket = |oid| reference(oid, "BTrees.OOBTree", "OOBucket");
         let mapping = |state: &[u8]| record("persistent.mapping", "PersistentMapping", state);

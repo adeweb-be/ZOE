@@ -18,7 +18,7 @@
 //! and also waits for the single writer of the backend.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Result, ZoeError};
 use crate::store::Store;
@@ -52,7 +52,7 @@ pub(crate) struct Sequences {
 impl Sequences {
     /// Return the state of `name`. Make it on the first call.
     fn counter(&self, name: &str) -> Arc<Counter> {
-        let mut counters = self.counters.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut counters = crate::lock(&self.counters);
         if let Some(counter) = counters.get(name) {
             return Arc::clone(counter);
         }
@@ -153,10 +153,7 @@ impl<'a> Sequence<'a> {
     fn lock(&self) -> MutexGuard<'_, Option<Block>> {
         // A panic cannot leave a block half changed: `next` writes it back
         // only after the reservation succeeds.
-        self.counter
-            .block
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.counter.block)
     }
 
     /// Return the empty block at the stored end of the name. A name with no

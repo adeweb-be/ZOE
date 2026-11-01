@@ -2296,6 +2296,7 @@ name = "zoe-convert"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "serde_json",
  "thiserror",
  "xxhash-rust",
  "zoe-core",
@@ -2370,6 +2371,8 @@ dependencies = [
  "zoe-convert",
  "zoe-core",
  "zoe-mcp",
+ "zoe-pickle",
+ "zoe-wire",
 ]
 
 [[package]]
@@ -2380,6 +2383,14 @@ dependencies = [
  "zoe-core",
  "zoe-pickle",
  "zoe-server",
+]
+
+[[package]]
+name = "zoe-wire"
+version = "0.0.0"
+dependencies = [
+ "rmpv",
+ "rustls",
 ]
 
 [[package]]

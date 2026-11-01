@@ -25,6 +25,7 @@ import sys
 
 import jsonschema
 import pytest
+from conftest import output
 
 BENCH = pathlib.Path(__file__).parents[2]
 SCHEMA_PATH = BENCH / "schema" / "results.schema.json"
@@ -33,11 +34,6 @@ SCENARIOS = ("add", "update", "read_cold", "read_warm", "read_hot")
 SERVER_SCENARIOS = [name for name in SCENARIOS if name != "read_hot"]
 CELLS = (("threads", 16), ("processes", 16))
 PARITY = dict.fromkeys(SCENARIOS, 1000.0)
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text())
 
 
 def result_of(storage, ops):
@@ -106,10 +102,6 @@ def gate(directory, *args):
         text=True,
         check=False,
     )
-
-
-def output(result):
-    return result.stdout + result.stderr
 
 
 def rows(result, scenario):

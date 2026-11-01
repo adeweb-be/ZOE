@@ -24,8 +24,11 @@ use std::ops::ControlFlow;
 
 use serde::Serialize;
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
+use zoe_pickle::decode_class_key;
 
-use crate::{Error, Result, Snapshot, serialize_oid, serialize_tid, strong_references};
+use crate::ids::{serialize_oid, serialize_tid};
+use crate::snapshot::strong_references;
+use crate::{Error, Result, Snapshot};
 
 /// The most items of a path that [`PathSpace`] lists one by one. The
 /// others add up in [`PathSpace::others`].
@@ -229,15 +232,6 @@ fn report(
     }
 }
 
-/// Return the class key of a record: `module.name` from its class pickle,
-/// or `None` when the class pickle gives no name.
-fn class_of(data: &[u8]) -> Option<String> {
-    match zoe_pickle::decode_class_name(data) {
-        Ok(Some((module, name))) => Some(format!("{module}.{name}")),
-        _ => None,
-    }
-}
-
 /// A record that `space` keeps among the largest: the key of the heap,
 /// from its size and its oid, then its class.
 type Kept = (Reverse<(u64, Reverse<Oid>)>, Option<String>);
@@ -257,7 +251,7 @@ pub(crate) fn space(
     let mut done = 0;
     while let Some(record) = store.record_iternext(next)? {
         let size = record.data.len() as u64;
-        let class = class_of(&record.data);
+        let class = decode_class_key(&record.data).ok().flatten();
         let key = class.as_deref().unwrap_or(PackReport::UNKNOWN_CLASS);
         match space.by_class.get_mut(key) {
             Some(totals) => totals.add(size),
@@ -423,7 +417,9 @@ pub(crate) fn path_space(
     }
     items.truncate(ITEM_LIMIT);
     let class_at = |oid| -> Result<Option<String>> {
-        Ok(view.record(oid)?.and_then(|(data, _)| class_of(&data)))
+        Ok(view
+            .record(oid)?
+            .and_then(|(data, _)| decode_class_key(&data).ok().flatten()))
     };
     let items = items
         .into_iter()
@@ -453,41 +449,19 @@ fn normal_path(path: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
-impl Snapshot<'_> {
-    /// Return the record of `oid` and its serial, or `None` when `oid` has
-    /// no record in the view or its record is a deletion.
-    fn record(&self, oid: Oid) -> Result<Option<(Vec<u8>, Tid)>> {
-        match self.load(oid) {
-            Ok(found) => Ok(Some(found)),
-            Err(Error::NoRecordAsOf { .. } | Error::Store(ZoeError::NotFound { .. })) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::path::PathBuf;
+
+    use zoe_core::testing::TempDir;
+    use zoe_pickle::testing::{record, text};
 
     use super::*;
-    use crate::Folder;
-
-    /// A record of the class `module.name` with the state pickle `state`.
-    fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n.");
-        [b"\x80\x03", class.as_bytes(), b"\x80\x03", state, b"."].concat()
-    }
-
-    /// A text in a pickle.
-    fn text(value: &str) -> Vec<u8> {
-        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
-        [&b"X"[..], &length, value.as_bytes()].concat()
-    }
+    use crate::{Folder, fresh_dir};
 
     /// A persistent reference to `oid` with the class `m.C`.
     fn reference(oid: u64) -> Vec<u8> {
-        [&b"C\x08"[..], &oid.to_be_bytes(), b"cm\nC\n\x86Q"].concat()
+        zoe_pickle::testing::reference(oid, "m", "C")
     }
 
     /// A weak reference to `oid`: `['w', (oid,)]`.
@@ -529,21 +503,13 @@ mod tests {
         record("BTrees.OOBTree", "OOBTree", &state)
     }
 
-    /// Return a new directory for one test.
-    fn fresh(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zoe-loupe-space-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     /// The records of one transaction by oid. `None` is a deletion.
     type Records = Vec<(u64, Option<Vec<u8>>)>;
 
     /// Write a store with one restore transaction for each item of
     /// `txns`: its tid and its records by oid. `None` is a deletion.
-    fn store_with(name: &str, txns: &[(u64, Records)]) -> PathBuf {
-        let dir = fresh(name);
+    fn store_with(name: &str, txns: &[(u64, Records)]) -> TempDir {
+        let dir = fresh_dir(&format!("space-{name}"));
         let store = Store::open(&dir).unwrap();
         for (tid, records) in txns {
             let mut txn = store.tpc_begin_restore(Tid(*tid), b"", b"", b"").unwrap();
@@ -651,7 +617,7 @@ mod tests {
 
     #[test]
     fn the_space_counts_the_current_blob_files() {
-        let dir = fresh("blobs");
+        let dir = fresh_dir("space-blobs");
         {
             let store = Store::open(&dir).unwrap();
             for (oid, bytes) in [(1, &b"twelve bytes"[..]), (2, b"four")] {
@@ -717,7 +683,7 @@ mod tests {
 
     /// A site at `/site` with two items in its `_tree` that share an
     /// object, annotations, and a weak reference.
-    fn site() -> (PathBuf, BTreeMap<u64, Vec<u8>>) {
+    fn site() -> (TempDir, BTreeMap<u64, Vec<u8>>) {
         let records = BTreeMap::from([
             (0, root()),
             (1, item(&[("site", reference(2))])),

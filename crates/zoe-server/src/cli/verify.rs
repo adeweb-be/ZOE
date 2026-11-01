@@ -5,9 +5,11 @@
 //! `zoe_convert::verify` and `zoe_convert::verify_backup` do the work. The
 //! command opens the store read-only, so it changes no byte of a store
 //! that was closed cleanly. It writes `zoe.redb` only when it repairs a
-//! store that a writer left open, and then says so on stderr. With
-//! `--backup`, it opens the store only after it built its copy of the
-//! dumps. It fails with a report that lists a finding.
+//! store that a writer left open, and then says so on stderr. A damaged
+//! write-ahead log is the finding `log`: the check then reads the tables
+//! alone (ADR 0056). With `--backup`, it opens the store only after it
+//! built its copy of the dumps. It fails with a report that lists a
+//! finding.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -15,9 +17,16 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
-use zoe_convert::{BackupCheck, Verification};
+use zoe_convert::{BackupCheck, IdForm, LogProblem, Verification};
+use zoe_core::{Options, Store};
 
-use super::{Failure, closed_by_reader, open_with_blobs};
+use super::{
+    Failure, blob_dir_failure, closed_by_reader, open_repairing, open_with_blobs, store_failure,
+    write_counts,
+};
+
+/// The width of the names of the counts of the report.
+const COUNTS: usize = 17;
 
 /// The format of the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -98,8 +107,9 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     // `zoe.redb` only when it repairs a store that a writer left open. It
     // fails on a directory without a store. A wrong blob directory fails
     // here, so the report does not list each blob.
-    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
-    let report = zoe_convert::verify(&store, known.as_ref());
+    let (store, log) = open_checked(path, args.blob_dir.as_deref())?;
+    let mut report = zoe_convert::verify(&store, known.as_ref());
+    report.log = log;
     drop(store);
     let written = match args.format {
         Format::Text => write_text(out, path, &report),
@@ -107,6 +117,38 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     }
     .and_then(|()| out.flush());
     found(path, report.problems(), written)
+}
+
+/// Open the store in `path` for the check, as `open_with_blobs` does.
+///
+/// A damaged write-ahead log fails the open of the tools with `CorruptTxn`
+/// (ADR 0056). Then the call opens the tables alone with
+/// `Store::open_read_only_tables`, and returns the damage as the finding
+/// `log`. The open of the tools repaired `zoe.redb` before it read the log,
+/// so the strict open of the tables reads the file.
+fn open_checked(
+    path: &Path,
+    blob_dir: Option<&Path>,
+) -> Result<(Store, Option<LogProblem>), Failure> {
+    let options = Options {
+        blob_dir: blob_dir.map(Path::to_path_buf),
+        ..Options::default()
+    };
+    let (store, log) = match open_repairing(path, options.clone()) {
+        Ok(store) => (store, None),
+        Err(error) => match LogProblem::of(&error) {
+            Some(log) => {
+                let store = Store::open_read_only_tables(path, options)
+                    .map_err(|e| store_failure(path, e))?;
+                (store, Some(log))
+            }
+            None => return Err(store_failure(path, error)),
+        },
+    };
+    store
+        .check_blob_dir()
+        .map_err(|e| blob_dir_failure(path, e))?;
+    Ok((store, log))
 }
 
 /// Compare the dumps in `dumps` with the store of `args`, and write the
@@ -162,13 +204,19 @@ fn write_backup_text(
         dumps.display(),
         path.display()
     )?;
-    writeln!(out, "  dumps            {}", restored.dumps)?;
-    writeln!(out, "  last tid         {}", hex(restored.last_tid.0))?;
-    writeln!(out, "  transactions     {}", restored.transactions)?;
-    writeln!(out, "  records          {}", restored.records)?;
-    writeln!(out, "  blobs            {}", restored.blobs)?;
-    writeln!(out, "  sequences        {}", restored.sequences)?;
-    writeln!(out, "  durable rows     {}", restored.durable_rows)?;
+    write_counts(
+        out,
+        COUNTS,
+        &[
+            ("dumps", &restored.dumps),
+            ("last tid", &restored.last_tid.hex()),
+            ("transactions", &restored.transactions),
+            ("records", &restored.records),
+            ("blobs", &restored.blobs),
+            ("sequences", &restored.sequences),
+            ("durable rows", &restored.durable_rows),
+        ],
+    )?;
     writeln!(out, "Differences: {}", check.differences.len())?;
     for difference in &check.differences {
         writeln!(out, "  {difference}")?;
@@ -209,43 +257,22 @@ fn read_classes(path: &Path) -> Result<BTreeSet<String>, Failure> {
         .collect())
 }
 
-/// Return the report as one JSON value.
+/// Return the report as one JSON value, with the oids and the tids as
+/// numbers and every finding.
 fn to_json(report: &Verification) -> Value {
-    let checksums: Vec<Value> = report
-        .checksums
-        .iter()
-        .map(|p| json!({"oid": p.oid.map(|o| o.0), "tid": p.tid.map(|t| t.0), "error": p.error}))
-        .collect();
-    let blobs: Vec<Value> = report
-        .blob_files
-        .iter()
-        .map(|p| json!({"oid": p.oid.0, "tid": p.tid.0, "error": p.error}))
-        .collect();
-    let references: Vec<Value> = report
-        .references
-        .iter()
-        .map(|d| json!({"oid": d.oid.0, "tid": d.tid.0, "missing": d.missing.0}))
-        .collect();
-    let pickles: Vec<Value> = report
-        .pickles
-        .iter()
-        .map(|p| json!({"oid": p.oid.0, "tid": p.tid.0, "error": p.error}))
-        .collect();
-    json!({
-        "checksums": checksums,
-        "blobs": blobs,
-        "references": references,
-        "pickles": pickles,
-        "classes": report.classes,
-        "unknown_classes": report.unknown_classes,
-        "object_count": report.object_count,
-        "namespaces": {
-            "ephemeral_keys": report.ephemeral_keys,
-            "durable_keys": report.durable_keys,
-            "expired_keys": report.expired_keys,
-        },
-        "count": report.count.map(|c| json!({"stored": c.stored, "counted": c.counted})),
-    })
+    let mut value = report.to_json(IdForm::Number, usize::MAX);
+    value["object_count"] = json!(report.object_count);
+    value["namespaces"] = json!({
+        "ephemeral_keys": report.ephemeral_keys,
+        "durable_keys": report.durable_keys,
+        "expired_keys": report.expired_keys,
+    });
+    value["count"] = json!(
+        report
+            .count
+            .map(|c| json!({"stored": c.stored, "counted": c.counted}))
+    );
+    value
 }
 
 /// Write the report as one JSON document.
@@ -254,45 +281,43 @@ fn write_json(out: &mut dyn Write, report: &Verification) -> io::Result<()> {
     writeln!(out)
 }
 
-/// Return an oid or a tid as ZODB prints it.
-fn hex(n: u64) -> String {
-    format!("{n:#018x}")
-}
-
 /// Write the report for a person.
 fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Result<()> {
     writeln!(out, "Verified the store {}", path.display())?;
-    writeln!(out, "  transactions     {}", report.transactions)?;
-    writeln!(out, "  sequences        {}", report.sequences)?;
-    writeln!(out, "  ephemeral keys   {}", report.ephemeral_keys)?;
-    writeln!(out, "  durable keys     {}", report.durable_keys)?;
-    writeln!(out, "  expired keys     {}", report.expired_keys)?;
-    writeln!(out, "  records          {}", report.records)?;
-    writeln!(out, "  objects          {}", report.objects)?;
-    writeln!(out, "  blobs            {}", report.blobs)?;
+    write_counts(
+        out,
+        COUNTS,
+        &[
+            ("transactions", &report.transactions),
+            ("sequences", &report.sequences),
+            ("ephemeral keys", &report.ephemeral_keys),
+            ("durable keys", &report.durable_keys),
+            ("expired keys", &report.expired_keys),
+            ("records", &report.records),
+            ("objects", &report.objects),
+            ("blobs", &report.blobs),
+        ],
+    )?;
     match report.object_count {
         Some(count) => writeln!(out, "  object count     {count}")?,
-        None => writeln!(
-            out,
-            "  object count     none: the store has no count yet (ZOE format 1)"
-        )?,
+        None => writeln!(out, "  object count     none: the store has no count yet")?,
     }
     writeln!(out, "Findings: {}", report.problems())?;
     writeln!(out, "  checksums        {}", report.checksums.len())?;
     for p in &report.checksums {
-        let oid = p.oid.map(|o| format!("oid {}, ", hex(o.0)));
-        let tid = p.tid.map(|t| format!("tid {}: ", hex(t.0)));
+        let oid = p.oid.map(|o| format!("oid {}, ", o.hex()));
+        let tid = p.tid.map(|t| format!("tid {}: ", t.hex()));
         let (oid, tid) = (oid.unwrap_or_default(), tid.unwrap_or_default());
         writeln!(out, "    {oid}{tid}{}", p.error)?;
     }
     writeln!(out, "  blob files       {}", report.blob_files.len())?;
     for p in &report.blob_files {
-        let (oid, tid) = (hex(p.oid.0), hex(p.tid.0));
+        let (oid, tid) = (p.oid.hex(), p.tid.hex());
         writeln!(out, "    oid {oid}, tid {tid}: {}", p.error)?;
     }
     writeln!(out, "  references       {}", report.references.len())?;
     for d in &report.references {
-        let (oid, tid, missing) = (hex(d.oid.0), hex(d.tid.0), hex(d.missing.0));
+        let (oid, tid, missing) = (d.oid.hex(), d.tid.hex(), d.missing.hex());
         writeln!(
             out,
             "    oid {oid}, tid {tid}: oid {missing} has no current record"
@@ -300,7 +325,7 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     }
     writeln!(out, "  pickles          {}", report.pickles.len())?;
     for p in &report.pickles {
-        let (oid, tid) = (hex(p.oid.0), hex(p.tid.0));
+        let (oid, tid) = (p.oid.hex(), p.tid.hex());
         writeln!(out, "    oid {oid}, tid {tid}: {}", p.error)?;
     }
     writeln!(out, "  unknown classes  {}", report.unknown_classes.len())?;
@@ -317,6 +342,19 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
             out,
             "    the store counts {} objects, and {} oids have records",
             c.stored, c.counted
+        )?;
+    }
+    writeln!(
+        out,
+        "  log              {}",
+        usize::from(report.log.is_some())
+    )?;
+    if let Some(log) = &report.log {
+        writeln!(
+            out,
+            "    tid {}: {}; the check read the tables alone",
+            log.tid.hex(),
+            log.error
         )?;
     }
     writeln!(out, "Classes: {}", report.classes.len())?;
@@ -389,13 +427,13 @@ mod tests {
             write_text(&mut out, Path::new("store"), report).unwrap();
             String::from_utf8(out).unwrap()
         };
-        // A store of format 1 has no count: one line, and no finding.
-        let format_1 = text(&Verification::default());
+        // A store without a count: one line, and no finding.
+        let no_count = text(&Verification::default());
         assert!(
-            format_1.contains("\n  object count     none: the store has no count yet"),
-            "{format_1}"
+            no_count.contains("\n  object count     none: the store has no count yet"),
+            "{no_count}"
         );
-        assert!(format_1.contains("Findings: 0\n"), "{format_1}");
+        assert!(no_count.contains("Findings: 0\n"), "{no_count}");
 
         let differs = Verification {
             object_count: Some(3),

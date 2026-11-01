@@ -22,29 +22,17 @@ import threading
 import time
 
 import pytest
+from client_support import blob_native as native
+from support import TIMEOUT
 
-import zoe.testing
 from zoe.testing import ZoeServer
 
-TIMEOUT = 30
 # Larger than many chunks of 64 KiB, and not a multiple of it.
 LARGE = 3 * 1024 * 1024 + 12345
 # The target size of the blob cache for the pruning test.
 CACHE_SIZE = 1_000_000
 # Sixteen blobs of this size make 4 MiB.
 PRUNED_BLOB = 256 * 1024
-
-
-def native(server, blob_dir, shared=False, **kw):
-    """Open a native client of the storage 1 of `server`."""
-    return zoe.testing.native_client(
-        server.address,
-        storage="1",
-        wait_timeout=TIMEOUT,
-        blob_dir=str(blob_dir),
-        shared_blob_dir=shared,
-        **kw,
-    )
 
 
 @pytest.fixture
