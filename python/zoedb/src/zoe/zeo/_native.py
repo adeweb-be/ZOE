@@ -485,11 +485,11 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
-        # A bad list of hot classes or a bad twin raises before the client
-        # connects.
+        # A bad list of hot classes raises before the client connects.
         self._early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
-        prefetch = prefetch_references(_prefetch_references)
         given = dict(locals())
+        # A bad twin raises before the client connects too.
+        prefetch = prefetch_references(_prefetch_references)
         fall_back = self.__dict__.pop("_fall_back", False) and wait
         cache_path = _native_cache_path(cache, var, client, storage)
         if ssl is not None:
