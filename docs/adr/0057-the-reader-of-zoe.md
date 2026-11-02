@@ -121,8 +121,8 @@ The method follows `Connection.setstate` of ZODB 6.0, 6.1, 6.2, 6.3 and 6.4, whi
 These loads call the `setstate` that ZODB's `Connection` has at the call, with the connection and the object:
 
 - a closed connection: ZODB's method logs and raises its `ConnectionStateError`;
-- an instance of `ZODB.blob.Blob`: ZODB's method loads it and its blob file;
-- a connection whose `setstate` of ZODB's `Connection` is not the function of ZODB. The early locks of `zoe.zodb` put the `setstate` of `LockingConnection` there once per process; for a storage whose `early_lock_classes` is not empty, the load goes to it, and for another storage it stays in Rust, as `LockingConnection.setstate` gives such a load to the function of ZODB. Another function, such as a patch of another package, gets every load.
+- an object whose type is a subclass of `ZODB.blob.Blob`: ZODB's method loads it and its blob file;
+- a connection when the `setstate` in the dict of ZODB's `Connection` is not the function of ZODB. The early locks of `zoe.zodb` put the `setstate` of `LockingConnection` there once per process; for a storage whose `early_lock_classes` is not empty, the load goes to it, and for another storage it stays in Rust, as `LockingConnection.setstate` gives such a load to the function of ZODB. Another function, such as a patch of another package, gets every load.
 
 The method reads the function of ZODB at its first call, by its module and its name.
 

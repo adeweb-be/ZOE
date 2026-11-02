@@ -215,6 +215,8 @@ fn ghost_state(
 struct ConnectionNames {
     /// `ZODB.Connection.Connection`.
     zodb_connection: Py<PyType>,
+    /// The dict of `ZODB.Connection.Connection`, which holds its methods.
+    zodb_connection_dict: Py<PyDict>,
     /// The function `setstate` of ZODB, when `ZODB.Connection.Connection`
     /// held it at the first call.
     zodb_setstate: Option<Py<PyAny>>,
@@ -259,6 +261,7 @@ impl ConnectionNames {
                 .getattr("LockingConnection")?
                 .getattr("setstate")?
                 .unbind(),
+            zodb_connection_dict: type_dict(&zodb_connection)?.unbind(),
             zodb_connection: zodb_connection.unbind(),
             blob: class("ZODB.blob", "Blob")?,
             conflict_error: class("ZODB.POSException", "ConflictError")?,
@@ -319,14 +322,26 @@ fn connection_setstate(conn: &Bound<'_, PyAny>, obj: &Bound<'_, PyAny>) -> PyRes
     let py = conn.py();
     let names = CONNECTION_NAMES.get_or_try_init(py, || ConnectionNames::import(py))?;
     let oid = obj.getattr(intern!(py, "_p_oid"))?;
-    let setstate = names
-        .zodb_connection
+    // The method of ZODB's `Connection` now, from the dict of the class.
+    let setstate = match names
+        .zodb_connection_dict
         .bind(py)
-        .getattr(intern!(py, "setstate"))?;
+        .get_item(intern!(py, "setstate"))?
+    {
+        Some(setstate) => setstate,
+        None => names
+            .zodb_connection
+            .bind(py)
+            .getattr(intern!(py, "setstate"))?,
+    };
     if conn.getattr(intern!(py, "opened"))?.is_none()
-        || obj.is_instance(names.blob.bind(py))?
+        || obj.get_type().is_subclass(names.blob.bind(py))?
         || !names.in_rust(&setstate, conn)?
     {
+        let setstate = names
+            .zodb_connection
+            .bind(py)
+            .getattr(intern!(py, "setstate"))?;
         setstate.call1((conn, obj))?;
         return Ok(());
     }
@@ -359,9 +374,9 @@ fn load_state(
         reader.call_method1(intern!(py, "setGhostState"), (obj, &pickle))?;
     }
     obj.setattr(intern!(py, "_p_serial"), serial)?;
-    let size = pickle.len()?;
+    let Ok(size) = pickle.len()?.into_pyobject(py);
     conn.getattr(intern!(py, "_cache"))?
-        .call_method1(intern!(py, "update_object_size_estimation"), (oid, size))?;
+        .call_method1(intern!(py, "update_object_size_estimation"), (oid, &size))?;
     obj.setattr(intern!(py, "_p_estimated_size"), size)?;
     Ok(())
 }
@@ -439,6 +454,17 @@ fn log_load_error(
 pub(crate) fn setstate_method<'py>(m: &Bound<'py, PyModule>) -> PyResult<Bound<'py, PyAny>> {
     let function = wrap_pyfunction!(connection_setstate, m)?;
     instance_method(function.as_any())
+}
+
+/// The dict of the class `class`, as `PyType_GetDict` gives it.
+#[allow(unsafe_code)]
+fn type_dict<'py>(class: &Bound<'py, PyType>) -> PyResult<Bound<'py, PyDict>> {
+    // SAFETY: `class` is a live type object. The call returns a new
+    // reference to its dict, or NULL with an exception set.
+    let dict = unsafe {
+        Bound::from_owned_ptr_or_err(class.py(), ffi::PyType_GetDict(class.as_type_ptr()))?
+    };
+    Ok(dict.cast_into::<PyDict>()?)
 }
 
 /// `PyInstanceMethod_New(function)`. pyo3-ffi does not declare it.
