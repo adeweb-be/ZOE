@@ -224,126 +224,129 @@ pub fn build(
         t.elapsed().as_secs_f64(),
     ));
     drop(walk);
-    // The indexes.
+    // The indexes, then the metadata table. The structures of each tree
+    // build in a thread of their own while the next tree is walked.
+    let rows_ref = &rows;
+    let mut data_shape = TreeShape::default();
     let mut indexes = Vec::new();
-    let mut names = str_items(&record, "indexes");
-    names.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, reference) in names {
-        let oid = oid_of(&record.heap, reference).ok_or("an index without an oid")?;
-        let index_record = Record::decode(&source.load(oid)?).map_err(|e| e.0)?;
-        let class = format!("{}.{}", index_record.module, index_record.name);
-        report.records += 1;
-        let skipped = only.is_some_and(|o| !o.contains(&name));
-        let kind = if skipped {
-            None
-        } else {
-            kind_of(&index_record.module, &index_record.name)
-        };
-        let Some(kind) = kind else {
-            indexes.push(IndexEntry {
-                name,
+    let mut table = None;
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut pending = Vec::new();
+        let mut names = str_items(&record, "indexes");
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, reference) in names {
+            let oid = oid_of(&record.heap, reference).ok_or("an index without an oid")?;
+            let index_record = Record::decode(&source.load(oid)?).map_err(|e| e.0)?;
+            let class = format!("{}.{}", index_record.module, index_record.name);
+            report.records += 1;
+            let skipped = only.is_some_and(|o| !o.contains(&name));
+            let kind = if skipped {
+                None
+            } else {
+                kind_of(&index_record.module, &index_record.name)
+            };
+            let tree = index_record.attr_oid("_unindex");
+            let length_oid = index_record.attr_oid("_length");
+            let unavailable = |reason: String, length: i64| IndexEntry {
+                name: name.clone(),
                 class: class.clone(),
-                oid,
-                tree: None,
-                length_oid: None,
-                length: -1,
-                index: Index::Unavailable(if skipped {
-                    "left out of this build".into()
-                } else {
-                    format!("the class {class} is not mirrored")
-                }),
-                shape: TreeShape::default(),
-            });
-            continue;
-        };
-        let tree = index_record.attr_oid("_unindex");
-        let length_oid = index_record.attr_oid("_length");
-        let length = length_of(source, length_oid);
-        let multi = int_attr(&index_record, "multi_valued").unwrap_or(0);
-        let Some(tree_oid) = tree else {
-            indexes.push(IndexEntry {
-                name,
-                class,
                 oid,
                 tree,
                 length_oid,
                 length,
-                index: Index::Unavailable("no _unindex".into()),
+                index: Index::Unavailable(reason),
                 shape: TreeShape::default(),
+            };
+            let Some(kind) = kind else {
+                let reason = if skipped {
+                    "left out of this build".into()
+                } else {
+                    format!("the class {class} is not mirrored")
+                };
+                pending.push((unavailable(reason, -1), None, 0, 0, 0.0));
+                continue;
+            };
+            let length = length_of(source, length_oid);
+            let multi = int_attr(&index_record, "multi_valued").unwrap_or(0);
+            let depth = int_attr(&index_record, "_depth").unwrap_or(0);
+            let Some(tree_oid) = tree else {
+                pending.push((unavailable("no _unindex".into(), length), None, 0, 0, 0.0));
+                continue;
+            };
+            let t = Instant::now();
+            let walk = collect_tree(source, tree_oid, threads)?;
+            let walked = t.elapsed().as_secs_f64();
+            let shape = shape_of(&walk);
+            report.records += walk.records;
+            report.bytes += walk.bytes;
+            let (records, bytes) = (walk.records, walk.bytes);
+            let items = walk.items;
+            let handle = scope.spawn(move || {
+                let t = Instant::now();
+                let built = match kind {
+                    Kind::Field | Kind::Date | Kind::Uuid => {
+                        build_value(rows_ref, items).map(Index::Value)
+                    }
+                    Kind::Boolean => build_value(rows_ref, items).map(Index::Boolean),
+                    Kind::Keyword => build_keyword(rows_ref, items).map(Index::Keyword),
+                    Kind::DateRange => build_date_range(rows_ref, items).map(Index::DateRange),
+                    Kind::Path if multi != 0 => Err("a multi-valued path index".into()),
+                    Kind::Path => build_path(rows_ref, items, depth).map(Index::Path),
+                };
+                (built.unwrap_or_else(Index::Unavailable), t.elapsed().as_secs_f64())
             });
-            continue;
-        };
-        let t = Instant::now();
-        let walk = collect_tree(source, tree_oid, threads)?;
-        let walked = t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        let shape = shape_of(&walk);
-        report.records += walk.records;
-        report.bytes += walk.bytes;
-        let (records, bytes) = (walk.records, walk.bytes);
-        let items = walk.items;
-        let built = match kind {
-            Kind::Field | Kind::Date | Kind::Uuid => build_value(&rows, items).map(Index::Value),
-            Kind::Boolean => build_value(&rows, items).map(Index::Boolean),
-            Kind::Keyword => build_keyword(&rows, items).map(Index::Keyword),
-            Kind::DateRange => build_date_range(&rows, items).map(Index::DateRange),
-            Kind::Path if multi != 0 => Err("a multi-valued path index".into()),
-            Kind::Path => {
-                let depth = int_attr(&index_record, "_depth").unwrap_or(0);
-                build_path(&rows, items, depth).map(Index::Path)
+            let mut entry = unavailable(String::new(), length);
+            entry.shape = shape;
+            pending.push((entry, Some(handle), records, bytes, walked));
+        }
+        let mut table_handle = None;
+        if with_table {
+            let mut schema: Vec<(String, i64)> = str_items(&record, "schema")
+                .into_iter()
+                .filter_map(|(k, v)| match v {
+                    Value::Int(i) => Some((k, i64::try_from(i).ok()?)),
+                    _ => None,
+                })
+                .collect();
+            schema.sort_by_key(|(_, i)| *i);
+            let names: Vec<String> = schema.into_iter().map(|(k, _)| k).collect();
+            let t = Instant::now();
+            let walk = collect_tree(source, trees.data, threads)?;
+            let walked = t.elapsed().as_secs_f64();
+            report.records += walk.records;
+            report.bytes += walk.bytes;
+            let (records, bytes) = (walk.records, walk.bytes);
+            data_shape = shape_of(&walk);
+            let items = walk.items;
+            table_handle = Some((
+                scope.spawn(move || {
+                    let t = Instant::now();
+                    (build_table(rows_ref, names, items), t.elapsed().as_secs_f64())
+                }),
+                records,
+                bytes,
+                walked,
+            ));
+        }
+        for (mut entry, handle, records, bytes, walked) in pending {
+            if let Some(handle) = handle {
+                let (index, built) = handle.join().map_err(|_| "a build thread panicked")?;
+                entry.index = index;
+                report
+                    .parts
+                    .push((entry.name.clone(), records, bytes, walked, built));
             }
-        };
-        let index = built.unwrap_or_else(Index::Unavailable);
-        report.parts.push((
-            name.clone(),
-            records,
-            bytes,
-            walked,
-            t.elapsed().as_secs_f64(),
-        ));
-        indexes.push(IndexEntry {
-            name,
-            class,
-            oid,
-            tree,
-            length_oid,
-            length,
-            index,
-            shape,
-        });
-    }
-    // The metadata table.
-    let mut data_shape = TreeShape::default();
-    let table = if with_table {
-        let mut schema: Vec<(String, i64)> = str_items(&record, "schema")
-            .into_iter()
-            .filter_map(|(k, v)| match v {
-                Value::Int(i) => Some((k, i64::try_from(i).ok()?)),
-                _ => None,
-            })
-            .collect();
-        schema.sort_by_key(|(_, i)| *i);
-        let names: Vec<String> = schema.into_iter().map(|(k, _)| k).collect();
-        let t = Instant::now();
-        let walk = collect_tree(source, trees.data, threads)?;
-        let walked = t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        report.records += walk.records;
-        report.bytes += walk.bytes;
-        let (records, bytes) = (walk.records, walk.bytes);
-        data_shape = shape_of(&walk);
-        let table = build_table(&rows, names, walk.items)?;
-        report.parts.push((
-            "data".into(),
-            records,
-            bytes,
-            walked,
-            t.elapsed().as_secs_f64(),
-        ));
-        Some(table)
-    } else {
-        None
-    };
+            indexes.push(entry);
+        }
+        if let Some((handle, records, bytes, walked)) = table_handle {
+            let (built, seconds) = handle.join().map_err(|_| "a build thread panicked")?;
+            table = Some(built?);
+            report
+                .parts
+                .push(("data".into(), records, bytes, walked, seconds));
+        }
+        Ok(())
+    })?;
     let by_name = indexes
         .iter()
         .enumerate()

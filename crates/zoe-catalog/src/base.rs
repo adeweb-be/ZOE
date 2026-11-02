@@ -769,39 +769,59 @@ pub fn build_table(rows: &Rows, names: Vec<String>, items: Vec<(Val, Val)>) -> R
 }
 
 fn build_columns(by_row: &[Option<Box<[Val]>>], width: usize) -> Vec<Column> {
-    let mut columns = Vec::with_capacity(width);
-    let mut buffer = Vec::new();
-    for c in 0..width {
-        let mut cells = BytesArena::default();
-        let mut seen: HashMap<Vec<u8>, u32> = HashMap::new();
-        let mut codes = Vec::with_capacity(by_row.len());
-        for row in by_row {
-            buffer.clear();
-            match row {
-                Some(cells_of_row) => encode_cell(&cells_of_row[c], &mut buffer),
-                None => encode_cell(&Val::Missing, &mut buffer),
+    // One thread per group of columns.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(width.max(1));
+    let mut columns: Vec<Option<Column>> = (0..width).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    (t..width)
+                        .step_by(threads)
+                        .map(|c| (c, build_column(by_row, c)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (c, column) in h.join().unwrap_or_default() {
+                columns[c] = Some(column);
             }
-            let code = match seen.get(&buffer) {
-                Some(code) => *code,
-                None => {
-                    let code = cells.push(&buffer);
-                    seen.insert(buffer.clone(), code);
-                    code
-                }
-            };
-            codes.push(code);
         }
-        cells.shrink();
-        let codes = if cells.len() <= 256 {
-            Codes::U8(codes.iter().map(|c| *c as u8).collect())
-        } else if cells.len() <= 65_536 {
-            Codes::U16(codes.iter().map(|c| *c as u16).collect())
-        } else {
-            Codes::U32(codes)
+    });
+    columns.into_iter().map(|c| c.expect("a column")).collect()
+}
+
+fn build_column(by_row: &[Option<Box<[Val]>>], c: usize) -> Column {
+    let mut buffer = Vec::new();
+    let mut cells = BytesArena::default();
+    let mut seen: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut codes = Vec::with_capacity(by_row.len());
+    for row in by_row {
+        buffer.clear();
+        match row {
+            Some(cells_of_row) => encode_cell(&cells_of_row[c], &mut buffer),
+            None => encode_cell(&Val::Missing, &mut buffer),
+        }
+        let code = match seen.get(&buffer) {
+            Some(code) => *code,
+            None => {
+                let code = cells.push(&buffer);
+                seen.insert(buffer.clone(), code);
+                code
+            }
         };
-        columns.push(Column { codes, cells });
+        codes.push(code);
     }
-    columns
+    cells.shrink();
+    let codes = if cells.len() <= 256 {
+        Codes::U8(codes.iter().map(|c| *c as u8).collect())
+    } else if cells.len() <= 65_536 {
+        Codes::U16(codes.iter().map(|c| *c as u16).collect())
+    } else {
+        Codes::U32(codes)
+    };
+    Column { codes, cells }
 }
 
 /// The rid of a key of an IO tree.
