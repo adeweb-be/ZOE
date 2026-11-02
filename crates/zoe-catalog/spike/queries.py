@@ -55,6 +55,12 @@ def main():
         add("phrase", "SearchableText", '"' + " ".join(w.strip(".") for w in t[i : i + 2]) + '"')
     for w in rng.sample(vocab, 10):
         add("prefix", "SearchableText", w[:3] + "*")
+    # The search form of Plone: `munge_search_term` joins the words with
+    # AND and adds `*` to the last one.
+    for k in (1, 2, 3):
+        for _ in range(8):
+            ws = rng.sample(vocab, k)
+            add(f"plone-{k}", "SearchableText", " AND ".join(ws) + "*")
     for index in ("Title", "Description"):
         for w in rng.sample(vocab, 10):
             add(f"word-{index}", index, w)

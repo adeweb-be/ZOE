@@ -12,7 +12,7 @@ use std::path::Path;
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TextFieldIndexing, TextOptions,
 };
-use tantivy::tokenizer::{Language, PreTokenizedString};
+use tantivy::tokenizer::{Language, PreTokenizedString, TokenStream};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::analysis::{self, ENHANCED, PLONE, PloneTokenizer, plone_words};
@@ -40,6 +40,17 @@ pub struct Fields {
     pub len: Vec<Field>,
     /// The effective date in minutes, for the sort of the measures.
     pub effective: Field,
+    /// The field of the pairs of words in a row of each index: a phrase of
+    /// two words is one term.
+    pub pairs: Vec<Field>,
+}
+
+/// The separator of the two words of a pair.
+pub const PAIR: char = '\u{1}';
+
+/// Return the term of the pair `a`, `b`.
+pub fn pair(a: &str, b: &str) -> String {
+    format!("{a}{PAIR}{b}")
 }
 
 /// Return the schema of `mode` and its fields.
@@ -58,7 +69,13 @@ pub fn schema(mode: Mode) -> (Schema, Fields) {
     let text = INDEXES.iter().map(|n| b.add_text_field(n, opts.clone())).collect();
     let len = INDEXES.iter().map(|n| b.add_u64_field(&format!("n_{n}"), FAST)).collect();
     let effective = b.add_i64_field("effective", FAST);
-    (b.build(), Fields { rid, text, len, effective })
+    let popts = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(tokenizer)
+            .set_index_option(IndexRecordOption::WithFreqs),
+    );
+    let pairs = INDEXES.iter().map(|n| b.add_text_field(&format!("p_{n}"), popts.clone())).collect();
+    (b.build(), Fields { rid, text, len, effective, pairs })
 }
 
 /// Register the tokenizers on `index`.
@@ -125,6 +142,7 @@ pub fn document(mode: Mode, fields: &Fields, doc: &Doc) -> TantivyDocument {
             Mode::Compat => {
                 let words = plone_words(text);
                 d.add_u64(fields.len[i], words.len() as u64 + 1);
+                add_pairs(&mut d, fields.pairs[i], words.iter().map(|w| (w.as_str(), 0)).enumerate().map(|(p, (w, _))| (w, p)));
                 let tokens = analysis::WordStream::new(&words).into_tokens();
                 d.add_pre_tokenized_text(
                     fields.text[i],
@@ -133,11 +151,51 @@ pub fn document(mode: Mode, fields: &Fields, doc: &Doc) -> TantivyDocument {
             }
             Mode::Enhanced => {
                 d.add_u64(fields.len[i], 1);
-                d.add_text(fields.text[i], text);
+                let tokens = ENHANCED_ANALYZER.with(|a| {
+                    let mut a = a.borrow_mut();
+                    let mut stream = a.token_stream(text);
+                    let mut out = Vec::new();
+                    while stream.advance() {
+                        out.push(stream.token().clone());
+                    }
+                    out
+                });
+                add_pairs(&mut d, fields.pairs[i], tokens.iter().map(|t| (t.text.as_str(), t.position)));
+                d.add_pre_tokenized_text(
+                    fields.text[i],
+                    PreTokenizedString { text: String::new(), tokens },
+                );
             }
         }
     }
     d
+}
+
+thread_local! {
+    static ENHANCED_ANALYZER: std::cell::RefCell<tantivy::tokenizer::TextAnalyzer> =
+        std::cell::RefCell::new(analysis::enhanced(Language::English));
+}
+
+/// Add the pairs of the words in a row of `words`, (word, position), to
+/// `field`. Two words with a gap between them, a stop word, make no pair.
+fn add_pairs<'a>(d: &mut TantivyDocument, field: Field, words: impl Iterator<Item = (&'a str, usize)>) {
+    let mut tokens = Vec::new();
+    let mut prev: Option<(&str, usize)> = None;
+    for (w, p) in words {
+        if let Some((a, q)) = prev
+            && q + 1 == p
+        {
+            tokens.push(tantivy::tokenizer::Token {
+                offset_from: 0,
+                offset_to: 0,
+                position: tokens.len(),
+                text: pair(a, w),
+                position_length: 1,
+            });
+        }
+        prev = Some((w, p));
+    }
+    d.add_pre_tokenized_text(field, PreTokenizedString { text: String::new(), tokens });
 }
 
 /// Replace the document of `doc.rid` in the writer: a delete of the rid,

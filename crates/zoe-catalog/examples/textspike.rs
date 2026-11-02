@@ -182,7 +182,7 @@ impl Bench {
         match self.mode {
             Mode::Compat => {
                 let len_name = format!("n_{index_name}");
-                let mut c = Compat::new(&self.searcher, self.fields.text[i], &len_name, self.stats[i]);
+                let mut c = Compat::new(&self.searcher, self.fields.text[i], &len_name, self.stats[i]).with_pairs(self.fields.pairs[i]);
                 let Some(hits) = c.run(tree).unwrap() else { return 0 };
                 if sort {
                     // The mirror sorts: here, the effective date of each hit.
@@ -230,6 +230,12 @@ impl Bench {
                         .search(&q, &FilterCollector::new("rid".to_string(), keep, col))
                         .unwrap();
                     n
+                } else if matches!(v, Variant::Alone) {
+                    // No filter: the count, then the first hits with the
+                    // pruning of tantivy (block-max WAND).
+                    let n = self.searcher.search(&q, &Count).unwrap();
+                    let _ = self.searcher.search(&q, &TopDocs::with_limit(limit).order_by_score()).unwrap();
+                    n
                 } else {
                     let (n, _) = overlay::enhanced(&self.searcher, None, &*q, keep, limit).unwrap();
                     n
@@ -251,6 +257,11 @@ fn open_bench(mode: Mode, dir: &Path, fuzzy: u8, boosts: bool) -> Bench {
             vec![(fields.text[1], 3.0), (fields.text[2], 1.5), (fields.text[0], 1.0)]
         } else {
             vec![(fields.text[0], 1.0)]
+        },
+        pairs: if boosts {
+            vec![fields.pairs[1], fields.pairs[2], fields.pairs[0]]
+        } else {
+            vec![fields.pairs[0]]
         },
         fuzzy,
     };
@@ -369,7 +380,7 @@ fn compat_check(args: &[String]) {
             .map(|p| (p[0].as_u64().unwrap(), p[1].as_i64().unwrap()))
             .collect();
         let len_name = format!("n_{name}");
-        let mut c = Compat::new(&searcher, fields.text[i], &len_name, stats[i]);
+        let mut c = Compat::new(&searcher, fields.text[i], &len_name, stats[i]).with_pairs(fields.pairs[i]);
         let got = match c.run(&tree).unwrap() {
             Some(h) => compat::rank(&searcher, &h, |_| true, usize::MAX).unwrap().1,
             None => Vec::new(),
@@ -549,7 +560,7 @@ fn window(args: &[String]) {
     let tree: Node = serde_json::from_value(queries[0]["tree"].clone()).unwrap();
     let mut translator = Translator::new(
         &idx,
-        Options { fields: vec![(fields.text[0], 1.0)], fuzzy: 0 },
+        Options { fields: vec![(fields.text[0], 1.0)], fuzzy: 0, pairs: vec![fields.pairs[0]] },
     );
     let q = translator.translate(&tree).unwrap();
     println!("{{\"query\":{},\"mode\":\"{mode:?}\",\"rows\":[", queries[0]["query"]);
@@ -724,7 +735,7 @@ fn main() {
                 let tree: Node = serde_json::from_value(q["tree"].clone()).unwrap();
                 let len_name = format!("n_{name}");
                 let t = Instant::now();
-                let mut c = Compat::new(&searcher, fields.text[i], &len_name, stats[i]);
+                let mut c = Compat::new(&searcher, fields.text[i], &len_name, stats[i]).with_pairs(fields.pairs[i]);
                 let all = match c.run(&tree).unwrap() {
                     Some(h) => compat::rank(&searcher, &h, |_| true, usize::MAX).unwrap().1,
                     None => Vec::new(),

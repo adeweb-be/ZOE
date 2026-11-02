@@ -2,6 +2,8 @@
 //! with the analyzer of the enhanced mode, the BM25 of tantivy and the
 //! boosts of each field.
 
+use std::collections::HashMap;
+
 use tantivy::Index;
 use tantivy::query::{
     BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, RegexQuery, TermQuery,
@@ -20,6 +22,8 @@ pub struct Options {
     pub fields: Vec<(Field, f32)>,
     /// A word also matches the words at this edit distance (0: off).
     pub fuzzy: u8,
+    /// The field of the pairs of each field of `fields`, in the same order.
+    pub pairs: Vec<Field>,
 }
 
 /// The translator of the enhanced mode.
@@ -97,10 +101,33 @@ impl Translator {
                 match terms.len() {
                     0 => None,
                     1 => Some(self.word(&terms[0])),
-                    _ => Some(self.across(|f| {
-                        let ts = terms.iter().map(|t| Term::from_field_text(f, t)).collect();
-                        Box::new(PhraseQuery::new(ts))
-                    })),
+                    _ => {
+                        let pairs: HashMap<Field, Field> = self
+                            .opts
+                            .fields
+                            .iter()
+                            .map(|f| f.0)
+                            .zip(self.opts.pairs.iter().copied())
+                            .collect();
+                        Some(self.across(|f| {
+                            // A pair of words in a row is one term: a phrase
+                            // of two words reads one posting list.
+                            let pf = pairs[&f];
+                            let mut clauses: Vec<(Occur, Box<dyn Query>)> = terms
+                                .windows(2)
+                                .map(|w| {
+                                    let t = Term::from_field_text(pf, &super::index::pair(&w[0], &w[1]));
+                                    let q: Box<dyn Query> = Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs));
+                                    (Occur::Must, q)
+                                })
+                                .collect();
+                            if terms.len() > 2 {
+                                let ts = terms.iter().map(|t| Term::from_field_text(f, t)).collect();
+                                clauses.push((Occur::Must, Box::new(PhraseQuery::new(ts))));
+                            }
+                            Box::new(BooleanQuery::new(clauses))
+                        }))
+                    }
                 }
             }
             Node::And { items, nots } => {

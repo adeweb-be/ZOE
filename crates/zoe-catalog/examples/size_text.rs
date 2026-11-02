@@ -17,7 +17,7 @@ fn main() {
         let stats = Stats::count(&searcher, "n_SearchableText").unwrap();
         let mut c = Compat::new(&searcher, fields.text[0], "n_SearchableText", stats);
         println!("{:?}", c.run(&node).unwrap().map(|h| h.len()));
-        let mut t = Translator::new(&idx, Options { fields: vec![(fields.text[0], 1.0)], fuzzy: 1 });
+        let mut t = Translator::new(&idx, Options { fields: vec![(fields.text[0], 1.0)], fuzzy: 1, pairs: vec![fields.pairs[0]] });
         let q = t.translate(&node).unwrap();
         println!("{:?}", overlay::enhanced(&searcher, None, &*q, |_| true, 10).unwrap().0);
         let w = idx.writer_with_num_threads::<tantivy::TantivyDocument>(1, 20_000_000);

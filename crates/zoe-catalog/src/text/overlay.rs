@@ -154,7 +154,7 @@ pub fn compat(
 ) -> tantivy::Result<Ranked> {
     let len_name = format!("n_{}", INDEXES[i]);
     let Some(o) = overlay else {
-        let mut c = Compat::new(main, fields.text[i], &len_name, stats);
+        let mut c = Compat::new(main, fields.text[i], &len_name, stats).with_pairs(fields.pairs[i]);
         let Some(hits) = c.run(node)? else {
             return Ok((0, Vec::new()));
         };
@@ -194,7 +194,7 @@ pub fn compat(
             (s, Adjust { n: 0, total: 0, df })
         }
     };
-    let mut c = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust);
+    let mut c = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust).with_pairs(fields.pairs[i]);
     if counts == Counts::Exact {
         c.exclude = Some(&ex);
     }
@@ -210,7 +210,7 @@ pub fn compat(
             df_main.insert(w, df);
         }
     }
-    let mut oc = Compat::new(&o.searcher, o.fields.text[i], &len_name, main_stats).with_df(df_main);
+    let mut oc = Compat::new(&o.searcher, o.fields.text[i], &len_name, main_stats).with_df(df_main).with_pairs(o.fields.pairs[i]);
     let o_hits = oc.run(node)?;
     let (Some(mh), Some(oh)) = (main_hits, o_hits) else {
         return Ok((0, Vec::new()));
@@ -431,7 +431,7 @@ pub fn compat_direct(
             },
         ),
     };
-    let mut c = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust);
+    let mut c = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust).with_pairs(fields.pairs[i]);
     if counts == Counts::Exact {
         c.exclude = Some(&ex);
     }

@@ -192,6 +192,7 @@ pub struct Compat<'a> {
     pub exclude: Option<&'a [HashSet<DocId>]>,
     df: HashMap<String, u64>,
     mean: f64,
+    pairs: Option<Field>,
 }
 
 impl<'a> Compat<'a> {
@@ -206,7 +207,14 @@ impl<'a> Compat<'a> {
             exclude: None,
             df: HashMap::new(),
             mean: 0.0,
+            pairs: None,
         }
+    }
+
+    /// Match a phrase through the field of the pairs of words.
+    pub fn with_pairs(mut self, field: Field) -> Self {
+        self.pairs = Some(field);
+        self
     }
 
     /// Use these document frequencies in place of those of the searcher.
@@ -316,6 +324,40 @@ impl<'a> Compat<'a> {
         Ok(out)
     }
 
+    /// The scores of `word` in segment `ord` for the documents of `docs`,
+    /// which hold it, in their order.
+    fn term_scores_for(&mut self, ord: usize, word: &str, docs: &[DocId]) -> tantivy::Result<Scores> {
+        let df = self.doc_freq(word)?;
+        let n = self.n() as f64;
+        let idf = (1.0 + n / df.max(1) as f64).ln() * 1024.0;
+        let mean = self.mean;
+        let seg = &self.searcher.segment_readers()[ord];
+        let lens = seg.fast_fields().u64(&self.len_name)?;
+        let term = Term::from_field_text(self.field, word);
+        let mut out = Vec::with_capacity(docs.len());
+        let Some(mut p) = seg.inverted_index(self.field)?.read_postings(&term, IndexRecordOption::WithFreqs)?
+        else {
+            return Ok(docs.iter().map(|d| (*d, 0)).collect());
+        };
+        let (b, k1) = (0.75f64, 1.2f64);
+        let (b_from1, k1_plus1) = (1.0 - b, k1 + 1.0);
+        for &d in docs {
+            if p.doc() < d {
+                p.seek(d);
+            }
+            let mut score = 0;
+            if p.doc() == d {
+                let f = f64::from(p.term_freq());
+                let len = lens.first(d).unwrap_or(1).saturating_sub(1) as f64;
+                let lenweight = b_from1 + b * len / mean;
+                let tf = f * k1_plus1 / (f + k1 * lenweight);
+                score = (tf * idf + 0.5) as i64;
+            }
+            out.push((d, score));
+        }
+        Ok(out)
+    }
+
     /// The document count of the run.
     pub fn n(&self) -> u64 {
         let adj = self.adjust.map_or(0, |a| a.n);
@@ -421,16 +463,58 @@ impl<'a> Compat<'a> {
                         return Ok(Some(Vec::new()));
                     }
                 }
-                let mut lists = Vec::new();
-                for w in words {
-                    lists.push(self.term_scores(ord, w)?);
+                if let (Some(pf), true) = (self.pairs, words.len() > 1) {
+                    // The documents that hold each pair in a row: for two
+                    // words, the documents of the phrase.
+                    let seg = &self.searcher.segment_readers()[ord];
+                    let inv = seg.inverted_index(pf)?;
+                    let mut cand: Option<Vec<DocId>> = None;
+                    for w in words.windows(2) {
+                        let term = Term::from_field_text(pf, &super::index::pair(&w[0], &w[1]));
+                        let mut docs = Vec::new();
+                        if let Some(mut p) = inv.read_postings(&term, IndexRecordOption::Basic)? {
+                            let mut d = p.doc();
+                            while d != TERMINATED {
+                                if self.alive(ord, seg, d) {
+                                    docs.push(d);
+                                }
+                                d = p.advance();
+                            }
+                        }
+                        cand = Some(match cand {
+                            None => docs,
+                            Some(c) => {
+                                let set: HashSet<DocId> = docs.into_iter().collect();
+                                c.into_iter().filter(|d| set.contains(d)).collect()
+                            }
+                        });
+                    }
+                    let cand = cand.unwrap_or_default();
+                    // The score of each word, read for the candidates only.
+                    let mut acc: Scores = cand.iter().map(|d| (*d, 0)).collect();
+                    for w in words {
+                        let s = self.term_scores_for(ord, w, &cand)?;
+                        for (a, b) in acc.iter_mut().zip(s) {
+                            a.1 += b.1;
+                        }
+                    }
+                    if words.len() > 2 {
+                        Some(self.phrase_filter(ord, words, acc)?)
+                    } else {
+                        Some(acc)
+                    }
+                } else {
+                    let mut lists = Vec::new();
+                    for w in words {
+                        lists.push(self.term_scores(ord, w)?);
+                    }
+                    lists.sort_by_key(Vec::len);
+                    let mut acc = lists[0].clone();
+                    for l in &lists[1..] {
+                        acc = intersection(&acc, l);
+                    }
+                    Some(self.phrase_filter(ord, words, acc)?)
                 }
-                lists.sort_by_key(Vec::len);
-                let mut acc = lists[0].clone();
-                for l in &lists[1..] {
-                    acc = intersection(&acc, l);
-                }
-                Some(self.phrase_filter(ord, words, acc)?)
             }
             Node::And { items, nots } => {
                 let mut lists = Vec::new();
