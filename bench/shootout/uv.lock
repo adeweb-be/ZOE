@@ -762,7 +762,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "msgpack", marker = "extra == 'plone'", specifier = ">=1.2.4" },
+    { name = "msgpack", marker = "extra == 'plone'", specifier = ">=1" },
     { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
     { name = "zconfig", specifier = ">=4" },
     { name = "zodb", specifier = ">=6" },
