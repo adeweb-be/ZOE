@@ -693,6 +693,11 @@ class Indexer:
         indexes. Search only below the highest such paths. A search that
         fails is a failure of its highest path, so the keys of that path
         stay in the queue and count the failure."""
+        from zoe.plone.security import security_index
+
+        if security_index(catalog) is not None:
+            # The entries below a path resolve through it.
+            return
         tops = highest(path for path, entry in entries.items() if entry.security)
         for top in tops:
             idxs = set(entries[top].idxs & SECURITY) or set(SECURITY)
