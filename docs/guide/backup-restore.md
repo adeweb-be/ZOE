@@ -47,7 +47,7 @@ The backup directory holds one file for each dump, named after its range of tids
 
 A pack keeps the chain when its pack time is at or before the last backup. For example, a daily backup and a pack with `--days 7` keep the chain.
 
-A pack past the last backup breaks the chain: the pack removed history that the next dump must hold. The next backup then refuses, writes nothing and exits with 1:
+A pack breaks the chain when its pack time is after the last tid of the dumps: the pack removed history that the next dump must hold. A pack never goes past the last transaction of the store, so when no commit came after the last backup, a pack keeps the chain, also with `--days 0`. When the chain breaks, the next backup refuses, writes nothing and exits with 1:
 
 ```text
 zoe backup: backups/zoe: the store was packed at tid 0x040c80440de1d2aa, after the last tid 0x040c80440d4f6f11 of the dumps; write a new full dump into a new directory

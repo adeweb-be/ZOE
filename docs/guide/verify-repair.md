@@ -36,10 +36,10 @@ Classes: 2
 
 The command checks:
 
-- the checksum of each record and of each row of the store (the line `checksums`);
+- the checksum of each record, of each transaction row, of each sequence row and of each row of the KV namespaces (the line `checksums`); the rows of `meta` have no checksum;
 - the blob file of each blob record: its size and its hash (`blob files`);
 - the references of each current record: each object that it refers to has a record (`references`);
-- each current record: the command reads its class and its references from the pickle (`pickles`);
+- each current record: the command reads its references from the pickle (`pickles`), and counts its class under `Classes`; a class that does not read counts as `<unknown>` there, and is not a finding;
 - the object count of the store (`count mismatch`);
 - with `--classes`, each class of the store against the classes of your application (`unknown classes`);
 - the write-ahead log in `wal/` (`log`): a damaged log is a finding, and the command then checks the tables alone.
