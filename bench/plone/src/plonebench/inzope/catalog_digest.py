@@ -22,7 +22,9 @@ the result of each.
 
 import hashlib
 import json
+import resource
 import sys
+import time
 import types
 
 from Acquisition import aq_base
@@ -52,6 +54,7 @@ elif kind == "zoe":
 else:
     sys.exit(f"catalog_digest: unknown kind {kind}")
 db = DB(storage, cache_size=100_000)
+started = time.time()
 connection = db.open()
 updates = 0
 # The objects that the walk is in, so that a cycle ends.
@@ -123,13 +126,21 @@ def _state(value):
 
 
 def feed(digest, value):
-    """Update the hash `digest` with `value` and its state, a large tree
-    a chunk of items at a time."""
+    """Update the hash `digest` with `value` and its state, a tree a chunk
+    of items at a time. A tree in the value of an item goes the same way,
+    after its key, so the walk never holds a large tree in one list."""
     if is_tree(value):
         digest.update(type(value).__name__.encode())
         items = value.items() if hasattr(value, "items") else value.keys()
         chunk = []
         for item in items:
+            if isinstance(item, tuple) and is_tree(item[1]):
+                digest.update(repr(chunk).encode())
+                chunk = []
+                digest.update(repr(canon(item[0])).encode())
+                feed(digest, item[1])
+                tick()
+                continue
             chunk.append(canon(item))
             if len(chunk) == CHUNK:
                 digest.update(repr(chunk).encode())
@@ -161,6 +172,18 @@ def hash_of(value):
     return digest.hexdigest()
 
 
+def progress(what):
+    """Print a line of progress to stderr: the seconds and the peak memory."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_mb = peak / 1024 if sys.platform != "darwin" else peak / 1024 / 1024
+    elapsed = time.time() - started
+    print(
+        f"catalog_digest: {what} at {elapsed:.0f} s, peak RSS {peak_mb:.0f} MB",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 try:
     site = connection.root()["Application"][SITE_ID]
     catalog = site["portal_catalog"]
@@ -180,6 +203,8 @@ try:
             "entries": entries,
             "sha": hash_of(index),
         }
+        connection.cacheGC()
+        progress(f"index {name}")
 
     names = list(inner.names)
     digests = [hashlib.sha256() for _ in names]
@@ -203,6 +228,7 @@ try:
         name: {"entries": values[position], "sha": digests[position].hexdigest()}
         for position, name in enumerate(names)
     }
+    progress("the columns")
     catalog_digest = {
         "size": len(inner),
         "indexes": indexes,
@@ -223,6 +249,7 @@ try:
             results = catalog.unrestrictedSearchResults(**query["query"])
             queries[query["name"]] = results.actual_result_count
             connection.cacheGC()
+        progress("the queries")
     catalog_digest["queries"] = queries
 finally:
     connection.close()

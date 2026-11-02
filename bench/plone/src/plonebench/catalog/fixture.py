@@ -133,12 +133,10 @@ def prepare(
     data_fs = store / "filestorage" / "Data.fs"
     data_fs.parent.mkdir(parents=True)
     (target / "spec.json").write_text(json.dumps(spec.to_json(), indent=1))
-    started = time.time()
 
     print(f"plonebench: building {spec.entries} catalog entries", flush=True)
     _build(target, data_fs)
-    planned = json.loads((target / "plan.json").read_text())
-    seconds = dict(planned["seconds"])
+    seconds = dict(json.loads((target / "plan.json").read_text())["seconds"])
     unpacked = data_fs.stat().st_size
 
     phase = time.time()
@@ -164,7 +162,25 @@ def prepare(
     if result.returncode != 0:
         raise RuntimeError(f"zoe convert failed:\n{result.stdout}{result.stderr}")
     seconds["convert"] = round(time.time() - phase, 1)
+    return finish(spec, target, preset, seconds, unpacked)
 
+
+def finish(
+    spec: plan.CatalogSpec,
+    target: Path,
+    preset: str | None,
+    seconds: dict,
+    unpacked: int,
+) -> Path:
+    """Read the digest of the catalog through each store of the fixture in
+    `target`, built, packed and converted, compare the digests with each
+    other and with the plan, and write `manifest.json`. `seconds` holds
+    the seconds of the phases so far, and `unpacked` the bytes of the
+    `Data.fs` before the pack."""
+    store = target / "store"
+    data_fs = store / "filestorage" / "Data.fs"
+    planned = json.loads((target / "plan.json").read_text())
+    seconds = dict(seconds)
     digests = {}
     for kind, name, path in (
         ("filestorage", "zeo", data_fs),
@@ -178,7 +194,7 @@ def prepare(
         _digest(stack.STACKS[name], kind, path, out, target / "plan.json")
         digests[kind] = json.loads(out.read_text())
         seconds[f"digest_{kind}"] = round(time.time() - phase, 1)
-    seconds["total"] = round(time.time() - started, 1)
+    seconds["total"] = round(sum(seconds.values()), 1)
 
     differences = compare(spec, planned, digests["filestorage"], digests["zoe"])
     manifest = {
