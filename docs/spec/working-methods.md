@@ -81,12 +81,12 @@ First usable release: the server gate; the in-process storage is usable from the
 
 ## Feature triage
 
-58 candidate features were triaged against the phase 2 gate: 1 Must, 1 spike, 24 Should, 16 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the eleven phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
+58 candidate features were triaged against the phase 2 gate: 1 Must, 24 Should, 17 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the eleven phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
 
 | Feature | Verdict | Lands in | Note |
 | --- | --- | --- | --- |
 | Server-side sequences | Must | phase 1 primitive, phase 2 protocol | replaces the shared id counter `portal_uidgenerator`; `zoe.plone` wires it |
-| Field-addressable objects | Spike | spike before phase 6 design | conflicts and write amplification, throughput, ergonomics; weighting decided when the numbers exist |
+| Field-addressable objects | Could | when a reader of fields needs it, with an ADR of its own | the spike before phase 6 (`docs/spikes/field-addressable-objects.md`): no slots in phase 6; slots derived from the record later; field writes Won't |
 | Deterministic simulation testing | Should | phase 1 traits, phase 2 simulator | clock and I/O traits in `zoe-core` from the walking skeleton |
 | Compression, zstd now, deltas and dictionaries later | Should | phase 1 zstd; deltas after the bench | codec byte per record |
 | Blob content hashes, dedup later | Should | phase 1 hash; phase 9 dedup | BLAKE3 per blob record |
@@ -173,4 +173,4 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 - [x] Which conflict classes dominate the production logs of a real site? The synthetic logs of B5 and B6 replace the one-week log sample (step 0 of the ConflictError strategy in the specification). B5 ranks the posting dicts of ZCTextIndex first, then the shared `BTrees.Length` counters.
 - [ ] Is the reference machine a developer workstation, an on-premise server or a cloud VM? The benchmark numbers only mean something on one fixed box.
 - [ ] Should the async Python client ship with the server in phase 2 for collective.starlette, or later?
-- [ ] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? Decided when the numbers exist, before phase 6 design.
+- [x] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? The numbers of the spike (`docs/spikes/field-addressable-objects.md`) gave the verdict with no weighting: no slots in phase 6, slots derived from the record later, no field writes.
