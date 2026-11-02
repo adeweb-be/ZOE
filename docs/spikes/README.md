@@ -16,6 +16,7 @@ These findings still describe the code and its dependencies.
 | [load-path.md](load-path.md) | Where does a load through ZODB on the native client spend its time between the ghost and the client cache, on a hit and on a miss, and which terms do a prefetch (ZOE-273) and a path in Rust (ZOE-274) remove? |
 | [ghost-to-cache.md](ghost-to-cache.md) | How much of a load does a reader in Rust in place of `Connection._reader` remove, with the same state for every record, and does a path in Rust from the ghost to the client cache need a `persistent` in Rust? |
 | [field-addressable-objects.md](field-addressable-objects.md) | Should the store keep chosen fields of an object addressable in the typed-field slots of its record frame, and in which shape? The numbers of each shape on conflicts and write amplification, throughput and ergonomics, before the design of phase 6; the weighting of the criteria and the verdict are the human's. |
+| [security-index.md](security-index.md) | How can the catalog keep `allowedRolesAndUsers` as inherited values resolved at query time, with the value of `reindexObjectSecurity` for every entry, and what does Plone then write for a change of security on a folder? The facts of Plone 6.1, the corpus, the candidates, and a prototype checked on it; the decision is ADR 0061, proposed. |
 
 ## Archive
 
