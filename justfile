@@ -631,6 +631,12 @@ plone scenario="zoe" command="start" *args:
 # `just bench plone test` runs its tests. It needs the Plone instances of
 # `just plone zeo build`, `just plone zoeclient build` and
 # `just plone zeoclient build`, and builds `zoe` in release first.
+# `just bench catalog prepare [--preset P]` builds the catalog fixture of
+# bench/plone: a Plone site whose catalog holds the entries of a plan, 1,000,000
+# for `catalog-1m` (the default) and 10,000 for `catalog-mini`, in a
+# FileStorage and in a ZOE store, under target/bench/catalog/fixtures. It
+# needs `just plone zeo build` and `just plone zoeclient build`, and builds
+# `zoe` in release first. `just bench catalog fixtures` lists the fixtures.
 # `just bench replay RUN` runs the log replay of bench/replay (B6): the
 # transactions of the store that the B5 run RUN kept (`--keep-store` on
 # zeo), against ZEO and against zoe serve, in the interpreter of the
@@ -656,7 +662,7 @@ plone scenario="zoe" command="start" *args:
 # ZOE_BENCH_LOCK (target/bench/bench.lock by default), from before its
 # build to its end, so one benchmark runs at a time: `run`, `native`,
 # `client`, `load`, `saturate`, `plone prepare`, `plone run`,
-# `plone campaign` and `replay RUN`. The showcase takes it for each of its
+# `plone campaign`, `catalog prepare` and `replay RUN`. The showcase takes it for each of its
 # runs. A child command of a holder takes it through the open file that
 # ZOE_BENCH_LOCK_FD names, so it does not wait for its parent. The tests,
 # the reports, `gate`, `index` and `publish` take no lock.
@@ -683,6 +689,11 @@ bench *args="run":
             family="$1"
             shift
             ;;
+        catalog)
+            # `just bench catalog COMMAND` runs plonebench.catalog in the
+            # environment of bench/plone.
+            family=plone
+            ;;
         profile)
             # `just bench profile plone OPTIONS` runs plonebench.loadpath,
             # and `just bench profile oracle OPTIONS` its comparison of
@@ -706,6 +717,7 @@ bench *args="run":
         "shootout run "* | "shootout client run" | "shootout native run" | zoe-bench\ *) lock=true ;;
         "shootout profile terms" | "shootout profile loop") lock=true ;;
         "plone prepare "* | "plone run "* | "plone campaign "* | "plone loadpath "*) lock=true ;;
+        "plone catalog prepare") lock=true ;;
         "replay test "* | "replay report "*) lock=false ;;
         replay\ *) lock=true ;;
         *) lock=false ;;
@@ -739,8 +751,8 @@ _bench-plone *args:
         shift
         exec "${plonebench[@]}" pytest -q "${@:-bench/plone/tests}"
     fi
-    case "${1:-}" in
-        prepare | run | campaign | serve | loadpath)
+    case "${1:-} ${2:-}" in
+        "prepare "* | "run "* | "campaign "* | "serve "* | "loadpath "* | "catalog prepare")
             ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
             export ZOE_BINARY
             ;;
@@ -748,6 +760,10 @@ _bench-plone *args:
     if [ "${1:-}" = loadpath ]; then
         shift
         exec "${plonebench[@]}" python -m plonebench.loadpath "$@"
+    fi
+    if [ "${1:-}" = catalog ]; then
+        shift
+        exec "${plonebench[@]}" python -m plonebench.catalog "$@"
     fi
     exec "${plonebench[@]}" python -m plonebench "$@"
 
