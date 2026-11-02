@@ -555,7 +555,8 @@ fn window(args: &[String]) {
     println!("{{\"query\":{},\"mode\":\"{mode:?}\",\"rows\":[", queries[0]["query"]);
     for (ki, k) in [1usize, 10, 100, 1000, 10_000].into_iter().enumerate() {
         let snapshot = last - k as u64;
-        let mut best = [f64::MAX; 6];
+        let mut best = [f64::MAX; 8];
+        let mut direct_same = true;
         let mut found_deleted = false;
         for _ in 0..5 {
             // Outside the window: the changed documents, their texts at the
@@ -614,8 +615,22 @@ fn window(args: &[String]) {
                 .unwrap(),
             };
             let t_plain = t.elapsed();
+            // The direct overlay of the compatibility mode: no segment.
+            let (mut t_dcur, mut t_dtxn) = (Duration::ZERO, Duration::ZERO);
+            if mode == Mode::Compat {
+                let t = Instant::now();
+                let d = overlay::Direct::build(&odocs, 0);
+                let r1 = overlay::compat_direct(&searcher, &fields, 0, main_stats, &d, &tree, Counts::Current, |_| true, 20).unwrap();
+                t_dcur = t.elapsed();
+                let t = Instant::now();
+                let d = overlay::Direct::build(&odocs, 0);
+                let r2 = overlay::compat_direct(&searcher, &fields, 0, main_stats, &d, &tree, Counts::Exact, |_| true, 20).unwrap();
+                t_dtxn = t.elapsed();
+                let s2 = overlay::compat(&searcher, &fields, 0, main_stats, Some(&ov2), &tree, Counts::Exact, |_| true, 20).unwrap();
+                direct_same = r1 == res && r2 == s2;
+            }
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-            let row = [ms(t_scan), ms(t_read), ms(t_build), ms(t_query), ms(t_txn), ms(t_plain)];
+            let row = [ms(t_scan), ms(t_read), ms(t_build), ms(t_query), ms(t_txn), ms(t_plain), ms(t_dcur), ms(t_dtxn)];
             for (b, r) in best.iter_mut().zip(row) {
                 *b = b.min(r);
             }
@@ -648,9 +663,9 @@ fn window(args: &[String]) {
             }
         }
         println!(
-            "{}{{\"changed\":{k},\"scan_ms\":{:.2},\"read_ms\":{:.2},\"overlay_build_ms\":{:.2},\"query_with_overlay_ms\":{:.2},\"txn_overlay_total_ms\":{:.2},\"query_alone_ms\":{:.2},\"count_exact\":{found_deleted}}}",
+            "{}{{\"changed\":{k},\"scan_ms\":{:.2},\"read_ms\":{:.2},\"overlay_build_ms\":{:.2},\"query_with_overlay_ms\":{:.2},\"txn_overlay_total_ms\":{:.2},\"query_alone_ms\":{:.2},\"direct_current_ms\":{:.2},\"direct_txn_ms\":{:.2},\"direct_same\":{direct_same},\"count_exact\":{found_deleted}}}",
             if ki > 0 { "," } else { "" },
-            best[0], best[1], best[2], best[3], best[4], best[5]
+            best[0], best[1], best[2], best[3], best[4], best[5], best[6], best[7]
         );
     }
     println!("]}}");
@@ -691,6 +706,39 @@ fn main() {
         "deltas" => deltas(rest),
         "window" => window(rest),
         "threads" => threads_cmd(rest),
+        "compat1m" => {
+            // compat1m DIR QUERIES: for each query, the count, the sum of the
+            // scores, and every (rid, score) whose score is at least the
+            // 200th score, for a comparison with ZCTextIndex on the fixture.
+            let dir = PathBuf::from(&rest[0]);
+            let (idx, fields) = index::open(Mode::Compat, &dir).unwrap();
+            let searcher = index::reader(&idx).unwrap().searcher();
+            let stats: Vec<Stats> = INDEXES
+                .iter()
+                .map(|n| Stats::count(&searcher, &format!("n_{n}")).unwrap())
+                .collect();
+            for line in lines(Path::new(&rest[1])) {
+                let q: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let name = q["index"].as_str().unwrap();
+                let i = INDEXES.iter().position(|n| *n == name).unwrap();
+                let tree: Node = serde_json::from_value(q["tree"].clone()).unwrap();
+                let len_name = format!("n_{name}");
+                let t = Instant::now();
+                let mut c = Compat::new(&searcher, fields.text[i], &len_name, stats[i]);
+                let all = match c.run(&tree).unwrap() {
+                    Some(h) => compat::rank(&searcher, &h, |_| true, usize::MAX).unwrap().1,
+                    None => Vec::new(),
+                };
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                let sum: i64 = all.iter().map(|p| p.1).sum();
+                let cut = all.get(199).map_or(i64::MIN, |p| p.1);
+                let head: Vec<_> = all.iter().take_while(|p| p.1 >= cut).collect();
+                println!(
+                    "{}",
+                    serde_json::json!({"query": q["query"], "index": name, "count": all.len(), "sum": sum, "head": head, "ms": ms})
+                );
+            }
+        }
         "overlaycost" => {
             // overlaycost MODE CORPUS: the build of an overlay of 0, 1 and 10
             // documents, the mean of 200 builds.

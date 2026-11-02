@@ -195,22 +195,28 @@ pub fn compat(
         }
     };
     let mut c = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust);
-    c.exclude = Some(&ex);
+    if counts == Counts::Exact {
+        c.exclude = Some(&ex);
+    }
     let main_hits = c.run(node)?;
     // The overlay scores with the same counts and frequencies.
     let mut df_main = c.df_used().clone();
     if counts == Counts::Current {
         // The frequencies of the main index as it is, without exclusion.
         let mut plain = Compat::new(main, fields.text[i], &len_name, stats);
-        let _ = plain.run(node)?;
-        df_main = plain.df_used().clone();
+        df_main = HashMap::new();
+        for w in query_words(&plain, node)? {
+            let df = plain.doc_freq(&w)?;
+            df_main.insert(w, df);
+        }
     }
     let mut oc = Compat::new(&o.searcher, o.fields.text[i], &len_name, main_stats).with_df(df_main);
     let o_hits = oc.run(node)?;
     let (Some(mh), Some(oh)) = (main_hits, o_hits) else {
         return Ok((0, Vec::new()));
     };
-    let (n1, mut t1) = compat::rank(main, &mh, keep, limit)?;
+    let rids = &o.rids;
+    let (n1, mut t1) = compat::rank(main, &mh, |r| keep(r) && !rids.contains(&r), limit)?;
     let (n2, t2) = compat::rank(&o.searcher, &oh, keep, limit)?;
     t1.extend(t2);
     t1.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
@@ -225,4 +231,275 @@ fn collect_words(node: &Node, out: &mut std::collections::BTreeSet<String>) {
         Node::Atom { words } | Node::Phrase { words } => out.extend(words.iter().cloned()),
         Node::Glob { .. } => {}
     }
+}
+
+/// The words of `node`, with the words of the lexicon of `c` that its globs
+/// match.
+fn query_words(c: &Compat<'_>, node: &Node) -> tantivy::Result<Vec<String>> {
+    let mut words = std::collections::BTreeSet::new();
+    collect_words(node, &mut words);
+    let mut globs = Vec::new();
+    collect_globs(node, &mut globs);
+    for g in globs {
+        words.extend(c.expand_glob(&g)?);
+    }
+    Ok(words.into_iter().collect())
+}
+
+fn collect_globs(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::And { items, nots } => items.iter().chain(nots).for_each(|n| collect_globs(n, out)),
+        Node::Or { items } => items.iter().for_each(|n| collect_globs(n, out)),
+        Node::Glob { pattern } => out.push(pattern.clone()),
+        _ => {}
+    }
+}
+
+/// An overlay of the compatibility mode with no tantivy segment: the words
+/// of each document, matched and scored directly. It has no fixed cost.
+pub struct Direct {
+    /// The replaced rids.
+    pub rids: HashSet<u64>,
+    /// Each document: its rid, and the words of each index, `None` when
+    /// absent.
+    pub docs: Vec<(u64, [Option<Vec<String>>; 3])>,
+}
+
+impl Direct {
+    /// Split the texts of index `i` of `docs`: a query reads one index.
+    pub fn build(docs: &[Doc], i: usize) -> Self {
+        let rids = docs.iter().map(|d| d.rid).collect();
+        let docs = docs
+            .iter()
+            .map(|d| {
+                let mut ws: [Option<Vec<String>>; 3] = [None, None, None];
+                ws[i] = d.texts[i].as_deref().map(super::analysis::plone_words);
+                (d.rid, ws)
+            })
+            .collect();
+        Self { rids, docs }
+    }
+
+    fn exclusions(&self, main: &Searcher, fields: &Fields) -> tantivy::Result<Vec<HashSet<DocId>>> {
+        let mut out = Vec::new();
+        for seg in main.segment_readers() {
+            let inv = seg.inverted_index(fields.rid)?;
+            let mut set = HashSet::new();
+            for &rid in &self.rids {
+                let term = Term::from_field_u64(fields.rid, rid);
+                if let Some(mut p) = inv.read_postings(&term, IndexRecordOption::Basic)? {
+                    let mut d = p.doc();
+                    while d != TERMINATED {
+                        if seg.alive_bitset().is_none_or(|a| a.is_alive(d)) {
+                            set.insert(d);
+                        }
+                        d = p.advance();
+                    }
+                }
+            }
+            out.push(set);
+        }
+        Ok(out)
+    }
+}
+
+/// The score of one document for one node: `None` when the node matches
+/// every document, `Some(None)` when the document does not match.
+fn eval_doc(
+    node: &Node,
+    words: &[String],
+    score: &dyn Fn(&str) -> Option<i64>,
+    glob: &dyn Fn(&str, &[String]) -> Vec<String>,
+) -> Option<Option<i64>> {
+    match node {
+        Node::Atom { words: ws } => {
+            if ws.is_empty() {
+                return None;
+            }
+            let mut acc = None;
+            for w in ws {
+                if let Some(s) = score(w) {
+                    acc = Some(acc.unwrap_or(0) + s);
+                }
+            }
+            Some(acc)
+        }
+        Node::Glob { pattern } => {
+            let mut acc = None;
+            for w in glob(pattern, words) {
+                if let Some(s) = score(&w) {
+                    acc = Some(acc.unwrap_or(0) + s);
+                }
+            }
+            Some(acc)
+        }
+        Node::Phrase { words: ws } => {
+            let mut total = 0;
+            for w in ws {
+                match score(w) {
+                    Some(s) => total += s,
+                    None => return Some(None),
+                }
+            }
+            let found = words.windows(ws.len().max(1)).any(|win| win == ws.as_slice());
+            Some(found.then_some(total))
+        }
+        Node::And { items, nots } => {
+            let mut acc: Option<i64> = None;
+            let mut any = false;
+            for n in items {
+                match eval_doc(n, words, score, glob) {
+                    None => {}
+                    Some(None) => return Some(None),
+                    Some(Some(s)) => {
+                        any = true;
+                        acc = Some(acc.unwrap_or(0) + s);
+                    }
+                }
+            }
+            if !any {
+                return Some(None);
+            }
+            for n in nots {
+                if let Some(Some(_)) = eval_doc(n, words, score, glob) {
+                    return Some(None);
+                }
+            }
+            Some(acc)
+        }
+        Node::Or { items } => {
+            let mut acc = None;
+            for n in items {
+                if let Some(Some(s)) = eval_doc(n, words, score, glob) {
+                    acc = Some(acc.unwrap_or(0) + s);
+                }
+            }
+            Some(acc)
+        }
+    }
+}
+
+/// Run `node` of the compatibility mode on text index `i` of `main` with a
+/// direct overlay, as `compat` does with a segment.
+#[allow(clippy::too_many_arguments)]
+pub fn compat_direct(
+    main: &Searcher,
+    fields: &Fields,
+    i: usize,
+    stats: Stats,
+    o: &Direct,
+    node: &Node,
+    counts: Counts,
+    keep: impl Fn(u64) -> bool + Copy,
+    limit: usize,
+) -> tantivy::Result<Ranked> {
+    let len_name = format!("n_{}", INDEXES[i]);
+    let ex = o.exclusions(main, fields)?;
+    let (mut gone_n, mut gone_total) = (0i64, 0i64);
+    for (ord, set) in ex.iter().enumerate() {
+        let lens = main.segment_readers()[ord].fast_fields().u64(&len_name)?;
+        for &d in set {
+            let v = lens.first(d).unwrap_or(0);
+            if v > 0 {
+                gone_n += 1;
+                gone_total += v as i64 - 1;
+            }
+        }
+    }
+    let present: Vec<(u64, &Vec<String>)> =
+        o.docs.iter().filter_map(|(rid, ws)| ws[i].as_ref().map(|w| (*rid, w))).collect();
+    let (on, ototal) = (present.len() as i64, present.iter().map(|p| p.1.len() as i64).sum::<i64>());
+    // The overlay documents that hold each word.
+    let mut odf: HashMap<&str, i64> = HashMap::new();
+    for (_, ws) in &present {
+        let distinct: HashSet<&str> = ws.iter().map(String::as_str).collect();
+        for w in distinct {
+            *odf.entry(w).or_default() += 1;
+        }
+    }
+    let (main_stats, adjust) = match counts {
+        Counts::Current => (stats, Adjust::default()),
+        Counts::Exact => (
+            Stats {
+                n: (stats.n as i64 - gone_n + on) as u64,
+                total: (stats.total as i64 - gone_total + ototal) as u64,
+            },
+            Adjust {
+                n: 0,
+                total: 0,
+                df: odf.iter().map(|(w, n)| ((*w).to_owned(), *n)).collect(),
+            },
+        ),
+    };
+    let mut c = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust);
+    if counts == Counts::Exact {
+        c.exclude = Some(&ex);
+    }
+    let main_hits = c.run(node)?;
+    let mut c2 = Compat::new(main, fields.text[i], &len_name, main_stats).with_adjust(&adjust);
+    if counts == Counts::Exact {
+        c2.exclude = Some(&ex);
+    }
+    let n = c2.n() as f64;
+    let mean = if n == 0.0 { 0.0 } else { c2.total() as f64 / n };
+    let df_cache: std::cell::RefCell<HashMap<String, u64>> = Default::default();
+    let c2 = std::cell::RefCell::new(c2);
+    // The document frequency of a word, read once for the query.
+    let df_of = |w: &str| -> u64 {
+        if let Some(d) = df_cache.borrow().get(w) {
+            return *d;
+        }
+        let d = c2.borrow_mut().doc_freq(w).unwrap_or(0);
+        // A word that only the overlay holds, outside the window.
+        let d = if d == 0 { odf.get(w).copied().unwrap_or(0) as u64 } else { d };
+        df_cache.borrow_mut().insert(w.to_owned(), d);
+        d
+    };
+    let mut hits = Vec::new();
+    for (rid, ws) in &present {
+        let len = ws.len() as f64;
+        let mut tf: HashMap<&str, u32> = HashMap::new();
+        for w in ws.iter() {
+            *tf.entry(w.as_str()).or_default() += 1;
+        }
+        let score = |w: &str| -> Option<i64> {
+            let f = f64::from(*tf.get(w)?);
+            let df = df_of(w);
+            if df == 0 {
+                return None;
+            }
+            let idf = (1.0 + n / df as f64).ln() * 1024.0;
+            let lenweight = 0.25 + 0.75 * len / mean;
+            let t = f * 2.2 / (f + 1.2 * lenweight);
+            Some((t * idf + 0.5) as i64)
+        };
+        let glob = |pattern: &str, words: &[String]| -> Vec<String> {
+            let pat: Vec<char> = pattern.chars().collect();
+            let mut out: Vec<String> = words
+                .iter()
+                .filter(|w| super::compat::glob_match(&pat, &w.chars().collect::<Vec<_>>()))
+                .cloned()
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        if let Some(Some(s)) = eval_doc(node, ws, &score, &glob)
+            && keep(*rid)
+        {
+            hits.push((*rid, s));
+        }
+    }
+    let Some(mh) = main_hits else {
+        return Ok((0, Vec::new()));
+    };
+    // Outside the window the main index still holds the old versions:
+    // leave them out of its result.
+    let rids = &o.rids;
+    let (n1, mut t1) = compat::rank(main, &mh, |r| keep(r) && !rids.contains(&r), limit)?;
+    let n2 = hits.len();
+    t1.extend(hits);
+    t1.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+    t1.truncate(limit);
+    Ok((n1 + n2, t1.into_iter().map(|(r, s)| (r, s as f64)).collect()))
 }

@@ -172,7 +172,7 @@ fn difference(a: &Scores, b: &Scores) -> Scores {
 
 /// Tell if `word` matches the glob `pattern`: `*` is any run, `?` one
 /// character, as `Lexicon.globToWordIds` does with `re.match` and `$`.
-fn glob_match(pattern: &[char], word: &[char]) -> bool {
+pub fn glob_match(pattern: &[char], word: &[char]) -> bool {
     match pattern.split_first() {
         None => word.is_empty(),
         Some(('*', rest)) => (0..=word.len()).any(|k| glob_match(rest, &word[k..])),
@@ -235,7 +235,7 @@ impl<'a> Compat<'a> {
 
     /// The document frequency of `word` over the searcher, deletes and
     /// exclusions left out, plus the change of the overlay.
-    fn doc_freq(&mut self, word: &str) -> tantivy::Result<u64> {
+    pub fn doc_freq(&mut self, word: &str) -> tantivy::Result<u64> {
         if let Some(df) = self.df.get(word) {
             return Ok(*df);
         }
@@ -316,12 +316,14 @@ impl<'a> Compat<'a> {
         Ok(out)
     }
 
-    fn n(&self) -> u64 {
+    /// The document count of the run.
+    pub fn n(&self) -> u64 {
         let adj = self.adjust.map_or(0, |a| a.n);
         (self.stats.n as i64 + adj).max(0) as u64
     }
 
-    fn total(&self) -> u64 {
+    /// The word count of the run.
+    pub fn total(&self) -> u64 {
         let adj = self.adjust.map_or(0, |a| a.total);
         (self.stats.total as i64 + adj).max(0) as u64
     }

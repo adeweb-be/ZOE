@@ -83,6 +83,11 @@ fn transliterate(word: &str) -> String {
 /// through `unidecode` and keeps only printable ASCII; every word is then
 /// in lower case.
 fn normalize(word: &str) -> String {
+    // An ASCII word of letters, digits and underscores: Unidecode and the
+    // filter keep it as it is.
+    if word.is_ascii() {
+        return word.to_ascii_lowercase();
+    }
     let first = word.chars().next().map_or(0, |c| c as u32);
     if (0x41..=0x24F).contains(&first) {
         let ascii = transliterate(word);
@@ -96,10 +101,20 @@ fn normalize(word: &str) -> String {
 /// Return the words of `text` as the lexicon `plone_lexicon` gives them.
 pub fn plone_words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let normalized: String = text.nfkc().collect();
+    // ASCII text is in NFKC already.
+    let normalized: std::borrow::Cow<'_, str> = if text.is_ascii() {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.nfkc().collect())
+    };
     let mut run = String::new();
     let flush = |run: &mut String, out: &mut Vec<String>| {
         if run.is_empty() {
+            return;
+        }
+        if run.is_ascii() {
+            out.push(run.to_ascii_lowercase());
+            run.clear();
             return;
         }
         // Cut the run into segments of one script class.
@@ -125,7 +140,8 @@ pub fn plone_words(text: &str) -> Vec<String> {
         run.clear();
     };
     for c in normalized.chars() {
-        if is_python_word(c) {
+        let word = if c.is_ascii() { c.is_ascii_alphanumeric() || c == '_' } else { is_python_word(c) };
+        if word {
             run.push(c);
         } else {
             flush(&mut run, &mut out);
