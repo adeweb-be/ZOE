@@ -69,6 +69,8 @@ fn build(args: &[String]) {
     let th0 = threads();
     let (idx, fields) = index::create(mode, Some(&dir)).unwrap();
     let writer = idx.writer_with_num_threads(nthreads, 256_000_000 * nthreads).unwrap();
+    // No merge in the background: one merge after the commit.
+    writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
     let th_writer = threads();
     let (tx, rx) = mpsc::sync_channel::<Vec<String>>(8);
     let rx = Arc::new(Mutex::new(rx));
