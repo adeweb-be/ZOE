@@ -128,13 +128,13 @@ A policy is a dict with the key `classes` and, as switches, `structural_merges`,
 
 ## `zoe.reader`
 
-The reader of ZOE decodes a ZODB record in Rust, in place of ZODB's `ObjectReader`, with the same state for every object (ADR 0057). A record that its Rust path does not decode goes to `ObjectReader` whole.
+The reader of ZOE decodes a ZODB record in Rust, in place of ZODB's `ObjectReader`, with the same state for every object (ADR 0057). A record that its Rust path does not decode goes to `ObjectReader` whole. `Connection.setstate` does the lines of ZODB's `Connection.setstate` for an ordinary record in one call into Rust.
 
 | Name | What it is |
 | --- | --- |
 | `Reader(conn, cache, factory)` | ZODB's `ObjectReader` with `setGhostState` and `getState` in Rust. |
-| `Connection` | ZODB's `Connection` with a `Reader`. |
-| `install(db)` | Make each new connection of `db` a `Connection`, when `db.klass` is ZODB's `Connection`, and give a `Reader` to each connection that `db` already has. It gives nothing when `db.storage.native_reader` is false. `zoe.plone` calls it at the start of Zope for a main database on `zoe.Storage` or `zoe.zeo.ClientStorage`. |
+| `Connection` | ZODB's `Connection` with a `Reader`, and with `setstate` in Rust: the same object, serial, size estimation, load count, log and exception as ZODB's `setstate`. A closed connection, a blob, and a storage with the hot classes of early locks go to the `setstate` of ZODB's `Connection`. |
+| `install(db)` | Make each new connection of `db` a `Connection`, when `db.klass` is ZODB's `Connection`. Give a `Reader` to each connection that `db` already has, and make it a `Connection` when its class is ZODB's `Connection`. It gives nothing when `db.storage.native_reader` is false. `zoe.plone` calls it at the start of Zope for a main database on `zoe.Storage` or `zoe.zeo.ClientStorage`. |
 | `counts()` | Return the counts of the readers of the process: `decoded`, the records that the Rust path decoded; `fallback`, the records that went to `ObjectReader`, by reason; `opcodes`, the opcodes that sent a record there. |
 
 ## `zoe.testing`

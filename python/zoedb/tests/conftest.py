@@ -15,14 +15,20 @@ collect_ignore = ["conformance", "crash"]
 # The switch of the reader of ZOE (ADR 0057): with ZOE_TEST_READER=on, each
 # Connection of the run makes a `zoe.reader.Reader` in place of ZODB's
 # `ObjectReader`, also a Connection that a test of ZODB makes on a storage
-# of its own. This is a switch of the tests only. The end of the run prints
-# the counts of the reader.
+# of its own. Each connection that a database opens is a
+# `zoe.reader.Connection`, with `setstate` in Rust. The class gets the
+# module name of ZODB's `Connection`: the doctests of ZODB print a
+# connection with it. This is a switch of the tests only. The end of the
+# run prints the counts of the reader.
 if os.environ.get("ZOE_TEST_READER") == "on":
+    import ZODB
     import ZODB.Connection
 
     import zoe.reader
 
     ZODB.Connection.ObjectReader = zoe.reader.Reader
+    ZODB.DB.klass = zoe.reader.Connection
+    zoe.reader.Connection.__module__ = ZODB.Connection.Connection.__module__
 
     def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(f"zoe.reader counts: {zoe.reader.counts()}")

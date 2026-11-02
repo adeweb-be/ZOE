@@ -101,3 +101,48 @@ The reader adds no lock to the pickle cache: a connection and its reader serve o
 - A record of a construct that the list of section 2 does not name costs one decode more: the Rust path stops at the construct, and `ObjectReader` decodes the record again. The fixture and the Plone requests of the spike had no such record.
 - The rule of section 4 differs from ZODB in one case: a module that rebinds a class name while a connection lives. The conformance suites have no such case.
 - A new opcode that ZODB writes, such as a protocol above 3, goes to the Python path until the reader learns it.
+
+## Amendment (proposed): `setstate` of `zoe.reader.Connection` in Rust
+
+Status: proposed. Card ZOE-278. It replaces the sentence "`Connection.setstate` stays ZODB's" of the decision, section 1, the first sentence of the second item of the consequences for `Connection.setstate`, and adds to sections 6 and 9. The rest of the record stays. It changes no wire message, no on-disk format and no name of `zoe.reader`.
+
+### A. The method
+
+`zoe.reader.Connection.setstate` overrides ZODB's `Connection.setstate`. It is `zoe._zoe._setstate`, a function in Rust (`crates/zoe-py/src/reader.rs`) in an `instancemethod` of CPython, so the class attribute binds to the connection as a function of Python does, and a load runs no Python frame of `setstate`.
+
+For an ordinary record it does the lines of ZODB's method, in their order: `obj._p_oid`; the check of `self.opened`; `p, serial = self._storage.load(oid)`, so the MVCC load stays the load of the storage of the connection; `self._load_count += 1`; the decode and `__setstate__` of the reader; `obj._p_serial = serial`; `self._cache.update_object_size_estimation(oid, len(p))`; `obj._p_estimated_size = len(p)`. When `_reader` is exactly a `zoe.reader.Reader`, the decode is the Rust path of `setGhostState` without a call through Python; another reader gets `self._reader.setGhostState(obj, p)`.
+
+### B. The versions of ZODB
+
+The method follows `Connection.setstate` of ZODB 6.0, 6.1, 6.2, 6.3 and 6.4, which have the same lines. A version of ZODB that changes them needs a change of the method and of its acceptance test.
+
+### C. What goes to the method of ZODB
+
+These loads call the `setstate` that ZODB's `Connection` has at the call, with the connection and the object:
+
+- a closed connection: ZODB's method logs and raises its `ConnectionStateError`;
+- an object whose type is a subclass of `ZODB.blob.Blob`: ZODB's method loads it and its blob file;
+- a connection when the `setstate` in the dict of ZODB's `Connection` is not the function of ZODB. The early locks of `zoe.zodb` put the `setstate` of `LockingConnection` there once per process; for a storage whose `early_lock_classes` is not empty, the load goes to it, and for another storage it stays in Rust, as `LockingConnection.setstate` gives such a load to the function of ZODB. Another function, such as a patch of another package, gets every load.
+
+The method reads the function of ZODB at its first call, by its module and its name.
+
+### D. The exceptions
+
+A `ConflictError` of a line of section A leaves as it is. Another exception, `BaseException` included, is logged as the bare `except` of ZODB logs it, `self._log.exception("Couldn't load state for %s %s", className(obj), oid_repr(oid))`, with the exception as `exc_info`, then raised as it is. An exception of the log takes its place, with the first one as its context. Two facts of the log record differ from those of ZODB's method: its function, file and line are those of the caller of `setstate`, and `sys.exc_info()` gives no exception while a handler of the log runs.
+
+### E. The hook
+
+`zoe.reader.install(db)` also sets the class of each connection of the pools of `db` whose class is ZODB's `Connection` to `zoe.reader.Connection`. That class adds no slot and no instance attribute, so CPython accepts the assignment and the connection keeps its state. The connection that `DB()` pools to make the root, which a Zope of one thread uses for each request, then loads with the method of section A. A connection of another subclass of `Connection` keeps its class.
+
+### F. The tests
+
+- `python/zoedb/tests/test_zoe_reader_setstate.py`, the acceptance test: a `zoe.reader.Connection` and a ZODB `Connection` with ZODB's `ObjectReader` load the same ghost of one database. For an ordinary record (with the reader of ZOE and with `ObjectReader`), a blob, a closed connection, a `ConflictError` of the storage, another error of the storage (`POSKeyError` and `KeyboardInterrupt`) and a record that does not decode, the state of the object, `_p_serial`, `_p_estimated_size`, `_load_count`, the `total_estimated_size` of the pickle cache, the log records (logger, level, message, and the type and the text of their exception) and the exception (the same object for an error of the storage; else the same type, text and cause) are equal. The load of an ordinary record has no Python frame between the access and the storage. A replaced `setstate` of ZODB's `Connection` gets the load; the `setstate` of the early locks gets it for a storage with hot classes only. `install(db)` makes the pooled connection a `zoe.reader.Connection`.
+- The switch of the tests: with `ZOE_TEST_READER=on`, `conftest.py` also sets `DB.klass` to `zoe.reader.Connection`, so each connection that a database opens has the method of section A. The class then has the module name of ZODB's `Connection`, because the doctests of ZODB print a connection with it. `just conformance` runs the suites of ZODB with it.
+
+### G. Consequences
+
+- A load in a Zope process on a ZOE storage no longer runs the Python frame of `Connection.setstate` nor the call of `setGhostState`: a hit runs 2 Python calls in place of 3.
+- That does not make a load faster. On one workstation, `just bench profile terms` on the native client, three interleaved runs of each: a hit at 1 KB takes 3.20 µs on CPython 3.13 and 3.29 µs on 3.14t with this method, against 3.11 µs and 3.13 µs with the reader alone (ZEO: 8.82 µs and 8.33 µs); at 100 KB and on a miss, the two are equal within the noise. The Plone request of `just bench profile plone` (the `small` fixture of B5, one Zope thread, `cacheMinimize` before each request, two runs of each) gives equal times within the noise: a document view of about 2,220 loads takes 85.6 ms and 86.7 ms with this method, against 86.7 ms and 89.2 ms with the reader alone, and a folder listing of about 455 loads 89.0 ms and 93.1 ms, against 90.7 ms and 93.5 ms. The estimate of `docs/spikes/ghost-to-cache.md` for this method, about 2.0 µs on 3.14t, does not hold.
+- Two causes. The lines in Rust read and write the attributes of the connection through the C API, which costs about as much as the specialized bytecode of the frame: py-spy gives the lines about 17 % of a hit with either method. And the assignment of `__class__` in `install` (section E) gives the pooled connection a materialized instance dict: each access of one of its attributes from Python then takes 26 ns in place of 8 ns on 3.13, and 40 ns in place of 15 ns on 3.14t, in every method of ZODB that runs on that connection.
+- The method copies the lines of a method of ZODB. A new version of ZODB that changes `Connection.setstate` needs this record and the method to follow it, as section B says.
+- A load result of the storage that is not a tuple of two items is unpacked by iteration; it raises `ValueError`, or the error of the iteration, as the unpack of Python does, with a text that can differ.

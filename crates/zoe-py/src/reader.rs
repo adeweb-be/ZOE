@@ -15,6 +15,12 @@
 //! id, a Python 2 str that is not ASCII, an int of more than 16 bytes,
 //! malformed bytes, and an exception of a call into Python.
 //!
+//! `setstate`, the `setstate` of `zoe.reader.Connection`, does the lines of
+//! `Connection.setstate` of ZODB for an ordinary record in one call: the
+//! load through the storage, the bookkeeping, and the decode of the reader
+//! without a call through Python. A closed connection and a `Blob` go to
+//! the method of ZODB.
+//!
 //! The reader adds no lock to the pickle cache. One thread uses a
 //! connection and its reader at a time. The table of globals has a mutex,
 //! held for a lookup or an insert only, and no Python code runs while a
@@ -25,10 +31,11 @@ use std::ffi::c_char;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pyo3::exceptions::{PyAttributeError, PyException, PyTypeError};
+use pyo3::exceptions::{PyAttributeError, PyException, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple, PyType};
 use zoe_pickle::opcode as op;
 
@@ -150,12 +157,7 @@ impl Reader {
         obj: &Bound<'_, PyAny>,
         pickle: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let py = slf.py();
-        let state = state_of(slf, pickle)?;
-        match obj.call_method1(intern!(py, "__setstate__"), (state,)) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(slf.get().state_error(py, err)),
-        }
+        ghost_state(slf, obj, pickle)
     }
 
     /// Return the state of `pickle`, as `ObjectReader.getState` does.
@@ -192,6 +194,288 @@ impl Reader {
             Err(other) => other,
         }
     }
+}
+
+/// Decode the state of `pickle` and give it to `obj.__setstate__`, as
+/// `ObjectReader.setGhostState` does.
+fn ghost_state(
+    reader: &Bound<'_, Reader>,
+    obj: &Bound<'_, PyAny>,
+    pickle: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let py = reader.py();
+    let state = state_of(reader, pickle)?;
+    match obj.call_method1(intern!(py, "__setstate__"), (state,)) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(reader.get().state_error(py, err)),
+    }
+}
+
+/// The objects that `setstate` uses, imported at its first call.
+struct ConnectionNames {
+    /// `ZODB.Connection.Connection`.
+    zodb_connection: Py<PyType>,
+    /// The dict of `ZODB.Connection.Connection`, which holds its methods.
+    zodb_connection_dict: Py<PyDict>,
+    /// The function `setstate` of ZODB, when `ZODB.Connection.Connection`
+    /// held it at the first call.
+    zodb_setstate: Option<Py<PyAny>>,
+    /// `zoe.zodb.LockingConnection.setstate`, the `setstate` of the early
+    /// locks.
+    locking_setstate: Py<PyAny>,
+    /// `ZODB.blob.Blob`.
+    blob: Py<PyType>,
+    /// `ZODB.POSException.ConflictError`.
+    conflict_error: Py<PyType>,
+    /// `ZODB.Connection.className`.
+    class_name: Py<PyAny>,
+    /// `ZODB.utils.oid_repr`.
+    oid_repr: Py<PyAny>,
+    /// `zoe.reader.Reader`.
+    reader: Py<PyType>,
+}
+
+impl ConnectionNames {
+    fn import(py: Python<'_>) -> PyResult<Self> {
+        let connection = py.import("ZODB.Connection")?;
+        let class = |module: &str, name: &str| -> PyResult<Py<PyType>> {
+            Ok(py
+                .import(module)?
+                .getattr(name)?
+                .cast_into::<PyType>()?
+                .unbind())
+        };
+        let zodb_connection = connection.getattr("Connection")?.cast_into::<PyType>()?;
+        let setstate = zodb_connection.getattr("setstate")?;
+        // The function of ZODB, and not a function that replaced it.
+        let name = |attribute: &str| -> PyResult<String> {
+            setstate.getattr(attribute)?.extract::<String>()
+        };
+        let zodb_setstate = (name("__module__").is_ok_and(|n| n == "ZODB.Connection")
+            && name("__qualname__").is_ok_and(|n| n == "Connection.setstate"))
+        .then(|| setstate.clone().unbind());
+        Ok(Self {
+            zodb_setstate,
+            locking_setstate: py
+                .import("zoe.zodb")?
+                .getattr("LockingConnection")?
+                .getattr("setstate")?
+                .unbind(),
+            zodb_connection_dict: type_dict(&zodb_connection)?.unbind(),
+            zodb_connection: zodb_connection.unbind(),
+            blob: class("ZODB.blob", "Blob")?,
+            conflict_error: class("ZODB.POSException", "ConflictError")?,
+            class_name: connection.getattr("className")?.unbind(),
+            oid_repr: py.import("ZODB.utils")?.getattr("oid_repr")?.unbind(),
+            reader: class("zoe.reader", "Reader")?,
+        })
+    }
+
+    /// Whether `conn` loads through the lines of `setstate` in Rust, when
+    /// `setstate` is the method of ZODB's `Connection` now. It does with the
+    /// function of ZODB, and with the function of the early locks of
+    /// `zoe.zodb` for a storage without hot classes, which then calls the
+    /// function of ZODB. Another function keeps its lines.
+    fn in_rust(&self, setstate: &Bound<'_, PyAny>, conn: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if self
+            .zodb_setstate
+            .as_ref()
+            .is_some_and(|own| setstate.is(own))
+        {
+            return Ok(true);
+        }
+        if setstate.is(&self.locking_setstate) {
+            return Ok(!has_hot_classes(conn)?);
+        }
+        Ok(false)
+    }
+}
+
+/// Whether the storage of the database of `conn` has the hot classes of
+/// early locks, as `zoe.zodb` reads them.
+fn has_hot_classes(conn: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = conn.py();
+    let db = conn.getattr(intern!(py, "_db"))?;
+    if db.is_none() {
+        return Ok(false);
+    }
+    let Some(storage) = db.getattr_opt(intern!(py, "storage"))? else {
+        return Ok(false);
+    };
+    match storage.getattr_opt(intern!(py, "early_lock_classes"))? {
+        Some(classes) => classes.is_truthy(),
+        None => Ok(false),
+    }
+}
+
+static CONNECTION_NAMES: PyOnceLock<ConnectionNames> = PyOnceLock::new();
+
+/// The `setstate` of `zoe.reader.Connection`: the lines of
+/// `Connection.setstate` of ZODB for an ordinary record, in one call. A
+/// closed connection, a `Blob`, and a connection whose method of ZODB is
+/// another function (`ConnectionNames::in_rust`) go to the method of
+/// ZODB's `Connection`. A `ConflictError` leaves as it is. Another
+/// exception is logged, as the method of ZODB logs it, then raised.
+#[pyfunction]
+#[pyo3(name = "setstate", text_signature = "(self, obj)")]
+fn connection_setstate(conn: &Bound<'_, PyAny>, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    let py = conn.py();
+    let names = CONNECTION_NAMES.get_or_try_init(py, || ConnectionNames::import(py))?;
+    let oid = obj.getattr(intern!(py, "_p_oid"))?;
+    // The method of ZODB's `Connection` now, from the dict of the class.
+    let setstate = match names
+        .zodb_connection_dict
+        .bind(py)
+        .get_item(intern!(py, "setstate"))?
+    {
+        Some(setstate) => setstate,
+        None => names
+            .zodb_connection
+            .bind(py)
+            .getattr(intern!(py, "setstate"))?,
+    };
+    if conn.getattr(intern!(py, "opened"))?.is_none()
+        || obj.get_type().is_subclass(names.blob.bind(py))?
+        || !names.in_rust(&setstate, conn)?
+    {
+        let setstate = names
+            .zodb_connection
+            .bind(py)
+            .getattr(intern!(py, "setstate"))?;
+        setstate.call1((conn, obj))?;
+        return Ok(());
+    }
+    match load_state(names, conn, obj, &oid) {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_instance(py, names.conflict_error.bind(py)) => Err(err),
+        Err(err) => Err(log_load_error(names, conn, obj, &oid, err)),
+    }
+}
+
+/// The lines of the `try` of `Connection.setstate` of ZODB, but the blob.
+fn load_state(
+    names: &ConnectionNames,
+    conn: &Bound<'_, PyAny>,
+    obj: &Bound<'_, PyAny>,
+    oid: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let py = conn.py();
+    let loaded = conn
+        .getattr(intern!(py, "_storage"))?
+        .call_method1(intern!(py, "load"), (oid,))?;
+    let (pickle, serial) = pair_of(&loaded)?;
+    let count = conn.getattr(intern!(py, "_load_count"))?.add(1)?;
+    conn.setattr(intern!(py, "_load_count"), count)?;
+    let reader = conn.getattr(intern!(py, "_reader"))?;
+    if reader.get_type().is(names.reader.bind(py)) {
+        // The reader of ZOE: its decode, without a call through Python.
+        ghost_state(reader.cast::<Reader>()?, obj, &pickle)?;
+    } else {
+        reader.call_method1(intern!(py, "setGhostState"), (obj, &pickle))?;
+    }
+    obj.setattr(intern!(py, "_p_serial"), serial)?;
+    let Ok(size) = pickle.len()?.into_pyobject(py);
+    conn.getattr(intern!(py, "_cache"))?
+        .call_method1(intern!(py, "update_object_size_estimation"), (oid, &size))?;
+    obj.setattr(intern!(py, "_p_estimated_size"), size)?;
+    Ok(())
+}
+
+/// `pickle, serial = loaded`. A value that is not a tuple of two items is
+/// unpacked by iteration: it raises `ValueError`, or the error of the
+/// iteration.
+fn pair_of<'py>(loaded: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    if let Ok(pair) = loaded.cast::<PyTuple>()
+        && pair.len() == 2
+    {
+        return Ok((pair.get_item(0)?, pair.get_item(1)?));
+    }
+    let mut values = Vec::with_capacity(2);
+    for value in loaded.try_iter()? {
+        if values.len() == 2 {
+            return Err(PyValueError::new_err(
+                "too many values to unpack (expected 2)",
+            ));
+        }
+        values.push(value?);
+    }
+    let n = values.len();
+    let mut values = values.into_iter();
+    match (values.next(), values.next()) {
+        (Some(pickle), Some(serial)) => Ok((pickle, serial)),
+        _ => Err(PyValueError::new_err(format!(
+            "not enough values to unpack (expected 2, got {n})"
+        ))),
+    }
+}
+
+/// Log `err` as the bare `except` of `Connection.setstate` of ZODB logs
+/// it, and return it. An error of the log takes its place, with `err` as
+/// its context.
+fn log_load_error(
+    names: &ConnectionNames,
+    conn: &Bound<'_, PyAny>,
+    obj: &Bound<'_, PyAny>,
+    oid: &Bound<'_, PyAny>,
+    err: PyErr,
+) -> PyErr {
+    let py = conn.py();
+    let logged = (|| -> PyResult<()> {
+        let exception = conn
+            .getattr(intern!(py, "_log"))?
+            .getattr(intern!(py, "exception"))?;
+        let class_name = names.class_name.bind(py).call1((obj,))?;
+        let oid_text = names.oid_repr.bind(py).call1((oid,))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "exc_info"), err.value(py))?;
+        exception.call(
+            ("Couldn't load state for %s %s", class_name, oid_text),
+            Some(&kwargs),
+        )?;
+        Ok(())
+    })();
+    let Err(other) = logged else {
+        return err;
+    };
+    let value = other.value(py);
+    if value
+        .getattr(intern!(py, "__context__"))
+        .is_ok_and(|context| context.is_none())
+    {
+        // The error drops when the assignment fails: `other` is raised.
+        let _ = value.setattr(intern!(py, "__context__"), err.value(py));
+    }
+    other
+}
+
+/// The `setstate` of `zoe.reader.Connection`: `setstate(conn, obj)` as an
+/// `instancemethod` of CPython. A class attribute of that type binds to
+/// the instance, as a function of Python does.
+pub(crate) fn setstate_method<'py>(m: &Bound<'py, PyModule>) -> PyResult<Bound<'py, PyAny>> {
+    let function = wrap_pyfunction!(connection_setstate, m)?;
+    instance_method(function.as_any())
+}
+
+/// The dict of the class `class`, as `PyType_GetDict` gives it.
+#[allow(unsafe_code)]
+fn type_dict<'py>(class: &Bound<'py, PyType>) -> PyResult<Bound<'py, PyDict>> {
+    // SAFETY: `class` is a live type object. The call returns a new
+    // reference to its dict, or NULL with an exception set.
+    let dict = unsafe {
+        Bound::from_owned_ptr_or_err(class.py(), ffi::PyType_GetDict(class.as_type_ptr()))?
+    };
+    Ok(dict.cast_into::<PyDict>()?)
+}
+
+/// `PyInstanceMethod_New(function)`. pyo3-ffi does not declare it.
+#[allow(unsafe_code)]
+fn instance_method<'py>(function: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    unsafe extern "C" {
+        fn PyInstanceMethod_New(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    }
+    // SAFETY: `function` is a live object. The call takes its own reference
+    // to it, and returns a new reference or NULL with an exception set.
+    unsafe { Bound::from_owned_ptr_or_err(function.py(), PyInstanceMethod_New(function.as_ptr())) }
 }
 
 /// The state of `pickle` from the Rust path, else from the Python path of
