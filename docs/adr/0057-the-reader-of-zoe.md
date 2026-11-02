@@ -1,6 +1,6 @@
 # 0057. The reader of ZOE: a record decodes in Rust in place of ObjectReader
 
-Status: proposed. Card ZOE-276. The spike ZOE-274 built the prototype (finding: `docs/spikes/ghost-to-cache.md`). This record adds a public Python API: the module `zoe.reader` (`Reader`, `Connection`, `install(db)`, `counts()`), the key `native-reader` of `<zoe>` and of `<zoeclient>`, the argument `native_reader` of `zoe.Storage` and the attribute `native_reader` of the storages. It changes no wire message and no on-disk format.
+Status: accepted. Card ZOE-276. The spike ZOE-274 built the prototype (finding: `docs/spikes/ghost-to-cache.md`). This record adds a public Python API: the module `zoe.reader` (`Reader`, `Connection`, `install(db)`, `counts()`), the key `native-reader` of `<zoe>` and of `<zoeclient>`, the argument `native_reader` of `zoe.Storage` and the attribute `native_reader` of the storages. It changes no wire message and no on-disk format.
 
 ## Context
 
