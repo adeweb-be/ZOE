@@ -85,6 +85,7 @@
   - [0055. zoe-wire: the ZEO frame codec and the TLS certificate reader](adr/0055-zoe-wire.md)
   - [0056. A write-ahead log with a background fold: ZOE format 3](adr/0056-the-write-ahead-log.md)
   - [0057. The reader of ZOE: a record decodes in Rust in place of ObjectReader](adr/0057-the-reader-of-zoe.md)
+  - [0060. The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex](adr/0060-the-native-text-index.md)
 
 # Reference
 
@@ -106,6 +107,7 @@
   - [Where a load spends its time between the ghost and the client cache](spikes/load-path.md)
   - [A reader in Rust in place of `Connection._reader`](spikes/ghost-to-cache.md)
   - [Field-addressable objects, before the design of phase 6](spikes/field-addressable-objects.md)
+  - [The native text index on tantivy, its delta record type, and the compatibility with ZCTextIndex](spikes/text-index.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
   - [zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)
