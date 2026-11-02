@@ -62,6 +62,7 @@
 //! has no frame and no tag, as the transaction index.
 
 pub mod blob;
+pub(crate) mod text;
 pub(crate) mod wal;
 
 use std::borrow::Cow;
@@ -111,6 +112,8 @@ pub enum KeySpace {
     KvEphemeral = 7,
     /// The rows of the durable KV namespaces, in `kv_durable`.
     KvDurable = 8,
+    /// The text deltas, in `text_deltas`. Scratch: not merged.
+    TextDeltas = 9,
 }
 
 impl KeySpace {
@@ -676,7 +679,7 @@ mod tests {
     }
 
     /// Every key space of this build.
-    const SPACES: [KeySpace; 7] = [
+    const SPACES: [KeySpace; 8] = [
         KeySpace::Records,
         KeySpace::Blobs,
         KeySpace::Txns,
@@ -684,12 +687,13 @@ mod tests {
         KeySpace::Sequences,
         KeySpace::KvEphemeral,
         KeySpace::KvDurable,
+        KeySpace::TextDeltas,
     ];
 
     #[test]
     fn the_tags_of_the_key_spaces_never_change() {
         let tags = SPACES.map(KeySpace::tag);
-        assert_eq!(tags, [1, 2, 3, 4, 5, 7, 8]);
+        assert_eq!(tags, [1, 2, 3, 4, 5, 7, 8, 9]);
     }
 
     #[test]

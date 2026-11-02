@@ -25,6 +25,7 @@ mod store;
 #[doc(hidden)]
 pub mod testing;
 mod types;
+pub mod text;
 mod undo;
 pub mod vfs;
 mod wal;

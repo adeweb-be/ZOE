@@ -8,7 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# The prototype of the native text index (spike, not merged).
 [dependencies]
+roaring = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tantivy = "0.27"
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+unidecode = "0.3"
+zoe-core = { workspace = true }
 
 [lints]
 workspace = true
