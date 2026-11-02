@@ -16,6 +16,7 @@ These findings still describe the code and its dependencies.
 | [load-path.md](load-path.md) | Where does a load through ZODB on the native client spend its time between the ghost and the client cache, on a hit and on a miss, and which terms do a prefetch (ZOE-273) and a path in Rust (ZOE-274) remove? |
 | [ghost-to-cache.md](ghost-to-cache.md) | How much of a load does a reader in Rust in place of `Connection._reader` remove, with the same state for every record, and does a path in Rust from the ghost to the client cache need a `persistent` in Rust? |
 | [field-addressable-objects.md](field-addressable-objects.md) | Should the store keep chosen fields of an object addressable in the typed-field slots of its record frame, and in which shape? The numbers of each shape on conflicts and write amplification, throughput and ergonomics, before the design of phase 6; the weighting of the criteria and the verdict are the human's. |
+| [catalog-mirror.md](catalog-mirror.md) | Can a mirror that Rust builds from the committed index trees of a catalog meet the targets of F17 (5 ms at p99 for a five-index intersection, 60 s cold) on one million entries, and how must it be built? The cold build, the memory, the queries, the maintenance, the overlay of a transaction, the queries that Plone sends and the order of ZCatalog; the design is ADR 0059 (proposed). |
 
 ## Archive
 
