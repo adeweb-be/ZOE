@@ -122,6 +122,15 @@
         it. Without it, the storage writes no such line.
       </description>
     </key>
+    <key name="native-reader" datatype="string">
+      <description>
+        If true, the connections of a database of Zope on this storage
+        decode their records with the reader of ZOE, in Rust, in place of
+        the ObjectReader of ZODB (ADR 0057): zoe.plone gives it at the
+        start of Zope, and zoe.reader.install gives it outside Zope. If
+        false, they keep the ObjectReader of ZODB. The default is true.
+      </description>
+    </key>
   </sectiontype>
 
   <sectiontype name="ssl">
@@ -182,7 +191,8 @@
       A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
       ZEO.ClientStorage. It takes every key of the zeoclient section, with
       the same values, wait-timeout, native, early-locks,
-      early-lock-classes and prefetch-references, and an ssl section. It
+      early-lock-classes, prefetch-references and native-reader, and an
+      ssl section. It
       declares the ZOE extensions to the server, and works as a zeoclient
       against a stock ZEO server.
     </description>
@@ -228,6 +238,15 @@
         the native client. The asyncio client of ZEO ignores it. Without
         the key, the variable ZOE_PREFETCH_REFERENCES gives the value, and
         without the variable it is true.
+      </description>
+    </key>
+    <key name="native-reader" datatype="boolean" default="on">
+      <description>
+        If true, the connections of a database of Zope on this client
+        decode their records with the reader of ZOE, in Rust, in place of
+        the ObjectReader of ZODB (ADR 0057), as in the zoe section. If
+        false, they keep the ObjectReader of ZODB. The key has no
+        environment variable. The default is true.
       </description>
     </key>
   </sectiontype>

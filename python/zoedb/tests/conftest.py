@@ -12,6 +12,21 @@ import pytest
 # collects them there.
 collect_ignore = ["conformance", "crash"]
 
+# The switch of the reader of ZOE (ADR 0057): with ZOE_TEST_READER=on, each
+# Connection of the run makes a `zoe.reader.Reader` in place of ZODB's
+# `ObjectReader`, also a Connection that a test of ZODB makes on a storage
+# of its own. This is a switch of the tests only. The end of the run prints
+# the counts of the reader.
+if os.environ.get("ZOE_TEST_READER") == "on":
+    import ZODB.Connection
+
+    import zoe.reader
+
+    ZODB.Connection.ObjectReader = zoe.reader.Reader
+
+    def pytest_terminal_summary(terminalreporter):
+        terminalreporter.write_line(f"zoe.reader counts: {zoe.reader.counts()}")
+
 
 @pytest.fixture
 def server(tmp_path):

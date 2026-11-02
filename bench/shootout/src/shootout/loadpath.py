@@ -14,6 +14,13 @@ client or a server changes.
 `terms` also counts the Python calls of one load with `sys.setprofile`,
 and the `persistent_load` callbacks of each record of the corpus.
 
+With `--reader`, `terms` and `loop` call `zoe.reader.install` on the
+database before its first connection, so each load decodes its record
+with the reader of ZOE (ADR 0057). The layers of the unpickler setup and of
+the class lookup then still time ZODB's Python path, which the load no
+longer takes: the term `getState` is the whole decode. Each row records
+the counts of the reader.
+
 `python -m shootout.loadpath loop` repeats the hit or the miss round of
 one client for a number of seconds, for a sampling profiler: with
 `--py-spy FILE`, it runs itself under `py-spy record --native`; with
@@ -64,7 +71,7 @@ TIMED = "_touch"
 
 
 @contextlib.contextmanager
-def opened(client: str, size: int, objects: int, workdir: Path):
+def opened(client: str, size: int, objects: int, workdir: Path, reader: bool = False):
     """Start a server, open a `DB` on a client of it, write the corpus, and
     yield the `Fixture`. Stop all at the exit."""
     import ZODB
@@ -95,6 +102,12 @@ def opened(client: str, size: int, objects: int, workdir: Path):
         # leaves it between two rounds but by `cacheMinimize`.
         db = ZODB.DB(storage, cache_size=10 * objects)
         stack.callback(db.close)
+        if reader:
+            # The reader of ZOE (ADR 0057): setGhostState and getState in
+            # Rust, for every connection of the database.
+            import zoe.reader
+
+            zoe.reader.install(db)
         conn = db.open()
         stack.callback(conn.close)
         yield Fixture(client, size, objects, db, conn, admin)
@@ -298,8 +311,10 @@ def pass_mapping_new(f):
     from persistent import PickleCache
     from ZODB.serialize import ObjectReader
 
+    # The reader of the connection: the reader of ZOE with `--reader`.
+    klass = type(f.reader) if hasattr(f.reader, "setGhostState") else ObjectReader
     readers = [
-        ObjectReader(f.conn, PickleCache(f.conn, 10 * len(f.oids)), f.reader._factory)
+        klass(f.conn, PickleCache(f.conn, 10 * len(f.oids)), f.reader._factory)
         for _ in range(MAPPING_REPEAT)
     ]
     p = f.mapping_pickle
@@ -436,6 +451,7 @@ def terms_of(hit: dict, miss: dict | None) -> dict:
         - net["setstate"]
         - net["book"],
         "find_global alone": net["find_global"],
+        "getState": net["getstate"],
         "access of a loaded object": hit["access"],
         "cacheMinimize per object": hit["minimize"],
         "callback per reference": hit["callback"] - hit["empty"],
@@ -534,21 +550,38 @@ def summary(values: list[float]) -> dict:
 
 
 def run_terms(args) -> dict:
-    result = {"machine": machine(), "cache_size": CACHE_SIZE, "rows": []}
+    result = {
+        "machine": machine(),
+        "cache_size": CACHE_SIZE,
+        "reader": args.reader,
+        "rows": [],
+    }
     for client in args.client:
         for size in args.size:
             objects = args.objects or OBJECTS[size]
             rounds = args.rounds or ROUNDS[size]
             with tempfile.TemporaryDirectory(dir=args.workdir) as tmp:
-                result["rows"].append(one_row(client, size, objects, rounds, Path(tmp)))
+                result["rows"].append(
+                    one_row(client, size, objects, rounds, Path(tmp), args.reader)
+                )
             print_row(result["rows"][-1])
     result["machine"]["gil_enabled_at_end"] = machine()["gil_enabled"]
     return result
 
 
-def one_row(client: str, size: int, objects: int, rounds: int, workdir: Path) -> dict:
+def reader_counts() -> dict:
+    """The counts of the readers of ZOE in this process."""
+    import zoe.reader
+
+    return zoe.reader.counts()
+
+
+def one_row(
+    client: str, size: int, objects: int, rounds: int, workdir: Path, reader: bool
+) -> dict:
     load_before = os.getloadavg()
-    with opened(client, size, objects, workdir) as f:
+    reader_before = reader_counts() if reader else None
+    with opened(client, size, objects, workdir, reader) as f:
         # One round of each before the timed rounds warms them up.
         hit_round(f)
         miss_round(f)
@@ -570,7 +603,21 @@ def one_row(client: str, size: int, objects: int, rounds: int, workdir: Path) ->
             m["prefetch_touch_loads"] for m in misses if "prefetch_touch_loads" in m
         ]
         pickle_bytes = statistics.median(len(p) for p in f.pickles)
+        reader_after = reader_counts() if reader else None
     return {
+        "reader": reader,
+        "reader_counts": (
+            None
+            if reader_before is None
+            else {
+                "decoded": reader_after["decoded"] - reader_before["decoded"],
+                "fallback": {
+                    reason: n - reader_before["fallback"].get(reason, 0)
+                    for reason, n in reader_after["fallback"].items()
+                    if n != reader_before["fallback"].get(reason, 0)
+                },
+            }
+        ),
         "client": client,
         "size": size,
         "objects": objects,
@@ -596,6 +643,7 @@ def one_row(client: str, size: int, objects: int, rounds: int, workdir: Path) ->
 def print_row(row: dict) -> None:
     print(
         f"\n{row['client']} {row['size']} B ({row['pickle_bytes']} B pickles), "
+        f"reader {'on' if row['reader'] else 'off'}, "
         f"{row['objects']} objects, {row['rounds']} rounds, "
         f"load {row['loadavg_before'][0]:.2f} -> {row['loadavg_after'][0]:.2f}"
     )
@@ -608,6 +656,8 @@ def print_row(row: dict) -> None:
         f"server loads per miss {row['server_loads_per_miss']}, "
         f"per prefetch touch {row['server_loads_per_prefetch_touch']}"
     )
+    if row["reader_counts"] is not None:
+        print(f"  reader of ZOE: {row['reader_counts']}")
 
 
 # The command `loop`.
@@ -638,6 +688,7 @@ def run_loop(args) -> int:
             args.size[0],
             args.objects or OBJECTS[args.size[0]],
             Path(tmp),
+            args.reader,
         ) as f:
             profiler = None
             if args.cprofile:
@@ -666,6 +717,8 @@ def loop_args(args) -> list[str]:
     out = ["loop", "--kind", args.kind, "--seconds", str(args.seconds)]
     out += ["--client", args.client[0], "--size", str(args.size[0])]
     out += ["--workdir", str(args.workdir)]
+    if args.reader:
+        out += ["--reader"]
     if args.objects:
         out += ["--objects", str(args.objects)]
     return out
@@ -698,6 +751,8 @@ FRAMES = (
     ("Client.load_before (Rust)", "*___pymethod_load_before__", ""),
     ("Cache.load_before_with (Rust)", "*Cache16load_before_with", ""),
     ("getpid", "getpid", "libc.so.6"),
+    ("Reader.setGhostState (Rust)", "*__pymethod_setGhostState__", ""),
+    ("reader decode (Rust)", "*6reader7Decoder", ""),
 )
 
 
@@ -722,6 +777,9 @@ PARTS = (
     ("state decode (C unpickler)", "load", "_pickle_33.c"),
     ("class lookup (find_global)", "find_global", "ZODB/serialize.py"),
     ("persistent_load callbacks", "_persistent_load", "ZODB/serialize.py"),
+    ("reader: the call (Rust)", "*__pymethod_setGhostState__", ""),
+    ("reader: decode (Rust)", "*6reader7Decoder", ""),
+    ("reader: decode (Rust)", "*6reader6decode", ""),
     ("__setstate__ (C)", "pickle___setstate__", "cPersistence.c"),
     ("__setstate__ (Python)", "__setstate__", ".py"),
 )
@@ -903,6 +961,11 @@ def main(argv: list[str] | None = None) -> int:
             help="objects per row (default: 1000 at 1 KB, 200 at 100 KB)",
         )
         cmd.add_argument("--workdir", type=Path, default=Path("target/bench/work"))
+        cmd.add_argument(
+            "--reader",
+            action="store_true",
+            help="give each connection the reader of ZOE (zoe.reader.install)",
+        )
     terms = commands.choices["terms"]
     terms.add_argument(
         "--rounds", type=int, help="rounds per row (default: 30 at 1 KB, 15 at 100 KB)"

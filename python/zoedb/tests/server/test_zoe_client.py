@@ -52,6 +52,7 @@ def test_the_zoeclient_section_takes_every_key_of_zeoclient():
         "early-locks",
         "early-lock-classes",
         "prefetch-references",
+        "native-reader",
     }
 
 
@@ -108,6 +109,26 @@ def test_the_name_of_a_sequence_is_a_str(tmp_path):
             assert storage.sequence("intids").next() == 1
         finally:
             storage.close()
+
+
+def test_the_native_reader_key_reaches_both_clients(tmp_path):
+    # The client keeps `native-reader` as `native_reader`, which
+    # `zoe.reader.install` reads. It is true by default.
+    schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
+    with ZoeServer(str(tmp_path / "store")) as server:
+        host, port = server.address
+        for native in ("true", "false"):
+            for line, expected in (("", True), ("native-reader off\n", False)):
+                text = (
+                    f"%import zoe\n<zoeclient>\nserver {host}:{port}\n"
+                    f"native {native}\n{line}</zoeclient>\n"
+                )
+                config, _ = ZConfig.loadConfigFile(schema, io.StringIO(text))
+                storage = config.storage.open()
+                try:
+                    assert storage.native_reader is expected
+                finally:
+                    storage.close()
 
 
 def test_the_native_key_opens_the_native_client(tmp_path):
@@ -606,6 +627,19 @@ def test_the_zoeclient_section_without_native_takes_the_client_of_zeo(
         assert type(storage) is zoe.zeo.ClientStorage
         commit_and_load(storage)
         assert len(fell_back(caplog)) == 1
+    finally:
+        storage.close()
+
+
+def test_the_fall_back_to_the_client_of_zeo_keeps_native_reader(pickle_server):
+    import zoe.zeo
+
+    storage = zoe.zeo.ClientStorage(
+        pickle_server, storage="1", wait_timeout=TIMEOUT, _native_reader=False
+    )
+    try:
+        assert type(storage) is zoe.zeo.ClientStorage
+        assert storage.native_reader is False
     finally:
         storage.close()
 

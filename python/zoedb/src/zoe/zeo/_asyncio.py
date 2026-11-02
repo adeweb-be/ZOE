@@ -296,6 +296,7 @@ class ClientStorage(ZEOClientStorage):
         _client_factory=_ClientThread,
         _ssl_section=None,
         _prefetch_references=None,
+        _native_reader=True,
         **kw,
     ):
         # The asyncio client of ZEO has one session and one commit lock for
@@ -306,6 +307,9 @@ class ClientStorage(ZEOClientStorage):
         # The asyncio client of ZEO prefetches no references, so it ignores
         # `_prefetch_references`, the key `prefetch-references` of
         # `<zoeclient>`.
+        # `_native_reader` is the key `native-reader` of `<zoeclient>`.
+        # `zoe.reader.install` reads it (ADR 0057).
+        self.native_reader = bool(_native_reader)
         # `_ssl_section` is the `<ssl>` section of `<zoeclient>`. ZEO's
         # client takes the context that it gives.
         if _ssl_section is not None:

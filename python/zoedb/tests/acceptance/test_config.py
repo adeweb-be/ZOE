@@ -43,6 +43,7 @@ KEYS = {
     "structural-merge-class",
     "posting-dicts",
     "resolution-log",
+    "native-reader",
 }
 # The ways to give a value to a key.
 SOURCES = ["stanza", "environment", "uri"]

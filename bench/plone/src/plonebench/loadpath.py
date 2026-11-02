@@ -1,6 +1,7 @@
 """The loads of Plone requests on the stack zoe-native, in one Zope thread.
 
     python -m plonebench.loadpath [--fixture NAME] [--requests 200] [--py-spy]
+        [--native-reader on|off] [--oracle]
 
 It copies the store of the fixture, starts `zoe serve` on it as a B5 run
 does, writes the `zope.conf` of an instance of the stack with the
@@ -13,6 +14,15 @@ raw format), and `python -m shootout.loadpath frames FILE --root
 _request_folder` (or `_request_document`) prints the time per frame of the
 requests of one kind. It writes `loadpath.json` and, with `--py-spy`,
 `py-spy.txt` into `target/bench/plone/loadpath/`.
+
+`--native-reader off` writes `native-reader off` into the `<zoeclient>`
+section, so the connections keep ZODB's `ObjectReader`; with `on`, the
+default, `zoe.plone` gives them the reader of ZOE (ADR 0057).
+
+`--oracle` runs `inzope/reader_oracle.py` in place of the requests: the
+comparison of the reader of ZOE with `ObjectReader` over every current
+record of the FileStorage of the fixture. It writes `oracle.json`, and
+exits with 1 when a record does not compare equal.
 """
 
 from __future__ import annotations
@@ -57,6 +67,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--requests", type=int, default=200)
     parser.add_argument("--py-spy", action="store_true")
     parser.add_argument("--rate", type=int, default=499)
+    parser.add_argument(
+        "--native-reader",
+        choices=("on", "off"),
+        default="on",
+        help="the key native-reader of <zoeclient>: on gives the reader of ZOE",
+    )
+    parser.add_argument(
+        "--oracle",
+        action="store_true",
+        help="compare the reader of ZOE with ObjectReader on the fixture",
+    )
     args = parser.parse_args(argv)
     name = args.fixture or fixture.default_name(corpus.PRESETS["small"], "small")
     source = fixture.fixture_dir(name)
@@ -84,6 +105,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         home = run / "instance"
         conf = st.prepare_home(home, "loadpath")
+        if args.native_reader == "off":
+            text = conf.read_text()
+            end = "    </zoeclient>"
+            conf.write_text(text.replace(end, f"      native-reader off\n{end}"))
         command = [
             str(stack.interpreter(config)),
             str(stack.INZOPE / "run.py"),
@@ -94,6 +119,15 @@ def main(argv: list[str] | None = None) -> int:
             str(paths),
             str(args.requests),
         ]
+        if args.oracle:
+            command = [
+                str(stack.interpreter(config)),
+                str(stack.INZOPE / "run.py"),
+                str(conf),
+                "reader_oracle.py",
+                str(source / "store" / "filestorage" / "Data.fs"),
+                str(run / "oracle.json"),
+            ]
         if args.py_spy:
             command = [
                 "py-spy",
@@ -111,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         done = subprocess.run(command, env=stack.clean_environment(), cwd=home)
     finally:
         st.stop()
-    print(f"plonebench.loadpath: {run / 'loadpath.json'}", file=sys.stderr)
+    out = run / ("oracle.json" if args.oracle else "loadpath.json")
+    print(f"plonebench.loadpath: {out}", file=sys.stderr)
     return done.returncode
 
 

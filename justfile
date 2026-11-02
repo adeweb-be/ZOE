@@ -611,9 +611,14 @@ plone scenario="zoe" command="start" *args:
 # profiler (`--py-spy FILE` needs the profiling profile of the shell);
 # `frames FILE` prints the time per frame of a py-spy file; `scan FILE`
 # counts the references of the records of a FileStorage. It builds `zoe`
-# in release first. `just bench profile plone` runs plonebench.loadpath:
-# Plone requests in one Zope thread of the stack zoe-native, on a copy of
-# the small fixture (`--py-spy` samples them).
+# in release first. `--reader` gives the connections the reader of ZOE.
+# `just bench profile plone` runs plonebench.loadpath: Plone requests in
+# one Zope thread of the stack zoe-native, on a copy of the small fixture
+# (`--py-spy` samples them, `--native-reader off` keeps ZODB's
+# ObjectReader). `just bench profile oracle` runs plonebench.loadpath
+# --oracle: the reader of ZOE against ZODB's ObjectReader on every current
+# record of the small fixture; it fails when a record does not compare
+# equal.
 # `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
 # in release, start `zoe serve` on a new store in
 # target/bench/work/zoe-bench, with no `ZOE_*` variable of the caller, run
@@ -679,11 +684,17 @@ bench *args="run":
             shift
             ;;
         profile)
-            # `just bench profile plone OPTIONS` runs plonebench.loadpath.
+            # `just bench profile plone OPTIONS` runs plonebench.loadpath,
+            # and `just bench profile oracle OPTIONS` its comparison of
+            # the readers.
             if [ "${2:-}" = plone ]; then
                 family=plone
                 shift 2
                 set -- loadpath "$@"
+            elif [ "${2:-}" = oracle ]; then
+                family=plone
+                shift 2
+                set -- loadpath --oracle "$@"
             else
                 family=shootout
             fi
