@@ -374,16 +374,18 @@ fn mutate(heap: &mut Heap, value: Value, slot: Slot, boolean: bool) -> Value {
 }
 
 struct Synth<'a> {
-    source: &'a StoreSource,
+    source: &'a dyn Source,
     /// For each tree, its buckets by first rid: (first, last, oid).
     buckets: HashMap<Slot, Vec<(i64, i64, u64)>>,
     booleans: Vec<bool>,
     /// The bytes of the buckets that the synthetic commits wrote.
     written: HashMap<u64, Vec<u8>>,
+    /// The rids that the synthetic commits created.
+    created: std::collections::HashSet<i32>,
 }
 
 impl<'a> Synth<'a> {
-    fn new(source: &'a StoreSource, mirror: &Mirror) -> Self {
+    fn new(source: &'a dyn Source, mirror: &Mirror) -> Self {
         let mut buckets: HashMap<Slot, Vec<(i64, i64, u64)>> = HashMap::new();
         for (oid, (lo, hi)) in &mirror.shapes.buckets {
             if let Some(Owner::Node(slot)) = mirror.shapes.owners.get(oid) {
@@ -404,6 +406,7 @@ impl<'a> Synth<'a> {
             buckets,
             booleans,
             written: HashMap::new(),
+            created: Default::default(),
         }
     }
 
@@ -411,7 +414,10 @@ impl<'a> Synth<'a> {
     /// of `rid` changed, or with `new` added after it.
     fn change(&mut self, slot: Slot, rid: i32, new: Option<i32>) -> Option<(u64, Vec<u8>)> {
         let list = self.buckets.get(&slot)?;
-        let place = list.partition_point(|(lo, _, _)| *lo <= i64::from(rid));
+        // A new rid goes into the bucket that its key falls in, as a BTree
+        // puts it.
+        let key = i64::from(new.unwrap_or(rid));
+        let place = list.partition_point(|(lo, _, _)| *lo <= key);
         if place == 0 {
             return None;
         }
@@ -429,9 +435,17 @@ impl<'a> Synth<'a> {
         };
         let state = btrees::bucket_state(&heap, bucket, mapping)?;
         let mut items = state.items.clone();
-        let at = items
-            .chunks(2)
-            .position(|p| p[0] == Value::Int(i128::from(rid)))?;
+        let at = match new {
+            None => items
+                .chunks(2)
+                .position(|p| p[0] == Value::Int(i128::from(rid)))?,
+            // The value of the new rid: a copy of the value of the first item,
+            // changed.
+            Some(_) => 0,
+        };
+        if items.is_empty() {
+            return None;
+        }
         let boolean = matches!(slot, Slot::Index(i) if self.booleans[i]);
         let changed = mutate(&mut heap, items[2 * at + 1], slot, boolean);
         match new {
@@ -462,9 +476,10 @@ impl<'a> Synth<'a> {
         for rid in rids {
             let new = if create {
                 let mut n = *rid + 1;
-                while base.rows.row(n).is_some() {
+                while base.rows.row(n).is_some() || self.created.contains(&n) {
                     n += 1;
                 }
+                self.created.insert(n);
                 Some(n)
             } else {
                 None
@@ -631,15 +646,20 @@ fn bench(args: &[String]) {
 
     let rss0 = status("VmRSS:");
     let t = Instant::now();
-    let store = Store::open_read_only(store_dir).expect("open the store");
-    let tid = store.last_transaction().0;
+    let (source, tid): (Box<dyn Source>, u64) = if store_dir.ends_with(".bin") {
+        (Box::new(FileSource::read(store_dir)), 1)
+    } else {
+        let store = Store::open_read_only(store_dir).expect("open the store");
+        let tid = store.last_transaction().0;
+        (Box::new(StoreSource(store)), tid)
+    };
+    let source = source.as_ref();
     let open_s = t.elapsed().as_secs_f64();
-    let source = StoreSource(store);
     let rss_open = status("VmRSS:");
     let only: Option<Vec<String>> =
         option(args, "--indexes").map(|s| s.split(',').map(str::to_owned).collect());
     let (base, build) =
-        catalog::build(&source, catalog_oid, tid, threads, with_table, only.as_deref()).expect("build");
+        catalog::build(source, catalog_oid, tid, threads, with_table, only.as_deref()).expect("build");
     let rss_built = status("VmRSS:");
     eprintln!(
         "built in {:.1} s: {} records, {} MB",
@@ -679,6 +699,23 @@ fn bench(args: &[String]) {
             "unavailable": base.indexes.iter().filter_map(|e| match &e.index { Index::Unavailable(r) => Some(json!({"name": e.name, "class": e.class, "reason": r})), _ => None }).collect::<Vec<_>>(),
         }),
     );
+    // The drop of the mirror, and its build again with the pages of the
+    // store in the page cache.
+    let base = if args.iter().any(|a| a == "--rebuild") {
+        let t = Instant::now();
+        drop(base);
+        let drop_s = t.elapsed().as_secs_f64();
+        let rss_dropped = status("VmRSS:");
+        let (again, rebuild) =
+            catalog::build(source, catalog_oid, tid, threads, with_table, only.as_deref()).expect("rebuild");
+        report.insert(
+            "rebuild".into(),
+            json!({"drop_seconds": drop_s, "rss_after_drop": rss_dropped, "warm_build_seconds": rebuild.seconds}),
+        );
+        again
+    } else {
+        base
+    };
     let base_tid = base.tid;
     let mut mirror = Mirror::new(base);
     report.insert(
@@ -731,7 +768,7 @@ fn bench(args: &[String]) {
         s
     };
     let edit_slots = named(&["modified", "sortable_title", "Date"]);
-    let source_ref = &source;
+    let source_ref = source;
     let base_arc = mirror.base.clone();
     let mut synth = Synth::new(source_ref, &mirror);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -776,6 +813,14 @@ fn bench(args: &[String]) {
             let t = Instant::now();
             let (n, b, c) = mirror.apply(next_tid, &records);
             times.push(t.elapsed().as_secs_f64());
+            if std::env::var("ZOE283_DEBUG").is_ok() {
+                let d = mirror.deltas.back().unwrap();
+                let mut by: HashMap<String, Vec<i32>> = HashMap::new();
+                for ch in &d.changes {
+                    by.entry(format!("{:?}", ch.slot)).or_default().push(ch.rid);
+                }
+                eprintln!("{shape} {chosen:?}: {by:?}");
+            }
             decoded.push(n as f64);
             bytes.push(b as f64);
             changes.push(c as f64);
@@ -834,6 +879,37 @@ fn bench(args: &[String]) {
             per_plan.push(json!({"name": entry["name"], "timing": stats(times)}));
         }
         versions.insert("queries_at_head".into(), json!(per_plan));
+    }
+    {
+        let base = mirror.base.clone();
+        let head = mirror.head.clone();
+        let mut folds = Vec::new();
+        for name in ["modified", "review_state", "Subject", "path"] {
+            let Some(&i) = base.by_name.get(name) else { continue };
+            let entry = &base.indexes[i];
+            let t = Instant::now();
+            let slot = Slot::Index(i);
+            let mut items: Vec<(Val, Val)> = Vec::with_capacity(base.rows.len());
+            for (row, rid) in base.rows.rids.iter().enumerate() {
+                let changed = head.trees.get(&slot).and_then(|c| c.get(rid));
+                let value = match changed {
+                    Some(v) => v.clone(),
+                    None => catalog::base_value(entry, row as u32),
+                };
+                if let Some(v) = value {
+                    items.push((Val::Int(i64::from(*rid)), v));
+                }
+            }
+            let collect_s = t.elapsed().as_secs_f64();
+            let built = match &entry.index {
+                Index::Value(_) | Index::Boolean(_) => zoe_catalog::base::build_value(&base.rows, items).map(|_| ()),
+                Index::Keyword(_) => zoe_catalog::base::build_keyword(&base.rows, items).map(|_| ()),
+                Index::Path(p) => zoe_catalog::base::build_path(&base.rows, items, p.depth).map(|_| ()),
+                _ => Ok(()),
+            };
+            folds.push(json!({"index": name, "collect_s": collect_s, "seconds": t.elapsed().as_secs_f64(), "ok": built.is_ok()}));
+        }
+        versions.insert("fold_one_index".into(), json!(folds));
     }
     report.insert("versions".into(), Json::Object(versions));
     report.insert("rss_end".into(), json!(status("VmRSS:")));
