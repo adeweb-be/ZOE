@@ -276,7 +276,9 @@ class ZoeSecurityIndex(KeywordIndex):
         return len(self._inputs)
 
     def indexSize(self):
-        return len(self._values())
+        # The query plan of ZCatalog asks it of an index outside the
+        # catalog, so it cannot resolve.
+        return len(self._inputs)
 
     def _values(self):
         resolver = self.resolver()
