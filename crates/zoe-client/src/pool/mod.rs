@@ -54,7 +54,8 @@
 //! that a load fetches from the server (`set_prefetch_references`).
 //!
 //! A load of an oid at a tid that a load in flight already asks for waits
-//! for the reply of that load, and sends nothing.
+//! for the reply of that load, and sends nothing, when the server published
+//! each commit below that tid.
 //!
 //! `transaction` holds the transactions of the pool, their finishes and
 //! their turns, and the early write-intent locks of an owner. `dispatch`
@@ -711,7 +712,10 @@ impl Pool {
     /// When a load of `oid` at `tid` is in flight, a load of the pool or of
     /// a prefetch, the call waits for its reply and sends nothing: it gets
     /// a copy of the record or of the error. A load at another tid sends
-    /// its own request. A caller that drops its future does not stop the
+    /// its own request. Only a `tid` of at most the last tid of the
+    /// listener plus 1 joins: a load at a higher tid, as `load` at
+    /// `MAX_TID`, always sends its own request, so it sees each commit
+    /// that the server published before it. A caller that drops its future does not stop the
     /// load for the other waiters. Once the reply is in the cache and the
     /// waiters have it, the next call sends a new request.
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {

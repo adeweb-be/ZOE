@@ -7,6 +7,13 @@
 //! waits for the reply of that load and sends nothing. Else it sends the
 //! request and records the key.
 //!
+//! Only a load at a tid of at most the last tid of the listener plus 1
+//! joins. The server published each commit below that tid, so the reply
+//! gives the same record whenever the server reads it. A load at a higher
+//! tid, as a current load at `MAX_TID`, gives the record of the moment of
+//! its read. A later load must see the commits that came since, so such a
+//! load never joins and never records its key.
+//!
 //! The caller that sends the request runs the load on its own task, so
 //! the call frame carries the traceparent of that caller. When the caller
 //! drops its future before the reply, the load moves to a task of the
@@ -38,6 +45,9 @@ impl Shared {
     /// references of the record. When a load of `oid` at `tid` is in
     /// flight, wait for its reply, and send nothing.
     pub(super) async fn load_before(self: &Arc<Self>, oid: Oid, tid: Tid) -> Loaded {
+        if !self.published(tid) {
+            return self.fetch(oid, tid).await;
+        }
         let key = (oid, tid);
         let waiter = {
             let mut flights = lock(&self.flights);
@@ -65,6 +75,16 @@ impl Shared {
             detached: false,
         };
         flight.run().await
+    }
+
+    /// Tell if the server published each commit below `tid`: `tid` is at
+    /// most the last tid of the listener plus 1. False while the pool has
+    /// no listener.
+    fn published(&self, tid: Tid) -> bool {
+        self.server()
+            .listener
+            .as_ref()
+            .is_some_and(|listener| tid.0 <= listener.last_transaction().0.saturating_add(1))
     }
 
     /// Load the record of `oid` before `tid` from the server, through any

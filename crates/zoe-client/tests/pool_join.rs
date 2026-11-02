@@ -6,7 +6,9 @@
 //! server. Each waiter gets the record, or the error of the load. A load
 //! at another tid sends its own request. The load goes on when its caller
 //! drops its future, so the other waiters still get the reply. Once the
-//! reply came, the next load sends a new request. The prefetch of the
+//! reply came, the next load sends a new request. Only a load at a tid of
+//! at most the last tid of the listener plus 1 joins: a current load, at
+//! `MAX_TID`, always sends its own request. The prefetch of the
 //! references goes through the same loads, so a load of a child joins
 //! its prefetch, and the reverse.
 //!
@@ -284,6 +286,38 @@ async fn a_load_after_the_reply_sends_a_new_request() {
         .unwrap();
     assert_eq!(record_of(loaded).data, data);
     assert_eq!(loads(&server) - counted, 2);
+}
+
+#[tokio::test]
+async fn a_current_load_and_a_load_above_the_listener_do_not_join() {
+    let server = start("current");
+    let oid = new_oids(&server, 1).await[0];
+    let data = record(b"current");
+    let tid = commit_stores(&server, &[(oid, Tid(0), data.clone())]).await;
+
+    // The last tid of the listener is `tid`. A load at `MAX_TID` or above
+    // `tid + 1` gives the record of the moment of its read, so each one
+    // sends its own request.
+    let pool = open_uncached(&server).await;
+    let counted = loads(&server);
+    let (first, second) = tokio::time::timeout(TIMEOUT, async {
+        tokio::join!(pool.load(oid), pool.load(oid))
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.unwrap(), (data.clone(), tid));
+    assert_eq!(second.unwrap(), (data.clone(), tid));
+    assert_eq!(loads(&server) - counted, 2);
+
+    let above = Tid(tid.0 + 2);
+    let (first, second) = tokio::time::timeout(TIMEOUT, async {
+        tokio::join!(pool.load_before(oid, above), pool.load_before(oid, above))
+    })
+    .await
+    .unwrap();
+    assert_eq!(record_of(first).data, data);
+    assert_eq!(record_of(second).data, data);
+    assert_eq!(loads(&server) - counted, 4);
 }
 
 #[tokio::test]
