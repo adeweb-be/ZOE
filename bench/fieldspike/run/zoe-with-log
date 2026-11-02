@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# The zoe binary of the spike: `zoe serve` writes a resolution log in the
+# directory of the run (the working directory of the server).
+bin="$HOME/.cache/zoe-build/ZOE-281/target/release/zoe"
+if [ "${1:-}" = serve ]; then
+    shift
+    exec "$bin" serve --resolution-log "$PWD/resolution.jsonl" "$@"
+fi
+exec "$bin" "$@"
