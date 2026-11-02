@@ -16,7 +16,8 @@
 //! import of the module.
 //!
 //! `Reader` is the base of `zoe.reader.Reader`, the reader of ZOE, which
-//! decodes a ZODB record in Rust (`reader`, ADR 0057).
+//! decodes a ZODB record in Rust, and `_setstate` the `setstate` of
+//! `zoe.reader.Connection` (`reader`, ADR 0057).
 
 mod cli;
 mod client;
@@ -47,6 +48,7 @@ mod _zoe {
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+        m.add("_setstate", crate::reader::setstate_method(m)?)?;
         m.add(
             "OtherProtocol",
             m.py().get_type::<crate::client::OtherProtocol>(),
