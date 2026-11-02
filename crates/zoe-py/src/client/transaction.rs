@@ -16,7 +16,7 @@ use zoe_client::{Error, PoolTransaction, Turn, lock, traced};
 use zoe_core::{Oid, Tid};
 
 use super::convert::{blob_error, client_error};
-use super::{check_process, traceparent};
+use super::{check_process, this_process, traceparent};
 use crate::errors::{self, p64, u64_of};
 use crate::kv;
 
@@ -32,7 +32,7 @@ pub(super) type Slot = Mutex<Option<PoolTransaction>>;
 #[pyclass(frozen, module = "zoe._zoe", name = "Transaction")]
 pub(crate) struct NativeTransaction {
     /// The process that opened the client.
-    pub(super) pid: u32,
+    pub(super) process: u64,
     pub(super) runtime: &'static Runtime,
     /// The transaction, until its finish, its abort or a failed vote. The
     /// client keeps a weak reference to it for `Client.abort`.
@@ -166,7 +166,7 @@ impl NativeTransaction {
     /// the server, which answers as it does for `ZEO.ClientStorage`. The id
     /// is bytes, as `undoLog` gives it, or a `str` of its text.
     fn undo(&self, py: Python<'_>, trans_id: &Bound<'_, PyAny>) -> PyResult<()> {
-        check_process(self.pid)?;
+        check_process(self.process)?;
         let trans_id: Vec<u8> = match trans_id.cast::<PyString>() {
             Ok(text) => text.to_str()?.as_bytes().to_vec(),
             Err(_) => trans_id.extract()?,
@@ -201,7 +201,7 @@ impl NativeTransaction {
         py: Python<'py>,
         resolve: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        check_process(self.pid)?;
+        check_process(self.process)?;
         let runtime = self.runtime;
         let mut resolved: Vec<Oid> = Vec::new();
         for round in 0..=ROUNDS {
@@ -275,7 +275,7 @@ impl NativeTransaction {
     /// then runs the callback of `tpc_finish` and calls `done`: the pool
     /// delivers no later tid until then.
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        check_process(self.pid)?;
+        check_process(self.process)?;
         let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         let tid = py
@@ -308,7 +308,7 @@ impl NativeTransaction {
     /// End the turn of the commit: the callback of `tpc_finish` ran. The
     /// pool then delivers the tid and goes on. Without a turn, do nothing.
     fn done(&self, py: Python<'_>) -> PyResult<()> {
-        check_process(self.pid)?;
+        check_process(self.process)?;
         py.detach(|| drop(lock(&self.turn).take()));
         Ok(())
     }
@@ -316,7 +316,7 @@ impl NativeTransaction {
     /// Abort the transaction, and wait for the reply of the server. After
     /// its end, do nothing.
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
-        check_process(self.pid)?;
+        check_process(self.process)?;
         let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         py.detach(|| {
@@ -334,7 +334,7 @@ impl NativeTransaction {
     /// Return the W3C traceparent of the calling thread for a call of the
     /// transaction. In a child of `os.fork()`, raise `RuntimeError`.
     fn trace(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        check_process(self.pid)?;
+        check_process(self.process)?;
         traceparent(py, self.traceparent.as_ref())
     }
 
@@ -384,7 +384,7 @@ impl Drop for NativeTransaction {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if self.pid != std::process::id() {
+        if self.process != this_process() {
             mem::forget((txn, turn));
             return;
         }
