@@ -29,10 +29,16 @@ Ready, the planner checks `OUT` against a run of the native layer. The
 builder never changes it: a test that fails is a bug, and a test that
 cannot pass is a question for the human.
 
+A test of `PREFETCH_OFF` runs with the prefetch of references of the
+native client off, with its reason: it counts the entries of the client
+cache, which the prefetch changes.
+
 The gate also checks that the native inside is the default of
 `zoe.zeo.ClientStorage` and of `<zoeclient>`.
 """
 
+import contextlib
+import os
 import threading
 import unittest
 
@@ -172,6 +178,20 @@ OUT_ZEO = {
     ),
 }
 
+# The tests that run with the prefetch of references of the native client
+# off, and why. The other tests run with it on, its default.
+PREFETCH_OFF = {
+    "drop_cache_rather_than_verify_txt": (
+        "it counts the entries of the client cache after the open of a "
+        "database, which loads the root, and expects the root alone; the "
+        "native client also prefetches the objects that the root refers to; "
+        "test_native_prefetch_references.py covers the prefetch"
+    ),
+}
+
+# The variable that turns the prefetch of references off.
+PREFETCH_TWIN = "ZOE_PREFETCH_REFERENCES"
+
 # The classes of ZEO's tests that the cards of phase 3 name. The tests of
 # FullGenericTests run in its subclasses.
 NAMED_CLASSES = {
@@ -213,6 +233,24 @@ def modules():
     return [name for name in phase_2().MODULES if name not in OUT_MODULES]
 
 
+@contextlib.contextmanager
+def prefetch_for(name):
+    """Turn the prefetch of references off while the test `name` of
+    PREFETCH_OFF runs. Do nothing for another test."""
+    if name not in PREFETCH_OFF:
+        yield
+        return
+    old = os.environ.get(PREFETCH_TWIN)
+    os.environ[PREFETCH_TWIN] = "off"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(PREFETCH_TWIN, None)
+        else:
+            os.environ[PREFETCH_TWIN] = old
+
+
 def run(module_name, layers, out):
     """Run the tests of a module inside layers, except those of out.
 
@@ -234,7 +272,8 @@ def run(module_name, layers, out):
                 if hasattr(layer, "testSetUp"):
                     layer.testSetUp()
             try:
-                test.run(result)
+                with prefetch_for(name):
+                    test.run(result)
                 ran += 1
             finally:
                 for layer in reversed(test_layers):
@@ -275,6 +314,9 @@ def test_the_named_tests_and_the_out_modules_are_in_the_suites():
     assert NAMED_CLASSES <= classes, f"the run misses {NAMED_CLASSES - classes}"
     assert NAMED_DOCTESTS <= names, f"the run misses {NAMED_DOCTESTS - names}"
     assert set(OUT) <= names | classes, f"OUT names no test: {set(OUT) - names}"
+    assert set(PREFETCH_OFF) <= names, (
+        f"PREFETCH_OFF names no test: {set(PREFETCH_OFF) - names}"
+    )
 
 
 def test_the_native_inside_is_the_default(tmp_path):
