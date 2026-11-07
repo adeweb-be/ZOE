@@ -603,6 +603,12 @@ impl KeywordIndex {
             + self.indexed.serialized_size()
     }
 
+    /// The transient bytes of a build from `pairs`, beside the pairs: the
+    /// row and the slot of each pair.
+    pub fn build_bytes(pairs: &Pairs) -> usize {
+        pairs.len() * 8
+    }
+
     /// Builds the index from the keys of `pairs`, one pair for each key of
     /// a row, for `rows` rows.
     pub fn build(pairs: Pairs, rows: usize) -> Result<KeywordIndex, String> {
@@ -919,6 +925,21 @@ impl Pairs {
                 }
             }
         }
+    }
+
+    /// The number of pairs.
+    pub fn len(&self) -> usize {
+        match self {
+            Pairs::Empty => 0,
+            Pairs::Int(v) => v.len(),
+            Pairs::Str(_, v) => v.len(),
+            Pairs::Any(v) => v.len(),
+        }
+    }
+
+    /// Tells if there is no pair.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The bytes that the pairs take.

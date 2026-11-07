@@ -214,44 +214,23 @@ impl<'a> View<'a> {
         }
     }
 
-    /// Refuses a UUIDIndex that holds a UUID at more than one row in this
-    /// version. ZCatalog keeps one of these rows in its `_index`, which
-    /// the mirror does not read.
+    /// Refuses a UUIDIndex whose `_length` in this version differs from
+    /// the number of its rows with a UUID. `_length` counts the keys of
+    /// `_index`, which the mirror does not read, and these keys are UUIDs
+    /// of `_unindex`. With a UUID at two rows, or a UUID that left `_index`
+    /// while a row keeps it (`removeForwardIndexEntry` deletes the key
+    /// whichever row holds it), ZCatalog then finds other rows than
+    /// `_unindex` gives.
     fn unique(&self, i: usize, f: &FieldIndex) -> Result<(), Fallback> {
-        let twice = || {
-            fallback(
+        let mut rows = f.indexed.len() as i64;
+        for (row, value) in self.changed(Slot::Index(i)) {
+            rows += i64::from(value.is_some()) - i64::from(f.slot(row).is_some());
+        }
+        if rows != self.length(i) {
+            return fallback(
                 Reason::IndexUnavailable,
-                "the UUIDIndex holds a UUID at more than one row",
-            )
-        };
-        let changed = self.changed(Slot::Index(i));
-        let touched: RoaringBitmap = changed.iter().map(|(row, _)| *row).collect();
-        for rows in f.postings.many() {
-            if (rows - &touched).len() > 1 {
-                return twice();
-            }
-        }
-        let values: Vec<&Val> = changed.iter().filter_map(|(_, v)| *v).collect();
-        for value in &values {
-            if let Some(Ok(s)) = f.keys.search(value)
-                && !(f.postings.get(s).to_bitmap() - &touched).is_empty()
-            {
-                return twice();
-            }
-        }
-        let texts: Option<Vec<&str>> = values.iter().map(|v| v.text()).collect();
-        let repeated = match texts {
-            Some(mut texts) => {
-                texts.sort_unstable();
-                texts.windows(2).any(|w| w[0] == w[1])
-            }
-            None => values
-                .iter()
-                .enumerate()
-                .any(|(k, a)| values[k + 1..].iter().any(|b| same(a, b))),
-        };
-        if repeated {
-            return twice();
+                "the _length of the UUIDIndex differs from its rows with a UUID",
+            );
         }
         Ok(())
     }
@@ -415,12 +394,20 @@ impl<'a> View<'a> {
     }
 
     /// The rows of the keys of `not`, which `_apply_not` gives.
-    fn excluded(&self, i: usize, keyed: Keyed<'_>, not: &[Val]) -> RoaringBitmap {
+    /// A key of `not` that the keys of the index do not order makes
+    /// ZCatalog raise: the clause takes the Python path.
+    fn excluded(&self, i: usize, keyed: Keyed<'_>, not: &[Val]) -> Result<RoaringBitmap, Fallback> {
         let mut out = RoaringBitmap::new();
         for key in not.iter().filter(|k| **k != Val::None) {
+            if keyed.keys().search(key).is_none() {
+                return fallback(
+                    Reason::Option,
+                    "a key of not that the keys of the index do not order",
+                );
+            }
             out |= self.posting(i, keyed, key);
         }
-        out
+        Ok(out)
     }
 
     /// The rows of a clause, as the `query_index` of its index gives them
@@ -504,7 +491,7 @@ impl<'a> View<'a> {
             }
             let mut rows = self.range(i, keyed, lo.as_ref(), hi.as_ref(), rs, trace)?;
             if !clause.not.is_empty() {
-                rows -= self.excluded(i, keyed, &clause.not);
+                rows -= self.excluded(i, keyed, &clause.not)?;
             }
             return Ok(rows);
         }
@@ -516,7 +503,7 @@ impl<'a> View<'a> {
             if clause.and {
                 return fallback(Reason::Option, "a query of not alone with the operator and");
             }
-            let excluded = self.excluded(i, keyed, &clause.not);
+            let excluded = self.excluded(i, keyed, &clause.not)?;
             if !excluded.is_empty() {
                 let mut all = match rs {
                     Some(r) => r.clone(),
@@ -557,7 +544,7 @@ impl<'a> View<'a> {
             r
         };
         if !clause.not.is_empty() {
-            r -= self.excluded(i, keyed, &clause.not);
+            r -= self.excluded(i, keyed, &clause.not)?;
         }
         Ok(r)
     }

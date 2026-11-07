@@ -776,3 +776,134 @@ fn a_row_without_an_entry_in_a_daterangeindex_gives_date_range_order() {
     );
     mirrors.stop();
 }
+
+/// Refuses `UID=uid` at `tid` with `index_unavailable`.
+fn refuses_uid(mirrors: &Mirrors, catalog: u64, tid: u64, uid: &str, what: &str) {
+    let plan = plan_of(vec![clause("UID", vec![s(uid)])], &[], None);
+    assert_eq!(
+        mirrors
+            .query(catalog, tid + 1, &plan)
+            .map_err(|f| f.reason)
+            .err(),
+        Some(Reason::IndexUnavailable),
+        "{what}: a clause"
+    );
+    let sorted = plan_of(
+        vec![clause("portal_type", vec![s("Document")])],
+        &[("UID", false)],
+        Some(5),
+    );
+    assert_eq!(
+        mirrors
+            .query(catalog, tid + 1, &sorted)
+            .map_err(|f| f.reason)
+            .err(),
+        Some(Reason::IndexUnavailable),
+        "{what}: a sort"
+    );
+}
+
+#[test]
+fn a_uuidindex_whose_length_differs_from_its_rows_is_refused() {
+    // Two ways to a UUID that `_unindex` holds and `_index` lost: the row
+    // that `_index` kept for a duplicate leaves, or the duplicate takes a
+    // new UUID.
+    for holder_leaves in [true, false] {
+        let what = if holder_leaves {
+            "the holder leaves"
+        } else {
+            "the duplicate moves on"
+        };
+        let store = store();
+        let mut m = CatalogModel::new(10, &KINDS, &["getId"]);
+        for i in 0..50 {
+            add(&mut m, i, 0);
+        }
+        let first = commit(&store, None, &m.records(), &[m.key()]);
+        // Each change set past the base starts a rebase.
+        let config = Config {
+            rebase_rows: 0,
+            ..Config::default()
+        };
+        let mirrors = mirrors(&store, config);
+        assert!(ready_at(&mirrors, m.oid(), first));
+        let one = plan_of(vec![clause("UID", vec![s("uid-00007")])], &[], None);
+        assert_eq!(
+            mirrors.query(m.oid(), first + 1, &one).unwrap().rids.len(),
+            1
+        );
+        // The entry 8 takes the UUID of the entry 7, which `_index` keeps.
+        let mut values = vec![("portal_type", s("Document")), ("UID", s("uid-00007"))];
+        m.catalog(0, "/site/item-8", &values);
+        let duplicate = commit(&store, Some(&mirrors), &m.records(), &[]);
+        assert!(ready_at(&mirrors, m.oid(), duplicate));
+        refuses_uid(&mirrors, m.oid(), duplicate, "uid-00007", "a duplicate");
+        if holder_leaves {
+            m.uncatalog("/site/item-7");
+        } else {
+            values[1] = ("UID", s("uid-new"));
+            m.catalog(0, "/site/item-8", &values);
+        }
+        let tid = commit(&store, Some(&mirrors), &m.records(), &[]);
+        assert!(ready_at(&mirrors, m.oid(), tid));
+        refuses_uid(&mirrors, m.oid(), tid, "uid-00007", what);
+        // After a rebase at the last tid, the counts follow each change set.
+        let rebased = mirrors.wait_for(m.oid(), WAIT, |s| {
+            s.is_some_and(|s| s.rebases >= 1 && s.base_tid == Some(tid))
+        });
+        assert!(
+            rebased,
+            "{what}: {:?} {:?}",
+            mirrors.status(m.oid()),
+            mirrors.take_events()
+        );
+        refuses_uid(&mirrors, m.oid(), tid, "uid-00007", "after the rebase");
+        refuses_uid(
+            &mirrors,
+            m.oid(),
+            duplicate,
+            "uid-00007",
+            "a duplicate, after the rebase",
+        );
+        assert_eq!(
+            mirrors.query(m.oid(), first + 1, &one).unwrap().rids.len(),
+            1
+        );
+        // A fresh build refuses too.
+        let built = build(&*store, m.oid(), tid, 2, &|_| true).expect("a build");
+        let over = Default::default();
+        assert_eq!(
+            View::new(&built.base, &over)
+                .query(&one)
+                .map_err(|f| f.reason)
+                .err(),
+            Some(Reason::IndexUnavailable),
+            "{what}: a fresh build"
+        );
+        mirrors.stop();
+    }
+}
+
+#[test]
+fn a_key_of_not_that_the_keys_of_the_index_do_not_order_is_refused() {
+    let (_store, mirrors, catalog, tid, _data) = indexes_store(Config::default());
+    for (name, key) in [
+        ("Subject", Val::Int(1)),
+        ("modified", s("a str")),
+        ("UID", Val::Int(3)),
+    ] {
+        let mut with_keys = clause(name, Vec::new());
+        with_keys.not = vec![key.clone()];
+        let plan = plan_of(
+            vec![with_keys, clause("portal_type", vec![s("Document")])],
+            &[],
+            None,
+        );
+        assert_eq!(
+            mirrors.query(catalog, tid + 1, &plan).unwrap_err().reason,
+            Reason::Option,
+            "not {key:?} on {name}"
+        );
+    }
+    mirrors.stop();
+}

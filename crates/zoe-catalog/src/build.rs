@@ -320,7 +320,10 @@ pub fn build(
                     tree_shapes.push(None);
                 }
                 Ok(Some((part, shape, bytes))) => {
-                    let transient = part.heap_bytes() + shape.heap_bytes();
+                    let mut transient = part.heap_bytes() + shape.heap_bytes();
+                    if let (Some(Kind::Keyword), Part::Pairs(pairs)) = (entry.kind, &part) {
+                        transient += KeywordIndex::build_bytes(pairs);
+                    }
                     if !room(held.load(AtomicOrdering::Relaxed) + transient) {
                         stopped = true;
                         pending.push(None);

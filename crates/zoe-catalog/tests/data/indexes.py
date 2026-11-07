@@ -1,6 +1,6 @@
 """Write the test data of `tests/indexes.rs`: the records of a catalog with a
 KeywordIndex, a DateIndex, a DateRangeIndex, a BooleanIndex and a UUIDIndex
-that Products.ZCatalog writes, the records of three commits, and the
+that Products.ZCatalog writes, the records of six commits, and the
 answers of ZCatalog to a set of queries on these indexes.
 
     PYTHONHASHSEED=0 python indexes.py OUT.json
@@ -20,7 +20,11 @@ after the base and after each commit: the rids in order, `len()` and
 The commits: `split` catalogs new entries, so buckets of the `_unindex`
 trees split; `change` removes entries, changes the values of others, and
 removes two entries from `effectiveRange` alone, so they have no entry in
-it; `duplicate` gives a second entry the UUID of another.
+it; `duplicate` gives a second entry the UUID of another, and `holder`
+uncatalogs the entry whose UUID `_index` kept, so `_index` loses the UUID
+that the duplicate still holds; `again` makes another duplicate, and
+`moved` gives that duplicate a new UUID, so `_index` loses the UUID that
+the first entry still holds.
 """
 
 import json
@@ -251,7 +255,9 @@ def order_dependent(query):
 
 
 def duplicated(query):
-    """Tell if a UUIDIndex of the query holds a UUID at two rows."""
+    """Tell if a UUIDIndex of the query has a `_length` other than its rows
+    with a UUID: a UUID at two rows, or a UUID that left `_index` while a
+    row keeps it in `_unindex`."""
     sort_on = query.get("sort_on", [])
     names = [n for n in query if n in cat.indexes]
     names += sort_on if isinstance(sort_on, list) else [sort_on]
@@ -259,7 +265,7 @@ def duplicated(query):
         index = cat.getIndex(name)
         if type(aq_base(index)).__name__ != "UUIDIndex":
             continue
-        if len(set(index._unindex.values())) != len(index._unindex):
+        if index._length() != len(index._unindex):
             return True
     return False
 
@@ -454,6 +460,43 @@ def duplicate():
 
 
 commit("duplicate", duplicate)
+
+
+def holder():
+    path = min(entries)
+    cat.uncatalogObject(path)
+    del entries[path]
+
+
+commit("holder", holder)
+
+
+def again():
+    paths = sorted(entries)
+    v = dict(entries[paths[3]])
+    v["UID"] = entries[paths[2]]["UID"]
+    cat.catalogObject(Stub(paths[3], **v), paths[3])
+    entries[paths[3]] = v
+
+
+commit("again", again)
+
+
+def moved():
+    path = sorted(entries)[3]
+    v = dict(entries[path])
+    v["UID"] = f"{rnd.getrandbits(128):032x}"
+    cat.catalogObject(Stub(path, **v), path)
+    entries[path] = v
+
+
+commit("moved", moved)
+# ZCatalog finds no row for the UUIDs that left `_index`, which rows of
+# `_unindex` still hold.
+uid = cat.getIndex("UID")
+kept = set(uid._unindex.values()) - set(uid._index.keys())
+assert len(kept) == 2, kept
+assert all(not list(cat.searchResults(UID=u)) for u in kept)
 
 with open(out, "w") as f:
     json.dump(
