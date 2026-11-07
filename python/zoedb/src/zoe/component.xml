@@ -383,6 +383,35 @@
         512MB or 1GB. The default is 1GB.
       </description>
     </key>
+    <key name="catalog-memory" datatype="string">
+      <description>
+        The bound of the memory of the catalog mirrors of each store with
+        a registered catalog, such as 2GB. The default is 2GB.
+      </description>
+    </key>
+    <key name="catalog-window-tids" datatype="string">
+      <description>
+        The change sets of the mirror window. The default is 10000.
+      </description>
+    </key>
+    <key name="catalog-window-seconds" datatype="string">
+      <description>
+        The age past which a change set leaves the mirror window, in whole
+        seconds. The default is 600.
+      </description>
+    </key>
+    <key name="catalog-rebase-rows" datatype="string">
+      <description>
+        The rows of the overrides past which a mirror rebases. The default
+        is 20000.
+      </description>
+    </key>
+    <key name="catalog-wait" datatype="string">
+      <description>
+        The longest wait of a catalog query for the mirror, in whole
+        seconds. Past it, the reply is lag. The default is 1.
+      </description>
+    </key>
     <key name="compression" datatype="string">
       <description>
         The compression of the records that each store writes: none,
