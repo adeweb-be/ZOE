@@ -1,10 +1,10 @@
 # 0061. The security index: the inherited inputs of `allowedRolesAndUsers`
 
-Status: proposed. Card ZOE-285 (finding: `docs/spikes/security-index.md`); the build is ZOE-301. This record adds a public Python API to `zoe.plone`: the index class `zoe.plone.security.ZoeSecurityIndex` and the opt-in backend `security` (`install()`, `uninstall()`, `installed()`). It changes what Plone writes for a change of security. It changes no wire message and no on-disk format.
+Status: accepted. Card ZOE-285 (finding: `docs/spikes/security-index.md`); the build is ZOE-301. This record adds a public Python API to `zoe.plone`: the index class `zoe.plone.security.ZoeSecurityIndex` and the opt-in backend `security` (`install()`, `uninstall()`, `installed()`). It changes what Plone writes for a change of security. It changes no wire message and no on-disk format.
 
 ## Context
 
-F33 asks for "inherited allowedRolesAndUsers as parent pointers, resolved at query time", accepted when "security bitmaps equal to reindexObjectSecurity on the corpus; a local-role change on a folder with 50,000 descendants writes O(1) records". The specification also says "Security stays in Plone: `allowedRolesAndUsers` is a `KeywordIndex` like any other" ("Step 2", and the invariants of `crates/zoe-catalog/CLAUDE.md`). The decision Q10 of the plan of phase 6 chose an index class of `zoe.plone` with "inherit", resolved at query time in the mirror and in the Python path, to confirm on the finding of ZOE-285.
+F33 asks for "inherited allowedRolesAndUsers as parent pointers, resolved at query time", accepted when "security bitmaps equal to reindexObjectSecurity on the corpus; a local-role change on a folder with 50,000 descendants writes O(1) records". The specification also says "Security stays in Plone: `allowedRolesAndUsers` is a `KeywordIndex` like any other" ("Step 2", and the invariants of `crates/zoe-catalog/CLAUDE.md`). The decision Q10 of the plan of phase 6 chose an index class of `zoe.plone` with "inherit", resolved at query time in the mirror and in the Python path. The finding of ZOE-285 gives the form of that choice.
 
 The facts of the finding:
 
@@ -14,6 +14,17 @@ The facts of the finding:
 - Each input alone does inherit: a share changes the local roles of the folder only, and a transition changes the permission setting of the folder only. The value of every other catalog entry follows from its own inputs and from those of its containers. On `xlarge-mini` and on the folder of 50,004 descendants, the value that the prototype resolves equals the Plone value for every catalog entry, before and after five changes, and on `xlarge-mini` after two changes that make opaque entries. A share then takes 0.03 s and writes 4 records, a transition 0.02 s and 10 records, and with queued indexing each writes one key.
 
 ## Decision
+
+### Decisions of the human
+
+1. The index inherits each input: the setting of "Access contents information" and the local roles. It does not inherit the value whole (sections 1 and 2).
+2. `zoe.plone` replaces `CatalogAware.reindexObjectSecurity` and `MembershipTool.deleteLocalRoles` of CMFCore at run time (section 3). The code of CMFCore does not change.
+3. The public Python API is the index class `zoe.plone.security.ZoeSecurityIndex` and the opt-in backend `security`.
+4. An add-on that changes the inputs below a folder through its own walk leaves stale entries (Consequences).
+5. The new wording of "Step 2" and of the invariant of `zoe-catalog` stands (section 8).
+6. The mirror resolves at the version of a query. The change sets hold inputs, not resolved values (section 6). F33 takes the wording of section 8.
+7. The index goes into a catalog through the backend `security`, with `install()`, `uninstall()` and `installed()`, as the other backends of `zoe.plone`. `replace_index` and `restore_index` stay private, and a site created later gets the index in the transaction that creates it (section 5).
+8. The Python path is slower than a `KeywordIndex` until ZOE-301 adds its cache. This record accepts that limit (Consequences).
 
 ### 1. The index class
 
@@ -59,19 +70,32 @@ With a `ZoeSecurityIndex`, the Indexer of ADR 0047 does not add the catalog subt
 
 ### 5. The backend
 
-`security` is an opt-in backend of `zoe.plone`, as `indexing` is: `ZOE_PLONE_BACKENDS=security` or `zoe.plone:security.zcml`. `install()` replaces the methods of section 3 in the process, and `uninstall()` gives the stock methods back. Every instance of the site needs the backend. An instance without it runs the stock walk: the result is correct, but it writes and waits as before.
+`security` is an opt-in backend of `zoe.plone`, as `indexing` is: `ZOE_PLONE_BACKENDS=security` or `zoe.plone:security.zcml`, which call `install()`. It has `install()`, `uninstall()` and `installed()`, as the other backends of `zoe.plone`. A second call of `install()` or `uninstall()` does nothing. Every instance of the site needs the backend. An instance without it runs the stock walk: the result is correct, but it writes and waits as before.
 
-The index goes into each catalog in a transaction of its own, which indexes every catalog entry: 36 to 42 s for 50,064 entries in the prototype. The call that does it, also for a site created later, is a point for the human. A site that keeps the stock index runs the stock methods.
+- `install()` replaces the methods of section 3 in the process. It also puts a `ZoeSecurityIndex` in place of the `KeywordIndex` `allowedRolesAndUsers` into each catalog that does not hold one yet. It finds the sites as queued indexing does (ADR 0047), in the databases that the process has open and at each open of a database (`IDatabaseOpenedWithRoot`). Each catalog gets the index in a transaction of its own, which indexes every catalog entry: 36 to 42 s for 50,064 entries in the prototype.
+- A site created later gets the index in the transaction that creates it.
+- `uninstall()` gives the stock methods back in the process. For each catalog of the databases that the process has open, it puts the `KeywordIndex` back in a transaction of its own and indexes every catalog entry.
+- `installed()` tells if the backend is installed in the process.
+- The functions `replace_index(catalog)` and `restore_index(catalog)` of `zoe.plone.security` do the work for one catalog. They are private, and no public API.
 
-The way back of a site puts the `KeywordIndex` back and indexes every catalog entry. Then the option leaves every instance. The way back runs before zoedb leaves the environment: without the class `ZoeSecurityIndex`, the catalog does not load, and every search fails.
+A catalog without a `ZoeSecurityIndex` runs the stock methods (section 3).
+
+The way back of a site: run `uninstall()` in one instance, then remove the option from every instance. The way back runs before zoedb leaves the environment: without the class `ZoeSecurityIndex`, the catalog does not load, and every search fails.
 
 A GenericSetup import of `catalog.xml` keeps an index whose id exists. An import that purges the catalog puts the stock index back. An export writes the meta_type `ZoeSecurityIndex`, which a site without zoedb cannot import.
 
-The index holds persistent objects only, so it runs on a `DemoStorage`. The Plone suites with the backend and the stock index run the stock methods. ZOE-301 names the suites that run with the index in the catalog of the test fixture, as section 9 of ADR 0047 does for queued indexing.
+The index holds persistent objects only, so it runs on a `DemoStorage`. ZOE-301 names the suites that run with the index in the catalog of the test fixture, as section 9 of ADR 0047 does for queued indexing. The other suites keep the stock index and run the stock methods.
 
 ### 6. The mirror
 
-The mirror decodes the buckets of the inputs, and keeps the inputs of each node of the path trie (ZOE-288). It resolves the value of each catalog entry and keeps one bitmap for each distinct value. A query of the tokens of a user is an or of the bitmaps whose value holds one of them. How the resolved values follow the versions and the rebase of ADR 0059 is a point for the human.
+The mirror decodes the buckets of the inputs. It keeps the inputs of each node: each catalog entry and each recorded container. It resolves the value of each catalog entry and keeps one bitmap for each distinct value. A query of the tokens of a user is an or of the bitmaps whose value holds one of them.
+
+The mirror resolves at the version of a query, with the versions of ADR 0059:
+
+- The base holds the inputs of each node, the value of each catalog entry and the bitmaps of the distinct values.
+- A change set holds the changed inputs of a commit, one row for each changed node. It holds no resolved value.
+- A query at tid `t` resolves, with the inputs at `t`, the catalog entries below the nodes that the change sets after the base and up to `t` changed. It puts them over the bitmaps of the base. The transaction overlay does the same, for its query only.
+- For the rebase, the overrides count the catalog entries below their changed nodes. So a share on the folder of 50,004 descendants passes `catalog-rebase-rows`, and the rebase resolves the tree into a new base. Until the rebase, each query at a later tid resolves those 50,004 catalog entries: 9.2 ms for 50,064 in the prototype.
 
 ### 7. The Python path
 
@@ -81,6 +105,8 @@ The Python path resolves the value of each candidate rid at query time, with a m
 
 "Step 2" says: "Security stays in Plone: `allowedRolesAndUsers` is a `KeywordIndex`, or the `ZoeSecurityIndex` of `zoe.plone` (ADR 0061), which the mirror resolves as its Python path does." The invariant of `crates/zoe-catalog/CLAUDE.md` becomes: "Security stays in Plone: a `KeywordIndex` `allowedRolesAndUsers` is an index like any other, and a `ZoeSecurityIndex` resolves as its Python path does."
 
+F33 says: "incremental security index (the inherited inputs of allowedRolesAndUsers, resolved through the containers of each entry: in the mirror at the version of the query, in the Python path at query time)". Its acceptance does not change.
+
 ## Consequences
 
 - A share or a transition of a folder writes the entry of the folder, whatever the size of its subtree, and takes the time of one reindex.
@@ -89,29 +115,16 @@ The Python path resolves the value of each candidate rid at query time, with a m
 - A security reindex above an opaque entry reindexes the opaque entries below it, as the stock walk does. A stock site has no opaque entry.
 - The corpus of the spike has no Owner local role, no sequence setting below the site root (no stock workflow of Plone 6.1 acquires "Access contents information"), no comment and no mount. Its only opaque entries come from two changes on `xlarge-mini`. A check on `xlarge` covers none of these cases. ZOE-301 adds a small synthetic fixture for each.
 - The acceptance test of ZOE-301 compares, before and after changes of security: the resolved value of every catalog entry with the Plone value; the bitmap of each token in the mirror with the postings of a stock `KeywordIndex`; and the rids of queries. It runs on these fixtures and on `xlarge` (G5).
-- The Python path is O(N) in its candidates: 0.18 to 0.42 s at 50,064 catalog entries, not run at one million. Every restricted search pays it while the mirror is `not_ready`, `lag`, `outside_window` or `dropped`.
-- ZOE-301 changes the specification: "Step 2" and the invariant of `zoe-catalog` (section 8); the table of the surface of `zoe.plone`, with the backend `security` and `ZoeSecurityIndex`; the list of the opt-in backends of `zoe.plone`, with `zoe.plone:security.zcml`; the line of the Indexer in "`zoe.plone` and queued indexing", which adds no security subtree with the index (section 4); and F33, if the human takes the wording below.
-
-## Points for the human
-
-Accepted:
-
-- Inherit per input (the permission setting and the local roles), not the value whole: the form that Q10 (a) takes.
-- `zoe.plone` replaces two methods of CMFCore at run time (`CatalogAware.reindexObjectSecurity`, `MembershipTool.deleteLocalRoles`): no change of the code of CMFCore, but a patch.
-- The public Python API: `zoe.plone.security.ZoeSecurityIndex` and the opt-in backend `security`.
-- An add-on that changes the inputs of the objects below a folder and relies on the walk leaves stale entries.
-- The new wording of "Step 2" and of the invariant of `zoe-catalog` (section 8).
-
-Open:
-
-- **The mirror resolves at the version of a query.** Q10 and F33 say "resolved at query time", and section 6 resolves in the mirror. The proposal: the base of ADR 0059 holds the inputs of each node, the value of each catalog entry and the bitmaps of the distinct values. A change set holds the changed inputs of a commit, one row for each node. A query at tid `t` resolves, with the inputs at `t`, the catalog entries below the nodes that the change sets up to `t` changed, and puts them over the bitmaps of the base. The transaction overlay does the same, for its query only. For the rebase, the overrides count the catalog entries below their changed nodes. So a share on the folder of 50,004 descendants passes `catalog-rebase-rows`, and the rebase resolves the tree into a new base. Until the rebase, each query at a later tid resolves those 50,004 catalog entries (9.2 ms for 50,064 in the prototype). F33 then says: "incremental security index (the inherited inputs of allowedRolesAndUsers, resolved through the containers of each entry: in the mirror at the version of the query, in the Python path at query time)". The other choice: the change sets hold resolved values. A share then changes 13,875 rows, and two shares make a rebase.
-- **The call that puts the index into a catalog.** (a) `replace_index(catalog)` and `restore_index(catalog)` of `zoe.plone.security`, as in the prototype: public functions beyond the accepted API, run from a script of `bin/instance run`, once for each site, a site created later included. (b) A profile of `zoe.plone`: an import step that puts the index in, which a site created later runs when its profile depends on it, and an uninstall profile for the way back.
-- The Python path resolves at query time, slower than a `KeywordIndex` until ZOE-301 adds its cache.
+- The Python path is O(N) in its candidates: 0.18 to 0.42 s at 50,064 catalog entries, not run at one million. Every restricted search pays it while the mirror is `not_ready`, `lag`, `outside_window` or `dropped`. This record accepts the limit until the cache of ZOE-301.
+- ZOE-301 changes the specification: "Step 2" and the invariant of `zoe-catalog` (section 8); the table of the surface of `zoe.plone`, with the backend `security` (`install()`, `uninstall()`, `installed()`) and `ZoeSecurityIndex`; the list of the opt-in backends of `zoe.plone`, with `zoe.plone:security.zcml`; the line of the Indexer in "`zoe.plone` and queued indexing", which adds no security subtree with the index (section 4); and the row F33 (section 8).
 
 ## Alternatives
 
 - **"Own value or inherit", the value whole.** A share writes the private and pending entries below the folder, and a transition the entries that held its value by chance.
 - **An opaque entry that keeps its inputs, with only its own value opaque.** A str setting makes the walk above it read another permission, and an `IWorkspace` adapter replaces the local roles of a principal instead of adding to them. The entries below such a node cannot resolve through its inputs.
+- **Change sets that hold resolved values.** A share on the folder of 50,004 descendants then changes 13,875 rows, and two shares make a rebase.
+- **Public functions that put the index in.** `replace_index(catalog)` and `restore_index(catalog)`, run from a script of `bin/instance run` once for each site, a site created later included. They add a public API beyond the backend.
+- **A profile of `zoe.plone`.** An import step puts the index in, a site created later runs it when its profile depends on it, and an uninstall profile gives the way back. It is a second way to install, beside the backends.
 - **The mirror only.** Plone writes as today: the walk of the subtree, its records, and one key for each entry with queued indexing. F33 asks for O(1) records.
 - **No change of `reindexObjectSecurity`.** The index writes nothing for the entries that do not change, but the walk wakes every object of the subtree, and queued indexing writes one key for each.
 - **A subtree operation in CMFCore.** A change of CMFCore, out of scope.
