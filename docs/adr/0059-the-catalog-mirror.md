@@ -1,6 +1,6 @@
 # 0059. The catalog mirror: a base built from the index trees, a change set per commit, and `catalog_query`
 
-Status: proposed. Card ZOE-283, a spike (finding: `docs/spikes/catalog-mirror.md`; prototype: branch `spike/ZOE-283`). It adds a wire call (`catalog_query`, extension `catalog_query`), a public Python API (`catalog_query` and `catalog_supported` of `zoe.Storage` and of `zoe.zeo.ClientStorage`, the backend `catalog` of `zoe.plone`), a durable namespace and its keys, and five keys of `zoe serve` and of `<zoe>`. It changes no on-disk format and no record. It records the decisions Q2 to Q7 of the plan of phase 6 (#597) and gives the design around them.
+Status: accepted. Card ZOE-283, a spike (finding: `docs/spikes/catalog-mirror.md`; prototype: branch `spike/ZOE-283`). It adds a wire call (`catalog_query`, extension `catalog_query`), a public Python API (`catalog_query` and `catalog_supported` of `zoe.Storage` and of `zoe.zeo.ClientStorage`, the backend `catalog` of `zoe.plone`), a durable namespace and its keys, and five keys of `zoe serve` and of `<zoe>`. It changes no on-disk format and no record. It records the decisions Q2 to Q7 of the plan of phase 6 (#597) and gives the design around them.
 
 ## Context
 
@@ -29,6 +29,15 @@ The evidence has limits (finding, "Limits"). `generic-numbers` misses G2 with 29
 - **Test storage**: a `DemoStorage` over a ZOE storage, at any depth of a stack, as in the test layers of plone.app.testing.
 
 ## Decision
+
+### Decisions of the human
+
+1. The specification states the memory of a mirror: about 1.1 GB for a stock catalog of 1,000,000 entries, and 1.5 GB with the indexes of `xlarge`. N6 counts `catalog-memory` as a term of its bound, and the default stays 2 GiB (section 6).
+2. The throwaway mirror of the mode `compare` (Q7) runs on a test storage only. A ZOE store uses the real mirror (section 9).
+3. `catalog-1m` stands for `xlarge` in this card, as it does for G2 and G3. The probe of ZOE-292 records the inventory of the B5 runs.
+4. The durable namespace keeps the name `zoe.catalog` (section 1). The store reads it, and only `zoe.plone` reads the namespaces `zoe.plone.*`.
+5. The miss of `generic-numbers` gets no new spike. ZOE-286 builds the rule (a test of the key of each row of the other clauses, when they give fewer rows than the range has keys) with a test, and `just bench catalog` (ZOE-299) proves G2.
+6. ZOE-292 adds a replay of the synthetic B5 query log in the mode `compare` on a ZOE store, with commits during the replay. So G1 covers the change sets, the rebase, the mirror window and the wire.
 
 ### 1. Registration (Q3)
 
@@ -89,7 +98,7 @@ At the bytes of the finding, the default holds one catalog of 1,000,000 entries 
 
 A build, a rebase or a growth that would pass the bound drops the mirror of the store that answered a query least recently. `zoe_catalog_mirror_drops_total` counts the drop, and the queries of that mirror take the Python path (`dropped`). A dropped mirror builds again at the next open of the store, or when an uninstall frees its room.
 
-N6 bounds the resident memory of a server by its configuration. The mirrors add one term to that bound: `catalog-memory` for each store with a registered catalog, beside `cache-size` and the log. The test of N6 (a store of 100 GB under a limit of 2 GB) registers no catalog. A server with one mirror at the default needs a limit 2 GiB higher (points for the human, 1).
+N6 bounds the resident memory of a server by its configuration. The mirrors add one term to that bound: `catalog-memory` for each store with a registered catalog, beside `cache-size` and the log. The test of N6 (a store of 100 GB under a limit of 2 GB) registers no catalog. A server with one mirror at the default needs a limit 2 GiB higher.
 
 ### 7. What the mirror serves, and the reasons of a fallback
 
@@ -162,7 +171,7 @@ A call holds at most 50,000 msgpack values and 16 MiB, under the limits of a fra
 - `catalog_supported()` of both storages tells if the storage serves `catalog_query`: always for `zoe.Storage`, and for `zoe.zeo.ClientStorage` when its server accepted the extension. The hook reads it with `getattr`, as `zoe.kv` reads `kv_supported()`. The asyncio mode of `zoe.zeo.ClientStorage`, a stock ZEO client and a test storage have no such call (`unsupported`).
 - `zoe.plone.catalog` is the opt-in backend `catalog` (`ZOE_PLONE_BACKENDS=catalog`, or `zoe.plone:catalog.zcml`), with `install()`, `uninstall()` and `installed()` (Q5). It hooks `Catalog.search`, as `collective.solr` does. It builds the plan, sends it with the transaction overlay, and gives a `LazyMap` of brains in the order of the reply. For a refusal, or for a query that it cannot type, it runs the stock search.
 - The modes: `on`, the default once installed, and `compare`. `compare` also runs the stock search, logs and counts each difference, and returns the stock result. `ZOE_PLONE_CATALOG_MODE` gives the mode of a process (Q5).
-- On a test storage, in `compare` mode, the backend builds a throwaway mirror for each search (Q7). The build of section 2 reads the test storage at the snapshot of the Connection, then reads the transaction overlay as section 8 does. The mirror answers the one search and is dropped. A private function of `zoe._zoe` builds it: it is no public API. In mode `on`, a test storage has no mirror, and the backend runs the stock search.
+- On a test storage, in `compare` mode, the backend builds a throwaway mirror for each search (Q7). The build of section 2 reads the test storage at the snapshot of the Connection, then reads the transaction overlay as section 8 does. The mirror answers the one search and is dropped. A private function of `zoe._zoe` builds it: it is no public API. In mode `on`, a test storage has no mirror, and the backend runs the stock search. A ZOE store uses the real mirror in both modes.
 
 ### 10. Named storages and mounts
 
@@ -175,8 +184,9 @@ Each named storage of `zoe serve` and each store of the process keeps the mirror
 ## Consequences
 
 - The build cards change the specification and the reference. This record does not. The changes:
-  - "Step 2: the mirror": the scope (the GopipIndex sort waits for ZOE-302); the representation of section 3, with no trie (the titles of ZOE-288 and ZOE-304 name one); discovery by registration; maintenance after publication; versions as a base, change sets and a rebase, and the rule of the mirror window; the overlay of `catalog_query` and the form of its reply; the memory line (points for the human, 1).
-  - N6 and the paragraph on the memory of a server in "Server mode": the term of the mirrors.
+  - "Step 2: the mirror": the scope (the GopipIndex sort waits for ZOE-302); the representation of section 3, with no trie (the titles of ZOE-288 and ZOE-304 name one); discovery by registration; maintenance after publication; versions as a base, change sets and a rebase, and the rule of the mirror window; the overlay of `catalog_query` and the form of its reply; the memory line, which states about 1.1 GB for a stock catalog of 1,000,000 entries and 1.5 GB with the indexes of `xlarge`.
+  - N6 and the paragraph on the memory of a server in "Server mode": `catalog-memory` is a term of the bound, for each store with a registered catalog.
+  - The correctness line of "Step 2: the mirror" and "Testing of the catalog": the replay of the synthetic B5 query log in the mode `compare` on a ZOE store, with commits during the replay (ZOE-292).
   - "Extension negotiation", the naming row of the protocol extensions, the method table of "Server mode" and `docs/reference/protocol.md`: `catalog_query`.
   - The table of the Python surface and `docs/reference/python-api.md`: `catalog_query` and `catalog_supported`.
   - The five keys `catalog-memory`, `catalog-window-tids`, `catalog-window-seconds`, `catalog-rebase-rows` and `catalog-wait`, in `<zoe>`, in the flags and the configuration file of `zoe serve`, and their `ZOE_*` twins; `ZOE_PLONE_CATALOG_MODE`; their pages of `docs/reference/`.
@@ -187,16 +197,7 @@ Each named storage of `zoe serve` and each store of the process keeps the mirror
 - ZOE-286 takes the interim rule over the registered objects and the savepoint records. ZOE-291 takes the savepoint records and the cap of a call, and no reuse of pickles. ZOE-303 is the way back from `stale`.
 - `zoe-catalog` depends on `zoe-pickle` and `roaring`, and reads the store through the read API of `zoe-core`. It stays synchronous. It starts its threads at the open of a store, never at the load of a module.
 - A site gets native answers only after its mirror is built. The build time is the time to native answers after a cold start.
-- The Plone suites run on test storages, so `compare` mode runs the throwaway mirror there. It covers the build and the read of a transaction overlay. It does not cover the change sets, the rebase, the mirror window or the wire (points for the human, 6).
-
-## Points for the human
-
-1. **The memory line of the specification.** "The low hundreds of megabytes" becomes about 1.1 GB for a stock catalog of 1,000,000 entries, and 1.5 GB with the indexes of `xlarge`: a change of a requirement. Proposed: the specification states these numbers, N6 counts `catalog-memory` as a term of its bound, and the default stays 2 GiB, which holds one such catalog and not two.
-2. **Q7 on a test storage only.** Q7 says that `compare` builds a throwaway mirror. Section 9 builds it only on a test storage, and uses the real mirror on a ZOE store. Proposed: accept this narrower reading, with one build for each search.
-3. **`xlarge` and the B5 runs did not run.** The acceptance of ZOE-283 still asks for the numbers on `xlarge` and for the inventory of the B5 runs. Proposed: `catalog-1m` stands for `xlarge` in this card, as it does for G2 and G3, and the probe of ZOE-292 records the B5 inventory.
-4. **The name of the namespace.** `zoe.catalog` does not follow the names `zoe.plone.*` of the other namespaces that `zoe.plone` writes. Proposed: keep `zoe.catalog`, because the store reads it, and only `zoe.plone` reads the `zoe.plone.*` namespaces.
-5. **The miss of `generic-numbers`.** The fix (a test of the key of each row of the other clauses, when they give fewer rows than the range has keys) was not measured again. Proposed: no new spike; ZOE-286 builds the rule with a test, and G2 proves it in `just bench catalog` (ZOE-299).
-6. **A run of the differential suite on a ZOE store.** Proposed: the acceptance of ZOE-292 adds its replay of the synthetic B5 query log in `compare` mode on a ZOE store, with commits during the replay, so that G1 covers the change sets, the rebase and the wire.
+- The Plone suites run on test storages, so `compare` mode runs the throwaway mirror there. It covers the build and the read of a transaction overlay. It does not cover the change sets, the rebase, the mirror window or the wire. The replay of ZOE-292 on a ZOE store covers them.
 
 ## Alternatives
 
