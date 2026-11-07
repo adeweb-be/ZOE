@@ -36,7 +36,7 @@ The evidence has limits (finding, "Limits"). `generic-numbers` misses G2 with 29
 2. The throwaway mirror of the mode `compare` (Q7) runs on a test storage only. A ZOE store uses the real mirror (section 9).
 3. `catalog-1m` stands for `xlarge` in this card, as it does for G2 and G3. The probe of ZOE-292 records the inventory of the B5 runs.
 4. The durable namespace keeps the name `zoe.catalog` (section 1). The store reads it, and only `zoe.plone` reads the namespaces `zoe.plone.*`.
-5. The miss of `generic-numbers` gets no new spike. ZOE-286 builds the rule (a test of the key of each row of the other clauses, when they give fewer rows than the range has keys) with a test, and `just bench catalog` (ZOE-299) proves G2.
+5. The miss of `generic-numbers` gets no new spike. ZOE-286 builds the rule that the finding calls for (finding, "Queries"), sets its threshold by cost, and tests it, and `just bench catalog` (ZOE-299) proves G2.
 6. ZOE-292 adds a replay of the synthetic B5 query log in the mode `compare` on a ZOE store, with commits during the replay. So G1 covers the change sets, the rebase, the mirror window and the wire.
 
 ### 1. Registration (Q3)
@@ -83,7 +83,7 @@ The mirror applies each commit after its publication, in tid order, in a thread 
 
 To apply a commit, the mirror looks up each record of the commit in its map of the oids of the mirrored trees. It decodes the records that it owns. It registers the new buckets that a changed inner node names. It compares the items of each changed bucket with the rows of the old key range of the bucket. A record of another object costs one lookup.
 
-Some commits change what the mirror reads: a new root of a mirrored tree (a new `_unindex`, `paths`, `uids` or `data`, as `manage_catalogClear`, `clearFindAndRebuild` and `clearIndex` write), or a change of the `Catalog` object or of the record of an index (`addIndex`, `delIndex`, `addColumn`, `delColumn`). After such a commit, the mirror is stale: the queries at its tid and later take the Python path (`stale`). A stale mirror starts a rebuild in the background: the shadow rebuild of ZOE-303 (Q12), which builds the structures of the changed trees beside the base and swaps them in. Until ZOE-303 merges, the rebuild is a new build (section 2).
+Some commits change what the mirror reads: a new root of a mirrored tree (a new `_unindex`, `paths`, `uids` or `data`, as `manage_catalogClear`, `clearFindAndRebuild` and `clearIndex` write), or a change of the `Catalog` object or of the record of an index (`addIndex`, `delIndex`, `addColumn`, `delColumn`). After such a commit, the mirror is stale: the queries at its tid and later take the Python path (`stale`). A stale mirror starts a rebuild in the background: the shadow rebuild of ZOE-303 (Q12), which builds the structures of the changed trees beside the base and swaps them in. Until ZOE-303 merges, the rebuild is a new build (section 2). The stale mirror drops its base before that build starts, so the bound of section 6 holds.
 
 ### 6. The memory bound (Q2)
 
@@ -122,7 +122,7 @@ A query takes the Python path, whole, with one of these reasons:
 | `index_unavailable` | the decoder refused a record of an index of the query |
 | `overlay` | the server could not read a record of the transaction overlay |
 | `not_ready`, `dropped`, `stale` | the mirror is building, was dropped, or met a commit that it cannot follow (section 5) |
-| `outside_window`, `lag` | the tid of the query is outside the mirror window, or the mirror did not reach it in time |
+| `outside_window`, `lag` | a commit after the tid of the query has no change set in the mirror, or the mirror did not reach the tid in time |
 
 The client decides the reasons that it sees in the query: `unsupported`, `index`, `option`, `and_range`, `sort`, `transaction` and `too_large`. The server decides the others. `zoe_catalog_fallbacks_total{reason, side}` counts each one, with `side="client"` or `side="server"`. The client counts in its own process, where `zoe.plone` counts (ZOE-286). The table is a contract: the differential suite (ZOE-292) counts each reason.
 

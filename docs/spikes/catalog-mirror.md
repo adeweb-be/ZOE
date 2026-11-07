@@ -1,6 +1,6 @@
 # Finding: the catalog mirror, built from the index trees of a catalog of one million entries
 
-Card ZOE-283; requirements F17, N6 and N7, the sections "Step 2: the mirror, `zoe-catalog`", "Metrics of the catalog" and "Testing of the catalog" of the specification, and the decisions Q2 to Q7 of the plan of phase 6 (#597). The prototype and the scripts are on the branch `spike/ZOE-283` at [`71ce00c4`](https://github.com/adeweb-be/ZOE/tree/71ce00c40dc45339e37b774c0a521b613553ea42), not for merge. The design that this finding proposes is ADR 0059 (proposed).
+Card ZOE-283; requirements F17, N6 and N7, the sections "Step 2: the mirror, `zoe-catalog`", "Metrics of the catalog" and "Testing of the catalog" of the specification, and the decisions Q2 to Q7 of the plan of phase 6 (#597). The prototype and the scripts are on the branch `spike/ZOE-283` at [`71ce00c4`](https://github.com/adeweb-be/ZOE/tree/71ce00c40dc45339e37b774c0a521b613553ea42), not for merge. The design that follows from this finding is ADR 0059 (accepted).
 
 **The numbers, in short.**
 
@@ -14,7 +14,7 @@ Card ZOE-283; requirements F17, N6 and N7, the sections "Step 2: the mirror, `zo
 - **Inventory (Q6):** in the Plone suites, 9,282 calls of `Catalog.search`; the prototype serves 66.8 %; 25.0 % sort on `getObjPositionInParent` (the order index, ZOE-302), 6.6 % use DateRecurringIndex, 1.5 % ZCTextIndex. In the part of the suites recorded with the fixed probe, 18.2 % of the searches ran in a transaction that had changed the catalog. The B5 runs were not run (see "Limits").
 - **The order of ZCatalog (Q7):** four sort paths with four rules for ties; `_sort_nbest` keeps neither the lowest nor the highest rids at its threshold, and the prototype follows its rule exactly.
 
-**The design that follows (ADR 0059, proposed):** registration of each catalog in the durable namespace `zoe.catalog`; a build in the background after the open; a base with one change set per tid and a rebase; the apply after publication with a bounded wait of a query at a newer tid; a memory bound of 2 GiB per store; typed plans built with `IndexQuery`; the transaction overlay as the changed records of the transaction, savepoints included, with provisional oids; the Python API and the backend `catalog` of `zoe.plone`.
+**The design that follows (ADR 0059, accepted):** registration of each catalog in the durable namespace `zoe.catalog`; a build in the background after the open; a base with one change set per tid and a rebase; the apply after publication with a bounded wait of a query at a newer tid; a memory bound of 2 GiB per store; typed plans built with `IndexQuery`; the transaction overlay as the changed records of the transaction, savepoints included, with provisional oids; the Python API and the backend `catalog` of `zoe.plone`.
 
 ## Question
 
@@ -260,7 +260,7 @@ The numbers ask for one change of content, not of count:
 
 - **ZOE-286** takes the versions (the base, the change sets, the overrides, the rebase), the apply of a commit and the four sort paths of ZCatalog with their ties, beside FieldIndex: a FieldIndex query cannot be exact without them, and the testbed is its acceptance harness. Its budget stays 3 if the testbed and `mirror test` move into it from the prototype.
 - **ZOE-291**, the overlay, reads the records of a transaction with the code of the apply of ZOE-286 over the version of the query: the server side shrinks to the call and its limits; the client side (the pickles of the registered objects and of the savepoint records, with provisional oids, and the cap of a call) stays. Budget 2 → 1.
-- **ZOE-289**, the metadata table, carries the memory question: the table is the largest part of the mirror (see "Memory"). It should start after the human sets the default of the memory bound (ADR 0059, section 6).
+- **ZOE-289**, the metadata table, carries the memory question: the table is the largest part of the mirror (see "Memory"). The default of the memory bound is 2 GiB (ADR 0059, section 6).
 - ZOE-287, ZOE-288 and ZOE-290 stay as written.
 
 ## Limits
