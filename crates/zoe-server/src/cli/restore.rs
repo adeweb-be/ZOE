@@ -61,6 +61,7 @@ fn write_report(
             ("blobs", &report.blobs),
             ("sequences", &report.sequences),
             ("durable rows", &report.durable_rows),
+            ("deltas", &report.deltas),
         ],
     )
 }
@@ -102,6 +103,7 @@ mod tests {
             blobs: 2,
             sequences: 1,
             durable_rows: 0,
+            deltas: 1,
             last_tid: Tid(0x10),
         };
         let mut out = Vec::new();

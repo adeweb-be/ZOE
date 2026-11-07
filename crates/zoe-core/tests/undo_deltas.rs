@@ -190,14 +190,16 @@ fn the_catalog_records_of_the_same_undo_go_through_the_tiers() {
     let before = snapshot(&store);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(counter, Tid::ZERO, &length(10)).unwrap();
-    txn.text_set(CATALOG, INDEX, 1, "en", "one", before).unwrap();
+    txn.text_set(CATALOG, INDEX, 1, "en", "one", before)
+        .unwrap();
     txn.vote().unwrap();
     let first = txn.finish().unwrap();
 
     let before = snapshot(&store);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(counter, first, &length(15)).unwrap();
-    txn.text_set(CATALOG, INDEX, 1, "en", "two", before).unwrap();
+    txn.text_set(CATALOG, INDEX, 1, "en", "two", before)
+        .unwrap();
     txn.vote().unwrap();
     let undone = txn.finish().unwrap();
     let later = zoe_core::testing::commit(&store, counter, undone, &length(17));

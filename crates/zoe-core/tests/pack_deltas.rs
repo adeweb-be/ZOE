@@ -164,7 +164,14 @@ const KEYS: [(Oid, &str, i32); 8] = [
 /// The snapshots after T of the scenario.
 fn after_t(tids: Tids) -> Vec<Tid> {
     let next = |tid: Tid| Tid(tid.0 + 1);
-    vec![next(tids.t7), tids.t8, next(tids.t8), tids.t9, next(tids.t9), Tid::MAX]
+    vec![
+        next(tids.t7),
+        tids.t8,
+        next(tids.t8),
+        tids.t9,
+        next(tids.t9),
+        Tid::MAX,
+    ]
 }
 
 /// The live text of each key at each snapshot of `snapshots`. With garbage
@@ -172,7 +179,9 @@ fn after_t(tids: Tids) -> Vec<Tid> {
 /// rule 5 removes the deltas of the other one.
 fn live_texts(store: &Store, gc: bool, snapshots: &[Tid]) -> Vec<Option<LiveText>> {
     let mut texts = Vec::new();
-    let keys = KEYS.iter().filter(|(catalog, ..)| !gc || *catalog != ORPHAN);
+    let keys = KEYS
+        .iter()
+        .filter(|(catalog, ..)| !gc || *catalog != ORPHAN);
     for &(catalog, index, rid) in keys {
         for &tid in snapshots {
             texts.push(store.text_before(catalog, index, rid, tid).unwrap());

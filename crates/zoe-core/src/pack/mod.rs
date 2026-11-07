@@ -527,6 +527,11 @@ struct DeltaRemoval {
     by_rules: bool,
 }
 
+/// The key without its tid of the text deltas that the scan reads, and
+/// their rows at or before T, from the oldest: the tid, and true for an
+/// unindex.
+type Group = (Vec<u8>, Vec<(Tid, bool)>);
+
 /// The scan of the deltas of a pack, in key order of `text_deltas`.
 #[derive(Default)]
 struct DeltaScan {
@@ -541,10 +546,8 @@ struct DeltaScan {
     /// that catalog, by index id. The clear deltas of a catalog sort before
     /// its text deltas, so the scan reads them first.
     newest_clears: HashMap<Vec<u8>, Tid>,
-    /// The key without its tid of the text deltas that the scan reads, and
-    /// their rows at or before T, from the oldest: the tid, and true for an
-    /// unindex.
-    group: Option<(Vec<u8>, Vec<(Tid, bool)>)>,
+    /// The text deltas of one key that the scan reads.
+    group: Option<Group>,
     /// The text deltas that the scan selected and that no batch took yet,
     /// in key order.
     pending: VecDeque<DeltaRemoval>,

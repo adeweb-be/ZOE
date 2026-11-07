@@ -77,7 +77,9 @@ const BUSHY: &[u8] = b"bushy";
 ///
 /// A `Data.fs` holds no KV namespace, so the conversion leaves the durable
 /// rows out, and `Report.durable_keys` counts their keys. It leaves the
-/// ephemeral rows out too, and counts none.
+/// ephemeral rows out too, and counts none. A `Data.fs` holds no text
+/// delta either: the conversion leaves the deltas out, never fails for
+/// them, and `Report.deltas` counts them, with no text.
 pub fn to_datafs(source: &Store, data_fs: &Path, blob_dir: &Path) -> Result<Report, Error> {
     let _lock = lock(&sibling(data_fs, LOCK_SUFFIX)?)?;
     let temp = sibling(data_fs, TEMP_SUFFIX)?;
@@ -369,6 +371,9 @@ fn verify(
         report.transactions += 1;
         report.records += txn.records.len() as u64;
         report.last_tid = txn.tid;
+        // The deltas of the transaction stay out of the file. The read
+        // gives their keys only, never a text.
+        report.deltas += store.text_changed(Tid(txn.tid.0 - 1), txn.tid)?.len() as u64;
 
         for record in txn.records.iter().filter(|record| record.data.is_some()) {
             let (oid, tid) = (record.oid, txn.tid);

@@ -51,7 +51,9 @@ pub(crate) fn empty_range(from: Bound<&[u8]>, to: Bound<&[u8]>) -> bool {
 /// tid, with a tid before `before`: its key and its stored frame. A key
 /// that the scan gives outside the prefix is `CorruptText`.
 pub(super) fn newest(db: &Db, prefix: &[u8], before: Tid) -> Result<Option<(Bytes, Bytes)>> {
-    newest_with(db, prefix, before, |key, frame| (key.to_vec(), frame.to_vec()))
+    newest_with(db, prefix, before, |key, frame| {
+        (key.to_vec(), frame.to_vec())
+    })
 }
 
 /// Return the key of the newest row of `prefix` with a tid before
