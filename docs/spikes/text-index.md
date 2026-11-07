@@ -1,17 +1,17 @@
 # Finding: the native text index on tantivy, its delta record type, and the compatibility with ZCTextIndex
 
-Card ZOE-284; requirement F18, "Native BM25 text index", the risk row "Text index lags the tid or diverges from ZCTextIndex ranking", "Data model", "Record framing", "Pack", "The write-ahead log" and the naming table of the specification, N13 and N15; the decisions Q8, Q9, Q15 and N1 of the plan of phase 6. The prototype and the scripts are on the branch `spike/ZOE-284` at [`a11a75e7`](https://github.com/adeweb-be/ZOE/tree/a11a75e7622fd18ffc2cc87345bd2ea6f276aa81), not for merge. ADR 0060 (proposed) gives the design that follows from this finding.
+Card ZOE-284; requirement F18, "Native BM25 text index", the risk row "Text index lags the tid or diverges from ZCTextIndex ranking", "Data model", "Record framing", "Pack", "The write-ahead log" and the naming table of the specification, N13 and N15; the decisions Q8, Q9, Q15 and N1 of the plan of phase 6. The prototype and the scripts are on the branch `spike/ZOE-284` at [`1b3d7a42`](https://github.com/adeweb-be/ZOE/tree/1b3d7a42b96cd15814c51b922b6a4c55c075ae2d), not for merge. Sections 1 to 7 ran at [`a11a75e7`](https://github.com/adeweb-be/ZOE/tree/a11a75e7622fd18ffc2cc87345bd2ea6f276aa81); section 8 adds the filter and the sort inside the search. ADR 0060 (proposed) gives the design that follows from this finding.
 
 **The numbers, in short.**
 
-- **G4, a text query under 20 ms at p99 on `catalog-1m`.** Alone, the enhanced mode meets it: 7.7 ms on the 12 terms of the plan, 13.7 ms with the boosts over three fields; the compatibility mode gives 19.1 ms. With the filter of a listing (495,943 rids) or a sort, both modes miss it on the 3 words of the top band, which match 77 % of the entries: 34 to 72 ms. Below the top band, every variant of both modes on `SearchableText` stays under 20 ms (16.5 ms the worst), and the boosts reach 20.0 ms with the filter. The cost is the check of the filter and of the sort on each hit after the scores; section 6 gives the levers for ZOE-295.
+- **G4, a text query under 20 ms at p99 on `catalog-1m`: met in both modes, with the filter and the sort inside the search (section 8).** On the 12 terms of the plan, with the filter of a listing (495,943 rids), a selective filter (1,207 rids), a sort, or the filter and the sort, the worst p99 is 6.7 ms in the enhanced mode, 6.1 ms in the compatibility mode and 9.7 ms with the boosts over three fields; alone, 4.8, 13.2 and 6.4 ms. A check of each hit after the scores (sections 4 and 6) gave 34 to 72 ms on the 3 words of the top band, which match 77 % of the entries. The limits that stay: a query with no `sort_on` and no `b_size` orders every hit, and a phrase of two frequent words takes up to 30 ms in the compatibility mode, alone as with a filter.
 - **Build and size.** One million entries, three text fields: 196 s (compatibility) and 243 s (enhanced) with 4 threads, merge included; 1.40 GB of index; 3.0 to 3.3 GB peak memory. A field of pairs of words makes a phrase of two words one posting list; it holds 60 % of the size.
 - **The deltas.** A save writes three rows of 3,105 bytes in all, against 458 records and about 420 KB for ZCTextIndex on the same fixture. Every two saves of different documents share 74 records of ZCTextIndex on average; they share no delta.
-- **Compatibility.** On the 1,472 queries of 1,640 that the parser of ZCTextIndex accepts, over the texts of `catalog-mini` and 3,000 synthetic documents of many scripts, the rids, the order, the counts and the integer scores equal those of ZCTextIndex, with a transliteration table generated from Unidecode 1.4.0; without it, 35 queries differ. On `catalog-1m`, 105 of 111 queries are identical, and 6 differ by 1 in a few scores, cause not established. tantivy gives the postings and the dictionary; ZOE keeps the exact length of each document, the counts, and the score of `OkapiIndex`.
+- **Compatibility.** On the 1,472 queries of 1,640 that the parser of ZCTextIndex accepts, over the texts of `catalog-mini` and 3,000 synthetic documents of many scripts, the rids, the order, the counts and the integer scores equal those of ZCTextIndex, with a transliteration table generated from Unidecode 1.4.0; without it, 35 queries differ. On `catalog-1m`, all 111 queries are identical with the index of section 8; the index of the first measures gave 6 queries that differ by 1 in a few scores, from its corpus or its build, not from the score. tantivy gives the postings and the dictionary; ZOE keeps the exact length of each document, the counts, and the score of `OkapiIndex`.
 - **The two mechanisms of Q9.** Both give the exact matched set at the snapshot, also for a document deleted after it. The overlay of a transaction adds 1.3 to 3 ms for 1 to 10 staged documents with a direct overlay, against 6 to 19 ms with a tantivy segment in memory. Outside the window, the cost is about 0.06 ms for each document changed after the snapshot: 88 ms for 1,000, 0.6 s for 10,000.
 - **Threads and size.** A reader starts no thread; a writer with one indexing thread starts 6. tantivy adds 9.4 MB to a stripped binary.
 
-**Proposed decisions** are in ADR 0060 (status Proposed), with seven open points for the human.
+**The design** is in ADR 0060 (status Proposed); its section 17 gives the answers to its seven points.
 
 ## Question
 
@@ -78,7 +78,7 @@ The prototype writes the deltas into its own redb file, not through `Txn`. The d
 
 ## 3. Compatibility with ZCTextIndex
 
-**Yes, with two things beside tantivy and one table.** On the 1,640 queries of the comparison, 168 fail in `QueryParser` with `ParseError` or `QueryError` (for example `a NOT b`, `(a OR b) c`, a glob that starts with `*`): the translator runs the same parser, so they fail the same way. Of the other 1,472, all are identical to ZCTextIndex: the same rids, in the same order, with the same count and the same integer scores. 1,012 of them have ties of score, so the order of the ties is checked too. 215 have no hit. The families: words, words in another case and with accents, `AND`, `OR`, `AND NOT`, groups, phrases, globs with `*` and `?`, and mixed queries, on the three indexes, on the texts of `catalog-mini` and on the synthetic documents of many scripts. On `catalog-1m`, 105 of the 111 queries of the measures give the same count, the same sum of all the scores and the same 200 first hits as the ZCTextIndex of the fixture. The other 6 have the same rids and counts, and some scores differ by 1: the sums differ by 1 to 18 over 1,523 to 247,968 hits. The cause is not established: the comparison on `catalog-mini` shows the formula exact, so the likely cause is a small difference between the counts of the fixture's index (`document_count`, `_totaldoclen`) and those of the prototype, which moves a few scores across the rounding of `int(x + 0.5)`. The next check reads those two counts in the fixture. ZCTextIndex itself takes 233 ms at the median for these queries, and 7.7 s for the slowest, a phrase; the prototype takes at most 95 ms to rank all the hits of a query.
+**Yes, with two things beside tantivy and one table.** On the 1,640 queries of the comparison, 168 fail in `QueryParser` with `ParseError` or `QueryError` (for example `a NOT b`, `(a OR b) c`, a glob that starts with `*`): the translator runs the same parser, so they fail the same way. Of the other 1,472, all are identical to ZCTextIndex: the same rids, in the same order, with the same count and the same integer scores. 1,012 of them have ties of score, so the order of the ties is checked too. 215 have no hit. The families: words, words in another case and with accents, `AND`, `OR`, `AND NOT`, groups, phrases, globs with `*` and `?`, and mixed queries, on the three indexes, on the texts of `catalog-mini` and on the synthetic documents of many scripts. On `catalog-1m`, all 111 queries of the measures give the same count, the same sum of all the scores and the same 200 first hits as the ZCTextIndex of the fixture, with the corpus written again from the plan and the index built again for section 8. The index of the first measures gave 6 queries with the same rids and counts and some scores that differ by 1 (sums that differ by 1 to 18 over 1,523 to 247,968 hits). Its output, compared with the same run of ZCTextIndex, still gives these 6. The code of the score is the same in both, so the cause is in the corpus or the index of the first measures; that corpus is no longer on disk. ZCTextIndex itself takes 233 ms at the median for these queries, and 7.7 s for the slowest, a phrase; the prototype takes at most 95 ms to rank all the hits of a query.
 
 What tantivy gives: the term dictionary, so the expansion of a glob over the words of the lexicon in code-point order, as `Lexicon.globToWordIds`; the postings with the frequency of each word in each document, and its positions, so a phrase matches the words in a row, as the `WidCode` search of `search_phrase`; and the deletes.
 
@@ -121,7 +121,7 @@ What tantivy 0.27 gives, with its default features:
 
 The prototype runs the enhanced mode with the English stemmer and stop words; the generated words of the fixture are not English, so the stemmer cuts some of their endings, as it would for a word of another language.
 
-The costs on `catalog-1m`, p99 in ms, the 12 terms of the plan and the slowest families of the synthetic set (the full table is in section 6):
+The costs on `catalog-1m`, p99 in ms, the 12 terms of the plan and the slowest families of the synthetic set, with the check of each hit after the scores (the full table is in section 6; section 8 gives the filter and the sort inside the search):
 
 | Enhanced | Alone | Filter | Selective | Sort | Filter and sort |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -156,7 +156,7 @@ Both mechanisms run the query on the main index without the replaced documents, 
 
 ## 6. Costs
 
-**Queries, p99 in ms on `catalog-1m`, one thread, warm.** The 12 terms of the plan are the query set of G4; "all 111" is the whole synthetic set.
+**Queries, p99 in ms on `catalog-1m`, one thread, warm, with the check of each hit after the scores.** The 12 terms of the plan are the query set of G4; "all 111" is the whole synthetic set. Section 8 gives the same queries with the filter and the sort inside the search.
 
 | Mode | Set | Alone | Filter (495,943 rids) | Selective (1,207 rids) | Sort on `effective` | Filter and sort |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -171,11 +171,7 @@ Both mechanisms run the query on the main index without the replaced documents, 
 
 The p50 of every row is 1 to 4 ms. The p99 comes from the 3 terms of the top band, which match 77 % of the entries, and from the broad globs of the search form of Plone (`plone-1`, a word with `*`: 16.6 ms alone in the compatibility mode, 24.3 ms with boosts) and the 3-letter prefixes. A phrase of two words reads one pair: 27 ms in the compatibility mode, which reads the frequency and the length of both words for each of its hits, and 6 to 9 ms in the enhanced mode. Without the field of pairs, the phrases of the fixture took 10 times longer on a corpus of 100,000 entries (22 and 46 ms there, against 2.2 and 0.3 ms with it).
 
-**Against the target of 20 ms.** A text query alone meets it in the enhanced mode, on `SearchableText` (p99 7.7 ms on the terms of the plan, 6.8 ms on the whole set) and with the boosts (13.7 and 17.8 ms). The compatibility mode meets it alone on the terms of the plan (19.1 ms), not on the whole set (25.3 ms). With a filter or a sort, both modes miss it on the words of the top band. The cause is the same in every such row: the prototype scores each hit, then reads the rid of each hit from a fast field and looks it up in the bitmap of the filter, and reads the date of each hit for the sort. For a word in 770,000 entries that is 770,000 lookups after the scores, and the filter disables the pruning of tantivy (block-max WAND), which the query alone uses for its first hits. The levers, for ZOE-295, measured here only as their parts:
-
-- The filter drives the intersection when it is the smaller side: the mirror keeps the map from a rid to its tantivy document, and the text clause reads the postings of the documents of the filter only (`seek`). The selective filter then costs about its 1,207 lookups.
-- The pruning keeps working with a filter of tantivy documents: the filter is a `DocSet` of the query, not a check in the collector.
-- With a sort, the text clause gives the bitmap of its hits without a score, and the mirror sorts with its sort array, as for any other clause.
+**Against the target of 20 ms.** A text query alone meets it in the enhanced mode, on `SearchableText` (p99 7.7 ms on the terms of the plan, 6.8 ms on the whole set) and with the boosts (13.7 and 17.8 ms). The compatibility mode meets it alone on the terms of the plan (19.1 ms), not on the whole set (25.3 ms). With a filter or a sort, both modes miss it on the words of the top band. The cause is the same in every such row: the prototype scores each hit, then reads the rid of each hit from a fast field and looks it up in the bitmap of the filter, and reads the date of each hit for the sort. For a word in 770,000 entries that is 770,000 lookups after the scores, and the filter disables the pruning of tantivy (block-max WAND), which the query alone uses for its first hits. Section 8 moves the filter and the sort inside the search, and meets the target.
 
 **The build.** `build` reads the 2.98 GB of JSON, analyses each text in 4 threads and writes the index, then merges it into one segment:
 
@@ -196,9 +192,100 @@ Each mode holds the three fields, with positions, the three fields of pairs, the
 - **The directory.** `text/<oid>/` in the store directory, one tantivy index for each registered catalog, with the tid of its last commit in the payload of the tantivy commit (ADR 0060, section 10). The lock of the store covers it: tantivy's own writer lock is a file inside the index directory and guards against a second writer of the same process tree only. A copy of a closed store opens its copy of the directory; a torn directory or one behind the pack watermark is rebuilt at the open; a dump holds no directory; a fork answers from the index of its base with an overlay.
 - **`zoe catalog rebuild-text`.** It reads the current delta of each key, a full scan of `text_deltas` (22 s for `catalog-1m`), and builds the index (196 to 243 s with 4 threads): about 4 minutes for `catalog-1m`, the two overlapped. It writes only `text/`. Its row in the naming table: the subcommand `catalog` with `rebuild-text`, beside `migrate`, the migration tool of format 4.
 
+## 8. The filter and the sort inside the search
+
+**Question.** Section 6 shows the queries that miss G4: a word of the top band with the filter of a listing or with a sort, 34 to 72 ms at p99. Can a filter and a sort inside the search meet 20 ms at p99 in both modes? If not, what would it take?
+
+**What the catalog must give.** `Catalog.search` of Products.ZCatalog 7.2.1:
+
+- With no `sort_on`, the result of a text index has scores (an `IIBucket`). The catalog sorts it with `byValue(0)`: the score descending, then the rid descending. Then it slices the list to `b_start` and `b_size`, and `actual_result_count` is the number of all hits. So the text clause gives the count of all its hits in the filter, and the first `b_start + b_size` hits by score with their scores. Without `b_size`, it gives every hit in that order.
+- With `sort_on`, the catalog gives the keys of the result to `sortResults`, and the scores are not used. So the text clause gives its hits as a set, with no score, and the sort of the mirror orders them.
+- The search view of Products.CMFPlone 6.1.4 removes `sort_on` when it is `relevance`, and gives `b_start` and `b_size` (10 by default) to the catalog. `@search` of plone.restapi 9.15.6 gives `b_size` and `sort_limit` to the catalog when the request holds them.
+
+The measures keep the first 20, as in section 6. A query with no `b_size` is measured as a part below.
+
+**The design measured** (`src/text/filter.rs` of the prototype):
+
+- The text index keeps in memory the rid of each of its documents and the document of each rid: 12 MB for 1,000,000 documents, built at the open from the fast field `rid`. The rows of the mirror sort as the rids (ADR 0059), so the same map serves the rows.
+- The other clauses give a bitmap of rids. The smaller side drives the intersection:
+  - A filter that holds fewer than one document in 32 drives. Its documents, sorted, are a document set of the query. In the enhanced mode, a `Must` clause with a score of 0 leads the intersection of tantivy. In the compatibility mode, each word seeks its postings to these documents.
+  - A query whose hits are fewer than a quarter of the filter drives: the rid of each hit is looked up in the bitmap of the filter, as in section 6, but from the map in memory. The bound of the hits comes from the document frequencies: a word gives its frequency, a phrase the least of its words, `AND` the least of its items, `OR` the sum. In the enhanced mode a glob and fuzzy matching give no bound.
+  - In the other cases, the filter becomes a bitset of the documents of each segment: 1.2 ms for 495,943 rids. In the enhanced mode, the collector checks this bitset in the callback of the pruning of tantivy (block-max WAND): a hit outside the filter does not enter the first 20, so the threshold of the pruning rises with the hits of the filter only. A second pass on the same weight counts the hits in the filter, with no score. A query with no bound has one pass that scores every hit, since its terms do not prune. In the compatibility mode, each hit gets its score of `OkapiIndex`, and the bitset only moves the end of the list, with no branch: a check that keeps one hit in two at random is a branch that the processor cannot predict. The lengths of the documents come from an array in memory (4 bytes for each document of each index), not from the fast field. A heap keeps the first 20 by score, then by rid descending.
+- With `sort_on`, the text clause gives its hits as a bitset with no score; in the compatibility mode the parse tree runs on bitsets. The bitset of the filter cuts it, and the count is its population. The sort array of the mirror gives the first 20: for a large result, a walk of the rows in the order of the sort that stops at 20; for a small one, the best 20 of the result. The prototype has the sort array of one index, the key of each rid and the rids in its order; ties go by rid descending.
+- Each other clause whose result is a set adds 1 to the score, as before (section 3).
+
+**Method.** The same 111 queries and five variants as section 6: one warm pass, then 5 rounds (3 with fuzzy matching), one thread, the p99 over all the runs of a variant. One binary runs the check after the scores of section 6 ("before") and the path inside the search ("after") on the same index, in turn: before, after, three times. The tables give the median of the three runs. The Alone variant runs the same code in both. The machine is that of the method, `main` at `979273db` and the prototype at `1b3d7a42`; the desktop was in use, with a load average of 1.6 to 3.3. The corpus and the indexes of sections 1 to 7 were no longer on disk: `corpus.py` wrote the corpus again from the plan of `main`, and the same `build` command built each index again (4 threads, merged into one segment): 164 s in the compatibility mode and 168 s in the enhanced mode.
+
+**The results are identical.** The command `check` runs both paths on each query and each variant with a filter or a sort: 444 results in each mode.
+
+- The compatibility mode: 444 of 444 identical, rids, order, counts and integer scores.
+- The enhanced mode on `SearchableText`: 263 identical. The other 181 are sorts on `effective`, and they differ only in the order of rows with the same key: the sort of tantivy orders such rows by document, the prototype by rid descending. The rule of the mirror (ADR 0059) gives that order.
+- With the boosts: 260 identical, the same 181 sorts, and 3 phrases with the same rids, order and count whose scores differ in the last bit of an `f32` (1 in 10 million): the scores of three fields add in another order. With fuzzy matching: 253 identical and 191 sorts.
+- `compat1m` on the index of this section against ZCTextIndex on the fixture (`compare1m.py`): 111 of 111 identical (section 3).
+
+**The numbers.** p99 in ms on the 12 terms of the plan, the median of three runs. "First" is the table of section 6; "before" is the check after the scores in this run.
+
+| Mode | | Alone | Filter (495,943 rids) | Selective (1,207 rids) | Sort on `effective` | Filter and sort |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| compatibility | first | 19.1 | 35.0 | 19.5 | 38.9 | 71.6 |
+| compatibility | before | 16.7 | 25.0 | 12.1 | 18.9 | 26.4 |
+| compatibility | after | 13.2 | 6.1 | 0.09 | 1.9 | 3.1 |
+| enhanced, `SearchableText` | first | 7.7 | 34.0 | 25.3 | 20.8 | 41.1 |
+| enhanced, `SearchableText` | before | 4.4 | 20.5 | 11.3 | 9.8 | 19.0 |
+| enhanced, `SearchableText` | after | 4.8 | 6.7 | 0.11 | 1.9 | 3.1 |
+| enhanced, boosts | first | 13.7 | 57.5 | 38.3 | 32.8 | 50.3 |
+| enhanced, boosts | before | 5.9 | 22.7 | 13.3 | 11.2 | 20.0 |
+| enhanced, boosts | after | 6.4 | 9.7 | 0.25 | 3.2 | 4.3 |
+| enhanced, boosts and fuzzy distance 1 | first | 25.3 | 65.2 | 42.0 | 39.8 | 54.0 |
+| enhanced, boosts and fuzzy distance 1 | before | 11.3 | 25.6 | 16.2 | 13.8 | 23.2 |
+| enhanced, boosts and fuzzy distance 1 | after | 11.1 | 14.1 | 1.8 | 5.3 | 6.5 |
+
+The 3 words of the top band give these p99s. Their p50 after: 5.8 ms with the filter, 1.8 ms with the sort and 3.0 ms with both in the compatibility mode; 6.3, 1.7 and 2.8 ms in the enhanced mode. The range of the three runs after is small: the compatibility mode with the filter gives 5.3 to 6.1 ms, the enhanced mode 6.6 to 7.3 ms. Before, the same cells gave 24.5 to 32.2 and 17.6 to 21.7 ms. The Alone variant runs the same code before and after: its spread (16.7 against 13.2 ms in the compatibility mode) is the effect of the state of the machine, and section 6 ran with another spike on the machine.
+
+All 111 queries, p99 in ms, before and after:
+
+| Mode | Alone | Filter | Selective | Sort | Filter and sort |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| compatibility | 23.6, 27.6 | 35.2, 23.1 | 22.3, 0.17 | 25.2, 1.8 | 36.4, 3.0 |
+| enhanced, `SearchableText` | 4.4, 4.7 | 20.2, 7.9 | 11.3, 1.2 | 9.6, 2.7 | 18.9, 3.8 |
+| enhanced, boosts | 8.2, 9.6 | 19.2, 13.2 | 12.1, 1.9 | 10.2, 5.0 | 17.7, 11.3 |
+| enhanced, boosts and fuzzy | 19.1, 20.7 | 24.5, 14.5 | 16.0, 2.4 | 13.3, 10.7 | 20.7, 11.8 |
+
+The p99 of the compatibility mode over all 111 comes from the phrases of two words: 30 ms at p99 alone, 26 ms with the filter (37 ms before). Section 6 gives the cause: the phrase reads the frequency and the length of both words for each hit of the pair. Its filter and its sort do not add to it.
+
+**Some families got slower, all under 10 ms at p99.** The families whose hits have no bound, or a loose one, pay the bitset of the filter (1.2 ms). At p50 they lose at most 1.9 ms, at p99 at most 3.7 ms, and no such family passes 9.1 ms at p99. They are the globs of the search form of Plone in the enhanced mode (`plone-2`, `plone-3` with a filter: p50 0.6 to 5.3 ms before, 1.8 to 6.6 ms after), the phrases of the compatibility mode (p50 0.7 ms before, 1.8 ms after), and `AND` with the boosts (p99 5.0 ms before, 8.7 ms after).
+
+**The parts,** for the 3 words of the top band with the filter of the listing, median in ms (commands `parts` and `expt`):
+
+| Part | Compatibility | Enhanced |
+| --- | ---: | ---: |
+| the filter of the listing as a bitset of documents (495,943 rids) | 1.2 | 1.2 |
+| the filter of `editor-000` as documents (1,207 rids) | 0.02 | 0.02 |
+| the hits in the listing with their scores | 7.1 | |
+| the first 20 of them by score: a heap; a selection of all of them | 0.6; 1.5 | |
+| the count of the hits in the listing, with no score | | 1.3 |
+| the first 20 by score in the listing, pruned | | 3.7 |
+| every hit in the listing in the order of the score (no `b_size`) | 16.7 | 35.1 |
+| the hits as a bitset, with no score | 1.8 | 1.7 |
+| the bitset of the hits and of the filter, and its count | 0.02 | 0.02 |
+| the first 20 of the hits in the listing by `effective`: a walk of the order; the best 20 of the set | under 0.01; 1.3 | under 0.01; 0.9 |
+
+In the compatibility mode, the scores of the hits of one word in the filter take 6.7 ms with a branch on the filter and the lengths from the fast field, 5.3 ms with the lengths from memory, and 3.1 ms with no branch and the lengths from memory. The postings alone, with their frequencies, take 0.7 ms.
+
+**Documents in the order of the rids.** If the documents of the index followed the order of the rids, the filter would be a copy of the bitmap into a bitset: 0.9 ms in batches, against 1.2 ms through the map. The cost is the read of the roaring bitmap, not the map. So the order of the rids saves 0.3 ms for a broad filter, and it does not last: an update moves a document to a new segment, and a merge does not sort. No index was built in that order.
+
+**Against G4.** Met in both modes. With the filter and the sort inside the search, the 12 terms of the plan stay under 20 ms at p99 in every variant: 6.7 ms the worst in the enhanced mode, 13.2 ms in the compatibility mode (alone, the code of section 6), 9.7 ms with the boosts and 14.1 ms with fuzzy matching. The limits that stay:
+
+- A query with no `sort_on` and no `b_size` gets every hit in the order of the score: `Catalog.search` uses `sort_limit` only for a sort. For a word of the top band in the listing, about 380,000 hits, the order adds 16.7 ms in the compatibility mode, about 25 ms with the filter and the scores, and the enhanced mode takes 35 ms with a heap. The search view of Plone gives `b_size`.
+- A phrase of two frequent words in the compatibility mode: 30 ms at p99 alone, 26 ms with the filter (section 6).
+- Fuzzy matching over all 111 queries: 20.7 ms at p99 alone. It is off by default.
+- The order of rows with equal keys of a sort follows the rule of the mirror; the prototype uses the rid descending.
+
 ## What did not run
 
 - The record type in the commit path of the core: the staging, the commit batch, the log, the fold, pack, undo, verify, the dumps and `zoe convert`. ADR 0060 gives their rules; ZOE-293 and ZOE-294 build them.
 - `ZoeTextIndex` in a Plone site, the profile step and the documents that the Plone suites create.
 - The overlay of a `DemoStorage`, and a field for each language with plone.app.multilingual.
 - A direct matcher for a small overlay, which would remove the fixed cost of a segment in memory (section 5).
+- The filter and the sort inside the search with an overlay of section 5, and on an index of many segments with deletes. The code of section 8 handles segments and deletes, but the measures ran on one segment with no delete, and with no overlay.
+- The order of every hit with no `b_size` through a plain sort in the enhanced mode: the measure used a heap.

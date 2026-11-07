@@ -1,6 +1,6 @@
 # 0060. The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex
 
-Status: proposed. Card ZOE-284; the finding is `docs/spikes/text-index.md`. This record gives the design of the native text index of F18 and of its delta record type. It records the decisions Q8, Q9 and Q15 of the plan of phase 6 and the decision N1. It changes the on-disk format and pack, two red zones. It adds a protocol extension, a public Python API (`ZoeTextIndex`, the write path of the deltas) and two subcommands of `zoe`. The section "Open points" lists what the human decides before ZOE-293 starts.
+Status: proposed. Card ZOE-284; the finding is `docs/spikes/text-index.md`. This record gives the design of the native text index of F18 and of its delta record type. It records the decisions Q8, Q9 and Q15 of the plan of phase 6 and the decision N1. It changes the on-disk format and pack, two red zones. It adds a protocol extension, a public Python API (`ZoeTextIndex`, the write path of the deltas) and two subcommands of `zoe`. Section 17 gives its names, its errors and its settings.
 
 ## Context
 
@@ -37,7 +37,7 @@ The finding gives the bytes: 3,105 bytes for the three deltas of one save of `ca
 
 ### 2. ZOE format 4 and its migration tool
 
-`ZOE format 4` names the tables with `text_deltas` and `text_txn`, and the log with the op of section 3. An open refuses a store of format 3 with `Format`, and the message names the tool. The tool is a subcommand of `zoe`: `zoe migrate STORE` (**open point 1**: its name). It runs on a store folder that no process holds. It opens the store with the rules of format 3, folds the log, then writes the row `format` and creates the two tables in one backend write with a sync. A crash before that write leaves a store of format 3; after it, a store of format 4. It refuses any other format. The naming table lists it, and `prepare` of the B5 fixtures and of `catalog-1m` runs it (ZOE-293), so no fixture is built again. The specification says that a store opens after its migration tool, in place of N19 "a phase 1 store opens unchanged".
+`ZOE format 4` names the tables with `text_deltas` and `text_txn`, and the log with the op of section 3. An open refuses a store of format 3 with `Format`, and the message names the tool. The tool is a subcommand of `zoe`: `zoe migrate STORE`. It runs on a store folder that no process holds. It opens the store with the rules of format 3, folds the log, then writes the row `format` and creates the two tables in one backend write with a sync. A crash before that write leaves a store of format 3; after it, a store of format 4. It refuses any other format. The naming table lists it, and `prepare` of the B5 fixtures and of `catalog-1m` runs it (ZOE-293), so no fixture is built again. The specification says that a store opens after its migration tool, in place of N19 "a phase 1 store opens unchanged".
 
 ### 3. The write-ahead log and the unfolded table
 
@@ -69,9 +69,9 @@ The undo of T stages, for each delta of T, the delta of its key before T, or an 
 ### 8. The write path
 
 - Core: `Txn::text_set(catalog: Oid, index: &str, rid: i32, language: &str, text: &str)` and `Txn::text_unindex(catalog, index, rid)` stage a delta between the begin and the vote, from the thread that drives the transaction, with the rules of `Txn::kv_set`: a later write of a key in the transaction replaces the staged one, and an abort drops it. A restore transaction refuses them and takes `Txn::restore_text`, which restores a delta at the tid of the transaction. `Store::text_at(catalog, index, rid, tid)` reads a text at a snapshot, and `Store::text_changed(catalog, after, last)` scans `text_txn`.
-- Wire: the protocol extension `text` (**open point 2**: its name), with the calls `text_set(catalog, index, rid, language, text)` and `text_unindex(catalog, index, rid)`. They have no reply, stage into the open transaction in its lane, and an error fails the vote, as `kv_set`.
+- Wire: the protocol extension `text`, with the calls `text_set(catalog, index, rid, language, text)` and `text_unindex(catalog, index, rid)`. They have no reply, stage into the open transaction in its lane, and an error fails the vote, as `kv_set`.
 - Python: `zoe.Storage.text_set(catalog, index, rid, text, language, transaction)` and `zoe.Storage.text_unindex(catalog, index, rid, transaction)`, and the same two methods on `zoe.zeo.ClientStorage` in its native mode. `ZoeTextIndex` keeps the deltas of a transaction in a data manager until the commit, as `zoe.kv` keeps its writes, and calls these methods in the commit.
-- A storage without the write path: a stock ZEO client, the asyncio mode of `zoe.zeo.ClientStorage`, FileStorage. The profile step refuses it with `Unsupported`. `ZoeTextIndex.index_object` on such a storage raises `Unsupported`, so the transaction fails and no instance writes content whose text no delta holds (**open point 3**).
+- A storage without the write path: a stock ZEO client, the asyncio mode of `zoe.zeo.ClientStorage`, FileStorage. The profile step refuses it with `Unsupported`. `ZoeTextIndex.index_object` on such a storage raises `Unsupported`, so the transaction fails and no instance writes content whose text no delta holds.
 
 ### 9. A `DemoStorage` (N1)
 
@@ -82,7 +82,7 @@ On a `DemoStorage` whose chain of bases ends at a ZOE storage, the deltas of a c
 - One tantivy index for each registered catalog (ADR 0059), in `text/<oid>/` of the store directory, `<oid>` as 16 lowercase hexadecimal digits. The store holds the directory: only the process that holds the lock of the store opens a writer. The payload of each tantivy commit holds the tid up to which the index holds the deltas.
 - The index is a cache. At the open, a missing directory, one that tantivy cannot open, a tid before the pack watermark or after the last tid of the store, or settings that changed (section 14) start a rebuild from the deltas in the background. Otherwise the open reads the deltas after the tid of the index through `text_txn` and applies them.
 - A writer commits the deltas behind the tid in batches: every `text-commit-interval` (500 ms) or every 10,000 deltas. `zoe_text_commit_lag_seconds` is the age of the oldest committed delta that the index does not hold yet, 0 when it holds all.
-- A query while a rebuild runs waits for it, up to the timeout of the query, then fails with `Unavailable` (**open point 4**). ZCTextIndex is not there to take the query.
+- A query while a rebuild runs waits for it, up to the timeout of the query, then fails with `Unavailable`. ZCTextIndex is not there to take the query.
 - A copy of a closed store copies `text/` with the store, and the copy opens it. A copy of an open store can copy a torn directory: the open of the copy rebuilds it. A backup holds no `text/`. A fork (phase 7) answers from the index of its base at the fork tid with the overlay of section 9.
 - The prototype opens its reader with the manual reload policy: it starts no thread. A writer with one indexing thread starts 6 threads. The extension starts them at the open of a store that holds a registered catalog, never at import.
 
@@ -90,14 +90,25 @@ On a `DemoStorage` whose chain of bases ends at a ZOE storage, the deltas of a c
 
 - The enhanced mode, the default of `ZoeTextIndex`: the analyzer of the site language (a Snowball stemmer, ASCII folding, the stop words of the language), the BM25 of tantivy (`k1` 1.2, `b` 0.75), phrases, prefixes, fuzzy matching (off by default), and the boosts `Title^3`, `Description^1.5`, `SearchableText^1` for a query on `SearchableText`. One tantivy field for each text index; with plone.app.multilingual, one field for each language of the site, chosen from the language of the delta.
 - Both modes index, beside the words of each field, a field of the pairs of words in a row. A phrase of two words reads the posting list of one pair; a longer phrase intersects its pairs, then checks the positions of the documents that hold them all. On the texts of `catalog-1m`, whose 2,000 words are all frequent, a phrase of two words read through the positions alone is the slowest query by far (finding, section 6).
-- The compatibility mode: the words of the lexicon `plone_lexicon` of Plone 6.1, the Okapi score of `OkapiIndex` in its integer form, and the order of `Catalog.search`. tantivy gives the term dictionary, the postings with their frequencies and positions, and the deletes. ZOE keeps beside it the number of words of each document in a fast field, and computes the score itself: the norms of tantivy round the length, and its BM25 has another `idf`. The finding shows the results identical to ZCTextIndex on every query of the comparison, with the transliteration table of the Unidecode release that Plone 6.1 pins: the splitter of Plone transliterates the words that start with a Latin letter with Unidecode, and the tables of the Rust crates differ from it. ZOE generates its table from that release (**open point 5**).
+- The compatibility mode: the words of the lexicon `plone_lexicon` of Plone 6.1, the Okapi score of `OkapiIndex` in its integer form, and the order of `Catalog.search`. tantivy gives the term dictionary, the postings with their frequencies and positions, and the deletes. ZOE keeps beside it the number of words of each document in a fast field, and computes the score itself: the norms of tantivy round the length, and its BM25 has another `idf`. The finding shows the results identical to ZCTextIndex on every query of the comparison and on the 111 queries on `catalog-1m`, with the transliteration table of the Unidecode release that Plone 6.1 pins: the splitter of Plone transliterates the words that start with a Latin letter with Unidecode, and the tables of the Rust crates differ from it. ZOE generates its table from that release, Unidecode 1.4.0, and changes it only with a release of Plone that changes the pin.
 - The scores of the compatibility mode are those of ZCTextIndex inside the window. Outside it, Q9 gives the statistics of the current corpus.
 
 ### 12. The query translator and the text clause
 
 `ZoeTextIndex` parses a query with the `QueryParser` and the lexicon pipeline of ZCTextIndex, in Python, so the syntax (`AND`, `OR`, `NOT`, parentheses, quoted phrases, `*` and `?`) and the errors stay those of ZCTextIndex. It sends a plan of the parse tree: `and` with `items` and `nots`, `or`, `atom` with its words, `phrase` with its words, `glob` with its pattern. The server runs the plan in the mode of the index. A glob that starts with `*` or `?` raises `QueryError` in the client, as ZCTextIndex raises it.
 
-The text clause of a plan of `catalog_query` (ADR 0059) holds the index id, the plan, and the staged texts of section 13. Its result is the rids with their scores, which the mirror intersects with the other clauses. The mirror keeps the map from a rid to its tantivy document. When the other clauses give fewer rids than the text clause, their bitmap is a document set of the tantivy query, so the text clause reads the postings of those documents only and the pruning of tantivy keeps working; with `sort_on` set, the text clause gives its hits without a score and the mirror sorts them with its sort array. The finding measures a filter checked on each hit after the scores: it misses G4 on the words of the top band. With `sort_on` unset, the order is the score descending, then the rid descending, as `IIBucket.byValue(0)`. Each other clause whose result is a set adds 1 to the score, as `weightedIntersection` adds it in `Catalog.search`, so `data_record_score_` stays that of ZCatalog.
+The text clause of a plan of `catalog_query` (ADR 0059) holds the index id, the plan, and the staged texts of section 13. The mirror runs its other clauses first and gives the bitmap of their rids with the text clause. The result follows `Catalog.search`:
+
+- With `sort_on` unset, the count of all the hits in the filter, and the first `b_start + b_size` hits by score, with their scores. The order is the score descending, then the rid descending, as `IIBucket.byValue(0)`. Each other clause whose result is a set adds 1 to the score, as `weightedIntersection` adds it, so `data_record_score_` stays that of ZCatalog. With no `b_size`, every hit in that order: `Catalog.search` uses `sort_limit` only for a sort.
+- With `sort_on` set, the hits in the filter as a set, with no score: `Catalog.search` does not use the scores for a sort. The mirror orders them with its sort array, as for any other clause: a walk of the rows in the order of the sort that stops at the limit for a large result, the best rows of the result for a small one.
+
+The text index keeps in memory the rid of each of its documents and the document of each rid, and, in the compatibility mode, the number of words of each document of each index. It builds them at the open and changes them with each reload of its reader: 12 MB, and 4 MB for each index, for 1,000,000 documents. The filter applies inside the search, and the smaller side drives it:
+
+- A filter that holds fewer than one document of the index in 32 drives: its documents seek the postings. In the enhanced mode they are a document set with a score of 0 that leads the intersection of tantivy.
+- A query whose bound of hits is less than a quarter of the filter drives: the text clause looks up the rid of each hit in the bitmap of the filter. The bound comes from the document frequencies of the words: a word gives its frequency, a phrase the least of its words, `AND` the least of its items, `OR` the sum. A glob in the enhanced mode and fuzzy matching have no bound.
+- Otherwise the filter becomes a bitset of the documents of each segment. In the enhanced mode, the collector checks it in the callback of the pruning of tantivy (block-max WAND), so the pruning keeps working and its threshold rises with the hits of the filter only; a second pass on the same weight counts the hits in the filter with no score. A query with no bound has one pass that scores every hit. In the compatibility mode, each hit gets its score, the bitset decides with no branch whether the hit stays, and a heap keeps the first hits.
+
+The finding (section 8) measures this design on `catalog-1m`: the 12 terms of the plan stay under 20 ms at p99 in both modes, with the filter of a listing, a selective filter, a sort, and both: 6.7 ms the worst in the enhanced mode, 6.1 ms in the compatibility mode, 9.7 ms with the boosts. A check of each hit after the scores gave 34 to 72 ms. The rids, the order, the counts and the integer scores of the compatibility mode are those of the check after the scores on every query.
 
 ### 13. Consistency: the two mechanisms of Q9
 
@@ -110,7 +121,7 @@ The finding gives the cost of each as a function of the documents.
 
 ### 14. `ZoeTextIndex`
 
-- A ZCatalog index class of `zoe.plone`, meta type `ZoeTextIndex`. Its settings: `indexed_attrs`, `mode` (`enhanced` or `compat`), `language`, the boosts, `k1` and `b`. The settings of each index of a catalog are kept in the durable namespace `zoe.text` of the store, under the oid of the catalog, so that `zoe catalog rebuild-text` reads them without Plone (**open point 6**).
+- A ZCatalog index class of `zoe.plone`, meta type `ZoeTextIndex`. Its settings: `indexed_attrs`, `mode` (`enhanced` or `compat`), `language`, the boosts, `k1` and `b`. The settings of each index of a catalog are kept in the durable namespace `zoe.text` of the store, under the oid of the catalog, so that `zoe catalog rebuild-text` reads them without Plone.
 - `index_object` stages the text of each indexed attribute, joined as ZCTextIndex joins them; an attribute that gives no text stages nothing, so the entry stays, as in ZCTextIndex. `unindex_object` stages an unindex. `_apply_index` sends the text clause. `numObjects`, `indexSize` and `getEntryForObject` read the index of the server.
 - The profile step `zoe.plone:text` replaces the three ZCTextIndex indexes of `portal_catalog`, `SearchableText`, `Title` and `Description`, with `ZoeTextIndex` indexes of the same ids, then indexes the catalog in batches, which writes the deltas. The way back is the step `zoe.plone:text-uninstall`: it stages an unindex for each document of each `ZoeTextIndex`, puts the ZCTextIndex indexes back and reindexes them in Python.
 
@@ -122,15 +133,15 @@ The finding gives the cost of each as a function of the documents.
 
 The split of the plan stands: ZOE-293 holds the key spaces, the format name, the migration tool, the op of the log, verify and the bit-flip harness; ZOE-294 holds pack, undo, the dumps and `zoe convert`; ZOE-295 holds the write path, the index of each catalog, its directory, the lag metric and the text clause; ZOE-296 holds `ZoeTextIndex`, the translator, the overlay of a `DemoStorage` and the profile steps; ZOE-297 holds the compatibility mode and its transliteration table; ZOE-298 holds `zoe catalog rebuild-text`. The settings namespace `zoe.text` goes with ZOE-296, and its read in `rebuild-text` with ZOE-298.
 
-## Open points
+### 17. Names, errors and settings
 
-1. The name of the migration tool: `zoe migrate`.
-2. The name of the protocol extension and of its calls: `text`, `text_set`, `text_unindex`.
-3. An instance without the write path: `index_object` raises `Unsupported`.
-4. A query while the index is rebuilt: it waits up to its timeout, then fails with `Unavailable`.
-5. The transliteration table of the compatibility mode: generated from Unidecode 1.4.0, the release that Plone 6.1 pins, and changed only with a release of Plone that changes the pin.
-6. The settings of `ZoeTextIndex` in the durable namespace `zoe.text`.
-7. tantivy behind a cargo feature `text` of `zoe-catalog`, on in `zoe serve` and in the wheel: it adds 9.4 MB to a stripped release binary.
+1. The migration tool is `zoe migrate` (section 2).
+2. The protocol extension is `text`, with the calls `text_set` and `text_unindex` (section 8).
+3. On an instance without the write path, `index_object` raises `Unsupported` (section 8).
+4. A query during a rebuild waits up to its timeout, then fails with `Unavailable` (section 10).
+5. The transliteration table of the compatibility mode is generated from Unidecode 1.4.0, the pin of Plone 6.1, and changes only with a release of Plone that changes the pin (section 11).
+6. The settings of `ZoeTextIndex` are in the durable namespace `zoe.text` (section 14).
+7. tantivy is behind the cargo feature `text` of `zoe-catalog`, on in `zoe serve` and in the wheel. It adds 9.4 MB to a stripped release binary. A build without the feature has no text index.
 
 ## Consequences
 
@@ -139,6 +150,10 @@ The split of the plan stands: ZOE-293 holds the key spaces, the format name, the
 - The tantivy directory is a cache: losing it costs a rebuild, about 4 minutes for `catalog-1m`.
 - A site on FileStorage or on a stock ZEO client cannot use `ZoeTextIndex`.
 - Snippets, the `@search` extension of plone.restapi and the labelled query set stay out of phase 6.
+- G4 holds for a query with `sort_on` or with `b_size`; the search view of Plone sends `b_size`. A text query with neither gets every hit in the order of the score: for a word in 77 % of the entries and the filter of a listing, about 380,000 hits, that takes about 25 ms in the compatibility mode and 35 ms in the enhanced mode (finding, section 8).
+- In the compatibility mode, a phrase of two frequent words takes up to 30 ms at p99, alone as with a filter: it reads the frequency and the length of both words for each hit of the pair (finding, sections 6 and 8).
+- A filter that becomes a bitset costs 1.2 ms for 495,943 rids. A query whose hits have no bound pays it even when its hits are few: a glob of the search form of Plone in the enhanced mode loses up to 1.9 ms at p50.
+- The order of the documents of the index does not follow the rids, and does not need to: that order would save 0.3 ms of the 1.2 ms of a broad filter, and updates and merges would break it.
 
 ## Alternatives
 
