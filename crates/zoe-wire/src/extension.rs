@@ -19,3 +19,7 @@ pub const TRACE_CONTEXT: &str = "trace_context";
 /// The vote of the connection can write a record that its transaction did
 /// not store (ADR 0049).
 pub const SERVER_WRITES: &str = "server_writes";
+
+/// The catalog queries of the mirror (ADR 0059):
+/// `catalog_query(catalog, tid, plan, overlay)`.
+pub const CATALOG_QUERY: &str = "catalog_query";

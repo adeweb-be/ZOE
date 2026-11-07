@@ -149,6 +149,64 @@ pub(super) struct ServeArgs {
     )]
     cache_size: Option<usize>,
 
+    /// The bound of the memory of the catalog mirrors of each store with a
+    /// registered catalog, such as 2GB, with the units of --cache-size
+    /// (ADR 0059). A build, a rebase or a growth that would pass it drops
+    /// the mirror that answered a query least recently, and its queries
+    /// take the Python path. It adds to the resident memory of the server
+    /// for each such store. The default is 2GB.
+    #[arg(
+        long,
+        env = "ZOE_CATALOG_MEMORY",
+        value_name = "BYTES",
+        value_parser = catalog_memory
+    )]
+    catalog_memory: Option<usize>,
+
+    /// The change sets of the mirror window: the change set of a commit
+    /// leaves the window when this many newer change sets exist. A query
+    /// at a tid whose later commits have no change set in the mirror takes
+    /// the Python path. The default is 10000.
+    #[arg(
+        long,
+        env = "ZOE_CATALOG_WINDOW_TIDS",
+        value_name = "TIDS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    catalog_window_tids: Option<u64>,
+
+    /// The age past which a change set leaves the mirror window, in whole
+    /// seconds, such as 600, 600s or 10m. The default is 10 minutes.
+    #[arg(
+        long,
+        env = "ZOE_CATALOG_WINDOW_SECONDS",
+        value_name = "SECONDS",
+        value_parser = whole_seconds
+    )]
+    catalog_window_seconds: Option<Duration>,
+
+    /// The rows of the overrides of the last tid past which a catalog
+    /// mirror rebases in the background, 1 or more. The default is 20000.
+    #[arg(
+        long,
+        env = "ZOE_CATALOG_REBASE_ROWS",
+        value_name = "ROWS",
+        value_parser = rebase_rows
+    )]
+    catalog_rebase_rows: Option<u64>,
+
+    /// The longest wait of a catalog query for the mirror to apply the
+    /// commits of its snapshot, in whole seconds, such as 1 or 1s. The wait
+    /// holds a thread of the read pool. Past it, the query takes the Python
+    /// path. The default is 1 second.
+    #[arg(
+        long,
+        env = "ZOE_CATALOG_WAIT",
+        value_name = "SECONDS",
+        value_parser = whole_seconds
+    )]
+    catalog_wait: Option<Duration>,
+
     /// The longest time that a vote waits for the lock of an object, in
     /// whole seconds, such as 10, 10s or 2m, as the key lock-timeout of the
     /// <zoe> section takes it. A longer wait fails the vote with
@@ -520,6 +578,27 @@ fn whole_seconds(value: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{value} is not a whole number of seconds, 0 or more"))
 }
 
+/// Read the bound of the catalog mirrors: a byte size of `byte_size`,
+/// more than 0.
+fn catalog_memory(value: &str) -> Result<usize, String> {
+    match byte_size(value)? {
+        0 => Err("the catalog memory is more than 0 bytes".to_owned()),
+        bytes => Ok(bytes),
+    }
+}
+
+/// Read the rows past which a mirror rebases: a whole number, 1 or more. 0
+/// would rebase after each commit.
+fn rebase_rows(value: &str) -> Result<u64, String> {
+    match value.trim().parse::<u64>() {
+        Ok(0) => Err(
+            "the catalog rebase rows are 1 or more: 0 would rebase after each commit".to_owned(),
+        ),
+        Ok(rows) => Ok(rows),
+        Err(_) => Err(format!("{value} is not a whole number of rows")),
+    }
+}
+
 /// Parse a size in bytes, as ZConfig's `byte-size` does: a whole number,
 /// 0 or more, with the suffix `KB`, `MB` or `GB` in any case, or none for
 /// bytes. A suffix is a power of 1024.
@@ -719,6 +798,21 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     }
     if let Some(compression) = args.compression {
         options = options.compression(compression);
+    }
+    if let Some(bytes) = args.catalog_memory {
+        options = options.catalog_memory(bytes);
+    }
+    if let Some(tids) = args.catalog_window_tids {
+        options = options.catalog_window_tids(usize::try_from(tids).unwrap_or(usize::MAX));
+    }
+    if let Some(age) = args.catalog_window_seconds {
+        options = options.catalog_window_seconds(age);
+    }
+    if let Some(rows) = args.catalog_rebase_rows {
+        options = options.catalog_rebase_rows(usize::try_from(rows).unwrap_or(usize::MAX));
+    }
+    if let Some(wait) = args.catalog_wait {
+        options = options.catalog_wait(wait);
     }
     if let Some(threshold) = args.lock_warn.filter(|t| !t.is_zero()) {
         options = options.lock_warn(threshold);
@@ -1061,6 +1155,47 @@ mod tests {
                 error.kind(),
                 clap::error::ErrorKind::ValueValidation,
                 "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catalog_keys_keep_the_defaults_and_take_their_values() {
+        let args = serve(&[]).unwrap();
+        assert_eq!(args.catalog_memory, None);
+        assert_eq!(args.catalog_window_tids, None);
+        assert_eq!(args.catalog_window_seconds, None);
+        assert_eq!(args.catalog_rebase_rows, None);
+        assert_eq!(args.catalog_wait, None);
+        let args = serve(&[
+            "--catalog-memory",
+            "512MB",
+            "--catalog-window-tids",
+            "500",
+            "--catalog-window-seconds",
+            "2m",
+            "--catalog-rebase-rows",
+            "1000",
+            "--catalog-wait",
+            "3s",
+        ])
+        .unwrap();
+        assert_eq!(args.catalog_memory, Some(512 << 20));
+        assert_eq!(args.catalog_window_tids, Some(500));
+        assert_eq!(args.catalog_window_seconds, Some(Duration::from_secs(120)));
+        assert_eq!(args.catalog_rebase_rows, Some(1000));
+        assert_eq!(args.catalog_wait, Some(Duration::from_secs(3)));
+        for refused in [
+            &["--catalog-memory", "0"][..],
+            &["--catalog-window-tids", "0"],
+            &["--catalog-rebase-rows", "0"],
+            &["--catalog-wait", "1x"],
+        ] {
+            let error = serve(refused).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{refused:?}"
             );
         }
     }

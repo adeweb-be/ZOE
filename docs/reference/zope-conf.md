@@ -108,6 +108,11 @@ An unknown key, a bad boolean, a storage without a path and a storage name that 
 | `invalidation-age` | `--invalidation-age` | The age under which `getInvalidations` covers every transaction, in whole seconds. 0, the default, turns it off. |
 | `client-queue-size` | `--client-queue-size` | The most messages that wait for one client. |
 | `cache-size` | `--cache-size` | The page cache of each store, such as `512MB`. The default is 1 GiB. |
+| `catalog-memory` | `--catalog-memory` | The bound of the catalog mirrors of each store with a registered catalog, such as `2GB`. The default is 2 GiB. |
+| `catalog-window-tids` | `--catalog-window-tids` | The change sets of the mirror window. The default is 10000. |
+| `catalog-window-seconds` | `--catalog-window-seconds` | The age past which a change set leaves the mirror window, in whole seconds. The default is 600. |
+| `catalog-rebase-rows` | `--catalog-rebase-rows` | The rows of the overrides past which a mirror rebases, 1 or more. The default is 20000. |
+| `catalog-wait` | `--catalog-wait` | The longest wait of a catalog query for the mirror, in whole seconds. The default is 1. |
 | `compression` | `--compression` | `none`, `zstd` or `zstd:LEVEL`. The default is `none`. |
 | `lock-timeout` | `--lock-timeout` | The longest lock wait of a vote, in whole seconds. |
 | `max-frame-size` | `--max-frame-size` | The longest frame that a client can send, in bytes. |

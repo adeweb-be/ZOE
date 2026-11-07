@@ -64,13 +64,7 @@ impl Call {
 /// Decode the frame of a call. Return a text that says why the frame is
 /// not a call.
 pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
-    check_values(frame, MAX_VALUES)?;
-    let mut bytes = frame;
-    let value = rmpv::decode::read_value_with_max_depth(&mut bytes, MAX_DEPTH)
-        .map_err(|e| e.to_string())?;
-    if !bytes.is_empty() {
-        return Err("bytes after the message".into());
-    }
+    let value = decode_value(frame)?;
     let Value::Array(parts) = value else {
         return Err("a message is not an array".into());
     };
@@ -120,6 +114,20 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
         args,
         context,
     })
+}
+
+/// Decode the msgpack value of `frame` within the bounds of a frame: its
+/// values and its depth. The bounds hold before rmpv builds a value.
+/// Return a text that says why the bytes are not one value.
+pub(crate) fn decode_value(frame: &[u8]) -> Result<Value, String> {
+    check_values(frame, MAX_VALUES)?;
+    let mut bytes = frame;
+    let value = rmpv::decode::read_value_with_max_depth(&mut bytes, MAX_DEPTH)
+        .map_err(|e| e.to_string())?;
+    if !bytes.is_empty() {
+        return Err("bytes after the message".into());
+    }
+    Ok(value)
 }
 
 /// Encode the reply to the call `id` with `result`.

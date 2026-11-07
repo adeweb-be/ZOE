@@ -1,5 +1,6 @@
 //! The entry of the fuzz targets in `fuzz/`: the frame decoder and the
-//! message decoder of `zoe serve`, on any bytes.
+//! message decoder of `zoe serve`, and the decoder of the plan of a
+//! catalog query, on any bytes.
 //!
 //! This module compiles with the feature `fuzz`, and in the unit tests of
 //! the crate.
@@ -7,7 +8,7 @@
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-use super::{PROTOCOL, frame, message};
+use super::{PROTOCOL, catalog, frame, message};
 
 /// Read `data` as the server reads the bytes of a client: the protocol
 /// `M5`, then frames of at most `max_frame_size` bytes, each one a message.
@@ -30,6 +31,22 @@ pub fn read_messages(data: &[u8], max_frame_size: u32) -> usize {
         messages += 1;
     }
     messages
+}
+
+/// Read `data` as the server reads the argument `plan` of a
+/// `catalog_query` call: one msgpack value within the bounds of a frame,
+/// then a plan of ADR 0059, section 8, with the kind of each clause.
+///
+/// Return true when the plan reads, false when the call fails or gives the
+/// reason `plan`. The function never panics.
+pub fn read_plan(data: &[u8]) -> bool {
+    let Ok(value) = message::decode_value(data) else {
+        return false;
+    };
+    let Ok(wire) = catalog::wire_of(&value) else {
+        return false;
+    };
+    zoe_catalog::decode_typed(&wire).is_ok()
 }
 
 /// Read one frame of at most `max` bytes from `reader`. Return `None` at
@@ -193,6 +210,35 @@ mod tests {
                     assert_eq!(read_messages(&data, MAX), messages, "{target}/{name}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn each_seed_of_plan_reads_or_is_refused_as_its_name_says() {
+        let seeds = corpus("plan");
+        assert!(seeds.len() >= 5, "plan: {} seeds", seeds.len());
+        for (name, data) in seeds {
+            let refused = ["unknown-kind", "unknown-key", "malformed"].contains(&name.as_str());
+            assert_eq!(read_plan(&data), !refused, "plan/{name}");
+        }
+    }
+
+    #[test]
+    fn mutated_plans_never_panic() {
+        let seeds: Vec<Vec<u8>> = corpus("plan").into_iter().map(|(_, data)| data).collect();
+        let mut rng = Rng(2);
+        for _ in 0..20_000 {
+            let mut data = seeds[rng.below(seeds.len())].clone();
+            for _ in 0..1 + rng.below(8) {
+                let at = rng.below(data.len());
+                match rng.below(4) {
+                    0 => data[at] ^= 1 << rng.below(8),
+                    1 => data[at] = [0x00, 0x7f, 0x80, 0xc1, 0xdd, 0xff][rng.below(6)],
+                    2 => data.truncate(at.max(1)),
+                    _ => data.insert(at, rng.next() as u8),
+                }
+            }
+            read_plan(&data);
         }
     }
 

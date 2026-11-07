@@ -520,7 +520,7 @@ pub(crate) fn render(storages: &[Exported]) -> String {
 
 /// Escape `value` for a label value: a backslash, a double quote and a
 /// line feed.
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")

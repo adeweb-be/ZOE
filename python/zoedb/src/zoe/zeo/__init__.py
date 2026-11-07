@@ -20,6 +20,12 @@ server that accepted `kv` on the connection: `kv_supported()` tells. Without
 it, each raises `ZODB.POSException.Unsupported`. `zoe.kv.Namespace` gives a
 namespace to a connection of a database.
 
+With the native client inside, a connection also declares `catalog_query`,
+and `catalog_query(catalog, tid, plan)` answers a catalog query from the
+catalog mirror of the server, as `zoe.Storage` does from the mirror of the
+process (ADR 0059). `catalog_supported()` tells if the server accepted it.
+The asyncio mode has neither call.
+
 When the package `opentelemetry` is installed, each connection also declares
 `trace_context`. When the server accepts it, each call that the client makes
 inside a span carries the W3C traceparent of that span: a fifth element of
