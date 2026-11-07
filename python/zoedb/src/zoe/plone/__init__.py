@@ -25,9 +25,9 @@ __all__ = ["backends_from_environment"]
 
 def backends_from_environment():
     """Install the backends that `ZOE_PLONE_BACKENDS` names, separated by
-    commas: `locking`, `indexing`, `registry`, `catalog` and `security`. `configure.zcml` calls it
-    when the ZCML loads, after `<environment>` of `zope.conf` set the
-    variable. An unknown name raises `ValueError`."""
+    commas: `locking`, `indexing`, `registry`, `catalog` and `security`.
+    `configure.zcml` calls it when the ZCML loads, after `<environment>` of
+    `zope.conf` set the variable. An unknown name raises `ValueError`."""
     for name in filter(None, os.environ.get("ZOE_PLONE_BACKENDS", "").split(",")):
         name = name.strip()
         if name == "locking":

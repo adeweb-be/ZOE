@@ -719,20 +719,14 @@ impl SecurityIndex {
                 continue;
             };
             inputs[row as usize] = match value {
-                Some(value) => Some(Arc::new(
-                    Raw::parse(value)?.intern(&mut names, &mut sets),
-                )),
+                Some(value) => Some(Arc::new(Raw::parse(value)?.intern(&mut names, &mut sets))),
                 None => None,
             };
         }
         Ok(Self::resolved(names, inputs, rows))
     }
 
-    fn resolved(
-        mut names: Names,
-        inputs: Vec<Option<Arc<Inputs>>>,
-        rows: &Rows,
-    ) -> SecurityIndex {
+    fn resolved(mut names: Names, inputs: Vec<Option<Arc<Inputs>>>, rows: &Rows) -> SecurityIndex {
         let mut by_path: Vec<u32> = rows.live.iter().collect();
         by_path.sort_by(|a, b| rows.paths.get(*a).cmp(rows.paths.get(*b)));
         let indexed: RoaringBitmap = by_path
@@ -844,7 +838,11 @@ impl SecurityIndex {
             + self.by_path.capacity() * 4
             + self.values.capacity() * 4
             + self.classes.iter().map(|c| c.len() * 4 + 16).sum::<usize>()
-            + self.members.iter().map(|m| m.serialized_size()).sum::<usize>()
+            + self
+                .members
+                .iter()
+                .map(|m| m.serialized_size())
+                .sum::<usize>()
             + self.indexed.serialized_size()
     }
 }
@@ -984,7 +982,8 @@ mod tests {
     use super::*;
 
     fn node(kind: &str, roles: &[&str], local: &[(&str, &[&str])], block: bool) -> Val {
-        let strs = |items: &[&str]| Val::Tuple(items.iter().map(|s| Val::Str((*s).into())).collect());
+        let strs =
+            |items: &[&str]| Val::Tuple(items.iter().map(|s| Val::Str((*s).into())).collect());
         Val::Tuple(
             vec![
                 Val::Str(kind.into()),
@@ -1019,13 +1018,26 @@ mod tests {
     #[test]
     fn the_form_of_the_change_sets_sorts_and_merges() {
         let value = entry(
-            node("t", &["Reader", "Manager", "Reader"], &[("bob", &["Reader"]), ("al", &[]), ("bob", &["Editor"])], false),
+            node(
+                "t",
+                &["Reader", "Manager", "Reader"],
+                &[("bob", &["Reader"]), ("al", &[]), ("bob", &["Editor"])],
+                false,
+            ),
             vec![],
         );
         let raw = Raw::parse(&value).unwrap();
         assert_eq!(
             raw.to_val(),
-            entry(node("t", &["Manager", "Reader"], &[("bob", &["Editor", "Reader"])], false), vec![])
+            entry(
+                node(
+                    "t",
+                    &["Manager", "Reader"],
+                    &[("bob", &["Editor", "Reader"])],
+                    false
+                ),
+                vec![]
+            )
         );
         assert!(Raw::parse(&Val::Tuple(vec![Val::Str("x".into())].into())).is_err());
         assert!(Raw::parse(&entry(node("?", &[], &[], false), vec![])).is_err());
@@ -1043,21 +1055,44 @@ mod tests {
         let rows = Rows::from_sorted(&pairs);
         let private = ["Manager", "Owner", "Reader", "Editor"];
         let items = vec![
-            (0, entry(node("l", &["Reader"], &[], false), vec![("", node("t", &["Anonymous", "Manager"], &[], false))])),
-            (1, entry(node("t", &private, &[("alice", &["Owner"]), ("bob", &["Reader"])], false), vec![])),
+            (
+                0,
+                entry(
+                    node("l", &["Reader"], &[], false),
+                    vec![("", node("t", &["Anonymous", "Manager"], &[], false))],
+                ),
+            ),
+            (
+                1,
+                entry(
+                    node(
+                        "t",
+                        &private,
+                        &[("alice", &["Owner"]), ("bob", &["Reader"])],
+                        false,
+                    ),
+                    vec![],
+                ),
+            ),
             (2, entry(node("t", &private, &[], false), vec![])),
             (3, entry(node("", &[], &[], false), vec![])),
             (
                 4,
                 entry(
                     node("", &[], &[], false),
-                    vec![("/site/folder/doc/++conversation++default", node("", &[], &[("carol", &["Reader"])], false))],
+                    vec![(
+                        "/site/folder/doc/++conversation++default",
+                        node("", &[], &[("carol", &["Reader"])], false),
+                    )],
                 ),
             ),
         ];
         let index = SecurityIndex::build(items, &rows).unwrap();
         assert_eq!(index.tokens(0).unwrap(), ["Anonymous"]);
-        assert_eq!(index.tokens(2).unwrap(), ["Editor", "Manager", "Reader", "user:alice", "user:bob"].map(|s| s));
+        assert_eq!(
+            index.tokens(2).unwrap(),
+            ["Editor", "Manager", "Reader", "user:alice", "user:bob"].map(|s| s)
+        );
         assert_eq!(index.tokens(3).unwrap(), index.tokens(2).unwrap());
         // The comment takes the local roles of its conversation.
         assert!(index.tokens(4).unwrap().contains(&"user:carol"));
@@ -1074,7 +1109,10 @@ mod tests {
         let rows = Rows::from_sorted(&pairs);
         let items = vec![
             (0, entry(node("t", &["Anonymous"], &[], false), vec![])),
-            (1, entry(node("v", &["Reader", "user:bob"], &[], false), vec![])),
+            (
+                1,
+                entry(node("v", &["Reader", "user:bob"], &[], false), vec![]),
+            ),
             (2, entry(node("", &[], &[], false), vec![])),
             (3, entry(node("", &[], &[], false), vec![])),
         ];

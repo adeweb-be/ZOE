@@ -20,8 +20,8 @@ use crate::base::{
     PathIndex, Rows, date_range_of, rid_of,
 };
 use crate::change::{Owner, Shapes, Slot};
-use crate::security::SecurityIndex;
 use crate::read::{RECORDS, Reads, Record, TreeShape, oid_of, walk_tree, walk_tree_with};
+use crate::security::SecurityIndex;
 use crate::table::{Table, TablePart};
 use crate::value::{StrArena, Val};
 

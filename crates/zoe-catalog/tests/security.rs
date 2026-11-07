@@ -123,7 +123,8 @@ impl World {
     }
 
     fn add(&mut self, path: &str, perm: Perm, catalogued: bool) {
-        self.objs.insert(path.to_owned(), Obj::new(perm, catalogued));
+        self.objs
+            .insert(path.to_owned(), Obj::new(perm, catalogued));
     }
 
     fn obj(&mut self, path: &str) -> &mut Obj {
@@ -224,9 +225,7 @@ impl World {
         let paths: Vec<String> = self
             .objs
             .iter()
-            .filter(|(p, o)| {
-                o.catalogued && (*p == path || p.starts_with(&format!("{path}/")))
-            })
+            .filter(|(p, o)| o.catalogued && (*p == path || p.starts_with(&format!("{path}/"))))
             .map(|(p, _)| p.clone())
             .collect();
         for p in paths {
@@ -281,7 +280,8 @@ impl World {
                     break all;
                 }
                 Perm::List(l) if !l.is_empty() => {
-                    r.get_or_insert_with(BTreeSet::new).extend(l.iter().cloned());
+                    r.get_or_insert_with(BTreeSet::new)
+                        .extend(l.iter().cloned());
                 }
                 _ => {}
             }
@@ -346,7 +346,12 @@ fn mirrors(store: &Arc<Store>, config: Config) -> Mirrors {
     Mirrors::start(open, store.last_transaction().0, config)
 }
 
-fn commit(store: &Store, mirrors: Option<&Mirrors>, records: &[(u64, Vec<u8>)], keys: &[[u8; 8]]) -> u64 {
+fn commit(
+    store: &Store,
+    mirrors: Option<&Mirrors>,
+    records: &[(u64, Vec<u8>)],
+    keys: &[[u8; 8]],
+) -> u64 {
     let tid = testing::commit(store, records, keys, &[]).expect("a commit");
     if let Some(mirrors) = mirrors {
         mirrors.committed(tid);
@@ -392,11 +397,21 @@ fn expected(postings: &Postings, keys: &[&str], and: bool) -> Vec<i32> {
 /// The queries of the tests: each token alone, the tokens of an anonymous
 /// user, of a member and of a member of a group, and an `and`.
 fn queries(postings: &Postings) -> Vec<(Vec<String>, bool)> {
-    let mut out: Vec<(Vec<String>, bool)> = postings.keys().map(|k| (vec![k.clone()], false)).collect();
+    let mut out: Vec<(Vec<String>, bool)> =
+        postings.keys().map(|k| (vec![k.clone()], false)).collect();
     out.push((strs(&["Anonymous"]), false));
-    out.push((strs(&["Anonymous", "Authenticated", "Member", "user:bob"]), false));
     out.push((
-        strs(&["Anonymous", "Authenticated", "Member", "user:carol", "user:editors"]),
+        strs(&["Anonymous", "Authenticated", "Member", "user:bob"]),
+        false,
+    ));
+    out.push((
+        strs(&[
+            "Anonymous",
+            "Authenticated",
+            "Member",
+            "user:carol",
+            "user:editors",
+        ]),
         false,
     ));
     out.push((strs(&["Reader", "user:bob"]), true));
@@ -406,7 +421,14 @@ fn queries(postings: &Postings) -> Vec<(Vec<String>, bool)> {
 
 /// Checks each query of the mirror at `tid`, and of a base built at `tid`,
 /// against the postings.
-fn check(store: &Store, mirrors: &Mirrors, catalog: u64, tid: u64, postings: &Postings, what: &str) {
+fn check(
+    store: &Store,
+    mirrors: &Mirrors,
+    catalog: u64,
+    tid: u64,
+    postings: &Postings,
+    what: &str,
+) {
     let built = build(store, catalog, tid, 2, &|_| true).expect("a build");
     let over = Overrides::default();
     let fresh = View::new(&built.base, &over);
@@ -443,21 +465,39 @@ fn site() -> World {
     let mut w = World::new();
     w.add(
         "/site",
-        Perm::List(strs(&["Contributor", "Editor", "Reader", "Site Administrator"])),
+        Perm::List(strs(&[
+            "Contributor",
+            "Editor",
+            "Reader",
+            "Site Administrator",
+        ])),
         true,
     );
     w.add("/site/a", Perm::Tuple(strs(PUBLISHED)), true);
     w.add("/site/a/doc1", Perm::Tuple(strs(PRIVATE)), true);
     w.add("/site/a/doc2", Perm::Tuple(strs(PUBLISHED)), true);
     w.add("/site/a/doc1/++conversation++default", Perm::Missing, false);
-    w.add("/site/a/doc1/++conversation++default/1", Perm::Missing, true);
-    share(&mut w, "/site/a/doc1/++conversation++default", "carol", "Reader");
+    w.add(
+        "/site/a/doc1/++conversation++default/1",
+        Perm::Missing,
+        true,
+    );
+    share(
+        &mut w,
+        "/site/a/doc1/++conversation++default",
+        "carol",
+        "Reader",
+    );
     w.add("/site/b", Perm::Tuple(strs(PRIVATE)), true);
     share(&mut w, "/site/b", "editors", "Editor");
     share(&mut w, "/site/b", "alice", "Owner");
     w.add("/site/b/doc", Perm::Missing, true);
     w.add("/site/b/pub", Perm::Tuple(strs(PUBLISHED)), true);
-    w.add("/site/b/pending", Perm::Tuple(strs(&["Manager", "Reviewer", "Owner"])), true);
+    w.add(
+        "/site/b/pending",
+        Perm::Tuple(strs(&["Manager", "Reviewer", "Owner"])),
+        true,
+    );
     w.add("/site/c", Perm::Tuple(strs(PRIVATE)), true);
     w.obj("/site/c").block = true;
     share(&mut w, "/site/c", "bob", "Reader");
@@ -495,12 +535,24 @@ fn the_inputs_resolve_through_the_paths_of_the_rows() {
     assert_eq!(w.plone_value("/site"), ["Anonymous"]);
     // The comment takes the local roles of its conversation, outside the
     // catalog.
-    assert!(w.plone_value("/site/a/doc1/++conversation++default/1").contains(&"user:carol".to_owned()));
+    assert!(
+        w.plone_value("/site/a/doc1/++conversation++default/1")
+            .contains(&"user:carol".to_owned())
+    );
     // The block of /site/c keeps the editors out; the list of /site/c/d adds
     // Reviewer.
-    assert!(w.plone_value("/site/c/d/x").contains(&"user:dave".to_owned()));
-    assert!(!w.plone_value("/site/c/d/x").contains(&"user:editors".to_owned()));
-    assert!(w.plone_value("/site/b/doc").contains(&"user:alice".to_owned()));
+    assert!(
+        w.plone_value("/site/c/d/x")
+            .contains(&"user:dave".to_owned())
+    );
+    assert!(
+        !w.plone_value("/site/c/d/x")
+            .contains(&"user:editors".to_owned())
+    );
+    assert!(
+        w.plone_value("/site/b/doc")
+            .contains(&"user:alice".to_owned())
+    );
     check(&store, &mirrors, catalog, first, &postings, "the base");
     mirrors.stop();
 }
@@ -520,7 +572,10 @@ fn a_share_writes_one_row_of_inputs_and_no_resolved_value() {
         &Overrides::default(),
         &built.shapes,
         &built.objects,
-        &records.iter().map(|(o, d)| (*o, Some(d.clone()))).collect::<Vec<_>>(),
+        &records
+            .iter()
+            .map(|(o, d)| (*o, Some(d.clone())))
+            .collect::<Vec<_>>(),
     );
     assert!(read.stale.is_none(), "{:?}", read.stale);
     let place = built.base.by_name[INDEX];
@@ -578,7 +633,11 @@ fn changes_of_security_resolve_at_each_version_and_older_tids_stay_right() {
     // A new entry below the folder and one below the conversation.
     w.add("/site/c/moved/new", Perm::Missing, true);
     w.index("/site/c/moved/new");
-    w.add("/site/a/doc1/++conversation++default/2", Perm::Missing, true);
+    w.add(
+        "/site/a/doc1/++conversation++default/2",
+        Perm::Missing,
+        true,
+    );
     w.index("/site/a/doc1/++conversation++default/2");
     step(&mut w, &mirrors, &mut states, "new entries");
     // The deletion of the local roles of a user on the whole site: each
@@ -593,7 +652,12 @@ fn changes_of_security_resolve_at_each_version_and_older_tids_stay_right() {
         w.obj(path).local.remove("bob");
         w.index(path);
     }
-    step(&mut w, &mirrors, &mut states, "the deletion of the local roles of a user");
+    step(
+        &mut w,
+        &mirrors,
+        &mut states,
+        "the deletion of the local roles of a user",
+    );
     // A container that leaves the catalog: the entry below gives no token.
     w.uncatalog("/site/h");
     w.obj("/site/h").catalogued = false;
@@ -628,7 +692,14 @@ fn an_opaque_entry_closes_its_subtree_and_reopens_it() {
     let tid = commit(&store, Some(&mirrors), &w.records(), &[]);
     assert!(ready_at(&mirrors, catalog, tid));
     assert!(w.opaque("/site/c/d/x/y"));
-    check(&store, &mirrors, catalog, tid, &w.postings(), "a str setting");
+    check(
+        &store,
+        &mirrors,
+        catalog,
+        tid,
+        &w.postings(),
+        "a str setting",
+    );
     // A local role provider other than the default adapter on another
     // folder.
     w.obj("/site/a").provider = true;
@@ -643,7 +714,14 @@ fn an_opaque_entry_closes_its_subtree_and_reopens_it() {
     let tid = commit(&store, Some(&mirrors), &w.records(), &[]);
     assert!(ready_at(&mirrors, catalog, tid));
     assert!(!w.opaque("/site/c/d/x/y"));
-    check(&store, &mirrors, catalog, tid, &w.postings(), "a tuple again");
+    check(
+        &store,
+        &mirrors,
+        catalog,
+        tid,
+        &w.postings(),
+        "a tuple again",
+    );
     mirrors.stop();
 }
 
@@ -673,13 +751,27 @@ fn a_share_on_a_large_folder_passes_rebase_rows_and_the_rebase_stays_right() {
     let after = w.postings();
     assert_ne!(before, after);
     check(&store, &mirrors, catalog, tid, &after, "after the rebase");
-    check(&store, &mirrors, catalog, first, &before, "before the rebase");
+    check(
+        &store,
+        &mirrors,
+        catalog,
+        first,
+        &before,
+        "before the rebase",
+    );
     // A change after the rebase.
     w.obj("/site/big").local.remove("bob");
     w.index("/site/big");
     let tid = commit(&store, Some(&mirrors), &w.records(), &[]);
     assert!(ready_at(&mirrors, catalog, tid));
-    check(&store, &mirrors, catalog, tid, &w.postings(), "a change after the rebase");
+    check(
+        &store,
+        &mirrors,
+        catalog,
+        tid,
+        &w.postings(),
+        "a change after the rebase",
+    );
     mirrors.stop();
 }
 

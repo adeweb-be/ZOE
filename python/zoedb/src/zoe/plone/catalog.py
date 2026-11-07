@@ -32,9 +32,10 @@ Connection sees it then. A schema that does not give each position from 0
 once sends no columns.
 
 This version types the clauses of FieldIndex, KeywordIndex, DateIndex,
-UUIDIndex and the `ZoeSecurityIndex` of `zoe.plone.security` (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
-key), of DateRangeIndex (`"k": "d"`, the date in minutes of
-`_convertDateTime`) and of ExtendedPathIndex (`"k": "p"`, each path with
+UUIDIndex and the `ZoeSecurityIndex` of `zoe.plone.security` (`"k": "v"`),
+of BooleanIndex (`"k": "b"`, the truth of the first key), of
+DateRangeIndex (`"k": "d"`, the date in minutes of `_convertDateTime`) and
+of ExtendedPathIndex (`"k": "p"`, each path with
 its level, the options of `ExtendedPathIndex.query_index` and the
 physical path of the index), and a sort on FieldIndexes, DateIndexes and
 UUIDIndexes. A sort on an ExtendedPathIndex takes the Python path

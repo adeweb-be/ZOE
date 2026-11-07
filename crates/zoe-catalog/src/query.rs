@@ -568,10 +568,7 @@ impl<'a> View<'a> {
         rs: Option<&RoaringBitmap>,
     ) -> Result<RoaringBitmap, Fallback> {
         if clause.range.is_some() || !clause.not.is_empty() {
-            return fallback(
-                Reason::Option,
-                "a range or not on a ZoeSecurityIndex",
-            );
+            return fallback(Reason::Option, "a range or not on a ZoeSecurityIndex");
         }
         let mut keys = Vec::with_capacity(clause.keys.len());
         for key in &clause.keys {

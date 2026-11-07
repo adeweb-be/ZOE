@@ -676,11 +676,7 @@ def _delete(tool, stock, obj, member_ids, reindex, recursive, REQUEST):
 
     before = held()
     stock(tool, obj, member_ids, 0, 0, REQUEST)
-    if (
-        reindex
-        and before != held()
-        and hasattr(aq_base(obj), "reindexObjectSecurity")
-    ):
+    if reindex and before != held() and hasattr(aq_base(obj), "reindexObjectSecurity"):
         obj.reindexObjectSecurity()
     if recursive and hasattr(aq_base(obj), "contentValues"):
         for child in obj.contentValues():

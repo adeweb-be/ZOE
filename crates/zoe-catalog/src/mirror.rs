@@ -236,10 +236,15 @@ pub fn rebase(
             entry.length = *length;
         }
         let rebuilt = match (&entry.index, head.trees.get(&Slot::Index(i))) {
-            (Index::Security(s), changed) if changed.is_some() || !Arc::ptr_eq(&rows, &base.rows) => {
+            (Index::Security(s), changed)
+                if changed.is_some() || !Arc::ptr_eq(&rows, &base.rows) =>
+            {
                 // The value of a row follows from the rows of its
                 // containers, which a change of the paths can change.
-                Some(s.rebuilt(changed, &rows).map(|i| Index::Security(Arc::new(i))))
+                Some(
+                    s.rebuilt(changed, &rows)
+                        .map(|i| Index::Security(Arc::new(i))),
+                )
             }
             (_, Some(changed)) => entry.index.rebuilt(changed, &rows),
             // Every row keeps its number, so a structure that no change

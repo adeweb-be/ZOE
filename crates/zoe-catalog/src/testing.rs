@@ -1165,9 +1165,7 @@ impl IndexKind {
             | IndexKind::Keyword
             | IndexKind::Path
             | IndexKind::Security
-            | IndexKind::Other(..) => {
-                (OO, IO)
-            }
+            | IndexKind::Other(..) => (OO, IO),
             IndexKind::Date => (IO, II),
             IndexKind::Uuid => (OI, IO),
             IndexKind::Boolean => (II_SET, II),
