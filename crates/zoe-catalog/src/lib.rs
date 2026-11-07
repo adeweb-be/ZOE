@@ -6,6 +6,8 @@
 //!   tree.
 //! - `base` and `build`: the rows and the structures of a base, and their
 //!   build from the committed trees.
+//! - `table` and `cell`: the metadata table of a base, and the msgpack
+//!   cells of its columns.
 //! - `change`: the change sets of the commits, and the read of a commit.
 //! - `mirror`: the versions of a mirror, the window and the rebase.
 //! - `query`: the clauses and the four sort paths of ZCatalog.
@@ -21,6 +23,7 @@
 
 pub mod base;
 pub mod build;
+pub mod cell;
 pub mod change;
 pub mod counts;
 pub mod mirror;
@@ -29,12 +32,13 @@ pub mod plan;
 pub mod query;
 pub mod read;
 pub mod reason;
+pub mod table;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod value;
 
 pub use mirrors::{Config, Hooks, Mirrors, Opener, Status};
-pub use plan::{PlanError, Wire, decode_plan, encode_reply};
-pub use query::{Clause, Plan, Reply};
+pub use plan::{PlanError, Wire, decode_plan, decode_request, encode_reply};
+pub use query::{Clause, Columns, Plan, Reply};
 pub use read::{NAMESPACE, Reads};
 pub use reason::{Fallback, Reason};

@@ -3,6 +3,7 @@ ExtendedPathIndex that Products.ZCatalog writes, the records of seven
 commits, and the answers of ZCatalog to a set of path queries.
 
     PYTHONHASHSEED=0 python path.py OUT.json
+    PYTHONHASHSEED=0 python path.py OUT.json multi-valued
 
 Run it with an interpreter that has Products.ZCatalog 7.2,
 Products.ExtendedPathIndex 5, ZODB 6 and BTrees 6, such as the
@@ -11,7 +12,10 @@ interpreter of the zoe scenario of `just plone`.
 The catalog is a `Products.ZCatalog.Catalog.Catalog` at `root["catalog"]`
 of a `MappingStorage`, with the ExtendedPathIndex `path`, the FieldIndexes
 `portal_type` and `sortable_title`, and the column `getId`. The physical
-path of the index is `/site/portal_catalog/path`. A seeded random gives
+path of the index is `/site/portal_catalog/path`. With `multi-valued`, the
+index has `multi_valued` set: a search at the level 0 with a depth of 0
+reads `_index_parents`, and a navtree of depth 1 reads `_index_items`.
+`path.json` is the data without it, `path-multi.json` the data with it. A seeded random gives
 each entry its rid. The entries are a tree of folders under `/site`, with
 no entry for `/site` itself, so no row ends at the level 0; an entry
 outside the site, `/other/item`; an entry of one component, `/lone`; and
@@ -51,6 +55,7 @@ from ZODB import DB
 from ZODB.MappingStorage import MappingStorage
 
 out = sys.argv[1]
+multi = sys.argv[2:] == ["multi-valued"]
 rnd = random.Random(288)
 catalog_module.randint = random.Random(289).randint
 
@@ -76,7 +81,7 @@ conn = db.open()
 root = conn.root()
 cat = Catalog()
 root["catalog"] = cat
-cat.addIndex("path", ExtendedPathIndex("path"))
+cat.addIndex("path", ExtendedPathIndex("path", extra={"multi_valued": multi}))
 cat.addIndex("portal_type", FieldIndex("portal_type"))
 cat.addIndex("sortable_title", FieldIndex("sortable_title"))
 cat.addColumn("getId")
@@ -217,8 +222,9 @@ Catalog.instantiate = lambda self, record, score_data=None: record[0]
 
 def reads_index_items(query):
     """Tell if `ExtendedPathIndex.search` reads `_index_items` for a key of
-    the path clause of `query`: a search at the level 0 with a depth of 0,
-    and a navtree of depth 0 that its `navtree_start` does not empty."""
+    the path clause of `query`: a search at the level 0 with a depth of 0
+    without `multi_valued`, a navtree of depth 0, and a navtree of depth 1
+    with `multi_valued`, that its `navtree_start` does not empty."""
     made = cat.make_query(cat.merge_query_args(query))
     index = cat.getIndex("path")
     rec = IndexQuery(
@@ -238,8 +244,11 @@ def reads_index_items(query):
             d = 1 if navtree and depth == -1 else depth
             if navtree and start > min(level + len(comps) - 1 + d, index._depth):
                 continue
-            if level == 0 and d == 0:
-                return True
+            if level == 0 and d in (0, 1):
+                if navtree and (d == 0 or index.multi_valued):
+                    return True
+                if not navtree and d == 0 and not index.multi_valued:
+                    return True
     return False
 
 

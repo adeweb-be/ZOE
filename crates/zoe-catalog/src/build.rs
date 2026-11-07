@@ -1,7 +1,8 @@
 //! The build of the base of one catalog from its committed trees.
 //!
-//! The build reads as of one tid: `paths`, `uids`, and the record of each
-//! index with its `_unindex` and its `_length`. It reads no `_index` tree.
+//! The build reads as of one tid: `paths`, `uids`, `data`, and the record
+//! of each index with its `_unindex` and its `_length`. It reads no
+//! `_index` tree.
 //! It decodes each value of a tree straight into the structure of its
 //! index: the keys go into arenas, which the build frees whole when the
 //! structure is built. The structure of a tree builds in a thread of its
@@ -9,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use zoe_pickle::python::Value;
@@ -19,7 +20,8 @@ use crate::base::{
     PathIndex, Rows, date_range_of, rid_of,
 };
 use crate::change::{Owner, Shapes, Slot};
-use crate::read::{Reads, Record, TreeShape, oid_of, walk_tree};
+use crate::read::{RECORDS, Reads, Record, TreeShape, oid_of, walk_tree, walk_tree_with};
+use crate::table::{Table, TablePart};
 use crate::value::{StrArena, Val};
 
 /// The class of the catalog object.
@@ -151,7 +153,11 @@ pub fn build(
         uids: record
             .attr_oid("uids")
             .ok_or_else(|| BuildError::Refused("the catalog has no uids".into()))?,
+        data: record
+            .attr_oid("data")
+            .ok_or_else(|| BuildError::Refused("the catalog has no data".into()))?,
     };
+    let schema = schema_of(&record);
     let names: Vec<(String, Value)> = match record.attr("indexes").and_then(|v| record.heap.dict(v))
     {
         Some(items) => {
@@ -233,16 +239,70 @@ pub fn build(
             "uids is not the inverse of paths: they differ in length".into(),
         ));
     }
+    // The records of `data`, cell by cell. A record of a rid that `paths`
+    // does not hold is in no result: the table does not keep it. The cells
+    // count against the bound as the walk collects them.
+    let width = schema.len();
+    let walked = AtomicUsize::new(0);
+    let over = AtomicBool::new(false);
+    let walk = walk_tree_with(
+        reads,
+        before,
+        trees.data,
+        threads,
+        RECORDS,
+        || TablePart::new(width),
+        |part: &mut TablePart, items| {
+            let start = part.heap_bytes();
+            for (rid, value) in items {
+                if let Some(row) = rows_ref.row(rid_of(&rid)?) {
+                    part.push(row, &value)?;
+                }
+            }
+            let grown = part.heap_bytes().saturating_sub(start);
+            let now = walked.fetch_add(grown, AtomicOrdering::Relaxed) + grown;
+            if !room(held.load(AtomicOrdering::Relaxed) + now) {
+                over.store(true, AtomicOrdering::Relaxed);
+                return Err("the memory bound has no room for data".into());
+            }
+            Ok(())
+        },
+    );
+    if over.load(AtomicOrdering::Relaxed) {
+        return Err(BuildError::Dropped);
+    }
+    let (data_shape, parts, stats) = walk.map_err(|e| refused("data", e))?;
+    read_records += stats.records;
+    read_bytes += stats.bytes;
+    let mut table_part = TablePart::new(width);
+    for part in parts {
+        table_part.append(part).map_err(|e| refused("data", e))?;
+    }
+    if !room(held.load(AtomicOrdering::Relaxed) + table_part.heap_bytes() + data_shape.heap_bytes())
+    {
+        return Err(BuildError::Dropped);
+    }
     let mut shapes = Shapes::default();
     shapes.owners.insert(catalog, Owner::Catalog);
     shapes.add_tree(Slot::Paths, trees.paths, &paths_shape);
+    shapes.add_tree(Slot::Data, trees.data, &data_shape);
+    drop(data_shape);
     let mut objects = HashMap::from([(catalog, catalog_bytes)]);
     // The indexes. The structure of each index builds in a thread
     // while the next tree is walked.
     let mut entries: Vec<IndexEntry> = Vec::with_capacity(names.len());
     let mut tree_shapes: Vec<Option<TreeShape>> = Vec::with_capacity(names.len());
     let mut stopped = false;
+    let mut table = Table::default();
     std::thread::scope(|scope| {
+        let count = rows_ref.len();
+        let held_ref = &held;
+        let table_build = scope.spawn(move || {
+            // A table that does not build serves no row.
+            let table = table_part.build(schema, count).unwrap_or_default();
+            held_ref.fetch_add(table.heap_bytes(), AtomicOrdering::Relaxed);
+            table
+        });
         let mut pending = Vec::new();
         for (name, reference) in &names {
             let Some(oid) = oid_of(&record.heap, *reference) else {
@@ -396,6 +456,11 @@ pub fn build(
                 };
             }
         }
+        // A table that did not build serves no row: each brain then comes
+        // from `data`.
+        if let Ok(built) = table_build.join() {
+            table = built;
+        }
     });
     if stopped || !room(held.load(AtomicOrdering::Relaxed)) {
         return Err(BuildError::Dropped);
@@ -425,6 +490,7 @@ pub fn build(
             indexes: entries,
             by_name,
             trees,
+            table,
         },
         shapes,
         objects,
@@ -432,6 +498,34 @@ pub fn build(
         bytes: read_bytes,
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// The position of each column of the `schema` of the catalog record. It
+/// is empty when the schema is not a dict of strs to ints that gives each
+/// position from 0 once: `Catalog.instantiate` then reads the records in a
+/// way that the table does not model, and no brain comes from a row.
+fn schema_of(record: &Record) -> HashMap<String, usize> {
+    let Some(items) = record.attr("schema").and_then(|v| record.heap.dict(v)) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::with_capacity(items.len());
+    for (k, v) in items {
+        let (Some(name), Value::Int(place)) = (record.heap.str(*k), *v) else {
+            return HashMap::new();
+        };
+        let Ok(place) = usize::try_from(place) else {
+            return HashMap::new();
+        };
+        out.insert(name.to_owned(), place);
+    }
+    let mut seen = vec![false; out.len()];
+    for place in out.values() {
+        match seen.get_mut(*place) {
+            Some(slot) if !*slot => *slot = true,
+            _ => return HashMap::new(),
+        }
+    }
+    out
 }
 
 /// `_depth` and `multi_valued` of the record of an ExtendedPathIndex. A

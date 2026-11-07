@@ -34,6 +34,10 @@ pub enum Val {
     /// A `Message`: the arguments of its `__reduce__`. The first is its
     /// text. It compares as a str.
     Message(Box<[Val]>),
+    /// A cell of the metadata table: its msgpack bytes (`cell`), or `None`
+    /// for a value of a type that the table does not model. It orders with
+    /// no other value.
+    Cell(Option<Box<[u8]>>),
 }
 
 /// A value that the mirror does not model. The text names it.
@@ -135,6 +139,7 @@ impl Val {
                 v.len() * std::mem::size_of::<Val>() + v.iter().map(Val::heap_bytes).sum::<usize>()
             }
             Val::DateTime(_, _, tz) => tz.len(),
+            Val::Cell(cell) => cell.as_ref().map_or(0, |c| c.len()),
             _ => 0,
         }
     }

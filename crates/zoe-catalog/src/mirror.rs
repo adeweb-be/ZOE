@@ -11,8 +11,9 @@
 //! A change set leaves the mirror window when `window_tids` newer change
 //! sets exist, or when it is older than `window`. The mirror drops such a
 //! change set when a base holds it. The rebase builds a new base at the
-//! last tid: a new structure for each index that the change sets touched,
-//! one at a time; the other structures stay shared with the old base.
+//! last tid: a new structure for each index and each column of the
+//! metadata table that the change sets touched, one at a time; the other
+//! structures stay shared with the old base.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use std::time::Duration;
 
 use crate::base::{Base, Index};
 use crate::change::{ChangeSet, Overrides, Slot};
+use crate::table;
 
 /// The versions of a mirror that queries read.
 #[derive(Debug)]
@@ -219,6 +221,27 @@ pub fn rebase(
             Some(Err(e)) => entry.index = Index::Unavailable(e),
         }
     }
+    let columns: Vec<_> = (0..base.table.width())
+        .map(|c| head.trees.get(&Slot::Column(c)))
+        .collect();
+    let widths = head.trees.get(&Slot::Width);
+    let table = if columns.iter().any(Option::is_some) || widths.is_some() {
+        let table = table::rebuilt(&base.table, &columns, widths, &rows)?;
+        // The columns that the rebase built, and the lengths of the records.
+        held += table.widths.capacity() * 4
+            + columns
+                .iter()
+                .zip(&table.columns)
+                .filter(|(changed, _)| changed.is_some())
+                .map(|(_, column)| column.heap_bytes())
+                .sum::<usize>();
+        if !room(held) {
+            return Err("the memory bound has no room for the rebase".into());
+        }
+        table
+    } else {
+        base.table.clone()
+    };
     Ok(Base {
         tid,
         catalog: base.catalog,
@@ -226,5 +249,6 @@ pub fn rebase(
         indexes,
         by_name: base.by_name.clone(),
         trees: base.trees,
+        table,
     })
 }

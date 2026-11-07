@@ -38,8 +38,8 @@ use crate::build::{BuildError, Built, build};
 use crate::change::{ChangeSet, Shapes, read_records};
 use crate::counts::{Counters, Counts, MirrorCounts};
 use crate::mirror::{Versions, rebase};
-use crate::plan::{PlanError, Wire, decode_plan};
-use crate::query::{Plan, Reply, View};
+use crate::plan::{PlanError, Wire, decode_request};
+use crate::query::{Columns, Plan, Reply, View};
 use crate::read::{Commit, Reads};
 use crate::reason::{Fallback, Reason};
 
@@ -266,8 +266,19 @@ impl Mirrors {
     /// Answers `plan` on the catalog `catalog` as of the snapshot that ends
     /// before `tid`, as the tid of `loadBefore`.
     pub fn query(&self, catalog: u64, tid: u64, plan: &Plan) -> Result<Reply, Fallback> {
+        self.query_rows(catalog, tid, plan, &Columns::default())
+    }
+
+    /// Answers `plan` as `query` does, with the rows of `columns`.
+    pub fn query_rows(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Plan,
+        columns: &Columns,
+    ) -> Result<Reply, Fallback> {
         let started = Instant::now();
-        let answer = self.answer(catalog, tid, plan);
+        let answer = self.answer(catalog, tid, plan, columns);
         match &answer {
             Ok(_) => self.shared.counters.native(started.elapsed()),
             Err(f) => self.shared.counters.python(f.reason, started.elapsed()),
@@ -275,17 +286,18 @@ impl Mirrors {
         answer
     }
 
-    /// Answers the plan `plan` in the form of section 8, as `query` does.
-    /// A plan of another form is an error: its text. A key or a kind of
-    /// clause that this version does not know gives the reason `plan`.
+    /// Answers the plan `plan` in the form of section 8, with its rows, as
+    /// `query_rows` does. A plan of another form is an error: its text. A
+    /// key or a kind of clause that this version does not know gives the
+    /// reason `plan`.
     pub fn query_wire(
         &self,
         catalog: u64,
         tid: u64,
         plan: &Wire,
     ) -> Result<Result<Reply, Fallback>, String> {
-        match decode_plan(plan) {
-            Ok(plan) => Ok(self.query(catalog, tid, &plan)),
+        match decode_request(plan) {
+            Ok((plan, columns)) => Ok(self.query_rows(catalog, tid, &plan, &columns)),
             Err(PlanError::Malformed(why)) => Err(why),
             Err(PlanError::Unknown(why)) => {
                 self.shared.counters.python(Reason::Plan, Duration::ZERO);
@@ -294,7 +306,13 @@ impl Mirrors {
         }
     }
 
-    fn answer(&self, catalog: u64, tid: u64, plan: &Plan) -> Result<Reply, Fallback> {
+    fn answer(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Plan,
+        columns: &Columns,
+    ) -> Result<Reply, Fallback> {
         let shared = &self.shared;
         let v = tid.saturating_sub(1);
         let Some(store) = (shared.open)() else {
@@ -359,7 +377,7 @@ impl Mirrors {
         };
         let answer = catch_unwind(AssertUnwindSafe(|| {
             let (base, over) = snapshot.resolve();
-            View::new(&base, &over).query(plan)
+            View::new(&base, &over).query_rows(plan, columns)
         }));
         answer.unwrap_or_else(|_| Err(Fallback::new(Reason::Refused, "the query panicked")))
     }

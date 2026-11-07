@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
+use crate::table::Table;
 use crate::value::{StrArena, Val, py_cmp};
 
 /// The marker of a row without a key.
@@ -1312,6 +1313,8 @@ pub struct CatalogTrees {
     pub paths: u64,
     /// `uids`.
     pub uids: u64,
+    /// `data`.
+    pub data: u64,
 }
 
 /// The base of a catalog: its rows and its indexes at one tid.
@@ -1329,6 +1332,8 @@ pub struct Base {
     pub by_name: HashMap<String, usize>,
     /// The trees of the catalog object.
     pub trees: CatalogTrees,
+    /// The metadata table.
+    pub table: Table,
 }
 
 impl Base {
@@ -1336,6 +1341,7 @@ impl Base {
     /// counts in each.
     pub fn heap_bytes(&self) -> usize {
         self.rows.heap_bytes()
+            + self.table.heap_bytes()
             + self
                 .indexes
                 .iter()

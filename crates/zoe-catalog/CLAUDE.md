@@ -2,12 +2,13 @@
 
 The catalog mirror: the ZCatalog indexes of each registered catalog of a store in memory, answering queries as of a tid (ADR 0059). Specification: "Catalog acceleration and search", "Step 2: the mirror".
 
-Built: FieldIndex, KeywordIndex, DateIndex, DateRangeIndex, BooleanIndex, UUIDIndex and ExtendedPathIndex with their clauses, and the sorts on FieldIndex, DateIndex and UUIDIndex; the registration, the build, the base and its change sets, the rebase, the mirror window, the memory bound and the counts; the plan and the reply of section 8 as a tree of msgpack values (`Wire`). The metadata table, the wire of `zoe serve` and the transaction overlay come later.
+Built: FieldIndex, KeywordIndex, DateIndex, DateRangeIndex, BooleanIndex, UUIDIndex and ExtendedPathIndex with their clauses, and the sorts on FieldIndex, DateIndex and UUIDIndex; the registration, the build, the base and its change sets, the rebase, the mirror window, the memory bound and the counts; the metadata table and the rows of a reply; the plan and the reply of section 8 as a tree of msgpack values (`Wire`). The wire of `zoe serve` and the transaction overlay come later.
 
 ## Layout
 
 - `read.rs`: `Reads`, what the mirror reads of a store (`zoe_core::Store` gives it), the decode of a record and the walk of a tree over several threads.
 - `base.rs`, `build.rs`: the rows and the structures of a base, and their build.
+- `table.rs`, `cell.rs`: the metadata table of a base, and the msgpack cells of its columns with their ext types.
 - `change.rs`: the change sets and the read of the records of a commit.
 - `mirror.rs`: the versions of one mirror, the window and the rebase.
 - `query.rs`: the clauses of each index type and the four sort paths of ZCatalog.
@@ -15,7 +16,7 @@ Built: FieldIndex, KeywordIndex, DateIndex, DateRangeIndex, BooleanIndex, UUIDIn
 - `mirrors.rs`: the mirrors of a store, their thread, their builds and the bound.
 - `reason.rs`, `counts.rs`: the reasons of a fallback and the counts.
 - `testing.rs`, with the feature `testing`: the records of a catalog as Products.ZCatalog writes them, and `commit`.
-- `tests/data/zcatalog.py` writes `tests/data/zcatalog.json`: records and answers of Products.ZCatalog on FieldIndexes, for `tests/mirror.rs`. `tests/data/indexes.py` writes `tests/data/indexes.json` for the other index types, for `tests/indexes.rs`. `tests/data/path.py` writes `tests/data/path.json` for ExtendedPathIndex, for `tests/path.rs`. Run each with `PYTHONHASHSEED=0`.
+- `tests/data/zcatalog.py` writes `tests/data/zcatalog.json`: records and answers of Products.ZCatalog on FieldIndexes, for `tests/mirror.rs`. `tests/data/indexes.py` writes `tests/data/indexes.json` for the other index types, for `tests/indexes.rs`. `tests/data/path.py` writes `tests/data/path.json` for ExtendedPathIndex, and with `multi-valued` `tests/data/path-multi.json`, for `tests/path.rs`. `tests/data/metadata.py` writes `tests/data/metadata.json`: records of `data` with the columns of a Plone 6.1 catalog and the brains of ZCatalog, for `tests/metadata.rs`. Run each with `PYTHONHASHSEED=0`.
 
 ## Invariants
 
@@ -28,6 +29,12 @@ Built: FieldIndex, KeywordIndex, DateIndex, DateRangeIndex, BooleanIndex, UUIDIn
 - A key of `not` that the keys of the index do not order gives `option`: ZCatalog raises.
 - A path clause follows `ExtendedPathIndex.search` step by step, with the `None` of BTrees: `intersection` with no set gives the other set whole, so a level at which no row ends adds the whole set of the path. A search that reads `_index_items` (the level 0 with a depth of 0, a `navtree` of depth 0, and a `navtree` of depth 1 with `multi_valued`) gives `index_unavailable`: `_index_items` keeps one rid for each path, loses it when any row of the path leaves, and keeps the key of a path of one component, so no tree that the mirror reads gives it. A commit that raises `_depth` writes the index record, so the mirror goes stale and builds again.
 - A rebase gives a new row only to a rid that the old base has no row for, whatever the order of the new rids.
+- The build reads `data` on a heap that holds the objects of other classes, so a value of another type is a cell of another type, not a refusal. A record of `data` that the decoder refuses makes the catalog `refused`. The table keeps one column for each position of the `schema` of the catalog record, and nothing when the schema does not give each position from 0 once.
+- The cells that the table models: nil, bool, an int of 64 bits, float, str, bytes, a tuple, a dict, `Missing.Value` (ext 1), a `DateTime` of NEWOBJ with no arguments and the state `(int, bool, str)` (ext 2), a `Message` of REDUCE (ext 3), each nested at most 32 deep. A cell of another type (a list, a set, an instance of another class, a persistent reference, a class, a larger int) never goes into a row: the row comes as nil, and the client makes the brain with the stock `Catalog.__getitem__`.
+- A brain made from a row equals the brain that `Catalog.__getitem__` makes from `data` at the snapshot: the same values and types after the round trip into Python, the same `getRID()`, `data_record_id_` and `getPath()`. So a row comes only for a record with one value for each column of the schema (the fast path of `Catalog.instantiate`), and a column that the schema does not name makes each row nil.
+- A change set holds, for a record of `data`, one change for each changed cell (`Slot::Column`) and one for the length of the record (`Slot::Width`) when it changed. A record of `data` applies through the same code for a commit and for a transaction overlay.
+- A reply holds rows and paths for its first `rn` rids only, and only when the plan names `cols`.
+- The byte arenas of the table hold at most 4 GiB: past it, the build refuses the catalog, and a rebase fails. The walk of `data` counts its cells against `catalog-memory` as it collects them.
 - A clause on a DateRangeIndex applies after the other clauses. A row of the result without an entry in a DateRangeIndex of the query gives `date_range_order`, as does a date outside the range of the index with another clause: the answer of ZCatalog then depends on the order of its plan. The only clause of a query comes first in that plan.
 - The mirror builds only registered catalogs: the keys of the durable namespace `zoe.catalog`, read at the start and after each commit that changes its generation. No scan of the store, no build on a first query.
 - A base never changes. A change set holds only the changed values. A rebase keeps the number of each row, so the structures that it does not build again stay shared.
