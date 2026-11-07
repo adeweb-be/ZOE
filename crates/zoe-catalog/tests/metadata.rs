@@ -22,7 +22,7 @@ use zoe_catalog::read::{Node, Record, node};
 use zoe_catalog::testing;
 use zoe_catalog::value::Val;
 use zoe_catalog::{
-    Columns, Config, Mirrors, Opener, Reads, Reply, Wire, decode_request, encode_reply,
+    Columns, Config, Mirrors, Opener, Reads, Reply, Wire, decode_plan, decode_request, encode_reply,
 };
 use zoe_core::Store;
 use zoe_core::vfs::MemVfs;
@@ -218,6 +218,17 @@ fn the_cells_of_each_row_of_a_reply_equal_the_cells_of_the_brains_of_zcatalog() 
     assert!(mirrors.wait_for(catalog, WAIT, |s| {
         s.is_some_and(|s| s.state == "ready" && s.applied >= Some(tid))
     }));
+    // A plan with `cols` and `rn` reads, and its reply gives rows.
+    let batch = wire(&data["plans"]["batch"]);
+    assert!(decode_plan(&batch).is_ok());
+    let (_, wanted) = decode_request(&batch).expect("a plan with cols");
+    assert_eq!(wanted.cols.as_ref().map(Vec::len), Some(44));
+    assert_eq!(wanted.rn, 15);
+    let reply = mirrors
+        .query_wire(catalog, tid + 1, &batch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.rows.as_ref().map(Vec::len), Some(15));
     let version = &data["versions"][0];
     let mut nil = 0;
     for (name, plan) in data["plans"].as_object().unwrap() {

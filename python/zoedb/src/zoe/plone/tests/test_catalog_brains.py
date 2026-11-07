@@ -46,6 +46,18 @@ MODIFIED = {
 BATCH = {**LISTING, "sort_on": "sortable_title", "b_start": 30, "b_size": 25}
 
 
+def effective(i):
+    """The effective date of the item `i`: in an offset zone, in a named
+    zone, naive, or none."""
+    day = 1 + i % 28
+    return (
+        DateTime(2026, 1, day, 10, 30, 0, "GMT+2"),
+        DateTime(2026, 2, day, 11, 45, 30, "Etc/GMT-3"),
+        DateTime(f"2026/03/{day:02d} 12:15:45"),
+        None,
+    )[i % 4]
+
+
 def make_content(site):
     site.invokeFactory("Folder", FOLDER, title="Brains")
     folder = site[FOLDER]
@@ -59,8 +71,7 @@ def make_content(site):
             subject=("alpha", "beta")[: i % 3],
         )
         doc = folder[name]
-        if i % 4 == 0:
-            doc.setEffectiveDate(DateTime(2026, 1, 1 + i % 28, 10, 30, 0, "GMT+2"))
+        doc.setEffectiveDate(effective(i))
         if i % 2:
             site.portal_workflow.doActionFor(doc, "publish")
         doc.reindexObject()
@@ -74,7 +85,11 @@ def same(a, b):
     if a is Missing.Value or b is Missing.Value:
         return a is b
     if isinstance(a, DateTime):
-        return a.__getstate__() == b.__getstate__()
+        return (
+            a.__getstate__() == b.__getstate__()
+            and a.ISO8601() == b.ISO8601()
+            and a.timezone() == b.timezone()
+        )
     if isinstance(a, Message):
         return a.__reduce__() == b.__reduce__()
     if isinstance(a, tuple):
@@ -216,6 +231,32 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
                     brain.Title  # noqa: B018
             cat = aq_base(site.portal_catalog)._catalog
             self.assertTrue(tree_oids(jar, cat.data._p_oid) & set(seen))
+
+    def test_a_datetime_comes_back_equal_in_a_named_an_offset_and_no_zone(self):
+        with opened(self.db) as site:
+            found, brains, loaded = self.native(site, LISTING)
+            self.assertEqual(loaded, set())
+            self.check(site, found, brains, LISTING)
+            by_id = {brain.getId: brain for brain in brains}
+            expected = {b.getId: b for b in stock(site, LISTING)}
+            for i, zone, naive in (
+                (0, "GMT+2", False),
+                (1, "Etc/GMT-3", False),
+                (2, None, True),
+            ):
+                name = f"doc-{i:03d}"
+                got, want = by_id[name].effective, expected[name].effective
+                held = site[FOLDER][name].effective_date
+                self.assertIs(type(got), DateTime)
+                for each in (want, held):
+                    self.assertEqual(got._micros, each._micros, name)
+                    self.assertEqual(got._tz, each._tz, name)
+                    self.assertEqual(got._timezone_naive, each._timezone_naive, name)
+                    self.assertEqual(got.ISO8601(), each.ISO8601(), name)
+                    self.assertEqual(got.timezone(), each.timezone(), name)
+                self.assertEqual(bool(got._timezone_naive), naive, name)
+                if zone is not None:
+                    self.assertEqual(got.timezone(), zone, name)
 
     def test_a_search_sorted_on_modified_with_sort_limit_gives_the_stock_brains(self):
         with opened(self.db) as site:

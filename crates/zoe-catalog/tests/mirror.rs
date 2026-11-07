@@ -1060,7 +1060,7 @@ fn an_option_that_the_mirror_does_not_serve_gives_a_refusal() {
         PlanError::Unknown(_)
     ));
     assert!(matches!(
-        unknown(r#"{"c": [], "cols": ["Title"]}"#),
+        unknown(r#"{"c": [], "zz": ["Title"]}"#),
         PlanError::Unknown(_)
     ));
     assert!(matches!(unknown(r#"{"s": []}"#), PlanError::Malformed(_)));
