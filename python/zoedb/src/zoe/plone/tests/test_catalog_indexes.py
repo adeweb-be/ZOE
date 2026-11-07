@@ -161,22 +161,28 @@ class TestTheIndexesOfTheCatalogMirror(unittest.TestCase):
         wait_ready(self.storage, self.key)
         catalog._counts.clear()
 
+    def counts(self):
+        """The searches of the process on the native path and on the Python
+        path."""
+        queries = catalog._counts_now()["queries"]
+        return queries.get("native", 0), queries.get("python", 0)
+
     def check(self, site, searches):
         """Each search gives the brains of the Python path, with the same
         `len()` and `actual_result_count`, natively."""
-        native = catalog._counts_now()["queries"].get("native", 0)
+        # The changes of the content search the catalog in their own
+        # transactions, on the Python path (`transaction`).
+        native, python = self.counts()
         for query in searches:
             expected = stock(site, query)
             got = answer(site.portal_catalog.unrestrictedSearchResults(**query))
             self.assertEqual(got, expected, query)
-        counts = catalog._counts_now()
-        self.assertEqual(counts["queries"].get("native", 0), native + len(searches))
-        self.assertNotIn("python", counts["queries"], counts)
+        self.assertEqual(self.counts(), (native + len(searches), python))
 
     def check_as_users(self, site):
         """The five-index intersection through `searchResults`, as a member
         and as anonymous."""
-        native = catalog._counts_now()["queries"].get("native", 0)
+        native, python = self.counts()
         found = []
         for user in (MEMBER, None):
             if user:
@@ -188,9 +194,7 @@ class TestTheIndexesOfTheCatalogMirror(unittest.TestCase):
             self.assertEqual(got, expected, user)
             found.append(expected[2])
         zope_testing.login(site.getPhysicalRoot().acl_users, SITE_OWNER_NAME)
-        counts = catalog._counts_now()
-        self.assertEqual(counts["queries"].get("native", 0), native + 2)
-        self.assertNotIn("python", counts["queries"], counts)
+        self.assertEqual(self.counts(), (native + 2, python))
         return found
 
     def test_each_option_of_each_index_type_gives_the_brains_of_the_python_path(self):
