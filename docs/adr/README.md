@@ -61,4 +61,6 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0055](0055-zoe-wire.md) | zoe-wire: the ZEO frame codec and the TLS certificate reader, written once in a sans-IO crate | accepted | |
 | [0056](0056-the-write-ahead-log.md) | A write-ahead log with a background fold: ZOE format 3 | accepted | |
 | [0057](0057-the-reader-of-zoe.md) | The reader of ZOE: a record decodes in Rust in place of ObjectReader | accepted | |
+| [0059](0059-the-catalog-mirror.md) | The catalog mirror: a base built from the index trees, a change set per commit, and `catalog_query` | accepted | |
 | [0060](0060-the-native-text-index.md) | The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex | accepted | |
+| [0061](0061-the-security-index.md) | The security index: the inherited inputs of `allowedRolesAndUsers` | accepted | |

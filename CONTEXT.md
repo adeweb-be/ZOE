@@ -362,6 +362,14 @@ _Avoid_: lag, delay (the delay of a key runs from the time in the key to the com
 The wait of a request that carries the session cookie `zoe.indexing`: at `PubStart`, at most 2 s, until the queue holds no key at or below the last key of the save of that browser, so the user who saved reads a catalog that holds the save.
 _Avoid_: sticky session, read-your-writes
 
+**Inputs**:
+What one object holds itself for its value of `allowedRolesAndUsers`: its setting of the permission "Access contents information", the local roles of the default adapter of borg.localrole, and its block flag. `ZoeSecurityIndex` keeps them for each catalog entry and resolves the value through the containers (ADR 0061).
+_Avoid_: security data, own value (that is the value whole)
+
+**Opaque entry**:
+A catalog entry of `ZoeSecurityIndex` whose object or container has an input that the index cannot read, such as another local role provider or a setting that is a str. It keeps the whole value that the `allowedRolesAndUsers` indexer of CMFPlone gives, and a security reindex of a container reindexes it (ADR 0061).
+_Avoid_: opaque node, stale entry
+
 **Derivation**:
 A value computed from one record and keyed by oid, tid and kind, such as an image scale or an embedding.
 _Avoid_: artefact, cache entry
