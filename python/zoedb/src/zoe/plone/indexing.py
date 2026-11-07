@@ -692,7 +692,13 @@ class Indexer:
         whose operations reindex only the security indexes, with those
         indexes. Search only below the highest such paths. A search that
         fails is a failure of its highest path, so the keys of that path
-        stay in the queue and count the failure."""
+        stay in the queue and count the failure. A catalog with a
+        `ZoeSecurityIndex` needs no subtree: its entries resolve through
+        the entries of their containers (ADR 0061)."""
+        from zoe.plone.security import security_index
+
+        if security_index(catalog) is not None:
+            return
         tops = highest(path for path, entry in entries.items() if entry.security)
         for top in tops:
             idxs = set(entries[top].idxs & SECURITY) or set(SECURITY)

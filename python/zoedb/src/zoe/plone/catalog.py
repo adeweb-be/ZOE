@@ -25,8 +25,8 @@ brain of the stock `Catalog.__getitem__`, which reads `data` as the
 Connection sees it then. A schema that does not give each position from 0
 once sends no columns.
 
-This version types the clauses of FieldIndex, KeywordIndex, DateIndex and
-UUIDIndex (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
+This version types the clauses of FieldIndex, KeywordIndex, DateIndex,
+UUIDIndex and the `ZoeSecurityIndex` of `zoe.plone.security` (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
 key), of DateRangeIndex (`"k": "d"`, the date in minutes of
 `_convertDateTime`) and of ExtendedPathIndex (`"k": "p"`, each path with
 its level, the options of `ExtendedPathIndex.query_index` and the
@@ -89,6 +89,8 @@ _CLAUSES = {
     f"{_PLUGIN_INDEXES}.BooleanIndex.BooleanIndex.BooleanIndex": "b",
     f"{_PLUGIN_INDEXES}.DateRangeIndex.DateRangeIndex.DateRangeIndex": "d",
     "Products.ExtendedPathIndex.ExtendedPathIndex.ExtendedPathIndex": "p",
+    # The security index of `zoe.plone` (ADR 0061): a clause of tokens.
+    "zoe.plone.security.ZoeSecurityIndex": "v",
 }
 _SORTS = {
     f"{_PLUGIN_INDEXES}.FieldIndex.FieldIndex.FieldIndex",

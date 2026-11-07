@@ -12,8 +12,10 @@ the locks of plone.locking in the ephemeral namespace of the store, and
 `indexing.zcml` writes the catalog operations of a save to a durable
 namespace, which one indexer applies (`indexing`), `registry.zcml`
 lets the records of a registry move to a durable namespace (`registry`),
-and `catalog.zcml` answers `Catalog.search` from the catalog mirror of the
-store (`catalog`).
+`catalog.zcml` answers `Catalog.search` from the catalog mirror of the
+store (`catalog`), and `security.zcml` keeps `allowedRolesAndUsers` as
+inherited inputs, so a share or a transition of a folder writes the entry
+of the folder alone (`security`).
 """
 
 import os
@@ -23,7 +25,7 @@ __all__ = ["backends_from_environment"]
 
 def backends_from_environment():
     """Install the backends that `ZOE_PLONE_BACKENDS` names, separated by
-    commas: `locking`, `indexing`, `registry` and `catalog`. `configure.zcml` calls it
+    commas: `locking`, `indexing`, `registry`, `catalog` and `security`. `configure.zcml` calls it
     when the ZCML loads, after `<environment>` of `zope.conf` set the
     variable. An unknown name raises `ValueError`."""
     for name in filter(None, os.environ.get("ZOE_PLONE_BACKENDS", "").split(",")):
@@ -44,8 +46,12 @@ def backends_from_environment():
             from zoe.plone import catalog
 
             catalog.install()
+        elif name == "security":
+            from zoe.plone import security
+
+            security.install()
         else:
             raise ValueError(
                 f"no backend {name!r} of zoe.plone:"
-                " use locking, indexing, registry or catalog"
+                " use locking, indexing, registry, catalog or security"
             )
