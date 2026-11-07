@@ -1,6 +1,6 @@
 # Back up and restore
 
-`zoe backup` writes the store into dump files in a backup directory. `zoe restore` builds a new store from them. A dump holds the transactions with their records and blobs, the sequences, and the durable KV namespaces. So a restore gives the same tids, oids, pickles and blob files, and the data of `zoe.plone`.
+`zoe backup` writes the store into dump files in a backup directory. `zoe restore` builds a new store from them. A dump holds the transactions with their records, blobs and text deltas, the sequences, and the durable KV namespaces. So a restore gives the same tids, oids, pickles and blob files, the deltas of the text indexes, and the data of `zoe.plone`. A dump has the version 3. A backup directory that holds a dump of version 2 needs a new full dump in a new directory.
 
 ## When to back up
 
@@ -39,6 +39,7 @@ Backed up the store var/zoe into backups/zoe
   blobs         1 (4096 bytes)
   sequences     0
   durable rows  0
+  deltas        0
 ```
 
 The backup directory holds one file for each dump, named after its range of tids: `<after>-<last>.zoedump`. The command never changes a dump that it wrote. Copy the whole directory to your backup media. Keep the dumps of a chain together: a restore needs each dump from the full dump on.
@@ -72,6 +73,7 @@ Compared the dumps in backups/zoe with the store var/zoe
   blobs            1
   sequences        0
   durable rows     0
+  deltas           0
 Differences: 0
 ```
 
@@ -92,6 +94,7 @@ Restored the store var/zoe-restored from backups/zoe
   blobs         1
   sequences     0
   durable rows  0
+  deltas        0
 ```
 
 - The target must not exist, or must be an empty directory. The command refuses a directory that holds a store, with `zoe restore: var/zoe-restored: holds a store; a restore never writes into a store`. To restore in place, move the damaged store away first.

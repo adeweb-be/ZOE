@@ -45,6 +45,8 @@ The extension module of the wheel has no server and no MCP server. So `zoe serve
 
 Convert a `Data.fs` into a store, or a store into a `Data.fs`. Give `--from-data-fs` or `--to-data-fs`, not both. Each conversion resumes after the last transaction of its target, verifies the target, and writes a report. A report that lists a problem fails the command with 1.
 
+A `Data.fs` has no place for the text deltas of the text indexes of ZOE (ADR 0060, section 6). With `--to-data-fs`, the command leaves them out and never fails for them: its report counts them on the line `left out`, with no text, and a warning goes to stderr. With `--from-data-fs`, it writes no delta.
+
 | Option | Twin | Default | Value |
 | --- | --- | --- | --- |
 | `--path STORE` | `ZOE_PATH` | necessary | The directory of the store. With `--from-data-fs`, the command creates the store when it does not exist. With `--to-data-fs`, the store must exist. |
@@ -64,6 +66,8 @@ Pack a store as of a number of days ago, or report what that pack would remove.
 | `--days N` | `ZOE_DAYS` | necessary | Pack as of N days ago: the time of the clock minus N times 86,400 seconds, as ZODB's `DB.pack(days=N)` computes it. The pack keeps every revision after that time. Of the older revisions, it keeps the newest one of each object that a reader at that time can reach, and removes the others. |
 | `--pack-gc[=BOOL]` | `ZOE_PACK_GC` | `true` | Collect garbage. With `false`, the pack removes old revisions only, as the `pack-gc` of FileStorage does: of the revisions at or before the pack time, it keeps the newest one of each object, also when no reader can reach the object. An object whose newest revision there is a deletion goes. |
 | `--dry-run[=BOOL]` | `ZOE_DRY_RUN` | `false` | Report what the pack would remove, by class, and change nothing. A dry run opens the store read-only. `--dry-run=false` packs, also when the twin asks for a dry run. |
+
+The pack applies the rules of the text deltas too (ADR 0060, section 4): it keeps every delta after the pack time and the newest text of each document at or before it, and removes the texts that a newer text, an unindex or a clear of the index replaced. The report gives the text deltas and the clear deltas that it removes, on the line `deltas`.
 
 ## `zoe serve`
 
@@ -129,7 +133,7 @@ The check reads every row of `text_deltas` and `text_txn` too (ADR 0060). It che
 | `--blob-dir DIR` | `ZOE_BLOB_DIR` | `blobs` in the store directory | The blob directory of the store. A store with blobs whose blob directory has no layout file fails the command before the check. |
 | `--format FORMAT` | `ZOE_FORMAT` | `text` | The format of the report: `text`, lines for a person, or `json`, one JSON document for a program, with oids and tids as integers. |
 | `--classes FILE` | `ZOE_CLASSES` | none | A file of the classes that the application provides, one `module.name` on each line. A class of the store that the file does not name is a finding. It does not go with `--backup`. |
-| `--backup DIR` | `ZOE_BACKUP` | none | Compare the dumps of this backup directory with the store, in place of the check of the store. The command restores the dumps into a copy, opens the store read-only, compares the copy with the store up to the last tid of the dumps, and removes the copy. A difference is a finding. |
+| `--backup DIR` | `ZOE_BACKUP` | none | Compare the dumps of this backup directory with the store, in place of the check of the store. The command restores the dumps into a copy, opens the store read-only, compares the copy with the store up to the last tid of the dumps, and removes the copy. A difference is a finding. The comparison covers the text deltas and the live text of each document at the last tid of the dumps; a delta that a pack removed at or before the pack watermark is no difference, and a difference of a delta names the catalog, the index, the rid and the tid, never the text. |
 | `--scratch SCRATCH` | `ZOE_SCRATCH` | the temporary directory, `TMPDIR` | The directory of the copy of `--backup`, on a filesystem with room for the whole store. It needs `--backup`. The command removes the copy at the end, also when the check fails. |
 
 ## `zoe migrate`
@@ -146,6 +150,8 @@ An open of a store of `ZOE format 3` by this build fails, and the message names 
 
 Write a dump of a store into a backup directory: the full dump the first time, then the transactions after the last dump. With nothing new, the command writes nothing. A running `zoe serve` holds the lock of its stores, so back up a store while no server serves it.
 
+A dump has the version 3: it holds the text deltas of each transaction (ADR 0060, section 6), and the report counts them on the line `deltas`. The command refuses a backup directory that holds a dump of version 2: write a new full dump into a new directory.
+
 | Option | Twin | Default | Value |
 | --- | --- | --- | --- |
 | `--path STORE` | `ZOE_PATH` | necessary | The directory of the store. The command opens it read-only. |
@@ -153,7 +159,7 @@ Write a dump of a store into a backup directory: the full dump the first time, t
 
 ## `zoe restore`
 
-Rebuild a store from the dumps of a backup directory. The command checks every dump before it writes anything. A restore that fails leaves nothing at the target.
+Rebuild a store from the dumps of a backup directory. The command checks every dump before it writes anything. A restore that fails leaves nothing at the target. It reads only the dumps of version 3, and restores each text delta under its tid. A dump of version 2 fails the command with 1.
 
 | Option | Twin | Default | Value |
 | --- | --- | --- | --- |
