@@ -1,5 +1,5 @@
 //! The query of a typed plan over a version: the clauses as ZCatalog's
-//! FieldIndex applies them, and the sort as `Catalog.sortResults` does it.
+//! indexes apply them, and the sort as `Catalog.sortResults` does it.
 //!
 //! A version is a base and its overrides. Each clause applies to the base,
 //! then to the rows of the overrides. A row of a rid that the base does
@@ -16,13 +16,19 @@ use std::collections::HashMap;
 
 use roaring::RoaringBitmap;
 
-use crate::base::{Base, FieldIndex, Index, Posting};
+use crate::base::{
+    Base, DateRangeIndex, FieldIndex, Index, Keys, KeywordIndex, Kind, Posting, Postings, covers,
+    date_range_of, keywords_of,
+};
 use crate::change::{Overrides, Slot, same};
 use crate::reason::{Fallback, Reason};
 use crate::value::{Val, py_cmp};
 
-/// A clause of a plan on a FieldIndex, typed by the client with ZCatalog's
-/// `IndexQuery` and the conversion of the index.
+/// A clause of a plan, typed by the client with ZCatalog's `IndexQuery`
+/// and the conversion of the index. The class of the index tells how the
+/// clause reads: a clause on a BooleanIndex has one key, its truth, or
+/// none; a clause on a DateRangeIndex has one key, its date in minutes, or
+/// `None` for a date that the index does not hold.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clause {
     /// The index.
@@ -168,20 +174,86 @@ impl<'a> View<'a> {
         rows
     }
 
-    fn field(&self, name: &str) -> Result<(usize, &'a FieldIndex), Fallback> {
+    /// The index `name`: its place, its kind and its structure.
+    fn entry(&self, name: &str) -> Result<(usize, Kind, &'a Index), Fallback> {
         let Some(&i) = self.base.by_name.get(name) else {
             return fallback(
                 Reason::IndexUnavailable,
                 format!("the catalog has no index {name}"),
             );
         };
-        match &self.base.indexes[i].index {
-            Index::Field(f) => Ok((i, f)),
-            Index::Unavailable(reason) => fallback(
+        let entry = &self.base.indexes[i];
+        match (&entry.index, entry.kind) {
+            (Index::Unavailable(reason), _) => fallback(
                 Reason::IndexUnavailable,
                 format!("the index {name}: {reason}"),
             ),
+            (index, Some(kind)) => Ok((i, kind, index)),
+            (_, None) => fallback(
+                Reason::IndexUnavailable,
+                format!("the index {name} is of a class that the mirror does not serve"),
+            ),
         }
+    }
+
+    /// The index `name` of a sort: a FieldIndex, a DateIndex or a
+    /// UUIDIndex.
+    fn field(&self, name: &str) -> Result<(usize, &'a FieldIndex), Fallback> {
+        let (i, kind, index) = self.entry(name)?;
+        match index {
+            Index::Field(f) if kind.sorts() => {
+                if kind == Kind::Uuid {
+                    self.unique(i, f)?;
+                }
+                Ok((i, f))
+            }
+            _ => fallback(
+                Reason::Sort,
+                format!("a sort on {name}, an index of a kind that the mirror does not sort"),
+            ),
+        }
+    }
+
+    /// Refuses a UUIDIndex that holds a UUID at more than one row in this
+    /// version. ZCatalog keeps one of these rows in its `_index`, which
+    /// the mirror does not read.
+    fn unique(&self, i: usize, f: &FieldIndex) -> Result<(), Fallback> {
+        let twice = || {
+            fallback(
+                Reason::IndexUnavailable,
+                "the UUIDIndex holds a UUID at more than one row",
+            )
+        };
+        let changed = self.changed(Slot::Index(i));
+        let touched: RoaringBitmap = changed.iter().map(|(row, _)| *row).collect();
+        for rows in f.postings.many() {
+            if (rows - &touched).len() > 1 {
+                return twice();
+            }
+        }
+        let values: Vec<&Val> = changed.iter().filter_map(|(_, v)| *v).collect();
+        for value in &values {
+            if let Some(Ok(s)) = f.keys.search(value)
+                && !(f.postings.get(s).to_bitmap() - &touched).is_empty()
+            {
+                return twice();
+            }
+        }
+        let texts: Option<Vec<&str>> = values.iter().map(|v| v.text()).collect();
+        let repeated = match texts {
+            Some(mut texts) => {
+                texts.sort_unstable();
+                texts.windows(2).any(|w| w[0] == w[1])
+            }
+            None => values
+                .iter()
+                .enumerate()
+                .any(|(k, a)| values[k + 1..].iter().any(|b| same(a, b))),
+        };
+        if repeated {
+            return twice();
+        }
+        Ok(())
     }
 
     /// The `_length` of the index at `i` in this version.
@@ -196,12 +268,34 @@ impl<'a> View<'a> {
     /// Answers `plan`.
     pub fn query(&self, plan: &Plan) -> Result<Reply, Fallback> {
         let mut trace = Trace::default();
-        let mut rs: Option<RoaringBitmap> = None;
+        // The clauses on a DateRangeIndex apply last, so they see the
+        // result of the others: ZCatalog's answer for a row without an
+        // entry depends on the order of its plan.
+        let mut ranges: Vec<(usize, &DateRangeIndex, Option<i64>)> = Vec::new();
+        let mut order: Vec<&Clause> = Vec::new();
+        for clause in &plan.clauses {
+            let (i, _, index) = self.entry(&clause.index)?;
+            match index {
+                Index::DateRange(d) => {
+                    let t = term(clause)?;
+                    if t.is_none() && plan.clauses.len() > 1 {
+                        // ZCatalog raises unless the index comes first in
+                        // its plan.
+                        return fallback(
+                            Reason::DateRangeOrder,
+                            "a date outside the range of a DateRangeIndex, with other clauses",
+                        );
+                    }
+                    ranges.push((i, d, t));
+                }
+                _ => order.push(clause),
+            }
+        }
         // ZCatalog intersects the sets of the indexes in an order of its
-        // own; the sets of FieldIndexes intersect in any order. The ranges
-        // come last, so they see the smallest result set.
-        let mut order: Vec<&Clause> = plan.clauses.iter().collect();
+        // own; the sets of the other indexes intersect in any order. The
+        // ranges come last, so they see the smallest result set.
         order.sort_by_key(|c| c.range.is_some());
+        let mut rs: Option<RoaringBitmap> = None;
         for clause in order {
             let set = self.clause(clause, rs.as_ref(), &mut trace)?;
             rs = Some(match rs {
@@ -214,6 +308,9 @@ impl<'a> View<'a> {
             if rs.as_ref().is_some_and(RoaringBitmap::is_empty) {
                 break;
             }
+        }
+        if !ranges.is_empty() && !rs.as_ref().is_some_and(RoaringBitmap::is_empty) {
+            rs = Some(self.date_ranges(&ranges, rs, plan.clauses.len() == 1)?);
         }
         let rs = match rs {
             Some(rs) if !rs.is_empty() => rs,
@@ -230,15 +327,74 @@ impl<'a> View<'a> {
         Ok(reply)
     }
 
+    /// The rows of the clauses on DateRangeIndexes over `rs`, the result of
+    /// the other clauses. ZCatalog drops a row without an entry when the
+    /// index comes first in its plan, and keeps it when the index comes
+    /// later: such a row in the result gives `date_range_order`. The only
+    /// clause of a query always comes first.
+    fn date_ranges(
+        &self,
+        ranges: &[(usize, &DateRangeIndex, Option<i64>)],
+        rs: Option<RoaringBitmap>,
+        alone: bool,
+    ) -> Result<RoaringBitmap, Fallback> {
+        if alone && let [(i, d, t)] = ranges {
+            return Ok(self.date_range(*i, d, *t).0);
+        }
+        let mut r = rs.unwrap_or_else(|| self.all_rows());
+        let mut entries = Vec::with_capacity(ranges.len());
+        for (i, d, t) in ranges {
+            let (matched, with_entry) = self.date_range(*i, d, *t);
+            let missing = &r - &with_entry;
+            r &= &matched;
+            r |= missing;
+            entries.push(with_entry);
+        }
+        if entries.iter().any(|e| !(&r - e).is_empty()) {
+            return fallback(
+                Reason::DateRangeOrder,
+                "a row of the result has no entry in a DateRangeIndex of the query",
+            );
+        }
+        Ok(r)
+    }
+
+    /// The rows whose range holds `t` in the DateRangeIndex at `i`, in this
+    /// version, and the rows with an entry. For no date, each row with an
+    /// entry: ZCatalog then takes every key of its trees.
+    fn date_range(
+        &self,
+        i: usize,
+        d: &DateRangeIndex,
+        t: Option<i64>,
+    ) -> (RoaringBitmap, RoaringBitmap) {
+        let mut entries = d.indexed.clone();
+        let mut matched = match t {
+            Some(t) => d.matched(t),
+            None => d.indexed.clone(),
+        };
+        for (row, value) in self.changed(Slot::Index(i)) {
+            entries.remove(row);
+            matched.remove(row);
+            if let Some(bounds) = value.and_then(date_range_of) {
+                entries.insert(row);
+                if t.is_none_or(|t| covers(bounds, t)) {
+                    matched.insert(row);
+                }
+            }
+        }
+        (matched, entries)
+    }
+
     /// The rows of `key` in the index at `i`, in this version.
-    fn posting(&self, i: usize, f: &FieldIndex, key: &Val) -> RoaringBitmap {
-        let mut rows = match f.keys.search(key) {
-            Some(Ok(s)) => f.postings.get(s).to_bitmap(),
+    fn posting(&self, i: usize, keyed: Keyed<'_>, key: &Val) -> RoaringBitmap {
+        let mut rows = match keyed.keys().search(key) {
+            Some(Ok(s)) => keyed.postings().get(s).to_bitmap(),
             _ => RoaringBitmap::new(),
         };
         for (row, value) in self.changed(Slot::Index(i)) {
             rows.remove(row);
-            if value.is_some_and(|v| same(v, key)) {
+            if value.is_some_and(|v| keyed.items(v).iter().any(|x| same(x, key))) {
                 rows.insert(row);
             }
         }
@@ -246,10 +402,10 @@ impl<'a> View<'a> {
     }
 
     /// The rows with a key in the index at `i`, in this version.
-    fn indexed(&self, i: usize, f: &FieldIndex) -> RoaringBitmap {
-        let mut rows = f.indexed.clone();
+    fn indexed(&self, i: usize, keyed: Keyed<'_>) -> RoaringBitmap {
+        let mut rows = keyed.indexed().clone();
         for (row, value) in self.changed(Slot::Index(i)) {
-            if value.is_some() {
+            if value.is_some_and(|v| !keyed.items(v).is_empty()) {
                 rows.insert(row);
             } else {
                 rows.remove(row);
@@ -259,31 +415,96 @@ impl<'a> View<'a> {
     }
 
     /// The rows of the keys of `not`, which `_apply_not` gives.
-    fn excluded(&self, i: usize, f: &FieldIndex, not: &[Val]) -> RoaringBitmap {
+    fn excluded(&self, i: usize, keyed: Keyed<'_>, not: &[Val]) -> RoaringBitmap {
         let mut out = RoaringBitmap::new();
         for key in not.iter().filter(|k| **k != Val::None) {
-            out |= self.posting(i, f, key);
+            out |= self.posting(i, keyed, key);
         }
         out
     }
 
-    /// The rows of a clause, as `UnIndex.query_index` gives them for the
-    /// result set `rs`.
+    /// The rows of a clause, as the `query_index` of its index gives them
+    /// for the result set `rs`. A clause on a DateRangeIndex applies in
+    /// `date_ranges`.
     fn clause(
         &self,
         clause: &Clause,
         rs: Option<&RoaringBitmap>,
         trace: &mut Trace,
     ) -> Result<RoaringBitmap, Fallback> {
-        let (i, f) = self.field(&clause.index)?;
+        let (i, kind, index) = self.entry(&clause.index)?;
+        match (kind, index) {
+            (Kind::Boolean, Index::Field(f)) => self.boolean(i, f, clause),
+            (Kind::Keyword, Index::Keyword(k)) => self.values(i, Keyed::Many(k), clause, rs, trace),
+            (Kind::Uuid, Index::Field(f)) => {
+                self.unique(i, f)?;
+                self.values(i, Keyed::One(f), clause, rs, trace)
+            }
+            (Kind::Field | Kind::Date, Index::Field(f)) => {
+                self.values(i, Keyed::One(f), clause, rs, trace)
+            }
+            _ => fallback(
+                Reason::IndexUnavailable,
+                format!(
+                    "the structure of the index {} is not of its class",
+                    clause.index
+                ),
+            ),
+        }
+    }
+
+    /// The rows of a clause on a BooleanIndex: the rows whose value has the
+    /// truth of the first key, as `BooleanIndex.query_index` gives them. No
+    /// key gives no row.
+    fn boolean(
+        &self,
+        i: usize,
+        f: &FieldIndex,
+        clause: &Clause,
+    ) -> Result<RoaringBitmap, Fallback> {
+        if clause.range.is_some() || !clause.not.is_empty() || clause.and || clause.keys.len() > 1 {
+            return fallback(
+                Reason::Option,
+                "an option that a BooleanIndex does not take",
+            );
+        }
+        let Some(key) = clause.keys.first() else {
+            return Ok(RoaringBitmap::new());
+        };
+        let wanted = truth(key);
+        let mut rows = RoaringBitmap::new();
+        for s in 0..f.keys.len() as u32 {
+            if truth(&f.keys.get(s)) == wanted {
+                f.postings.get(s).add_to(&mut rows);
+            }
+        }
+        for (row, value) in self.changed(Slot::Index(i)) {
+            rows.remove(row);
+            if value.is_some_and(|v| truth(v) == wanted) {
+                rows.insert(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The rows of a clause of keys, as `UnIndex.query_index` gives them for
+    /// the result set `rs`.
+    fn values(
+        &self,
+        i: usize,
+        keyed: Keyed<'_>,
+        clause: &Clause,
+        rs: Option<&RoaringBitmap>,
+        trace: &mut Trace,
+    ) -> Result<RoaringBitmap, Fallback> {
         let keys: Vec<&Val> = clause.keys.iter().filter(|k| **k != Val::None).collect();
         if let Some((lo, hi)) = &clause.range {
             if clause.and {
                 return fallback(Reason::AndRange, "a range with the operator and");
             }
-            let mut rows = self.range(i, f, lo.as_ref(), hi.as_ref(), rs, trace)?;
+            let mut rows = self.range(i, keyed, lo.as_ref(), hi.as_ref(), rs, trace)?;
             if !clause.not.is_empty() {
-                rows -= self.excluded(i, f, &clause.not);
+                rows -= self.excluded(i, keyed, &clause.not);
             }
             return Ok(rows);
         }
@@ -295,7 +516,7 @@ impl<'a> View<'a> {
             if clause.and {
                 return fallback(Reason::Option, "a query of not alone with the operator and");
             }
-            let excluded = self.excluded(i, f, &clause.not);
+            let excluded = self.excluded(i, keyed, &clause.not);
             if !excluded.is_empty() {
                 let mut all = match rs {
                     Some(r) => r.clone(),
@@ -304,11 +525,11 @@ impl<'a> View<'a> {
                 all -= excluded;
                 return Ok(all);
             }
-            return Ok(self.indexed(i, f));
+            return Ok(self.indexed(i, keyed));
         }
         let mut sets = Vec::with_capacity(keys.len());
         for key in keys {
-            let rows = self.posting(i, f, key);
+            let rows = self.posting(i, keyed, key);
             if rows.is_empty() && clause.and {
                 return Ok(RoaringBitmap::new());
             }
@@ -336,7 +557,7 @@ impl<'a> View<'a> {
             r
         };
         if !clause.not.is_empty() {
-            r -= self.excluded(i, f, &clause.not);
+            r -= self.excluded(i, keyed, &clause.not);
         }
         Ok(r)
     }
@@ -345,13 +566,13 @@ impl<'a> View<'a> {
     /// `index.values(lo, hi)` gives them.
     ///
     /// When the result set of the other clauses holds fewer rows than the
-    /// range has keys, the range tests the key of each row of that set:
-    /// one read of the rank of each row costs less than the union of the
+    /// range has keys, the range tests the keys of each row of that set:
+    /// one read of the ranks of each row costs less than the union of the
     /// rows of each key.
     fn range(
         &self,
         i: usize,
-        f: &FieldIndex,
+        keyed: Keyed<'_>,
         lo: Option<&Val>,
         hi: Option<&Val>,
         rs: Option<&RoaringBitmap>,
@@ -363,16 +584,17 @@ impl<'a> View<'a> {
                 "a bound of a range that the keys of the index do not order",
             )
         };
+        let keys_of = keyed.keys();
         let first = match lo {
             None => 0,
-            Some(lo) => match f.keys.search(lo) {
+            Some(lo) => match keys_of.search(lo) {
                 Some(Ok(s) | Err(s)) => s,
                 None => return Err(unordered()),
             },
         };
         let end = match hi {
-            None => f.keys.len() as u32,
-            Some(hi) => match f.keys.search(hi) {
+            None => keys_of.len() as u32,
+            Some(hi) => match keys_of.search(hi) {
                 Some(Ok(s)) => s + 1,
                 Some(Err(s)) => s,
                 None => return Err(unordered()),
@@ -392,7 +614,7 @@ impl<'a> View<'a> {
         let mut rows = RoaringBitmap::new();
         if end > first {
             let keys = end - first;
-            let in_keys = |row: u32| f.slot(row).is_some_and(|s| s >= first && s < end);
+            let in_keys = |row: u32| keyed.row_in(row, first, end);
             match rs {
                 Some(rs) if rs.len() < u64::from(keys) => {
                     trace.range_by_rows += 1;
@@ -400,12 +622,12 @@ impl<'a> View<'a> {
                 }
                 _ if keys > MANY_KEYS => {
                     trace.range_by_rows += 1;
-                    rows.extend(f.indexed.iter().filter(|row| in_keys(*row)));
+                    rows.extend(keyed.indexed().iter().filter(|row| in_keys(*row)));
                 }
                 _ => {
                     trace.range_by_keys += 1;
                     for s in first..end {
-                        f.postings.get(s).add_to(&mut rows);
+                        keyed.postings().get(s).add_to(&mut rows);
                     }
                 }
             }
@@ -415,12 +637,12 @@ impl<'a> View<'a> {
         for (row, value) in self.changed(Slot::Index(i)) {
             rows.remove(row);
             if let Some(value) = value {
-                match in_range(value) {
-                    Some(true) => {
-                        rows.insert(row);
-                    }
-                    Some(false) => {}
-                    None => return Err(unordered()),
+                let mut found = false;
+                for item in keyed.items(value) {
+                    found |= in_range(item).ok_or_else(unordered)?;
+                }
+                if found {
+                    rows.insert(row);
                 }
             }
         }
@@ -789,6 +1011,90 @@ impl<'a> View<'a> {
             len,
             actual,
             trace: Trace::default(),
+        }
+    }
+}
+
+/// The term of a clause on a DateRangeIndex: its one key, a date in
+/// minutes, or `None` for a date that the index does not hold.
+fn term(clause: &Clause) -> Result<Option<i64>, Fallback> {
+    if clause.range.is_some() || !clause.not.is_empty() || clause.and {
+        return fallback(
+            Reason::Option,
+            "an option that a DateRangeIndex does not take",
+        );
+    }
+    match &clause.keys[..] {
+        [Val::Int(t)] => Ok(Some(*t)),
+        [Val::None] => Ok(None),
+        _ => fallback(
+            Reason::Option,
+            "a clause on a DateRangeIndex takes one date",
+        ),
+    }
+}
+
+/// The truth of a value, as Python's `bool` gives it.
+fn truth(value: &Val) -> bool {
+    match value {
+        Val::None | Val::Missing => false,
+        Val::Bool(b) => *b,
+        Val::Int(i) => *i != 0,
+        Val::Float(f) => *f != 0.0,
+        Val::Str(s) => !s.is_empty(),
+        Val::Bytes(b) => !b.is_empty(),
+        Val::Tuple(v) | Val::List(v) => !v.is_empty(),
+        Val::Message(_) => value.text().is_some_and(|t| !t.is_empty()),
+        Val::DateTime(..) => true,
+    }
+}
+
+/// The structure that a clause of keys reads: one key for each row, or
+/// several.
+#[derive(Clone, Copy)]
+enum Keyed<'a> {
+    /// A FieldIndex, a DateIndex or a UUIDIndex.
+    One(&'a FieldIndex),
+    /// A KeywordIndex.
+    Many(&'a KeywordIndex),
+}
+
+impl<'a> Keyed<'a> {
+    fn keys(self) -> &'a Keys {
+        match self {
+            Keyed::One(f) => &f.keys,
+            Keyed::Many(k) => &k.keys,
+        }
+    }
+
+    fn postings(self) -> &'a Postings {
+        match self {
+            Keyed::One(f) => &f.postings,
+            Keyed::Many(k) => &k.postings,
+        }
+    }
+
+    fn indexed(self) -> &'a RoaringBitmap {
+        match self {
+            Keyed::One(f) => &f.indexed,
+            Keyed::Many(k) => &k.indexed,
+        }
+    }
+
+    /// Tells if a key of `row` in the base has a slot from `first` to
+    /// `end`, `end` excluded.
+    fn row_in(self, row: u32, first: u32, end: u32) -> bool {
+        match self {
+            Keyed::One(f) => f.slot(row).is_some_and(|s| s >= first && s < end),
+            Keyed::Many(k) => k.row_slots(row).iter().any(|s| *s >= first && *s < end),
+        }
+    }
+
+    /// The keys of a value of the overrides.
+    fn items(self, value: &Val) -> &[Val] {
+        match self {
+            Keyed::One(_) => std::slice::from_ref(value),
+            Keyed::Many(_) => keywords_of(value),
         }
     }
 }

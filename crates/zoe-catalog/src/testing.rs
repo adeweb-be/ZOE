@@ -6,12 +6,16 @@
 //!   pickler of zodbpickle and protocol 3: one memo for the class pickle
 //!   and the state pickle, a new tuple `(oid, class)` for each persistent
 //!   reference, and the oid bytes and the class shared in the record.
-//! - The record writers (`catalog_record`, `index_record`, `length_record`,
-//!   `tree_record`, `bucket_record`) give the records of the classes that
-//!   a catalog holds. A test compares them with records that CPython wrote.
+//! - The record writers (`catalog_record`, `index_record`,
+//!   `date_index_record`, `uuid_index_record`, `boolean_index_record`,
+//!   `date_range_index_record`, `length_record`, `tree_record`,
+//!   `bucket_record`) give the records of the classes that a catalog
+//!   holds. A test compares them with records that CPython wrote.
 //! - `CatalogModel` keeps a catalog with its indexes and its trees, as
 //!   `Catalog.catalogObject` and `uncatalogObject` change them, and gives
-//!   the records that changed since the last call. Its trees split a
+//!   the records that changed since the last call. Its indexes are
+//!   FieldIndexes, KeywordIndexes, DateIndexes, UUIDIndexes, BooleanIndexes
+//!   and DateRangeIndexes, each with its own trees. Its trees split a
 //!   bucket at half of its items, past the largest bucket of the family,
 //!   and an inner node at half of its children, past the largest inner
 //!   node of the family or the fan-out of `with_fanout`; the root splits as
@@ -356,6 +360,15 @@ pub const OO: Family = Family {
     set: false,
     internal: 250,
 };
+/// `IIBTree`.
+pub const II: Family = Family {
+    module: "BTrees.IIBTree",
+    tree: "IIBTree",
+    bucket: "IIBucket",
+    leaf: 120,
+    set: false,
+    internal: 500,
+};
 /// `IITreeSet`.
 pub const II_SET: Family = Family {
     module: "BTrees.IIBTree",
@@ -551,6 +564,167 @@ pub fn index_record(
     items.push((key, p.reference(counter, "BTrees.Length", "Length")));
     let state = p.dict(items);
     p.record(module, name, state)
+}
+
+/// One attribute of the state of an index object.
+enum Attr<'a> {
+    /// The id of the index.
+    Id,
+    /// `None`.
+    None,
+    /// An int.
+    Int(i64),
+    /// A str.
+    Str(&'a str),
+    /// The list `[id]`.
+    IdList,
+    /// A persistent reference to `oid`, of the class of `family`'s tree.
+    Tree(u64, Family),
+    /// A persistent reference to a `BTrees.Length.Length`.
+    Length(u64),
+}
+
+/// The record of an index of the class `class` with the id `id` and the
+/// attributes `attrs`, in the order of its `__dict__`.
+fn index_object(class: (&str, &str), id: &str, attrs: &[(&str, Attr<'_>)]) -> Vec<u8> {
+    let mut p = Pickle::default();
+    let mut items = Vec::new();
+    let mut id_str = None;
+    for (name, attr) in attrs {
+        let key = p.str(name);
+        let value = match attr {
+            Attr::Id => *id_str.get_or_insert_with(|| p.str(id)),
+            Attr::None => Py::None,
+            Attr::Int(i) => Py::Int(*i),
+            Attr::Str(text) => p.str(text),
+            Attr::IdList => {
+                let id = *id_str.get_or_insert_with(|| p.str(id));
+                p.list(vec![id])
+            }
+            Attr::Tree(oid, family) => p.reference(*oid, family.module, family.tree),
+            Attr::Length(oid) => p.reference(*oid, "BTrees.Length", "Length"),
+        };
+        items.push((key, value));
+    }
+    let state = p.dict(items);
+    p.record(class.0, class.1, state)
+}
+
+/// The record of a `DateIndex`, with the oids of its `_index`, its
+/// `_unindex`, its `_length` and its `_counter`.
+pub fn date_index_record(id: &str, index: u64, unindex: u64, length: u64, counter: u64) -> Vec<u8> {
+    index_object(
+        crate::base::DATE_INDEX,
+        id,
+        &[
+            ("id", Attr::Id),
+            ("ignore_ex", Attr::None),
+            ("call_methods", Attr::None),
+            ("indexed_attrs", Attr::IdList),
+            ("_index", Attr::Tree(index, IO)),
+            ("_unindex", Attr::Tree(unindex, II)),
+            ("_length", Attr::Length(length)),
+            ("_counter", Attr::Length(counter)),
+        ],
+    )
+}
+
+/// The record of a `UUIDIndex`, with the oids of its `_length`, its
+/// `_index`, its `_unindex` and its `_counter`.
+pub fn uuid_index_record(id: &str, length: u64, index: u64, unindex: u64, counter: u64) -> Vec<u8> {
+    index_object(
+        crate::base::UUID_INDEX,
+        id,
+        &[
+            ("id", Attr::Id),
+            ("ignore_ex", Attr::None),
+            ("call_methods", Attr::None),
+            ("indexed_attrs", Attr::IdList),
+            ("_length", Attr::Length(length)),
+            ("_index", Attr::Tree(index, OI)),
+            ("_unindex", Attr::Tree(unindex, IO)),
+            ("_counter", Attr::Length(counter)),
+        ],
+    )
+}
+
+/// The oids and the indexed value of a `BooleanIndex`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BooleanOids {
+    /// `_index`, an `IITreeSet`.
+    pub index: u64,
+    /// `_index_length`.
+    pub index_length: u64,
+    /// `_index_value`: the value of the rows of `_index`.
+    pub index_value: i64,
+    /// `_unindex`, an `IIBTree`.
+    pub unindex: u64,
+    /// `_length`.
+    pub length: u64,
+    /// `_counter`.
+    pub counter: u64,
+}
+
+/// The record of a `BooleanIndex`.
+pub fn boolean_index_record(id: &str, oids: &BooleanOids) -> Vec<u8> {
+    index_object(
+        crate::base::BOOLEAN_INDEX,
+        id,
+        &[
+            ("id", Attr::Id),
+            ("ignore_ex", Attr::None),
+            ("call_methods", Attr::None),
+            ("indexed_attrs", Attr::IdList),
+            ("_index", Attr::Tree(oids.index, II_SET)),
+            ("_index_length", Attr::Length(oids.index_length)),
+            ("_index_value", Attr::Int(oids.index_value)),
+            ("_unindex", Attr::Tree(oids.unindex, II)),
+            ("_length", Attr::Length(oids.length)),
+            ("_counter", Attr::Length(oids.counter)),
+        ],
+    )
+}
+
+/// The fields and the oids of a `DateRangeIndex`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DateRangeOids<'a> {
+    /// `_since_field`.
+    pub since_field: &'a str,
+    /// `_until_field`.
+    pub until_field: &'a str,
+    /// `_always`, an `IITreeSet`.
+    pub always: u64,
+    /// `_since_only`, `_until_only`, `_since` and `_until`, each an
+    /// `IOBTree`.
+    pub trees: [u64; 4],
+    /// `_unindex`, an `IOBTree`.
+    pub unindex: u64,
+    /// `_length`.
+    pub length: u64,
+    /// `_counter`.
+    pub counter: u64,
+}
+
+/// The record of a `DateRangeIndex`.
+pub fn date_range_index_record(id: &str, oids: &DateRangeOids<'_>) -> Vec<u8> {
+    let [since_only, until_only, since, until] = oids.trees;
+    index_object(
+        crate::base::DATE_RANGE_INDEX,
+        id,
+        &[
+            ("id", Attr::Id),
+            ("_since_field", Attr::Str(oids.since_field)),
+            ("_until_field", Attr::Str(oids.until_field)),
+            ("_always", Attr::Tree(oids.always, II_SET)),
+            ("_since_only", Attr::Tree(since_only, IO)),
+            ("_until_only", Attr::Tree(until_only, IO)),
+            ("_since", Attr::Tree(since, IO)),
+            ("_until", Attr::Tree(until, IO)),
+            ("_unindex", Attr::Tree(oids.unindex, IO)),
+            ("_length", Attr::Length(oids.length)),
+            ("_counter", Attr::Length(oids.counter)),
+        ],
+    )
 }
 
 /// A bucket of a tree of the model.
@@ -887,8 +1061,33 @@ fn state(node: &Inner) -> TreeRecord {
 pub enum IndexKind {
     /// A FieldIndex.
     Field,
+    /// A KeywordIndex: the value of a row is a list or a tuple of keys.
+    Keyword,
+    /// A DateIndex: the value of a row is its date in minutes.
+    Date,
+    /// A UUIDIndex: the value of a row is a str.
+    Uuid,
+    /// A BooleanIndex: the value of a row is a bool.
+    Boolean,
+    /// A DateRangeIndex on the attributes `since` and `until`: the value of
+    /// a row is the tuple `(since, until)`, each in minutes or `None`.
+    DateRange(&'static str, &'static str),
     /// An index of another class, `module.name`, whose trees stay empty.
     Other(&'static str, &'static str),
+}
+
+impl IndexKind {
+    /// The families of `_index` and of `_unindex`. The `_index` of a
+    /// DateRangeIndex is its `_always`.
+    fn families(self) -> (Family, Family) {
+        match self {
+            IndexKind::Field | IndexKind::Keyword | IndexKind::Other(..) => (OO, IO),
+            IndexKind::Date => (IO, II),
+            IndexKind::Uuid => (OI, IO),
+            IndexKind::Boolean => (II_SET, II),
+            IndexKind::DateRange(..) => (II_SET, IO),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -902,14 +1101,437 @@ struct IndexModel {
     unindex: Tree,
     /// The tree set of each key of `_index`.
     sets: Vec<(Val, Tree)>,
+    /// A BooleanIndex: `_index_length`, and `_index_value`.
+    boolean: ((u64, i64), i64),
+    /// The `_index_length` that the last records gave.
+    written: Option<(u64, i64)>,
+    /// A DateRangeIndex: `_since_only`, `_until_only`, `_since` and
+    /// `_until`, with the tree set of each of their keys.
+    ranges: Vec<(Tree, Vec<(Val, Tree)>)>,
     dirty: bool,
 }
 
 impl IndexModel {
+    fn new(id: &str, kind: IndexKind, next: &mut u64, fanout: Option<usize>) -> IndexModel {
+        let (index_family, unindex_family) = kind.families();
+        let oid = take(next);
+        let length = (take(next), 0);
+        let counter = (take(next), 0);
+        let index = Tree::new(take(next), index_family, fanout);
+        let unindex = Tree::new(take(next), unindex_family, fanout);
+        let mut model = IndexModel {
+            id: id.to_owned(),
+            kind,
+            oid,
+            length,
+            counter,
+            index,
+            unindex,
+            sets: Vec::new(),
+            boolean: ((0, 0), 1),
+            written: None,
+            ranges: Vec::new(),
+            dirty: true,
+        };
+        model.clear_extra(next, fanout);
+        model
+    }
+
+    /// New objects for the attributes of a BooleanIndex or of a
+    /// DateRangeIndex beyond `_index` and `_unindex`, as `clear` makes them.
+    fn clear_extra(&mut self, next: &mut u64, fanout: Option<usize>) {
+        match self.kind {
+            IndexKind::Boolean => self.boolean = ((take(next), 0), 1),
+            IndexKind::DateRange(..) => {
+                self.ranges = (0..4)
+                    .map(|_| (Tree::new(take(next), IO, fanout), Vec::new()))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
     fn class(&self) -> (&'static str, &'static str) {
         match self.kind {
             IndexKind::Field => crate::base::FIELD_INDEX,
+            IndexKind::Keyword => crate::base::KEYWORD_INDEX,
+            IndexKind::Date => crate::base::DATE_INDEX,
+            IndexKind::Uuid => crate::base::UUID_INDEX,
+            IndexKind::Boolean => crate::base::BOOLEAN_INDEX,
+            IndexKind::DateRange(..) => crate::base::DATE_RANGE_INDEX,
             IndexKind::Other(module, name) => (module, name),
+        }
+    }
+
+    /// The record of the index object.
+    fn record(&self) -> Vec<u8> {
+        let (module, name) = self.class();
+        match self.kind {
+            IndexKind::Field | IndexKind::Keyword | IndexKind::Other(..) => index_record(
+                module,
+                name,
+                &self.id,
+                self.length.0,
+                self.index.root,
+                self.unindex.root,
+                self.counter.0,
+            ),
+            IndexKind::Date => date_index_record(
+                &self.id,
+                self.index.root,
+                self.unindex.root,
+                self.length.0,
+                self.counter.0,
+            ),
+            IndexKind::Uuid => uuid_index_record(
+                &self.id,
+                self.length.0,
+                self.index.root,
+                self.unindex.root,
+                self.counter.0,
+            ),
+            IndexKind::Boolean => boolean_index_record(
+                &self.id,
+                &BooleanOids {
+                    index: self.index.root,
+                    index_length: self.boolean.0.0,
+                    index_value: self.boolean.1,
+                    unindex: self.unindex.root,
+                    length: self.length.0,
+                    counter: self.counter.0,
+                },
+            ),
+            IndexKind::DateRange(since_field, until_field) => date_range_index_record(
+                &self.id,
+                &DateRangeOids {
+                    since_field,
+                    until_field,
+                    always: self.index.root,
+                    trees: [0, 1, 2, 3].map(|k| self.ranges[k].0.root),
+                    unindex: self.unindex.root,
+                    length: self.length.0,
+                    counter: self.counter.0,
+                },
+            ),
+        }
+    }
+
+    /// The value of `doc` in `_unindex`.
+    fn old(&self, doc: &Val) -> Option<Val> {
+        match self.unindex.get(doc) {
+            Some(Item::Val(v)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Indexes `datum` for `rid`, as `index_object` of the class does. Tells
+    /// if the counter changes.
+    fn index_object(
+        &mut self,
+        rid: i32,
+        datum: Option<Val>,
+        new_oid: &mut impl FnMut() -> u64,
+    ) -> bool {
+        let doc = Val::Int(i64::from(rid));
+        let old = self.old(&doc);
+        match self.kind {
+            IndexKind::Other(..) => false,
+            IndexKind::Field | IndexKind::Date | IndexKind::Uuid => {
+                if old == datum {
+                    return false;
+                }
+                if let Some(old) = &old {
+                    self.remove_forward(old, rid);
+                }
+                match datum {
+                    Some(datum) => {
+                        self.insert_forward(&datum, rid, new_oid);
+                        self.unindex.set(doc, Item::Val(datum), new_oid);
+                    }
+                    None => {
+                        self.unindex.remove(&doc);
+                    }
+                }
+                true
+            }
+            IndexKind::Keyword => {
+                let new: Vec<Val> = match &datum {
+                    Some(Val::List(items) | Val::Tuple(items)) => {
+                        let mut keys: Vec<Val> = Vec::new();
+                        for item in items.iter() {
+                            if !keys.contains(item) {
+                                keys.push(item.clone());
+                            }
+                        }
+                        keys.sort_by(order);
+                        keys
+                    }
+                    _ => Vec::new(),
+                };
+                let old: Vec<Val> = old
+                    .map(|v| crate::base::keywords_of(&v).to_vec())
+                    .unwrap_or_default();
+                for key in old.iter().filter(|k| !new.contains(k)) {
+                    self.remove_forward(key, rid);
+                }
+                for key in new.iter().filter(|k| !old.contains(k)) {
+                    self.insert_forward(key, rid, new_oid);
+                }
+                if new.is_empty() {
+                    self.unindex.remove(&doc);
+                } else if new != old {
+                    self.unindex
+                        .set(doc, Item::Val(Val::List(new.into())), new_oid);
+                }
+                // `_index_object` of a KeywordIndex always tells of a change.
+                true
+            }
+            IndexKind::Boolean => {
+                let datum = datum.map(|v| {
+                    Val::Int(i64::from(!matches!(
+                        v,
+                        Val::None | Val::Bool(false) | Val::Int(0)
+                    )))
+                });
+                if old == datum {
+                    return false;
+                }
+                if let Some(old) = &old {
+                    self.boolean_remove(old, rid, false, new_oid);
+                    if datum.is_none() {
+                        self.unindex.remove(&doc);
+                        self.length.1 -= 1;
+                    }
+                }
+                if let Some(datum) = datum {
+                    self.boolean_insert(datum, rid, new_oid);
+                }
+                true
+            }
+            IndexKind::DateRange(..) => {
+                let datum = datum.unwrap_or_else(|| Val::Tuple(vec![Val::None, Val::None].into()));
+                if old.as_ref() == Some(&datum) {
+                    return false;
+                }
+                if let Some(old) = &old {
+                    self.range_forward(old, rid, false, new_oid);
+                }
+                self.range_forward(&datum, rid, true, new_oid);
+                self.unindex.set(doc, Item::Val(datum), new_oid);
+                true
+            }
+        }
+    }
+
+    /// Unindexes `rid`, as `unindex_object` of the class does. Tells if the
+    /// counter changes.
+    fn unindex_object(&mut self, rid: i32, new_oid: &mut impl FnMut() -> u64) -> bool {
+        let doc = Val::Int(i64::from(rid));
+        let Some(old) = self.old(&doc) else {
+            return false;
+        };
+        match self.kind {
+            IndexKind::Other(..) => return false,
+            IndexKind::Field | IndexKind::Date | IndexKind::Uuid => self.remove_forward(&old, rid),
+            IndexKind::Keyword => {
+                for key in crate::base::keywords_of(&old).to_vec() {
+                    self.remove_forward(&key, rid);
+                }
+            }
+            IndexKind::Boolean => {
+                self.boolean_remove(&old, rid, true, new_oid);
+                self.length.1 -= 1;
+            }
+            IndexKind::DateRange(..) => self.range_forward(&old, rid, false, new_oid),
+        }
+        self.unindex.remove(&doc);
+        true
+    }
+
+    /// Adds `rid` to the rows of `key` in `_index`.
+    fn insert_forward(&mut self, key: &Val, rid: i32, new_oid: &mut impl FnMut() -> u64) {
+        let row = Val::Int(i64::from(rid));
+        if self.kind == IndexKind::Uuid {
+            // One row for each UUID: the first row keeps it.
+            if self.index.get(key).is_none() {
+                self.index.set(key.clone(), Item::Val(row), new_oid);
+                self.length.1 += 1;
+                self.dirty = true;
+            }
+            return;
+        }
+        match self.sets.iter().position(|(k, _)| k == key) {
+            Some(i) => self.sets[i].1.set(row, Item::Val(Val::None), new_oid),
+            None => {
+                let mut set = Tree::new(new_oid(), II_SET, None);
+                set.set(row, Item::Val(Val::None), new_oid);
+                let reference = Item::Ref(set.root, II_SET.module, II_SET.tree);
+                self.index.set(key.clone(), reference, new_oid);
+                self.sets.push((key.clone(), set));
+                self.length.1 += 1;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Removes `rid` from the rows of `key` in `_index`.
+    fn remove_forward(&mut self, key: &Val, rid: i32) {
+        if self.kind == IndexKind::Uuid {
+            // The key goes, whichever row holds it.
+            if self.index.remove(key).is_some() {
+                self.length.1 -= 1;
+                self.dirty = true;
+            }
+            return;
+        }
+        let Some(i) = self.sets.iter().position(|(k, _)| k == key) else {
+            return;
+        };
+        self.sets[i].1.remove(&Val::Int(i64::from(rid)));
+        if self.sets[i].1.is_empty() {
+            self.sets.remove(i);
+            self.index.remove(key);
+            self.length.1 -= 1;
+            self.dirty = true;
+        }
+    }
+
+    /// `insertForwardIndexEntry` of a BooleanIndex.
+    fn boolean_insert(&mut self, entry: Val, rid: i32, new_oid: &mut impl FnMut() -> u64) {
+        let truth = entry != Val::Int(0);
+        if self.length.1 == 0 {
+            let value = i64::from(!truth);
+            if self.boolean.1 != value {
+                self.boolean.1 = value;
+                self.dirty = true;
+            }
+        }
+        let indexed = truth == (self.boolean.1 != 0);
+        if indexed {
+            self.boolean.0.1 += 1;
+            self.index
+                .set(Val::Int(i64::from(rid)), Item::Val(Val::None), new_oid);
+        }
+        self.unindex
+            .set(Val::Int(i64::from(rid)), Item::Val(entry), new_oid);
+        self.length.1 += 1;
+        if indexed && self.boolean.0.1 as f64 >= self.length.1 as f64 * 0.6 {
+            self.invert(None, new_oid);
+        }
+    }
+
+    /// `removeForwardIndexEntry` of a BooleanIndex.
+    fn boolean_remove(
+        &mut self,
+        entry: &Val,
+        rid: i32,
+        check: bool,
+        new_oid: &mut impl FnMut() -> u64,
+    ) {
+        let truth = *entry != Val::Int(0);
+        if truth == (self.boolean.1 != 0) {
+            if self.index.remove(&Val::Int(i64::from(rid))).is_some() {
+                self.boolean.0.1 -= 1;
+            }
+        } else if check && self.boolean.0.1 as f64 >= (self.length.1 - 1) as f64 * 0.6 {
+            self.invert(Some(rid), new_oid);
+        }
+    }
+
+    /// `_invert_index` of a BooleanIndex: `_index` holds the rows of the
+    /// other value, with a new `_index_length`.
+    fn invert(&mut self, without: Option<i32>, new_oid: &mut impl FnMut() -> u64) {
+        self.boolean.1 = i64::from(self.boolean.1 == 0);
+        for (key, _) in self.index.items().into_iter().cloned().collect::<Vec<_>>() {
+            self.index.remove(&key);
+        }
+        let value = Val::Int(self.boolean.1);
+        let rows: Vec<Val> = self
+            .unindex
+            .items()
+            .into_iter()
+            .filter(|(_, v)| *v == Item::Val(value.clone()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut length = 0;
+        for row in rows {
+            if without.is_some_and(|rid| row == Val::Int(i64::from(rid))) {
+                continue;
+            }
+            self.index.set(row, Item::Val(Val::None), new_oid);
+            length += 1;
+        }
+        self.boolean.0 = (new_oid(), length);
+        self.dirty = true;
+    }
+
+    /// Adds or removes `rid` in the trees of a DateRangeIndex for the
+    /// value `(since, until)`.
+    fn range_forward(
+        &mut self,
+        value: &Val,
+        rid: i32,
+        add: bool,
+        new_oid: &mut impl FnMut() -> u64,
+    ) {
+        let row = Val::Int(i64::from(rid));
+        let (since, until) = match value {
+            Val::Tuple(items) => (items[0].clone(), items[1].clone()),
+            _ => (Val::None, Val::None),
+        };
+        // The trees: `_since_only`, `_until_only`, `_since`, `_until`.
+        let places: Vec<(usize, Val)> = match (&since, &until) {
+            (Val::None, Val::None) => {
+                if add {
+                    self.index.set(row, Item::Val(Val::None), new_oid);
+                } else {
+                    self.index.remove(&row);
+                }
+                return;
+            }
+            (Val::None, until) => vec![(1, until.clone())],
+            (since, Val::None) => vec![(0, since.clone())],
+            (since, until) => vec![(2, since.clone()), (3, until.clone())],
+        };
+        for (k, key) in places {
+            let (tree, sets) = &mut self.ranges[k];
+            let found = sets.iter().position(|(s, _)| *s == key);
+            match (add, found) {
+                (true, Some(i)) => sets[i].1.set(row.clone(), Item::Val(Val::None), new_oid),
+                (true, None) => {
+                    let mut set = Tree::new(new_oid(), II_SET, None);
+                    set.set(row.clone(), Item::Val(Val::None), new_oid);
+                    tree.set(
+                        key.clone(),
+                        Item::Ref(set.root, II_SET.module, II_SET.tree),
+                        new_oid,
+                    );
+                    sets.push((key, set));
+                }
+                (false, Some(i)) => {
+                    sets[i].1.remove(&row);
+                    if sets[i].1.is_empty() {
+                        sets.remove(i);
+                        tree.remove(&key);
+                    }
+                }
+                (false, None) => {}
+            }
+        }
+    }
+
+    /// The records of the trees of the index that changed.
+    fn tree_records(&mut self, out: &mut Vec<(u64, Vec<u8>)>) {
+        self.index.records(out);
+        self.unindex.records(out);
+        for (_, set) in &mut self.sets {
+            set.records(out);
+        }
+        for (tree, sets) in &mut self.ranges {
+            tree.records(out);
+            for (_, set) in sets {
+                set.records(out);
+            }
         }
     }
 }
@@ -956,17 +1578,7 @@ impl CatalogModel {
         let length = (take(&mut next), 0);
         let indexes = indexes
             .iter()
-            .map(|(id, kind)| IndexModel {
-                id: (*id).to_owned(),
-                kind: *kind,
-                oid: take(&mut next),
-                length: (take(&mut next), 0),
-                counter: (take(&mut next), 0),
-                index: Tree::new(take(&mut next), OO, fanout),
-                unindex: Tree::new(take(&mut next), IO, fanout),
-                sets: Vec::new(),
-                dirty: true,
-            })
+            .map(|(id, kind)| IndexModel::new(id, *kind, &mut next, fanout))
             .collect();
         CatalogModel {
             oid,
@@ -1038,8 +1650,10 @@ impl CatalogModel {
     }
 
     /// Catalogs the object at `path` with `values`, as
-    /// `Catalog.catalogObject` does. A new path takes the rid `rid`. A
-    /// FieldIndex without a value in `values` has no key for the row.
+    /// `Catalog.catalogObject` does. A new path takes the rid `rid`. An
+    /// index without a value in `values` has no key for the row; a
+    /// DateRangeIndex then holds `(None, None)`, as for an object without
+    /// its two attributes.
     pub fn catalog(&mut self, rid: i32, path: &str, values: &[(&str, Val)]) {
         let next = &mut self.next;
         let mut new_oid = || take(next);
@@ -1074,33 +1688,11 @@ impl CatalogModel {
             &mut new_oid,
         );
         for index in &mut self.indexes {
-            if index.kind != IndexKind::Field {
-                continue;
-            }
             let datum = value_of(&index.id);
-            let old = match index.unindex.get(&doc) {
-                Some(Item::Val(v)) => Some(v.clone()),
-                _ => None,
-            };
-            if old == datum {
-                continue;
+            if index.index_object(rid, datum, &mut new_oid) {
+                index.counter.1 += 1;
+                self.dirty.insert(index.counter.0);
             }
-            if let Some(old) = &old {
-                remove_forward(index, old, rid);
-            }
-            match datum {
-                Some(datum) => {
-                    insert_forward(index, &datum, rid, &mut new_oid);
-                    index
-                        .unindex
-                        .set(doc.clone(), Item::Val(datum), &mut new_oid);
-                }
-                None => {
-                    index.unindex.remove(&doc);
-                }
-            }
-            index.counter.1 += 1;
-            self.dirty.insert(index.counter.0);
         }
     }
 
@@ -1109,17 +1701,15 @@ impl CatalogModel {
         let Some(rid) = self.rid(path) else {
             return;
         };
-        let doc = Val::Int(i64::from(rid));
+        let next = &mut self.next;
+        let mut new_oid = || take(next);
         for index in &mut self.indexes {
-            if index.kind != IndexKind::Field {
-                continue;
-            }
-            if let Some(Item::Val(old)) = index.unindex.remove(&doc) {
-                remove_forward(index, &old, rid);
+            if index.unindex_object(rid, &mut new_oid) {
                 index.counter.1 += 1;
                 self.dirty.insert(index.counter.0);
             }
         }
+        let doc = Val::Int(i64::from(rid));
         self.data.remove(&doc);
         self.paths.remove(&doc);
         self.uids.remove(&Val::Str(path.into()));
@@ -1127,8 +1717,27 @@ impl CatalogModel {
         self.dirty.insert(self.length.0);
     }
 
-    /// Clears the index `id`, as `clear` of an `UnIndex` does: new trees
-    /// and a new `_length`, so the index object changes.
+    /// Unindexes the object at `path` from the index `id` alone, as a call
+    /// of its `unindex_object` does.
+    pub fn unindex_from(&mut self, id: &str, path: &str) {
+        let Some(rid) = self.rid(path) else {
+            return;
+        };
+        let next = &mut self.next;
+        let mut new_oid = || take(next);
+        let index = self
+            .indexes
+            .iter_mut()
+            .find(|i| i.id == id)
+            .expect("an index of the model");
+        if index.unindex_object(rid, &mut new_oid) {
+            index.counter.1 += 1;
+            self.dirty.insert(index.counter.0);
+        }
+    }
+
+    /// Clears the index `id`, as `clear` of the index does: new trees and
+    /// a new `_length`, so the index object changes.
     pub fn clear_index(&mut self, id: &str) {
         let next = &mut self.next;
         let index = self
@@ -1138,9 +1747,11 @@ impl CatalogModel {
             .expect("an index of the model");
         index.length = (take(next), 0);
         let fanout = Some(index.unindex.fanout);
-        index.index = Tree::new(take(next), OO, fanout);
-        index.unindex = Tree::new(take(next), IO, fanout);
+        let (index_family, unindex_family) = index.kind.families();
+        index.index = Tree::new(take(next), index_family, fanout);
+        index.unindex = Tree::new(take(next), unindex_family, fanout);
         index.sets.clear();
+        index.clear_extra(next, fanout);
         index.counter.1 += 1;
         index.dirty = true;
         self.dirty.insert(index.counter.0);
@@ -1179,62 +1790,24 @@ impl CatalogModel {
             tree.records(&mut out);
         }
         for index in &mut self.indexes {
-            let (module, name) = index.class();
             if std::mem::take(&mut index.dirty) {
-                out.push((
-                    index.oid,
-                    index_record(
-                        module,
-                        name,
-                        &index.id,
-                        index.length.0,
-                        index.index.root,
-                        index.unindex.root,
-                        index.counter.0,
-                    ),
-                ));
-                out.push((index.length.0, length_record(index.length.1)));
+                out.push((index.oid, index.record()));
+                self.dirty.insert(index.length.0);
                 self.dirty.insert(index.counter.0);
+            }
+            if self.dirty.remove(&index.length.0) {
+                out.push((index.length.0, length_record(index.length.1)));
             }
             if self.dirty.remove(&index.counter.0) {
                 out.push((index.counter.0, length_record(index.counter.1)));
             }
-            index.index.records(&mut out);
-            index.unindex.records(&mut out);
-            for (_, set) in &mut index.sets {
-                set.records(&mut out);
+            if index.kind == IndexKind::Boolean && index.written != Some(index.boolean.0) {
+                index.written = Some(index.boolean.0);
+                out.push((index.boolean.0.0, length_record(index.boolean.0.1)));
             }
+            index.tree_records(&mut out);
         }
         out
-    }
-}
-
-fn insert_forward(index: &mut IndexModel, key: &Val, rid: i32, new_oid: &mut impl FnMut() -> u64) {
-    let row = Val::Int(i64::from(rid));
-    match index.sets.iter().position(|(k, _)| k == key) {
-        Some(i) => index.sets[i].1.set(row, Item::Val(Val::None), new_oid),
-        None => {
-            let mut set = Tree::new(new_oid(), II_SET, None);
-            set.set(row, Item::Val(Val::None), new_oid);
-            let reference = Item::Ref(set.root, II_SET.module, II_SET.tree);
-            index.index.set(key.clone(), reference, new_oid);
-            index.sets.push((key.clone(), set));
-            index.length.1 += 1;
-            index.dirty = true;
-        }
-    }
-}
-
-fn remove_forward(index: &mut IndexModel, key: &Val, rid: i32) {
-    let Some(i) = index.sets.iter().position(|(k, _)| k == key) else {
-        return;
-    };
-    index.sets[i].1.remove(&Val::Int(i64::from(rid)));
-    if index.sets[i].1.is_empty() {
-        index.sets.remove(i);
-        index.index.remove(key);
-        index.length.1 -= 1;
-        index.dirty = true;
     }
 }
 

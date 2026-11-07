@@ -201,24 +201,22 @@ pub fn rebase(
         if let Some(length) = head.lengths.get(&i) {
             entry.length = *length;
         }
-        let Index::Field(field) = &entry.index else {
-            continue;
-        };
         let rebuilt = match head.trees.get(&Slot::Index(i)) {
-            Some(changed) => field.rebuilt(changed, &rows),
+            Some(changed) => entry.index.rebuilt(changed, &rows),
             // Every row keeps its number, so a structure that no change
             // touched stays valid.
             None => continue,
         };
         match rebuilt {
-            Ok(index) => {
+            None => {}
+            Some(Ok(index)) => {
                 held += index.heap_bytes();
                 if !room(held) {
                     return Err("the memory bound has no room for the rebase".into());
                 }
-                entry.index = Index::Field(Arc::new(index));
+                entry.index = index;
             }
-            Err(e) => entry.index = Index::Unavailable(e),
+            Some(Err(e)) => entry.index = Index::Unavailable(e),
         }
     }
     Ok(Base {

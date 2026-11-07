@@ -11,9 +11,12 @@ brains in the order of the reply. The brains read their metadata from
 `data` through the Connection. For a refusal, or for a query that it
 cannot type, the hook runs the stock search, whole.
 
-This version types the clauses of FieldIndex, and a sort on FieldIndexes.
-The hook decides the reasons `unsupported`, `index`, `option`, `and_range`,
-`sort` and `transaction`; the store decides the others. A search in a
+This version types the clauses of FieldIndex, KeywordIndex, DateIndex and
+UUIDIndex (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
+key) and of DateRangeIndex (`"k": "d"`, the date in minutes of
+`_convertDateTime`), and a sort on FieldIndexes, DateIndexes and
+UUIDIndexes. The hook decides the reasons `unsupported`, `index`, `option`,
+`and_range`, `sort` and `transaction`; the store decides the others. A search in a
 transaction whose connection holds a registered object or a savepoint
 record takes the Python path (`transaction`): no overlay carries the
 changes of the transaction yet.
@@ -58,8 +61,22 @@ NAMESPACE = "zoe.catalog"
 #: The modes of the backend.
 MODES = ("on", "compare")
 
-# The classes of the indexes and of the sort indexes that the mirror serves.
-_FIELD_INDEX = "Products.PluginIndexes.FieldIndex.FieldIndex.FieldIndex"
+# The classes of the indexes that the mirror serves, with the kind of their
+# clauses, and the classes of the sort indexes that it serves.
+_PLUGIN_INDEXES = "Products.PluginIndexes"
+_CLAUSES = {
+    f"{_PLUGIN_INDEXES}.FieldIndex.FieldIndex.FieldIndex": "v",
+    f"{_PLUGIN_INDEXES}.KeywordIndex.KeywordIndex.KeywordIndex": "v",
+    f"{_PLUGIN_INDEXES}.DateIndex.DateIndex.DateIndex": "v",
+    f"{_PLUGIN_INDEXES}.UUIDIndex.UUIDIndex.UUIDIndex": "v",
+    f"{_PLUGIN_INDEXES}.BooleanIndex.BooleanIndex.BooleanIndex": "b",
+    f"{_PLUGIN_INDEXES}.DateRangeIndex.DateRangeIndex.DateRangeIndex": "d",
+}
+_SORTS = {
+    f"{_PLUGIN_INDEXES}.FieldIndex.FieldIndex.FieldIndex",
+    f"{_PLUGIN_INDEXES}.DateIndex.DateIndex.DateIndex",
+    f"{_PLUGIN_INDEXES}.UUIDIndex.UUIDIndex.UUIDIndex",
+}
 
 # The stock `Catalog.search` and the mode, while the backend is installed.
 _installed = {}
@@ -405,7 +422,6 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
     `IndexQuery` and the conversion of the index, and the sort as
     `searchResults` gives it.
     """
-    from Acquisition import aq_base
     from Products.ZCatalog.query import IndexQuery
 
     if not merge:
@@ -419,8 +435,8 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
         index = catalog.getIndex(name)
         if not any(n in made for n in catalog._get_index_query_names(index)):
             continue
-        cls = type(aq_base(index))
-        if f"{cls.__module__}.{cls.__qualname__}" != _FIELD_INDEX:
+        kind = _CLAUSES.get(_class_of(index))
+        if kind is None:
             return None, "index"
         try:
             rec = IndexQuery(
@@ -430,41 +446,32 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
             return None, "option"
         if rec.keys is None:
             continue
-        if rec.get("usage", None):
-            return None, "option"
-        conjunction = rec.operator == "and"
-        nots = [index._convert(k) for k in (rec.get("not", None) or [])]
-        clause = {"k": "v", "i": name, "q": [], "and": conjunction, "r": None}
-        range_ = rec.get("range", None)
-        if range_:
-            if conjunction:
-                return None, "and_range"
+        if kind == "b":
+            # `BooleanIndex.query_index` reads the truth of the first key.
+            keys = list(rec.keys)
+            clauses.append({"k": "b", "i": name, "q": bool(keys[0]) if keys else None})
+            continue
+        if kind == "d":
             if not rec.keys:
                 return None, "option"
-            keys = [index._convert(k) for k in rec.keys]
             try:
-                low = min(keys) if "min" in range_ else None
-                high = max(keys) if "max" in range_ else None
-            except TypeError:
+                term = index._convertDateTime(rec.keys[0])
+            except Exception:
                 return None, "option"
-            # `if hi:` of ZCatalog: a false bound is no bound.
-            clause["r"] = [low, high if high else None]
-        else:
-            keys = [index._convert(k) for k in rec.keys if k is not None]
-            if conjunction and not keys:
+            if not (term is None or (isinstance(term, int) and _wire(term))):
                 return None, "option"
-            clause["q"] = keys
-        clause["not"] = nots
-        if not all(_wire(v) for v in clause["q"] + nots + (clause["r"] or [])):
-            return None, "option"
+            clauses.append({"k": "d", "i": name, "t": term})
+            continue
+        clause, reason = _value_clause(index, name, rec)
+        if clause is None:
+            return None, reason
         clauses.append(clause)
     sort = []
     if sort_index is not None:
         indexes = sort_index if isinstance(sort_index, list) else [sort_index]
         orders = reverse if isinstance(reverse, list) else [bool(reverse)]
         for i, each in enumerate(indexes):
-            cls = type(aq_base(each))
-            if f"{cls.__module__}.{cls.__qualname__}" != _FIELD_INDEX:
+            if _class_of(each) not in _SORTS:
                 return None, "sort"
             if len(orders) == 1:
                 order = orders[0]
@@ -492,6 +499,51 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
     }, None
 
 
+def _class_of(index):
+    """The class of an index, as `module.name`."""
+    from Acquisition import aq_base
+
+    cls = type(aq_base(index))
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _value_clause(index, name, rec):
+    """Return the clause of keys of `rec` for an index of the `UnIndex`
+    family, and None; or None and the reason of the Python path."""
+    if rec.get("usage", None):
+        return None, "option"
+    conjunction = rec.operator == "and"
+    clause = {"k": "v", "i": name, "q": [], "and": conjunction, "r": None}
+    range_ = rec.get("range", None)
+    if range_:
+        if conjunction:
+            return None, "and_range"
+        if not rec.keys:
+            return None, "option"
+        keys = [index._convert(k) for k in rec.keys]
+        try:
+            low = min(keys) if "min" in range_ else None
+            high = max(keys) if "max" in range_ else None
+        except TypeError:
+            return None, "option"
+        # `if hi:` of ZCatalog: a false bound is no bound.
+        clause["r"] = [low, high if high else None]
+    else:
+        keys = [index._convert(k) for k in rec.keys if k is not None]
+        if conjunction and not keys:
+            return None, "option"
+        clause["q"] = keys
+    nots = list(rec.get("not", None) or [])
+    # `UnIndex.query_index` converts the keys of `not` for a query of `not`
+    # alone. With keys or a range, it looks them up as they are.
+    if not rec.keys:
+        nots = [index._convert(k) for k in nots]
+    clause["not"] = nots
+    if not all(_wire(v) for v in clause["q"] + nots + (clause["r"] or [])):
+        return None, "option"
+    return clause, None
+
+
 def _compare(plan, native, stock):
     """Log and count a difference between the native and the stock result
     of a search, with the indexes and the options of the plan and no
@@ -509,7 +561,11 @@ def _compare(plan, native, stock):
     _count("mismatches")
     clauses = []
     for clause in plan["c"]:
-        options = [name for name in ("q", "r", "not") if clause[name]]
+        options = [
+            name
+            for name in ("q", "r", "not", "t")
+            if clause.get(name) not in (None, [], False)
+        ]
         clauses.append(f"{clause['i']}({','.join(options)})")
     sort = [f"{name}:{'desc' if r else 'asc'}" for name, r in plan["s"]]
     logger.error(

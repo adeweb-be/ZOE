@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use crate::base::{Base, Index, rid_of};
+use crate::base::{Base, rid_of};
 use crate::read::{Node, Record, TreeShape, node};
 use crate::value::{Val, py_cmp};
 
@@ -216,10 +216,7 @@ pub fn base_value(base: &Base, slot: Slot, rid: i32) -> Option<Val> {
             .live
             .contains(row)
             .then(|| Val::Str(base.rows.paths.get(row).into())),
-        Slot::Index(i) => match &base.indexes.get(i)?.index {
-            Index::Field(f) => f.slot(row).map(|s| f.keys.get(s)),
-            Index::Unavailable(_) => None,
-        },
+        Slot::Index(i) => base.indexes.get(i)?.index.value(row),
     }
 }
 
@@ -247,9 +244,7 @@ fn rids_between(base: &Base, overrides: &Overrides, slot: Slot, low: i64, high: 
         }
         let has = match slot {
             Slot::Paths => base.rows.live.contains(row),
-            Slot::Index(i) => {
-                matches!(&base.indexes[i].index, Index::Field(f) if f.slot(row).is_some())
-            }
+            Slot::Index(i) => base.indexes[i].index.has(row),
         };
         if has {
             out.push(rid);
@@ -410,7 +405,22 @@ pub fn read_records(
                                 };
                                 let r = i64::from(rid);
                                 range = Some(range.map_or((r, r), |(a, _)| (a, r)));
-                                target.insert(rid, value);
+                                let value = match slot {
+                                    Slot::Paths => Some(value),
+                                    Slot::Index(i) => {
+                                        match base.indexes[i].index.normalize(value) {
+                                            Ok(value) => value,
+                                            Err(e) => {
+                                                out.stale = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                };
+                                // A row without a key is a row without a value.
+                                if let Some(value) = value {
+                                    target.insert(rid, value);
+                                }
                             }
                             edits.buckets.insert(*oid, range);
                         }

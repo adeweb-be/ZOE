@@ -15,10 +15,12 @@ use std::time::Instant;
 use zoe_pickle::python::Value;
 
 use crate::base::{
-    Base, CatalogTrees, FIELD_INDEX, FieldIndex, Index, IndexEntry, Pairs, Rows, rid_of,
+    Base, CatalogTrees, DateRangeIndex, FieldIndex, Index, IndexEntry, KeywordIndex, Kind, Pairs,
+    Rows, date_range_of, rid_of,
 };
 use crate::change::{Owner, Shapes, Slot};
 use crate::read::{Reads, Record, TreeShape, oid_of, walk_tree};
+use crate::value::Val;
 
 /// The class of the catalog object.
 pub const CATALOG: (&str, &str) = ("Products.ZCatalog.Catalog", "Catalog");
@@ -39,6 +41,56 @@ pub struct Built {
     pub bytes: usize,
     /// The seconds of the build.
     pub seconds: f64,
+}
+
+/// The values of an `_unindex` tree as a build collects them.
+enum Part {
+    /// The keys and their rows: one pair for each key of a row.
+    Pairs(Pairs),
+    /// The bounds of each row of a DateRangeIndex.
+    Ranges(Vec<(u32, i64, i64)>),
+}
+
+impl Part {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Part::Pairs(p) => p.heap_bytes(),
+            Part::Ranges(v) => v.capacity() * 24,
+        }
+    }
+
+    fn append(&mut self, other: Part) {
+        match (self, other) {
+            (Part::Pairs(a), Part::Pairs(b)) => a.append(b),
+            (Part::Ranges(a), Part::Ranges(b)) => a.extend(b),
+            _ => {}
+        }
+    }
+
+    /// Adds the value of `_unindex` of `row`, for an index of `kind`.
+    fn push(&mut self, kind: Kind, value: Val, row: u32) -> Result<(), String> {
+        match (self, kind) {
+            (Part::Ranges(v), _) => {
+                let (since, until) = date_range_of(&value)
+                    .ok_or_else(|| format!("a value of a DateRangeIndex: {value:?}"))?;
+                v.push((row, since, until));
+            }
+            (Part::Pairs(p), Kind::Keyword) => match value {
+                Val::List(items) | Val::Tuple(items) => {
+                    for key in items.into_vec() {
+                        p.push(key, row);
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "a value of a KeywordIndex that is not a list: {other:?}"
+                    ));
+                }
+            },
+            (Part::Pairs(p), _) => p.push(value, row),
+        }
+        Ok(())
+    }
 }
 
 /// Why a build gives no base.
@@ -172,7 +224,7 @@ pub fn build(
     shapes.owners.insert(catalog, Owner::Catalog);
     shapes.add_tree(Slot::Paths, trees.paths, &paths_shape);
     let mut objects = HashMap::from([(catalog, catalog_bytes)]);
-    // The indexes. The structure of each FieldIndex builds in a thread
+    // The indexes. The structure of each index builds in a thread
     // while the next tree is walked.
     let mut entries: Vec<IndexEntry> = Vec::with_capacity(names.len());
     let mut tree_shapes: Vec<Option<TreeShape>> = Vec::with_capacity(names.len());
@@ -185,6 +237,7 @@ pub fn build(
                 entries.push(IndexEntry {
                     name: name.clone(),
                     class: String::new(),
+                    kind: None,
                     oid: 0,
                     tree: None,
                     length_oid: None,
@@ -197,21 +250,27 @@ pub fn build(
             let mut entry = IndexEntry {
                 name: name.clone(),
                 class: String::new(),
+                kind: None,
                 oid,
                 tree: None,
                 length_oid: None,
                 length: -1,
                 index: Index::Unavailable(String::new()),
             };
-            let read = (|| -> Result<Option<(Pairs, TreeShape, Vec<u8>)>, String> {
+            let read = (|| -> Result<Option<(Part, TreeShape, Vec<u8>)>, String> {
                 let bytes = load(oid)?;
                 read_records += 1;
                 read_bytes += bytes.len();
                 let index_record = Record::decode(&bytes).map_err(|e| e.0)?;
                 entry.class = format!("{}.{}", index_record.module, index_record.name);
-                if !index_record.is(FIELD_INDEX.0, FIELD_INDEX.1) {
+                entry.kind = Kind::of(&index_record.module, &index_record.name);
+                let Some(kind) = entry.kind else {
                     return Ok(None);
-                }
+                };
+                let make = || match kind {
+                    Kind::DateRange => Part::Ranges(Vec::new()),
+                    _ => Part::Pairs(Pairs::Empty),
+                };
                 let tree = index_record.attr_oid("_unindex").ok_or("no _unindex")?;
                 let length_oid = index_record.attr_oid("_length").ok_or("no _length")?;
                 entry.tree = Some(tree);
@@ -228,25 +287,25 @@ pub fn build(
                     before,
                     tree,
                     threads,
-                    || Pairs::Empty,
-                    |pairs: &mut Pairs, items| {
-                        for (rid, key) in items {
+                    make,
+                    |part: &mut Part, items| {
+                        for (rid, value) in items {
                             let rid = rid_of(&rid)?;
                             let row = rows_ref
                                 .row(rid)
                                 .ok_or_else(|| format!("the rid {rid} is not in paths"))?;
-                            pairs.push(key, row);
+                            part.push(kind, value, row)?;
                         }
                         Ok(())
                     },
                 )?;
                 read_records += stats.records;
                 read_bytes += stats.bytes;
-                let mut pairs = Pairs::Empty;
+                let mut all = make();
                 for part in parts {
-                    pairs.append(part);
+                    all.append(part);
                 }
-                Ok(Some((pairs, shape, bytes)))
+                Ok(Some((all, shape, bytes)))
             })();
             match read {
                 Ok(None) => {
@@ -260,8 +319,8 @@ pub fn build(
                     pending.push(None);
                     tree_shapes.push(None);
                 }
-                Ok(Some((pairs, shape, bytes))) => {
-                    let transient = pairs.heap_bytes() + shape.heap_bytes();
+                Ok(Some((part, shape, bytes))) => {
+                    let transient = part.heap_bytes() + shape.heap_bytes();
                     if !room(held.load(AtomicOrdering::Relaxed) + transient) {
                         stopped = true;
                         pending.push(None);
@@ -273,8 +332,20 @@ pub fn build(
                     tree_shapes.push(Some(shape));
                     let held = &held;
                     let count = rows_ref.len();
+                    let kind = entry.kind;
                     pending.push(Some(scope.spawn(move || {
-                        let built = FieldIndex::build(pairs, count);
+                        let built = match (kind, part) {
+                            (Some(Kind::Keyword), Part::Pairs(pairs)) => {
+                                KeywordIndex::build(pairs, count)
+                                    .map(|i| Index::Keyword(Arc::new(i)))
+                            }
+                            (_, Part::Ranges(items)) => Ok(Index::DateRange(Arc::new(
+                                DateRangeIndex::build(items, count),
+                            ))),
+                            (_, Part::Pairs(pairs)) => {
+                                FieldIndex::build(pairs, count).map(|i| Index::Field(Arc::new(i)))
+                            }
+                        };
                         if let Ok(index) = &built {
                             held.fetch_add(index.heap_bytes(), AtomicOrdering::Relaxed);
                         }
@@ -287,7 +358,7 @@ pub fn build(
         for (entry, handle) in entries.iter_mut().zip(pending) {
             if let Some(handle) = handle {
                 entry.index = match handle.join() {
-                    Ok(Ok(index)) => Index::Field(Arc::new(index)),
+                    Ok(Ok(index)) => index,
                     Ok(Err(e)) => Index::Unavailable(e),
                     Err(_) => Index::Unavailable("the build of the index panicked".into()),
                 };
@@ -298,7 +369,8 @@ pub fn build(
         return Err(BuildError::Dropped);
     }
     for (i, (entry, shape)) in entries.iter().zip(&tree_shapes).enumerate() {
-        if let (Index::Field(_), Some(shape), Some(tree)) = (&entry.index, shape, entry.tree) {
+        let mirrored = !matches!(entry.index, Index::Unavailable(_));
+        if let (true, Some(shape), Some(tree)) = (mirrored, shape, entry.tree) {
             shapes.owners.insert(entry.oid, Owner::IndexObject(i));
             if let Some(length) = entry.length_oid {
                 shapes.owners.insert(length, Owner::Length(i));
