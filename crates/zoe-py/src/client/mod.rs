@@ -869,6 +869,29 @@ impl NativeClient {
         Ok(p64(py, tid.0))
     }
 
+    /// Answer the catalog query `plan` on the catalog whose `Catalog` object
+    /// has the oid `catalog`, as of the snapshot that ends before `tid`, on
+    /// the catalog mirror of the server (ADR 0059, section 9). The
+    /// arguments and the reply are those of `zoe.Storage.catalog_query`. A
+    /// plan of another form raises `ValueError`, and the connection stays
+    /// open. Raise `Unsupported` when the server did not accept
+    /// `catalog_query`.
+    fn catalog_query<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+        tid: &[u8],
+        plan: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let oid = crate::catalog::p64("catalog", catalog)?;
+        let before = crate::catalog::p64("tid", tid)?;
+        let plan = crate::catalog::value_of_wire(crate::catalog::wire(plan)?);
+        let reply = self.run(py, async move |pool| {
+            pool.catalog_query(Oid(oid), Tid(before), plan).await
+        })?;
+        crate::catalog::reply_of_value(py, reply)
+    }
+
     /// Return a new owner of early write-intent locks (ADR 0045). It
     /// holds no lock and no connection.
     fn intents(&self) -> NativeIntents {

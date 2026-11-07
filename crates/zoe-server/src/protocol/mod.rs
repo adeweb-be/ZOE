@@ -19,6 +19,7 @@
 //! in the order in which they went in.
 
 mod blob;
+pub(crate) mod catalog;
 mod clock;
 mod compress;
 mod extension;

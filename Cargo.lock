@@ -2576,6 +2576,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zoe-catalog",
  "zoe-client",
  "zoe-convert",
  "zoe-core",

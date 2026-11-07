@@ -262,6 +262,115 @@ pub(crate) fn reply<'py>(
     Ok(out)
 }
 
+/// The plan `wire` as a msgpack value of the wire, for the native client.
+pub(crate) fn value_of_wire(wire: Wire) -> rmpv::Value {
+    use rmpv::Value;
+    match wire {
+        Wire::Nil => Value::Nil,
+        Wire::Bool(b) => Value::Boolean(b),
+        Wire::Int(i) => Value::from(i),
+        Wire::Float(f) => Value::F64(f),
+        Wire::Str(s) => Value::from(s),
+        Wire::Bin(b) => Value::Binary(b),
+        Wire::Array(items) => Value::Array(items.into_iter().map(value_of_wire).collect()),
+        Wire::Map(items) => Value::Map(
+            items
+                .into_iter()
+                .map(|(k, v)| (value_of_wire(k), value_of_wire(v)))
+                .collect(),
+        ),
+        Wire::Ext(kind, data) => Value::Ext(kind, data),
+    }
+}
+
+/// The reply `value` of `catalog_query` over the wire, as `reply` gives
+/// the reply of the mirrors of the process: the same keys and the same
+/// types. Each row keeps its msgpack bytes, and `CatalogRows` makes its
+/// Python values only when the row is read. A reply of another form
+/// raises `ValueError`.
+pub(crate) fn reply_of_value<'py>(
+    py: Python<'py>,
+    value: rmpv::Value,
+) -> PyResult<Bound<'py, PyDict>> {
+    use rmpv::Value;
+    let bad = |what: &str| PyValueError::new_err(format!("a catalog reply with {what}"));
+    let Value::Map(items) = value else {
+        return Err(bad("another form"));
+    };
+    let out = PyDict::new(py);
+    let mut rows = py.None().into_bound(py);
+    let mut paths = py.None().into_bound(py);
+    let mut answered = false;
+    for (key, item) in items {
+        let Some(key) = key.as_str() else {
+            return Err(bad("a key that is not a str"));
+        };
+        match (key, item) {
+            ("tid", Value::Binary(tid)) => out.set_item("tid", PyBytes::new(py, &tid))?,
+            ("r", Value::Binary(rids)) => {
+                if rids.len() % 4 != 0 {
+                    return Err(bad("rids that are not 4 bytes each"));
+                }
+                let rids: Vec<i32> = rids
+                    .chunks_exact(4)
+                    .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                out.set_item("r", PyList::new(py, rids)?)?;
+                answered = true;
+            }
+            ("n" | "a", Value::Integer(n)) => {
+                out.set_item(key, n.as_i64().ok_or_else(|| bad("a count past 64 bits"))?)?;
+            }
+            ("rows", Value::Array(items)) => {
+                let mut made = Vec::with_capacity(items.len());
+                for item in items {
+                    made.push(match item {
+                        Value::Nil => None,
+                        row @ Value::Array(_) => {
+                            let mut bytes = Vec::new();
+                            rmpv::encode::write_value(&mut bytes, &row)
+                                .map_err(|_| bad("a row that does not encode"))?;
+                            Some(bytes)
+                        }
+                        _ => return Err(bad("a row that is not an array or nil")),
+                    });
+                }
+                rows = Bound::new(
+                    py,
+                    Rows {
+                        rows: made,
+                        decoded: AtomicUsize::new(0),
+                    },
+                )?
+                .into_any();
+            }
+            ("paths", Value::Array(items)) => {
+                let list = PyList::empty(py);
+                for item in items {
+                    match item {
+                        Value::Nil => list.append(py.None())?,
+                        Value::String(s) => list.append(
+                            s.as_str().ok_or_else(|| bad("a path that is not UTF-8"))?,
+                        )?,
+                        _ => return Err(bad("a path that is not a str or nil")),
+                    }
+                }
+                paths = list.into_any();
+            }
+            ("rows" | "paths", Value::Nil) => {}
+            ("f" | "why", Value::String(s)) => {
+                out.set_item(key, s.as_str().ok_or_else(|| bad("a text that is not UTF-8"))?)?;
+            }
+            _ => return Err(bad(&format!("the key {key:?} of another form"))),
+        }
+    }
+    if answered {
+        out.set_item("rows", rows)?;
+        out.set_item("paths", paths)?;
+    }
+    Ok(out)
+}
+
 /// The state of a mirror as a dict, or `None`.
 pub(crate) fn status<'py>(py: Python<'py>, status: Option<Status>) -> PyResult<Bound<'py, PyAny>> {
     let Some(status) = status else {

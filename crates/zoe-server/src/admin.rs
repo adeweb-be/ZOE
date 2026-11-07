@@ -25,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
+use crate::protocol;
 use crate::protocol::metrics::{self, Exported};
 
 /// The longest request head, in bytes, with the empty line at its end. A
@@ -90,7 +91,10 @@ impl Health {
         match self.metrics.get() {
             Some(storages) => Reply {
                 content_type: metrics::CONTENT_TYPE,
-                ..Reply::text(Status::Ok, metrics::render(storages))
+                ..Reply::text(
+                    Status::Ok,
+                    metrics::render(storages) + &protocol::catalog::render(storages),
+                )
             },
             None => Reply::text(Status::Unavailable, "starting\n".to_owned()),
         }

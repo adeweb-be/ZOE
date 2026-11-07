@@ -38,7 +38,7 @@ use crate::build::{BuildError, Built, build};
 use crate::change::{ChangeSet, Shapes, read_records};
 use crate::counts::{Counters, Counts, MirrorCounts};
 use crate::mirror::{Versions, rebase};
-use crate::plan::{PlanError, Wire, decode_request};
+use crate::plan::{ClauseKind, PlanError, Wire, decode_typed};
 use crate::query::{Columns, Plan, Reply, View};
 use crate::read::{Commit, Reads};
 use crate::reason::{Fallback, Reason};
@@ -277,8 +277,21 @@ impl Mirrors {
         plan: &Plan,
         columns: &Columns,
     ) -> Result<Reply, Fallback> {
+        self.query_kinds(catalog, tid, plan, columns, &[])
+    }
+
+    /// Answers `plan` as `query_rows` does, after a check of the kind of
+    /// each clause (`kinds`) against the class of its index.
+    fn query_kinds(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Plan,
+        columns: &Columns,
+        kinds: &[ClauseKind],
+    ) -> Result<Reply, Fallback> {
         let started = Instant::now();
-        let answer = self.answer(catalog, tid, plan, columns);
+        let answer = self.answer(catalog, tid, plan, columns, kinds);
         match &answer {
             Ok(_) => self.shared.counters.native(started.elapsed()),
             Err(f) => self.shared.counters.python(f.reason, started.elapsed()),
@@ -289,15 +302,18 @@ impl Mirrors {
     /// Answers the plan `plan` in the form of section 8, with its rows, as
     /// `query_rows` does. A plan of another form is an error: its text. A
     /// key or a kind of clause that this version does not know gives the
-    /// reason `plan`.
+    /// reason `plan`, and so does a clause whose kind does not read the
+    /// class of its index.
     pub fn query_wire(
         &self,
         catalog: u64,
         tid: u64,
         plan: &Wire,
     ) -> Result<Result<Reply, Fallback>, String> {
-        match decode_request(plan) {
-            Ok((plan, columns)) => Ok(self.query_rows(catalog, tid, &plan, &columns)),
+        match decode_typed(plan) {
+            Ok((plan, columns, kinds)) => {
+                Ok(self.query_kinds(catalog, tid, &plan, &columns, &kinds))
+            }
             Err(PlanError::Malformed(why)) => Err(why),
             Err(PlanError::Unknown(why)) => {
                 self.shared.counters.python(Reason::Plan, Duration::ZERO);
@@ -312,6 +328,7 @@ impl Mirrors {
         tid: u64,
         plan: &Plan,
         columns: &Columns,
+        kinds: &[ClauseKind],
     ) -> Result<Reply, Fallback> {
         let shared = &self.shared;
         let v = tid.saturating_sub(1);
@@ -377,9 +394,17 @@ impl Mirrors {
         };
         let answer = catch_unwind(AssertUnwindSafe(|| {
             let (base, over) = snapshot.resolve();
-            View::new(&base, &over).query_rows(plan, columns)
+            let view = View::new(&base, &over);
+            view.check_kinds(plan, kinds)?;
+            view.query_rows(plan, columns)
         }));
         answer.unwrap_or_else(|_| Err(Fallback::new(Reason::Refused, "the query panicked")))
+    }
+
+    /// Counts a query that the host of the mirrors refused before the
+    /// mirrors read it, with its reason.
+    pub fn count_fallback(&self, reason: Reason) {
+        self.shared.counters.python(reason, Duration::ZERO);
     }
 
     /// The state of the mirror of `catalog`, or `None` when the store has

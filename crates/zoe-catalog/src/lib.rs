@@ -38,7 +38,7 @@ pub mod testing;
 pub mod value;
 
 pub use mirrors::{Config, Hooks, Mirrors, Opener, Status};
-pub use plan::{PlanError, Wire, decode_plan, decode_request, encode_reply};
+pub use plan::{ClauseKind, PlanError, Wire, decode_plan, decode_request, decode_typed, encode_reply};
 pub use query::{Clause, Columns, Plan, Reply};
 pub use read::{NAMESPACE, Reads};
 pub use reason::{Fallback, Reason};

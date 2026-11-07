@@ -32,7 +32,12 @@
 //! A plan that does not have this form is `Malformed`: the caller raises
 //! `ValueError`. A key or a kind of clause that this version does not know
 //! is `Unknown`: the reply is the reason `plan`.
+//!
+//! `decode_typed` also gives the kind of each clause. The mirror checks it
+//! against the class of the index of the clause: a clause of another kind
+//! gives the reason `plan`.
 
+use crate::base::Kind;
 use crate::cell;
 use crate::query::{Clause, Columns, Plan, Reply};
 use crate::reason::{Fallback, Reason};
@@ -59,6 +64,44 @@ pub enum Wire {
     Map(Vec<(Wire, Wire)>),
     /// An ext: its type and its data.
     Ext(i8, Vec<u8>),
+}
+
+/// The kind of a clause on the wire (`"k"`): the classes of index that it
+/// reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClauseKind {
+    /// `"v"`: a FieldIndex, a KeywordIndex, a DateIndex or a UUIDIndex.
+    Value,
+    /// `"b"`: a BooleanIndex.
+    Boolean,
+    /// `"d"`: a DateRangeIndex.
+    DateRange,
+    /// `"p"`: an ExtendedPathIndex.
+    Path,
+}
+
+impl ClauseKind {
+    /// The name of the kind on the wire.
+    pub fn name(self) -> &'static str {
+        match self {
+            ClauseKind::Value => "v",
+            ClauseKind::Boolean => "b",
+            ClauseKind::DateRange => "d",
+            ClauseKind::Path => "p",
+        }
+    }
+
+    /// Tells if a clause of this kind reads an index of the class `class`.
+    pub fn reads(self, class: Kind) -> bool {
+        match self {
+            ClauseKind::Value => {
+                matches!(class, Kind::Field | Kind::Keyword | Kind::Date | Kind::Uuid)
+            }
+            ClauseKind::Boolean => class == Kind::Boolean,
+            ClauseKind::DateRange => class == Kind::DateRange,
+            ClauseKind::Path => class == Kind::Path,
+        }
+    }
 }
 
 /// Why a plan does not read.
@@ -155,22 +198,30 @@ fn values(wire: &Wire, what: &str) -> Result<Vec<Val>, PlanError> {
     array(wire, what)?.iter().map(value).collect()
 }
 
-fn clause(wire: &Wire) -> Result<Clause, PlanError> {
+fn clause(wire: &Wire) -> Result<(Clause, ClauseKind), PlanError> {
     let items = items(wire, "a clause")?;
     let kind = items.iter().find(|(k, _)| *k == "k").map(|(_, v)| *v);
     let kind = match kind {
-        Some(Wire::Str(k)) if matches!(k.as_str(), "v" | "b" | "d" | "p") => k.as_str(),
-        Some(Wire::Str(k)) => {
-            return Err(PlanError::Unknown(format!("a clause of the kind {k:?}")));
-        }
+        Some(Wire::Str(k)) => match k.as_str() {
+            "v" => ClauseKind::Value,
+            "b" => ClauseKind::Boolean,
+            "d" => ClauseKind::DateRange,
+            "p" => ClauseKind::Path,
+            _ => return Err(PlanError::Unknown(format!("a clause of the kind {k:?}"))),
+        },
         _ => return malformed("a clause without a kind"),
     };
-    if kind == "p" {
-        return path_clause(&items);
+    match kind {
+        ClauseKind::Path => path_clause(&items).map(|c| (c, kind)),
+        ClauseKind::Boolean | ClauseKind::DateRange => {
+            one_key_clause(kind.name(), &items).map(|c| (c, kind))
+        }
+        ClauseKind::Value => value_clause(&items).map(|c| (c, kind)),
     }
-    if kind != "v" {
-        return one_key_clause(kind, &items);
-    }
+}
+
+/// Reads a clause of keys (`"v"`).
+fn value_clause(items: &[(&str, &Wire)]) -> Result<Clause, PlanError> {
     let mut clause = Clause {
         index: String::new(),
         keys: Vec::new(),
@@ -179,7 +230,7 @@ fn clause(wire: &Wire) -> Result<Clause, PlanError> {
         not: Vec::new(),
     };
     let mut named = false;
-    for (key, v) in items {
+    for &(key, v) in items {
         match key {
             "k" => {}
             "i" => match v {
@@ -363,8 +414,15 @@ pub fn decode_plan(wire: &Wire) -> Result<Plan, PlanError> {
 /// Reads a plan and the rows that its reply gives: `cols` and `rn`. A
 /// negative `rn` gives no row.
 pub fn decode_request(wire: &Wire) -> Result<(Plan, Columns), PlanError> {
+    decode_typed(wire).map(|(plan, columns, _)| (plan, columns))
+}
+
+/// Reads a plan as `decode_request` does, and gives the kind of each of
+/// its clauses, in their order.
+pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), PlanError> {
     let mut plan = Plan::default();
     let mut columns = Columns::default();
+    let mut kinds = Vec::new();
     let mut clauses = None;
     let mut unknown = None;
     for (key, v) in items(wire, "the plan")? {
@@ -373,7 +431,10 @@ pub fn decode_request(wire: &Wire) -> Result<(Plan, Columns), PlanError> {
                 let mut out = Vec::new();
                 for c in array(v, "c")? {
                     match clause(c) {
-                        Ok(c) => out.push(c),
+                        Ok((c, kind)) => {
+                            out.push(c);
+                            kinds.push(kind);
+                        }
                         Err(PlanError::Unknown(why)) => {
                             unknown.get_or_insert(why);
                         }
@@ -427,7 +488,7 @@ pub fn decode_request(wire: &Wire) -> Result<(Plan, Columns), PlanError> {
         return Err(PlanError::Unknown(why));
     }
     plan.clauses = clauses;
-    Ok((plan, columns))
+    Ok((plan, columns, kinds))
 }
 
 /// The reply to a query at `tid`, as section 8 gives it on the wire.

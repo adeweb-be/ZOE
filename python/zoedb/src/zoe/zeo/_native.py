@@ -60,6 +60,11 @@ _MB = 1024**2
 _SERVER_WRITES = "server_writes"
 _NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES)
 
+# The extension of the catalog queries (ADR 0059). The native client
+# declares it after `_NATIVE_EXTENSIONS`: only the native client serves
+# `catalog_query`, so the asyncio client does not declare it.
+_CATALOG_QUERY = "catalog_query"
+
 # The protocols of a server for which a `ClientStorage` without `native`
 # takes the asyncio client of ZEO inside: the pickle protocol of a stock
 # ZEO server without `msgpack true`. The client of ZEO speaks it.
@@ -565,6 +570,8 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         self._closed = False
         # The answer of `kv_supported` from the last server.
         self._kv_accepted = False
+        # The answer of `catalog_supported` from the last server.
+        self._catalog_accepted = False
 
         from zoe import _zoe
 
@@ -578,7 +585,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
                 storage,
                 read_only=self._read_only,
                 read_only_fallback=self._read_only_fallback,
-                extensions=list(_NATIVE_EXTENSIONS),
+                extensions=[*_NATIVE_EXTENSIONS, _CATALOG_QUERY],
                 wait_timeout=float(wait_timeout or 30),
                 pool_bound=_POOL_BOUND,
                 cache_size=cache_size,
@@ -1290,6 +1297,24 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
 
     def kv_delete(self, flavour, name, key, transaction):
         self._check_trans(transaction, "kv_delete").kv_delete(flavour, name, key)
+
+    # The catalog queries (ADR 0059).
+
+    def catalog_supported(self):
+        """Tell if the server accepted `catalog_query` on the connection.
+        While the client has no server, give the answer of the last server,
+        as `kv_supported` does."""
+        connected = self._native.is_connected()
+        extensions = self._native.extensions()
+        if extensions or (connected and self._native.is_connected()):
+            self._catalog_accepted = _CATALOG_QUERY in extensions
+        return self._catalog_accepted
+
+    def catalog_query(self, catalog, tid, plan):
+        """Answer the catalog query `plan` on the catalog mirror of the
+        server, with the arguments and the reply of
+        `zoe.Storage.catalog_query`."""
+        return self._with_server(lambda: self._native.catalog_query(catalog, tid, plan))
 
     # The owners of the early write-intent locks of `zodb._IntentOwners`
     # (ADR 0045). The first lock of an owner leases a connection of the

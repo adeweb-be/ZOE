@@ -8,7 +8,8 @@
 # writes them. The seeds of merge are conflicts of BTrees records that
 # corpus/generate_merge.py writes with ZODB, and the seeds of fields are
 # conflicts of persistent objects, a policy and a root that
-# corpus/generate_fields.py writes with ZODB.
+# corpus/generate_fields.py writes with ZODB. The seeds of plan are plans
+# of catalog queries that corpus/generate_plan.py writes with msgpack.
 
 [package]
 name = "zoe-server-fuzz"
@@ -59,6 +60,14 @@ bench = false
 [[bin]]
 name = "fields"
 path = "fuzz_targets/fields.rs"
+test = false
+doc = false
+bench = false
+
+# The decoder of the plan of a catalog query.
+[[bin]]
+name = "plan"
+path = "fuzz_targets/plan.rs"
 test = false
 doc = false
 bench = false

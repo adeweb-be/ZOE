@@ -286,7 +286,11 @@ impl Server {
                 .timeout(!options.idle_timeout.is_zero() || !options.transaction_timeout.is_zero())
                 .transaction_timeout(
                     (!options.transaction_timeout.is_zero()).then_some(options.transaction_timeout),
-                );
+                )
+                .catalog(options.catalog_config());
+            // The catalog mirrors of a registered catalog build in the
+            // background, so the start does not wait for them.
+            named.start_catalog();
             storages.push(Arc::new(named));
         }
         health.measured(storages.iter().map(|storage| storage.exported()).collect());
@@ -424,8 +428,10 @@ impl Server {
             waited: Instant::now(),
         });
         // A session that runs holds the store of its storage. This drop
-        // closes every other store.
+        // closes every other store. The catalog mirrors stop first: a build
+        // holds a share of its store while it reads.
         if let Some(storages) = self.storages.take() {
+            storages.stop_catalogs();
             for name in Storages::held(&storages) {
                 tracing::warn!(
                     storage = name,
