@@ -330,12 +330,10 @@ impl Bench {
             }
             Mode::Enhanced => {
                 let Some(q) = self.translator.translate(tree) else { return (0, Vec::new()) };
-                let filter = rids.as_ref().map(|r| {
-                    // The sum of the frequencies of the terms bounds the
-                    // hits; a glob or fuzzy matching has no such bound here.
-                    let estimate = if self.fuzzy == 0 { estimate(&mut self.translator, &self.searcher, tree) } else { None };
-                    self.map.filter(r, estimate)
-                });
+                // The frequencies of the terms bound the hits; a glob or
+                // fuzzy matching has no such bound here.
+                let bound = if self.fuzzy == 0 { estimate(&mut self.translator, &self.searcher, tree) } else { None };
+                let filter = rids.as_ref().map(|r| self.map.filter(r, bound));
                 if sort {
                     let col = InFilter {
                         sets: filter.as_ref().map(|f| f.sets(&self.map)),
@@ -358,8 +356,9 @@ impl Bench {
                             .unwrap();
                         (n, top.into_iter().map(|(s, a)| (to_rid(&self.map, a), f64::from(s))).collect())
                     } else {
-                        let (n, top) =
-                            count_and_top(&self.searcher, &*q, f.sets(&self.map), self.map.max_docs.clone(), limit).unwrap();
+                        let sets = f.sets(&self.map);
+                        let max_docs = self.map.max_docs.clone();
+                        let (n, top) = count_and_top(&self.searcher, &*q, sets, max_docs, limit, bound.is_some()).unwrap();
                         (n as usize, top.into_iter().map(|(s, a)| (to_rid(&self.map, a), f64::from(s))).collect())
                     }
                 }

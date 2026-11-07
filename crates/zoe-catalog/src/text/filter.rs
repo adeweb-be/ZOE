@@ -551,18 +551,44 @@ impl SortArray {
 }
 
 /// The count of the hits of `query` in `sets` and the first `limit` of
-/// them by score. One weight serves both passes, so a glob or a fuzzy term
-/// expands once.
+/// them by score. With `prune`, a pass with no score counts and the pruning
+/// of tantivy gives the first hits; one weight serves both passes. Without
+/// it, one pass scores every hit: for a glob or fuzzy matching, which expand
+/// to many terms that the pruning does not skip.
 pub fn count_and_top(
     searcher: &Searcher,
     query: &dyn Query,
     sets: Vec<SegSet>,
     max_docs: Vec<u32>,
     limit: usize,
+    prune: bool,
 ) -> tantivy::Result<(u64, Vec<(Score, DocAddress)>)> {
     let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
-    let count = InFilter { sets: Some(sets.clone()), max_docs, keep: false };
-    let top = TopInFilter { sets, limit };
+    let top = TopInFilter { sets: sets.clone(), limit };
+    if !prune {
+        let mut count = 0;
+        let mut all = Vec::new();
+        for (ord, seg) in searcher.segment_readers().iter().enumerate() {
+            let set = &sets[ord];
+            let alive = seg.alive_bitset();
+            let mut heap: BinaryHeap<Reverse<Hit>> = BinaryHeap::with_capacity(limit + 1);
+            weight.for_each(seg, &mut |doc, score| {
+                if set.contains(doc) && alive.is_none_or(|a| a.is_alive(doc)) {
+                    count += 1;
+                    let hit = Hit { score, doc: DocAddress::new(ord as SegmentOrdinal, doc) };
+                    if heap.len() < limit {
+                        heap.push(Reverse(hit));
+                    } else if heap.peek().is_some_and(|m| hit > m.0) {
+                        heap.pop();
+                        heap.push(Reverse(hit));
+                    }
+                }
+            })?;
+            all.push(heap.into_iter().map(|Reverse(h)| (h.score, h.doc)).collect());
+        }
+        return Ok((count, top.merge_fruits(all)?));
+    }
+    let count = InFilter { sets: Some(sets), max_docs, keep: false };
     let (mut counts, mut tops) = (Vec::new(), Vec::new());
     for (ord, seg) in searcher.segment_readers().iter().enumerate() {
         counts.push(count.collect_segment(weight.as_ref(), ord as SegmentOrdinal, seg)?);
