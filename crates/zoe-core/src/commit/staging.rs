@@ -414,7 +414,10 @@ impl Staging {
     pub(crate) fn remove_texts(&mut self, prefix: &[u8]) -> u64 {
         let keys: Vec<Vec<u8>> = self
             .texts
-            .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .range::<[u8], _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
             .map(|(key, _)| key)
             .take_while(|key| key.starts_with(prefix))
             .cloned()
@@ -445,7 +448,9 @@ impl Staging {
     /// Return each staged delta, in the order of `text_deltas`. This reads
     /// no payload.
     pub(crate) fn texts(&self) -> impl Iterator<Item = (&[u8], &StagedText)> + '_ {
-        self.texts.iter().map(|(key, staged)| (key.as_slice(), staged))
+        self.texts
+            .iter()
+            .map(|(key, staged)| (key.as_slice(), staged))
     }
 
     /// Tell if the transaction stages a delta.

@@ -1467,7 +1467,8 @@ fn flips_in_the_frames_of_text_deltas_give_corrupt_text_and_hide_nothing() {
                 }
                 // The vote reads the same delta for a new text of its key.
                 let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-                txn.text_set(CATALOG, index, rid, "en", "new", after).unwrap();
+                txn.text_set(CATALOG, index, rid, "en", "new", after)
+                    .unwrap();
                 match txn.vote() {
                     Err(error) => assert!(names(&error, frame, index), "{what}: {error}"),
                     Ok(()) => panic!("{what}: the vote passed"),
@@ -1475,16 +1476,22 @@ fn flips_in_the_frames_of_text_deltas_give_corrupt_text_and_hide_nothing() {
                 drop(txn);
                 let checked = store.verify_text().unwrap();
                 assert!(
-                    checked.findings.iter().any(|finding| finding.tid == Some(frame.tid)
-                        && finding.rid == frame.rid
-                        && finding.index.as_deref() == Some(index)),
+                    checked
+                        .findings
+                        .iter()
+                        .any(|finding| finding.tid == Some(frame.tid)
+                            && finding.rid == frame.rid
+                            && finding.index.as_deref() == Some(index)),
                     "{what}: {checked:?}"
                 );
                 testing::write_text_frame(&store, &frame.key, Some(&frame.bytes)).unwrap();
             }
         }
     }
-    eprintln!("bit flips in the frames of text deltas, {} build: {flips} flips, every one CorruptText", profile());
+    eprintln!(
+        "bit flips in the frames of text deltas, {} build: {flips} flips, every one CorruptText",
+        profile()
+    );
     // The store reads again once the frames are back.
     let store = open_vfs(vfs).unwrap();
     assert!(store.verify_text().unwrap().findings.is_empty());

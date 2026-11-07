@@ -21,10 +21,10 @@ mod read;
 mod redb;
 mod sequence;
 mod store;
-mod text;
 #[cfg(feature = "testing")]
 #[doc(hidden)]
 pub mod testing;
+mod text;
 mod types;
 mod undo;
 pub mod vfs;

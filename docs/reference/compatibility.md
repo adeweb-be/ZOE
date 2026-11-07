@@ -35,6 +35,6 @@ The tests that read `/proc` run on Linux only. The static `zoe` binary of a rele
 
 ## Data
 
-- ZOE opens a store of `ZOE format 2`. It refuses a store of `ZOE format 1` (ADR 0033).
+- ZOE opens a store of `ZOE format 4`. It refuses a store of `ZOE format 3` with a message that names `zoe migrate`, which moves such a store (see [The zoe command](cli.md#zoe-migrate)), and refuses any other format, `ZOE format 1` and `ZOE format 2` included (ADR 0033, ADR 0060).
 - `zoe convert` copies a `Data.fs` into a store and back, with tids, oids, pickles and blobs unchanged (see [The zoe command](cli.md#zoe-convert)).
 - A `Data.fs` holds no KV namespace. `zoe convert --to-data-fs` refuses a store with the data of `zoe.plone` that a `Data.fs` cannot hold, unless `--force`.

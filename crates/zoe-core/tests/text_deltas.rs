@@ -110,8 +110,14 @@ fn text_deltas_unindexes_and_clears_give_the_live_text_at_each_tid() {
     assert_eq!(text(&store, 1, Tid::MAX), None);
     assert_eq!(text(&store, 3, Tid::MAX), live("fr", "trois"));
     // Another index and another catalog are not touched.
-    assert_eq!(store.text_before(CATALOG, "Title", 1, Tid::MAX).unwrap(), None);
-    assert_eq!(store.text_before(Oid(43), INDEX, 1, Tid::MAX).unwrap(), None);
+    assert_eq!(
+        store.text_before(CATALOG, "Title", 1, Tid::MAX).unwrap(),
+        None
+    );
+    assert_eq!(
+        store.text_before(Oid(43), INDEX, 1, Tid::MAX).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -252,8 +258,7 @@ fn a_delta_through_the_log_after_the_fold_and_in_a_direct_batch_reads_the_same()
         enabled: false,
         ..WriteLog::default()
     };
-    let store =
-        Store::open_full(MemVfs::new(), zoe_core::SystemClock, options(direct)).unwrap();
+    let store = Store::open_full(MemVfs::new(), zoe_core::SystemClock, options(direct)).unwrap();
     let tids = history(&store);
     assert_eq!(store.backlog_bytes(), 0);
     check_history(&store, &tids);
@@ -338,8 +343,10 @@ fn a_delta_over_a_limit_or_with_a_bad_argument_stages_nothing() {
         other => panic!("{other:?}"),
     }
     let fits = "y".repeat(60);
-    txn.text_set(CATALOG, INDEX, 1, "en", &fits, before).unwrap();
-    txn.text_set(CATALOG, INDEX, 2, "en", &fits, before).unwrap();
+    txn.text_set(CATALOG, INDEX, 1, "en", &fits, before)
+        .unwrap();
+    txn.text_set(CATALOG, INDEX, 2, "en", &fits, before)
+        .unwrap();
     match txn.text_set(CATALOG, INDEX, 3, "en", &fits, before) {
         Err(ZoeError::TextTooLarge {
             limit: SizeLimit::Transaction,
@@ -350,7 +357,12 @@ fn a_delta_over_a_limit_or_with_a_bad_argument_stages_nothing() {
     // A delta that replaces a staged one counts once.
     txn.text_set(CATALOG, INDEX, 2, "en", "short", before)
         .unwrap();
-    for (index, language) in [("", "en"), (&*"i".repeat(256), "en"), (INDEX, &*"l".repeat(36)), (INDEX, "é")] {
+    for (index, language) in [
+        ("", "en"),
+        (&*"i".repeat(256), "en"),
+        (INDEX, &*"l".repeat(36)),
+        (INDEX, "é"),
+    ] {
         match txn.text_set(CATALOG, index, 9, language, "t", before) {
             Err(ZoeError::InvalidText(_)) => {}
             other => panic!("{other:?}"),
@@ -369,7 +381,10 @@ fn a_delta_over_a_limit_or_with_a_bad_argument_stages_nothing() {
         check_rid(i64::from(i32::MAX) + 1),
         Err(ZoeError::InvalidText(_))
     ));
-    assert!(matches!(check_rid(i64::from(i32::MIN) - 1), Err(ZoeError::InvalidText(_))));
+    assert!(matches!(
+        check_rid(i64::from(i32::MIN) - 1),
+        Err(ZoeError::InvalidText(_))
+    ));
     assert_eq!(check_rid(-3).unwrap(), -3);
     txn.vote().unwrap();
     let tid = txn.finish().unwrap();
@@ -422,12 +437,22 @@ fn a_restore_transaction_takes_only_the_restored_deltas() {
 
 #[test]
 fn each_acknowledged_delta_survives_a_crash_and_no_delta_of_an_unacknowledged_commit_appears() {
-    for write_log in [WriteLog::default(), held(), WriteLog { enabled: false, ..WriteLog::default() }] {
+    for write_log in [
+        WriteLog::default(),
+        held(),
+        WriteLog {
+            enabled: false,
+            ..WriteLog::default()
+        },
+    ] {
         let vfs = MemVfs::new();
         let (first, second) = {
-            let store =
-                Store::open_full(vfs.clone(), zoe_core::SystemClock, options(write_log.clone()))
-                    .unwrap();
+            let store = Store::open_full(
+                vfs.clone(),
+                zoe_core::SystemClock,
+                options(write_log.clone()),
+            )
+            .unwrap();
             let first = set(&store, 1, "acknowledged");
             vfs.mark("acknowledged");
             let before = snapshot(&store);
@@ -446,8 +471,12 @@ fn each_acknowledged_delta_survives_a_crash_and_no_delta_of_an_unacknowledged_co
         let images = vfs.crash_images();
         assert!(images.len() > 1);
         for image in &images {
-            let store = Store::open_full(image.vfs(), zoe_core::SystemClock, options(write_log.clone()))
-                .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            let store = Store::open_full(
+                image.vfs(),
+                zoe_core::SystemClock,
+                options(write_log.clone()),
+            )
+            .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
             if image.is_after("acknowledged") {
                 assert_eq!(
                     text(&store, 1, after(first)),

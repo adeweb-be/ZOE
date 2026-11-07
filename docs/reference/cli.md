@@ -1,6 +1,6 @@
 # The `zoe` command
 
-`zoe` is one binary with seven subcommands. This page gives each subcommand, each of its options, the environment twin of each option, its default and the exit codes. ADR 0028 records the decisions of the command.
+`zoe` is one binary with eight subcommands. This page gives each subcommand, each of its options, the environment twin of each option, its default and the exit codes. ADR 0028 records the decisions of the command.
 
 ## Entry points
 
@@ -121,6 +121,8 @@ Serve the read-only ops tools of a store to an agent, over MCP on stdin and stdo
 
 Check the checksums, the blob files, the references and the classes of a store, or compare the dumps of a backup directory with it. The command changes nothing, and exits with 1 on a finding.
 
+The check reads every row of `text_deltas` and `text_txn` too (ADR 0060). It checks the frame and the key of each delta, its previous serial, the transaction row at its tid, and that each delta has its key in `text_txn` and each key of `text_txn` its delta. A missing previous delta at or before the pack watermark passes. Each problem is a finding of `checksums`, with the tid of the delta, and its text names the catalog, the index and the rid, never the text.
+
 | Option | Twin | Default | Value |
 | --- | --- | --- | --- |
 | `--path STORE` | `ZOE_PATH` | necessary | The directory of the store. |
@@ -129,6 +131,16 @@ Check the checksums, the blob files, the references and the classes of a store, 
 | `--classes FILE` | `ZOE_CLASSES` | none | A file of the classes that the application provides, one `module.name` on each line. A class of the store that the file does not name is a finding. It does not go with `--backup`. |
 | `--backup DIR` | `ZOE_BACKUP` | none | Compare the dumps of this backup directory with the store, in place of the check of the store. The command restores the dumps into a copy, opens the store read-only, compares the copy with the store up to the last tid of the dumps, and removes the copy. A difference is a finding. |
 | `--scratch SCRATCH` | `ZOE_SCRATCH` | the temporary directory, `TMPDIR` | The directory of the copy of `--backup`, on a filesystem with room for the whole store. It needs `--backup`. The command removes the copy at the end, also when the check fails. |
+
+## `zoe migrate`
+
+Move a store to the format of this build: `ZOE format 3` to `ZOE format 4` (ADR 0060). The command runs on a store folder that no process holds: it takes the lock of the store, so a store that `zoe serve` or another process holds fails with 1. It opens the store with the rules of format 3, folds its write-ahead log, then writes the format name and creates the tables of the text deltas in one backend write with a sync. A crash during the command leaves a store of format 3, which the command moves on its next run, or a store of format 4. On a store of format 4 it changes nothing and exits with 0. Any other format fails with 1 and gets no write. A directory without a store fails with 1 and gets nothing.
+
+An open of a store of `ZOE format 3` by this build fails, and the message names `zoe migrate`.
+
+| Argument | Twin | Default | Value |
+| --- | --- | --- | --- |
+| `STORE` | `ZOE_PATH` | necessary | The directory of the store. |
 
 ## `zoe backup`
 

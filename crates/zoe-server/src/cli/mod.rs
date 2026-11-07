@@ -18,6 +18,7 @@ mod backup;
 mod config;
 mod convert;
 mod mcp;
+mod migrate;
 mod pack;
 mod restore;
 mod serve;
@@ -115,6 +116,10 @@ enum Command {
     Backup(backup::BackupArgs),
     /// Rebuild a store from the dumps of a backup directory.
     Restore(restore::RestoreArgs),
+    /// Move a store that no process holds to the format of this build:
+    /// ZOE format 3 to ZOE format 4. A store of ZOE format 4 stays as it
+    /// is.
+    Migrate(migrate::MigrateArgs),
 }
 
 impl Command {
@@ -128,6 +133,7 @@ impl Command {
             Self::Verify(_) => "verify",
             Self::Backup(_) => "backup",
             Self::Restore(_) => "restore",
+            Self::Migrate(_) => "migrate",
         }
     }
 }
@@ -295,6 +301,7 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
         Command::Verify(args) => verify::run(args, out),
         Command::Backup(args) => backup::run(args, out),
         Command::Restore(args) => restore::run(args, out),
+        Command::Migrate(args) => migrate::run(args, out),
     };
     // The console script runs this code in the Python process. Nothing
     // flushes stdout there when the process ends, so flush it here.
@@ -364,6 +371,38 @@ mod tests {
     #[test]
     fn the_command_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Run `zoe migrate` on `dir`. Return the exit code and the report.
+    fn migrate(dir: &Path) -> (i32, String) {
+        let cli = Cli::try_parse_from(["zoe", "migrate", dir.to_str().unwrap()]).unwrap();
+        let mut out = Vec::new();
+        let code = run(&cli, &Fixed(day(0)), &mut out);
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn migrate_moves_a_store_of_format_3_and_changes_nothing_on_format_4() {
+        let dir = store_with_roots("migrate", &[Tid(10)]);
+        {
+            let store = Store::open(&dir).unwrap();
+            zoe_core::testing::write_previous_format(&store).unwrap();
+        }
+        assert!(Store::open(&dir).is_err());
+        let (code, report) = migrate(&dir);
+        assert_eq!(code, SUCCESS, "{report}");
+        assert!(report.contains("Moved"), "{report}");
+        let (code, report) = migrate(&dir);
+        assert_eq!(code, SUCCESS, "{report}");
+        assert!(report.contains("already"), "{report}");
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.load(Oid(0)).unwrap().1, Tid(10));
+        // Another format exits with 1 and keeps its name.
+        zoe_core::testing::write_meta(&store, "format", b"ZOE format 2").unwrap();
+        drop(store);
+        assert_eq!(migrate(&dir).0, FAILURE);
+        assert_eq!(migrate(&dir).0, FAILURE);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

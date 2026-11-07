@@ -656,7 +656,14 @@ impl WriteTxn for LogWrite<'_> {
         let compression = self.compression;
         self.builder
             .text(key, |out| {
-                format::append_frame_with(out, KeySpace::TextDeltas, key, prev, payload, compression);
+                format::append_frame_with(
+                    out,
+                    KeySpace::TextDeltas,
+                    key,
+                    prev,
+                    payload,
+                    compression,
+                );
             })
             .map_err(refused)
     }

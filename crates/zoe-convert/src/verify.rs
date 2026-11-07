@@ -3,8 +3,9 @@
 //! The check walks every record key of the store in key order. It reads
 //! each record, deletions too, and the blob record of each key, so each
 //! frame passes its checksum or gives a finding. It reads and hashes each
-//! blob file. It reads each transaction row, each sequence row and each row
-//! of the KV namespaces (`Store::verify_kv`). Of each
+//! blob file. It reads each transaction row, each sequence row, each row
+//! of the KV namespaces (`Store::verify_kv`) and each text delta
+//! (`Store::verify_text`). Of each
 //! oid, the newest record is the current record. A current record gives
 //! its class, from the class pickle alone, and its persistent references,
 //! from `zoe_pickle::persistent_ids`. No unpickler runs.
@@ -31,7 +32,7 @@ use zoe_pickle::{decode_class_key, persistent_ids};
 use crate::walk::OidVersions;
 
 /// A frame that does not read: a record, a blob record, a transaction row,
-/// a sequence row or a row of a KV namespace.
+/// a sequence row, a row of a KV namespace or a text delta.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameProblem {
     /// The oid of the record or of the blob record. A transaction row and
@@ -42,7 +43,8 @@ pub struct FrameProblem {
     pub tid: Option<Tid>,
     /// What is wrong. For a sequence row, the text names the sequence. For
     /// a row of a namespace, it names the flavour, the namespace and the
-    /// xxh3-64 hash of the key, never the key.
+    /// xxh3-64 hash of the key, never the key. For a text delta, it names
+    /// the catalog, the index, the rid and the tid, never the text.
     pub error: String,
 }
 
@@ -128,6 +130,10 @@ pub struct Verification {
     pub durable_keys: u64,
     /// The expired ephemeral keys that wait for a sweep step.
     pub expired_keys: u64,
+    /// The text deltas, unindexes included.
+    pub text_deltas: u64,
+    /// The clear deltas.
+    pub clear_deltas: u64,
     /// The record keys, deletions too.
     pub records: u64,
     /// The oids with a current record.
@@ -258,6 +264,7 @@ pub fn verify(store: &Store, known: Option<&BTreeSet<String>>) -> Verification {
     rows(store, &mut report);
     sequences(store, &mut report);
     namespaces(store, &mut report);
+    text_deltas(store, &mut report);
     let mut walk = Walk::default();
     records(store, &mut report, &mut walk);
     report.object_count = store.object_count();
@@ -355,6 +362,42 @@ fn namespaces(store: &Store, report: &mut Verification) {
                 finding.flavour.name(),
                 finding.problem
             ),
+        });
+    }
+}
+
+/// Read every row of `text_deltas` and `text_txn`. Each problem is a
+/// finding in the checksums, with the tid of the delta. Its text names the
+/// catalog, the index and the rid, never the text.
+fn text_deltas(store: &Store, report: &mut Verification) {
+    let check = match store.verify_text() {
+        Ok(check) => check,
+        Err(error) => {
+            report.checksums.push(frame_problem(None, error));
+            return;
+        }
+    };
+    report.text_deltas = check.text_deltas;
+    report.clear_deltas = check.clear_deltas;
+    for finding in check.findings {
+        let mut what = match finding.rid {
+            Some(rid) => format!("text delta of rid {rid}"),
+            None if finding.index.is_some() => "clear delta".to_owned(),
+            None => "text delta".to_owned(),
+        };
+        if let Some(index) = &finding.index {
+            what = format!("{what} in index {index:?}");
+        }
+        if let Some(catalog) = finding.catalog {
+            what = format!("{what} of catalog {}", catalog.repr());
+        }
+        if let Some(tid) = finding.tid {
+            what = format!("{what} at tid {}", tid.repr());
+        }
+        report.checksums.push(FrameProblem {
+            oid: None,
+            tid: finding.tid,
+            error: format!("{what}: {}", finding.problem),
         });
     }
 }

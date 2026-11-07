@@ -17,7 +17,7 @@
 //! store, so a commit whose clear is in memory and whose deltas are not
 //! visible yet changes no read.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::sync::Mutex;
 
@@ -329,14 +329,11 @@ impl Store {
                 Some(end) => Excluded(end.as_slice()),
                 None => Unbounded,
             };
-            let keys = self
-                .backend
-                .text_txn_keys(bound(&low), to, SCAN_CHUNK)?;
+            let keys = self.backend.text_txn_keys(bound(&low), to, SCAN_CHUNK)?;
             let full = keys.len() == SCAN_CHUNK;
             for key in &keys {
-                let (tid, prefix) = text::split_txn_key(key).ok_or(ZoeError::CorruptTxn {
-                    tid: Tid::ZERO,
-                })?;
+                let (tid, prefix) =
+                    text::split_txn_key(key).ok_or(ZoeError::CorruptTxn { tid: Tid::ZERO })?;
                 let parts = text::split_prefix(prefix).ok_or(ZoeError::CorruptTxn { tid })?;
                 changes.push(TextChange {
                     tid,
@@ -369,11 +366,9 @@ impl Store {
         rid: i32,
         snapshot: Tid,
     ) -> Result<Option<Vec<u8>>> {
-        let clear = self.text_clears.newest_before(
-            self,
-            &text::clear_prefix(catalog, index),
-            snapshot,
-        )?;
+        let clear =
+            self.text_clears
+                .newest_before(self, &text::clear_prefix(catalog, index), snapshot)?;
         let prefix = text::text_prefix(catalog, index, rid);
         let Some((key, frame)) = self.backend.text_newest(&prefix, snapshot)? else {
             return Ok(None);
@@ -469,7 +464,8 @@ impl Store {
     pub fn verify_text(&self) -> Result<TextCheck> {
         let mut check = TextCheck::default();
         let watermark = self.pack_watermark()?;
-        let mut tids = BTreeSet::new();
+        // The first delta of each tid, and the number of its deltas.
+        let mut tids: BTreeMap<Tid, (TextFinding, u64)> = BTreeMap::new();
         // The prefix and the tid of the row before, in key order.
         let mut previous: Option<(Vec<u8>, Tid)> = None;
         let mut low: Bound<Vec<u8>> = Unbounded;
@@ -477,7 +473,10 @@ impl Store {
             let rows = match self.backend.text_rows(bound(&low), Unbounded, SCAN_CHUNK) {
                 Ok(rows) => rows,
                 Err(error) => {
-                    check.findings.push(finding(None, format!("the scan of the deltas failed: {error}")));
+                    check.findings.push(finding(
+                        None,
+                        format!("the scan of the deltas failed: {error}"),
+                    ));
                     break;
                 }
             };
@@ -490,13 +489,16 @@ impl Store {
                 _ => break,
             }
         }
-        for tid in tids {
+        for (tid, (first, deltas)) in tids {
             let row = self.backend.iter_txns(tid, tid).next();
             if !matches!(row, Some(Ok(ref meta)) if meta.tid == tid) {
-                check.findings.push(TextFinding {
-                    tid: Some(tid),
-                    ..finding(None, "a delta without its transaction row".to_owned())
-                });
+                let problem = match deltas {
+                    1 => "a delta without its transaction row".to_owned(),
+                    n => format!(
+                        "a delta without its transaction row, the first of {n} deltas of the tid"
+                    ),
+                };
+                check.findings.push(TextFinding { problem, ..first });
             }
         }
         self.verify_index(&mut check);
@@ -510,7 +512,7 @@ impl Store {
         frame: &[u8],
         watermark: Tid,
         previous: &mut Option<(Vec<u8>, Tid)>,
-        tids: &mut BTreeSet<Tid>,
+        tids: &mut BTreeMap<Tid, (TextFinding, u64)>,
         check: &mut TextCheck,
     ) {
         let Some((parts, prefix, tid)) = text::split_key(key) else {
@@ -533,7 +535,7 @@ impl Store {
             Some(_) => check.text_deltas += 1,
             None => check.clear_deltas += 1,
         }
-        tids.insert(tid);
+        tids.entry(tid).or_insert_with(|| (named(""), 0)).1 += 1;
         let expected = match previous.take() {
             Some((last, last_tid)) if last == prefix => last_tid,
             _ => Tid::ZERO,
@@ -567,10 +569,12 @@ impl Store {
         let to = Included(index_key.as_slice());
         match self.backend.text_txn_keys(to, to, 1) {
             Ok(keys) if keys.len() == 1 => {}
-            Ok(_) => check.findings.push(named("a delta without its key in text_txn")),
-            Err(error) => check
+            Ok(_) => check
                 .findings
-                .push(named(&format!("the read of its key in text_txn failed: {error}"))),
+                .push(named("a delta without its key in text_txn")),
+            Err(error) => check.findings.push(named(&format!(
+                "the read of its key in text_txn failed: {error}"
+            ))),
         }
     }
 
@@ -578,17 +582,26 @@ impl Store {
     fn verify_index(&self, check: &mut TextCheck) {
         let mut low: Bound<Vec<u8>> = Unbounded;
         loop {
-            let keys = match self.backend.text_txn_keys(bound(&low), Unbounded, SCAN_CHUNK) {
+            let keys = match self
+                .backend
+                .text_txn_keys(bound(&low), Unbounded, SCAN_CHUNK)
+            {
                 Ok(keys) => keys,
                 Err(error) => {
-                    check.findings.push(finding(None, format!("the scan of text_txn failed: {error}")));
+                    check.findings.push(finding(
+                        None,
+                        format!("the scan of text_txn failed: {error}"),
+                    ));
                     return;
                 }
             };
             let full = keys.len() == SCAN_CHUNK;
             for key in &keys {
                 let Some((tid, prefix)) = text::split_txn_key(key) else {
-                    check.findings.push(finding(None, "a key of text_txn shorter than a tid".to_owned()));
+                    check.findings.push(finding(
+                        None,
+                        "a key of text_txn shorter than a tid".to_owned(),
+                    ));
                     continue;
                 };
                 let parts = text::split_prefix(prefix);
@@ -600,14 +613,18 @@ impl Store {
                     problem: problem.to_owned(),
                 };
                 if parts.is_none() {
-                    check.findings.push(named("a key of text_txn that does not read"));
+                    check
+                        .findings
+                        .push(named("a key of text_txn that does not read"));
                     continue;
                 }
                 let row = text::delta_key(prefix, tid);
                 let at = Included(row.as_slice());
                 match self.backend.text_rows(at, at, 1) {
                     Ok(rows) if rows.len() == 1 => {}
-                    Ok(_) => check.findings.push(named("a key of text_txn without its delta")),
+                    Ok(_) => check
+                        .findings
+                        .push(named("a key of text_txn without its delta")),
                     Err(error) => check
                         .findings
                         .push(named(&format!("the read of its delta failed: {error}"))),

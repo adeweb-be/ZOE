@@ -147,8 +147,15 @@ fn a_store_of_format_3_is_refused_and_moves_with_the_tool() {
     check(&store, &original);
     // The moved store takes deltas.
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.text_set(Oid(1), "Title", 1, "en", "a title", Tid(store.last_transaction().0 + 1))
-        .unwrap();
+    txn.text_set(
+        Oid(1),
+        "Title",
+        1,
+        "en",
+        "a title",
+        Tid(store.last_transaction().0 + 1),
+    )
+    .unwrap();
     txn.vote().unwrap();
     txn.finish().unwrap();
     drop(store);

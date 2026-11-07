@@ -524,12 +524,7 @@ impl Table {
     /// before `p`.
     /// Return the newest delta of `prefix`, a key of `text_deltas` without
     /// its tid, before `before` and at or before `p`: its key and its frame.
-    pub(super) fn text_newest(
-        &self,
-        prefix: &[u8],
-        before: Tid,
-        p: Tid,
-    ) -> Option<(&[u8], &[u8])> {
+    pub(super) fn text_newest(&self, prefix: &[u8], before: Tid, p: Tid) -> Option<(&[u8], &[u8])> {
         let end = before.min(after(p));
         if end == Tid::ZERO {
             return None;
@@ -578,9 +573,7 @@ impl Table {
         self.text_txn
             .range::<[u8], _>((from, to))
             .map(|(key, ())| key)
-            .filter(|key| {
-                crate::format::text::split_txn_key(key).is_some_and(|(tid, _)| tid <= p)
-            })
+            .filter(|key| crate::format::text::split_txn_key(key).is_some_and(|(tid, _)| tid <= p))
             .take(limit)
             .cloned()
             .collect()

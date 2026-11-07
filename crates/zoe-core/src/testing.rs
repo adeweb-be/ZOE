@@ -134,6 +134,18 @@ pub fn text_delta_key(catalog: Oid, index: &str, rid: Option<i32>, tid: Tid) -> 
     crate::format::text::delta_key(&prefix, tid)
 }
 
+/// Return the frame of the delta `key` with the previous serial `prev` and
+/// `payload` as it is, codec 0, as the store writes it.
+pub fn text_frame(key: &[u8], prev: Tid, payload: &[u8]) -> Vec<u8> {
+    use crate::format::{KeySpace, MAIN_BRANCH, encode_frame};
+    encode_frame(KeySpace::TextDeltas, key, MAIN_BRANCH, prev, payload)
+}
+
+/// Return the payload of a text delta in `language` with `text`.
+pub fn text_payload(language: &str, text: &str) -> Vec<u8> {
+    crate::format::text::encode_payload(language, text)
+}
+
 /// Return the key of `text_txn` of the delta `key`, a key of
 /// `text_deltas`.
 pub fn text_txn_key(key: &[u8]) -> Vec<u8> {
