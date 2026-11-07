@@ -9,12 +9,12 @@ Card ZOE-283; requirements F17, N6 and N7, the sections "Step 2: the mirror, `zo
 - **Queries (G2): five of the six five-index intersections under 5 ms at p99 warm** (0.06 to 1.84 ms); `generic-numbers` 29.0 ms, because the prototype unions the postings of a range of 3,000 keys one by one (not measured again after the fix that it calls for).
 - **Maintenance per commit: 0.88 ms (p50) / 1.20 ms (p99) for an edit, 2.9 / 4.9 ms for a creation, 9.3 / 13.2 ms for a batch of 4 objects of the indexer.** ADR 0059 applies each commit after its publication, so the hub never waits for it.
 - **The overlay of Q6:** a transaction that edits one entry sends 22 records (8.0 KB, 3 new objects with provisional oids), pickled in 0.4 ms in Python and read into a version in 0.20 ms; with a creation and a removal, 112 records (104.6 KB), 5.7 ms and 2.2 ms. The answers equal ZCatalog's in the transaction.
-- **Versions:** one delta per tid, 21.6 KB each in these commits, about 216 MB for a window of 10,000 tids; a copy-on-write version per tid would cost gigabytes (an estimate).
+- **Versions:** one change set per tid, 21.6 KB each in these commits, about 216 MB for a window of 10,000 tids; a copy-on-write version per tid would cost gigabytes (an estimate).
 - **Check of step 4: no mismatch.** On `catalog-1m`, 45 queries equal ZCatalog's rids, order, `len()` and `actual_result_count`, ties included, and 10 queries inside two transactions over the overlay; on a testbed of three seeds, 3,152 more over every sort path and option of the scope, overlays and a commit.
 - **Inventory (Q6):** in the Plone suites, 9,282 calls of `Catalog.search`; the prototype serves 66.8 %; 25.0 % sort on `getObjPositionInParent` (the order index, ZOE-302), 6.6 % use DateRecurringIndex, 1.5 % ZCTextIndex. In the part of the suites recorded with the fixed probe, 18.2 % of the searches ran in a transaction that had changed the catalog. The B5 runs were not run (see "Limits").
 - **The order of ZCatalog (Q7):** four sort paths with four rules for ties; `_sort_nbest` keeps neither the lowest nor the highest rids at its threshold, and the prototype follows its rule exactly.
 
-**The design that follows (ADR 0059, proposed):** registration of each catalog in the durable namespace `zoe.catalog`; a build in the background after the open; a base with one delta per tid and a fold; the apply after publication with a bounded wait of a query at a newer tid; a memory bound of 2 GiB per store; typed plans built with `IndexQuery`; the overlay as changed records with provisional oids; the Python API and the backend `catalog` of `zoe.plone`.
+**The design that follows (ADR 0059, proposed):** registration of each catalog in the durable namespace `zoe.catalog`; a build in the background after the open; a base with one change set per tid and a rebase; the apply after publication with a bounded wait of a query at a newer tid; a memory bound of 2 GiB per store; typed plans built with `IndexQuery`; the transaction overlay as the changed records of the transaction, savepoints included, with provisional oids; the Python API and the backend `catalog` of `zoe.plone`.
 
 ## Question
 
@@ -26,7 +26,7 @@ Can a mirror that Rust builds from the committed index trees of a catalog meet t
 
 - **The base**: the indexes, the metadata table and the paths of one catalog at one tid, built from the trees and never changed (ADR 0059, section 3). The rows are the rids of `paths` in ascending order; every bitmap is a `roaring` bitmap of rows.
 - **The build** walks each tree with a pool of threads: a thread loads a node, decodes it, queues the children of an inner node and hands the items of a bucket to the builder of the index. It reads `paths`, `uids` (checked to be the inverse of `paths`), the `_unindex` and `_length` of each index, and `data`, one tree after the other.
-- **The versions**: one delta per committed tid with the old and the new value of each changed row of each tree; a version is the base and the patch of the deltas up to its tid.
+- **The versions**: one change set per committed tid with the old and the new value of each changed row of each tree; a version is the base and the overrides of the change sets up to its tid (ADR 0059, "Terms").
 - **The apply of a commit**: the map of the oids of the mirrored trees, the decode of the records that it holds, the new buckets that a changed inner node names, and the diff of the items of each changed bucket against the rows of its old key range.
 - **The overlay of a transaction**: the same read, over the version at the tid of the query, kept for the query alone.
 - **The query** of a typed plan over a version: the clauses of each index as ZCatalog applies them, then the sort on the path of `sortResults` that ZCatalog takes (question 7).
@@ -38,7 +38,7 @@ Can a mirror that Rust builds from the committed index trees of a catalog meet t
 - On `catalog-1m`: `check.py` runs in the interpreter of the zoe scenario, opens the ZOE store through `zoe.Storage(read_only=True)`, and for each query builds the typed plan as the client will (ZCatalog's own `IndexQuery` and the conversion of each index), and records the answer of ZCatalog (`Catalog.searchResults`: the rids in order, `len()`, `actual_result_count`). Then two transactions change the catalog without a commit (an edit of 4 indexes of one entry; the same with a new entry and a removed one); the records that the connection registered, and the new objects that they reach with a provisional oid, form the overlay; the answers of ZCatalog in that transaction are the reference.
 - **The testbed** (`testbed.py`): a catalog of 3,000 and 6,000 entries with the 7 index classes of the scope, 14 indexes and 8 columns, in a `MappingStorage`, no Zope; random values with many ties, paths 7 deep, missing attributes; 600 random queries over every option of the scope, every sort path, batches, `not` and ranges; four overlays (1 to 200 changed entries, with new and removed entries, so with new buckets); and one commit with 300 queries after it. Three seeds.
 
-**The inventory of question 6**: a recording patch of `Catalog.search` (`probe_sitecustomize.py`, outside the repository) wrote one line per call in `just plone zoe suites`. The B5 runs of `browse`, `catalog` and `mixed` were not run (see "Limits").
+**The inventory of question 6**: a recording wrapper of `Catalog.search` (`probe_sitecustomize.py`, outside the repository) wrote one line per call in `just plone zoe suites`. The B5 runs of `browse`, `catalog` and `mixed` were not run (see "Limits").
 
 **Machine**: the reference machine (Intel Core Ultra 7 155H, 6 performance cores of 2 threads and 10 efficiency cores, 30 GB, NVMe), Linux 7.0, rustc 1.99 in release. Two other spikes ran on the machine at other times; the measures held the lock of heavy jobs.
 
@@ -50,7 +50,7 @@ From a cold page cache (the 11.2 GB of the store dropped with `posix_fadvise`), 
 | Measure | Value |
 | --- | --- |
 | Time to ready | **53.3 s** (target 60 s) |
-| Records read and decoded | 1,367,593 (1.87 GB of pickles): 33,137 buckets and inner nodes for each of the 41 trees (`paths`, `uids`, `data`, the `_unindex` of 38 indexes), and 56 records of the catalog, the indexes and their `_length` |
+| Records read and decoded | 1,367,593 (1.87 GB of pickles): the buckets and inner nodes of 53 trees (`paths`, `uids`, `data` and the `_unindex` of the 50 mirrored indexes), 16,377 to 33,599 records for each tree and 1 for each of the 3 empty indexes, and 56 records of the catalog, the indexes and their `_length` |
 | The walks, tree after tree | 43.9 s; `data` 8.6 s (772 MB of pickles), `paths` 3.7 s, an `_unindex` 0.5 to 2.6 s |
 | The structures, beside the walks | 56.7 s of build threads in all; `object_provides` 20.4 s (a KeywordIndex of about 30 interfaces per entry: 30 million pairs to sort), `data` 4.7 s, `path` 4.0 s, a KeywordIndex 1.6 to 2.2 s, a value index 0.2 to 1.2 s |
 | Peak RSS of the process | 15.2 GB (see "Memory") |
@@ -81,9 +81,9 @@ The stock catalog alone (its 25 mirrored indexes and 32 columns, without the 25 
 
 The resident memory of the process is far above these bytes: 10.9 GB after the build, 11.7 GB with the mirror, 15.2 GB at its peak. The build holds the decoded values of a tree (a `Val` per value, a boxed tuple per row of `data`) while its structures build, and glibc keeps the memory that 22 threads freed in their arenas. A drop of the mirror freed it in 2.6 s, and the RSS stayed at 10.0 GB. A mirror in `zoe serve` must build without that: values decoded straight into the structures of the index, and an allocator or arenas that give the memory back, or the bound of N6 counts the allocator, not the mirror.
 
-**The bound (Q2).** At these bytes, a default of 2 GiB per store holds the mirror of one catalog of 1,000,000 entries with the indexes of `xlarge`, or of about two catalogs of that size with the stock indexes. A drop is a free of its structures (2.6 s at one million entries, in a thread of the mirror). A build again costs a build: 53 to 59 s at one million entries.
+**The bound (Q2).** At these bytes, a default of 2 GiB per store holds the mirror of one catalog of 1,000,000 entries with the indexes of `xlarge`, its window and the room of a rebase of one index. It does not hold two stock catalogs of that size (2 × 1,093 MB is more than 2 GiB). A drop is a free of its structures (2.6 s at one million entries, in a thread of the mirror). A build again costs a build: 53 to 59 s at one million entries.
 
-**The versions in the window.** 21.6 KB per delta in these synthetic commits (the old and new value of each changed row of each tree; a row of `data` is all its cells): 216 MB for 10,000 tids of the same shapes.
+**The versions in the window.** 21.6 KB per change set in these synthetic commits (the old and new value of each changed row of each tree; a row of `data` is all its cells): 216 MB for 10,000 tids of the same shapes.
 
 ## Queries (question 3)
 
@@ -131,23 +131,23 @@ On the synthetic commits, an overlay read and the `listing` query over it cost 1
 
 **Naming the new objects.** A new object (the bucket of a split, a new treeset of a key, a new `IITreeSet` of `_index_parents`) has no oid before the commit. The client pickles it with a provisional oid, the high bit set and a counter of the transaction, and the persistent ids of the records that point to it carry that oid. The mirror reads a changed inner node, registers its new children for the read, and reads their records as buckets of the tree.
 
-**Keeping the pickles between two searches.** ZODB registers an object once per transaction, at its first change, so a later change of a registered object leaves no trace in the connection. The client therefore cannot reuse the pickles of the previous search by looking at the registered objects. It can when it knows that the catalog did not change since: the backend wraps `Catalog.catalogObject`, `uncatalogObject` and the calls that change the schema, and keeps the pickles while none of them ran. At 0.4 to 5.7 ms of pickling and 0.2 to 2.2 ms of reading, a resend for each search is also affordable.
+**Keeping the pickles between two searches.** ZODB registers an object once per transaction, at its first change, so a later change of a registered object leaves no trace in the connection. The client therefore cannot reuse the pickles of the previous search by looking at the registered objects. It can when it knows that the catalog did not change since: the backend wraps `Catalog.catalogObject`, `uncatalogObject` and the calls that change the schema, and keeps the pickles while none of them ran. That rule misses a savepoint, which moves the registered objects to the savepoint storage of the connection, and the calls that change the catalog without `catalogObject` or a change of the schema (`manage_catalogClear`, `clearIndex`). At 0.4 to 5.7 ms of pickling and 0.2 to 2.2 ms of reading, a resend for each search is affordable, so ADR 0059 resends.
 
 **Share.** In the part of the suites that the probe recorded with its fix, 18.2 % of the searches ran in a transaction that had changed the catalog, with p50 119 records and 19 KB to send (question 6).
 
 ## Versions (question 9)
 
-The prototype keeps one delta per tid, not one copy-on-write version per tid:
+The prototype keeps one change set per tid, not one copy-on-write version per tid:
 
 | Measure | Value |
 | --- | --- |
-| Bytes of a delta of these commits | 21.6 KB on average (the old and new values; a row of `data` counts all its 53 cells) |
-| The window of 10,000 tids | about 216 MB of these deltas |
-| The patch of a version, from the deltas | 0.7 to 2.1 ms after 200 commits (14,707 changed rows) |
-| A query over that patch | `listing` 0.61 ms (0.47 at the base); most queries within 1 ms of their time at the base; `navtree-depth999` 27 ms, against 0.17 ms, because the prototype parses the path of each patched row at each step |
-| A fold of one index into a new base | 0.2 s (`review_state`) to 2.0 s (`path`) |
+| Bytes of a change set of these commits | 21.6 KB on average (the old and new values; a row of `data` counts all its 53 cells) |
+| The window of 10,000 tids | about 216 MB of these change sets |
+| The overrides of a version, from the change sets | 0.7 to 2.1 ms after 200 commits (14,707 changed rows) |
+| A query over these overrides | `listing` 0.61 ms (0.47 at the base); most queries within 1 ms of their time at the base; `navtree-depth999` 27 ms, against 0.17 ms, because the prototype parses the path of each overridden row at each step |
+| A rebase of one index into a new base | 0.2 s (`review_state`) to 2.0 s (`path`) |
 
-A delta that keeps the changed cells of a row of `data`, not the whole row, divides the window by about three. A version per tid with copy-on-write bitmaps copies, for each changed key, at least the container of the bitmap that holds the row (up to 8 KB): a reindex of one object changes 48 trees, about 100 keys, so up to about 800 KB per version and gigabytes for a window of 10,000 tids. That is an estimate from the sizes of the containers; the prototype did not build it.
+A change set that keeps the changed cells of a row of `data`, not the whole row, divides the window by about three. A version per tid with copy-on-write bitmaps copies, for each changed key, at least the container of the bitmap that holds the row (up to 8 KB): a reindex of one object changes 48 trees, about 100 keys, so up to about 800 KB per version and gigabytes for a window of 10,000 tids. That is an estimate from the sizes of the containers; the prototype did not build it.
 
 ## The check (step 4)
 
@@ -159,7 +159,7 @@ A delta that keeps the changed cells of a row of `data`, not the whole row, divi
 | The testbed, overlays of 1 to 200 changed entries | 480 | 474 | 0 | 6 (ZCatalog raises) |
 | The testbed, after one commit applied to the mirror | 900 | 894 | 0 | 6 (ZCatalog raises) |
 
-Every answer that the mirror gave equals ZCatalog's: the rids, their order, `len()` and `actual_result_count`, ties included. The first runs of the testbed found two faults of the prototype that the final runs no longer have: the client took the sort from the query after `make_query`, which sorts the list of `sort_on`; and two new keys of a patch between the same two keys of the base had one rank.
+Every answer that the mirror gave equals ZCatalog's: the rids, their order, `len()` and `actual_result_count`, ties included. The first runs of the testbed found two faults of the prototype that the final runs no longer have: the client took the sort from the query after `make_query`, which sorts the list of `sort_on`; and two new keys of the overrides between the same two keys of the base had one rank.
 
 ## The queries that Plone sends (question 6)
 
@@ -258,8 +258,8 @@ The keys are none, bool, int, float, str or a tuple of them: the conversion leav
 
 The numbers ask for one change of content, not of count:
 
-- **ZOE-286** takes the versions (the base, the deltas, the patch, the fold), the apply of a commit and the four sort paths of ZCatalog with their ties, beside FieldIndex: a FieldIndex query cannot be exact without them, and the testbed is its acceptance harness. Its budget stays 3 if the testbed and `mirror test` move into it from the prototype.
-- **ZOE-291**, the overlay, reads the records of a transaction with the code of the apply of ZOE-286 over the version of the query: the server side shrinks to the call and its limits; the client side (the pickles of the registered objects of the catalog with provisional oids, and their reuse between two searches) stays. Budget 2 → 1.
+- **ZOE-286** takes the versions (the base, the change sets, the overrides, the rebase), the apply of a commit and the four sort paths of ZCatalog with their ties, beside FieldIndex: a FieldIndex query cannot be exact without them, and the testbed is its acceptance harness. Its budget stays 3 if the testbed and `mirror test` move into it from the prototype.
+- **ZOE-291**, the overlay, reads the records of a transaction with the code of the apply of ZOE-286 over the version of the query: the server side shrinks to the call and its limits; the client side (the pickles of the registered objects and of the savepoint records, with provisional oids, and the cap of a call) stays. Budget 2 → 1.
 - **ZOE-289**, the metadata table, carries the memory question: the table is the largest part of the mirror (see "Memory"). It should start after the human sets the default of the memory bound (ADR 0059, section 6).
 - ZOE-287, ZOE-288 and ZOE-290 stay as written.
 
@@ -269,7 +269,7 @@ The numbers ask for one change of content, not of count:
 - **Partly run: the share of searches in a transaction that changed the catalog.** The first run of the probe did not see the changed records; the run with the fix stopped at the end of the session after 2,189 of about 9,300 calls.
 - **`xlarge` was not measured.** The B5 fixture `xlarge` is not built on the machine, and its build takes about 6.5 hours. `catalog-1m` has the catalog of `xlarge` (56 indexes, 53 columns) at four times its entries, and the human counted it for G2 and G3; every cost of the build, of the memory and of a commit grows with the entries and the records, so the numbers of `xlarge` are those of `catalog-1m` at about a quarter. The commit shapes come from B5 on `small` (ZOE-281) and are synthetic on `catalog-1m`.
 - **The commits are synthetic.** `catalog-1m` holds no history, so the driver makes each commit: it rewrites the buckets of the chosen rids in the chosen trees (a changed value, or a new rid) with zoe-pickle, as ZODB's resolver writes them. A real save also writes the `_index` trees, the treesets and the text indexes, which the mirror looks up and leaves: one map lookup each.
-- **The fold is measured per index**, not as a background job beside queries; the window of 10,000 tids is an estimate from the bytes of the deltas of the synthetic commits.
+- **The rebase is measured per index**, not as a background job beside queries; the window of 10,000 tids is an estimate from the bytes of the change sets of the synthetic commits.
 - **One run of each measure.** The cold build ran once, with 22 threads; a run with fewer threads was not run. The queries ran 200 times each.
 - **The wire is estimated**, from the bytes of the plan and of the overlay; the prototype has no server.
 - **The testbed is not Plone.** Its catalog has the index classes of the scope with stub objects; the check on `catalog-1m` and the Plone suites of the differential suite (ZOE-292) cover the rest.
