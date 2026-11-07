@@ -27,6 +27,7 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | `just loupe` | builds Loupe in release and runs it; `just loupe dev` runs it on the Vite dev server, `just loupe check` lints it, `just loupe e2e` runs its end-to-end tests. They run in the `loupe` profile of the shell: `devenv --profile loupe shell -- just loupe` |
 | `just deploy check` | the tests of `deploy/tests` on the deployment files: the Tier 1 manifests, the host units, the Grafana dashboard; `just test` runs it at its end |
 | `just docs` | checks the links of the book, then builds the documentation site into `target/book`; a link to a missing file or to a page of `docs/` that `SUMMARY.md` does not list fails it |
+| `just lock PACKAGE...` | moves each named package to its newest release in the `uv.lock` of each uv project that locks it, and changes nothing else; a project that does not lock the package stays as it is |
 | `just ci` | runs the Dagger functions `check`, `test` and `docs` locally; `just ci <function>` runs one |
 | `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release wheel DIR VERSION...` builds the `zoedb` wheel in the shell, one for each CPython version, 3.13 by default; `just release test` runs the tests of `ci/`. Publishing is not built yet |
 
