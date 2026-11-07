@@ -13,9 +13,12 @@ cannot type, the hook runs the stock search, whole.
 
 This version types the clauses of FieldIndex, KeywordIndex, DateIndex and
 UUIDIndex (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
-key) and of DateRangeIndex (`"k": "d"`, the date in minutes of
-`_convertDateTime`), and a sort on FieldIndexes, DateIndexes and
-UUIDIndexes. The hook decides the reasons `unsupported`, `index`, `option`,
+key), of DateRangeIndex (`"k": "d"`, the date in minutes of
+`_convertDateTime`) and of ExtendedPathIndex (`"k": "p"`, each path with
+its level, the options of `ExtendedPathIndex.query_index` and the
+physical path of the index), and a sort on FieldIndexes, DateIndexes and
+UUIDIndexes. A sort on an ExtendedPathIndex takes the Python path
+(`sort`). The hook decides the reasons `unsupported`, `index`, `option`,
 `and_range`, `sort` and `transaction`; the store decides the others. A search in a
 transaction whose connection holds a registered object or a savepoint
 record takes the Python path (`transaction`): no overlay carries the
@@ -71,6 +74,7 @@ _CLAUSES = {
     f"{_PLUGIN_INDEXES}.UUIDIndex.UUIDIndex.UUIDIndex": "v",
     f"{_PLUGIN_INDEXES}.BooleanIndex.BooleanIndex.BooleanIndex": "b",
     f"{_PLUGIN_INDEXES}.DateRangeIndex.DateRangeIndex.DateRangeIndex": "d",
+    "Products.ExtendedPathIndex.ExtendedPathIndex.ExtendedPathIndex": "p",
 }
 _SORTS = {
     f"{_PLUGIN_INDEXES}.FieldIndex.FieldIndex.FieldIndex",
@@ -451,6 +455,15 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
             keys = list(rec.keys)
             clauses.append({"k": "b", "i": name, "q": bool(keys[0]) if keys else None})
             continue
+        if kind == "p":
+            try:
+                clause, reason = _path_clause(index, name, rec)
+            except Exception:
+                return None, "option"
+            if clause is None:
+                return None, reason
+            clauses.append(clause)
+            continue
         if kind == "d":
             if not rec.keys:
                 return None, "option"
@@ -549,6 +562,54 @@ def _value_clause(index, name, rec):
     return clause, None
 
 
+# The options of a path clause, with the defaults of
+# `ExtendedPathIndex.query_index`.
+_PATH_DEFAULTS = {"lv": 0, "d": -1, "nt": False, "ns": 0}
+
+
+def _int(value):
+    """The value as an int of a plan, for a level or a depth that
+    ExtendedPathIndex compares with ints; None for another value."""
+    if isinstance(value, int) and _wire(value):
+        return int(value)
+    return None
+
+
+def _path_clause(index, name, rec):
+    """Return the clause of `rec` for an ExtendedPathIndex, with the options
+    as `ExtendedPathIndex.query_index` reads them, and None; or None and the
+    reason of the Python path."""
+    level = _int(rec.get("level", 0))
+    depth = _int(getattr(rec, "depth", -1))
+    navtree = bool(rec.get("navtree", 0))
+    start = rec.get("navtree_start", 0)
+    # Without navtree, `search` does not read navtree_start.
+    start = _int(start) if navtree else (_int(start) or 0)
+    if level is None or depth is None or start is None:
+        return None, "option"
+    paths = []
+    for key in rec.keys:
+        if isinstance(key, str):
+            paths.append([key, None])
+            continue
+        # `search` reads a key that is not a str as (path, level).
+        path, key_level = key[0], _int(int(key[1]))
+        if not isinstance(path, str) or key_level is None:
+            return None, "option"
+        paths.append([path, key_level])
+    return {
+        "k": "p",
+        "i": name,
+        "q": paths,
+        "lv": level,
+        "and": rec.operator == "and",
+        "d": depth,
+        "nt": navtree,
+        "ns": start,
+        "ip": [p for p in index.getPhysicalPath() if p],
+    }, None
+
+
 def _compare(plan, native, stock):
     """Log and count a difference between the native and the stock result
     of a search, with the indexes and the options of the plan and no
@@ -570,6 +631,12 @@ def _compare(plan, native, stock):
             name
             for name in ("q", "r", "not", "t")
             if clause.get(name) not in (None, [], False)
+        ]
+        # The options of a path clause that differ from their defaults.
+        options += [
+            name
+            for name, default in _PATH_DEFAULTS.items()
+            if name in clause and clause[name] != default
         ]
         clauses.append(f"{clause['i']}({','.join(options)})")
     sort = [f"{name}:{'desc' if r else 'asc'}" for name, r in plan["s"]]

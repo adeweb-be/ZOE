@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use roaring::RoaringBitmap;
 
 use crate::base::{
-    Base, DateRangeIndex, FieldIndex, Index, Keys, KeywordIndex, Kind, Posting, Postings, covers,
-    date_range_of, keywords_of,
+    Base, DateRangeIndex, FieldIndex, Index, Keys, KeywordIndex, Kind, PathIndex, Posting,
+    Postings, components, covers, date_range_of, keywords_of, parent_of,
 };
 use crate::change::{Overrides, Slot, same};
 use crate::reason::{Fallback, Reason};
@@ -28,7 +28,11 @@ use crate::value::{Val, py_cmp};
 /// and the conversion of the index. The class of the index tells how the
 /// clause reads: a clause on a BooleanIndex has one key, its truth, or
 /// none; a clause on a DateRangeIndex has one key, its date in minutes, or
-/// `None` for a date that the index does not hold.
+/// `None` for a date that the index does not hold. A clause on an
+/// ExtendedPathIndex has its options as its first key, the tuple `(level,
+/// depth, navtree, navtree_start, (component...))`, then one key for each
+/// path of its query, the tuple `(path, level or None)`; `and` is its
+/// operator.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clause {
     /// The index.
@@ -430,6 +434,7 @@ impl<'a> View<'a> {
             (Kind::Field | Kind::Date, Index::Field(f)) => {
                 self.values(i, Keyed::One(f), clause, rs, trace)
             }
+            (Kind::Path, Index::Path(p)) => self.path(i, p, clause),
             _ => fallback(
                 Reason::IndexUnavailable,
                 format!(
@@ -999,6 +1004,370 @@ impl<'a> View<'a> {
             actual,
             trace: Trace::default(),
         }
+    }
+}
+
+/// The options of a clause on an ExtendedPathIndex, as
+/// `ExtendedPathIndex.query_index` reads them.
+struct PathQuery<'c> {
+    /// Each path of the query, with its level when the key gives one.
+    paths: Vec<(&'c str, Option<i64>)>,
+    /// `level`: the level of a path without its own.
+    level: i64,
+    /// `depth`.
+    depth: i64,
+    /// `navtree`, as a truth.
+    navtree: bool,
+    /// `navtree_start`.
+    start: i64,
+    /// The components of the physical path of the index.
+    ip: Vec<&'c str>,
+    /// True for the operator `and`.
+    and: bool,
+}
+
+impl<'c> PathQuery<'c> {
+    /// The options of `clause`. A clause of another form, a `depth` below
+    /// -1 and a negative `navtree_start` with `navtree` take the Python
+    /// path (`option`).
+    fn of(clause: &'c Clause) -> Result<PathQuery<'c>, Fallback> {
+        let refuse = || {
+            Fallback::new(
+                Reason::Option,
+                "a clause that an ExtendedPathIndex does not take",
+            )
+        };
+        if clause.range.is_some() || !clause.not.is_empty() {
+            return Err(refuse());
+        }
+        let Some((Val::Tuple(options), keys)) = clause.keys.split_first() else {
+            return Err(refuse());
+        };
+        let [
+            Val::Int(level),
+            Val::Int(depth),
+            Val::Bool(navtree),
+            Val::Int(start),
+            Val::Tuple(ip),
+        ] = &options[..]
+        else {
+            return Err(refuse());
+        };
+        let ip = ip
+            .iter()
+            .map(|c| c.text().filter(|_| matches!(c, Val::Str(_))))
+            .collect::<Option<Vec<&str>>>()
+            .ok_or_else(refuse)?;
+        let mut paths = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Val::Tuple(items) = key else {
+                return Err(refuse());
+            };
+            match &items[..] {
+                [Val::Str(path), Val::None] => paths.push((&**path, None)),
+                [Val::Str(path), Val::Int(level)] => paths.push((&**path, Some(*level))),
+                _ => return Err(refuse()),
+            }
+        }
+        if *depth < -1 {
+            return fallback(Reason::Option, "a depth below -1");
+        }
+        if *navtree && *start < 0 {
+            return fallback(Reason::Option, "a navtree_start below 0 with navtree");
+        }
+        Ok(PathQuery {
+            paths,
+            level: *level,
+            depth: *depth,
+            navtree: *navtree,
+            start: *start,
+            ip,
+            and: clause.and,
+        })
+    }
+}
+
+/// The rows of the overrides of an ExtendedPathIndex in one version, by
+/// the keys of its structures. The path of each row parses once.
+#[derive(Default)]
+struct PathOverrides<'a> {
+    /// The changed rows.
+    touched: RoaringBitmap,
+    /// The changed rows with a path.
+    indexed: RoaringBitmap,
+    /// The rows of each component at each level.
+    comps: HashMap<(&'a str, i64), RoaringBitmap>,
+    /// The rows that end at each level.
+    ends: HashMap<i64, RoaringBitmap>,
+    /// The rows of each parent path.
+    parents: HashMap<String, RoaringBitmap>,
+    /// The deepest level at which a changed row ends.
+    deepest: i64,
+}
+
+/// An ExtendedPathIndex in one version: the structures of the base, with
+/// the rows of the overrides over them.
+struct PathVersion<'v> {
+    base: &'v PathIndex,
+    over: PathOverrides<'v>,
+}
+
+/// `intersection` of BTrees: `None` stands for no set, and gives the other
+/// set whole.
+fn intersection(a: Option<RoaringBitmap>, b: Option<&RoaringBitmap>) -> Option<RoaringBitmap> {
+    match (a, b) {
+        (None, b) => b.cloned(),
+        (Some(a), None) => Some(a),
+        (Some(mut a), Some(b)) => {
+            a &= b;
+            Some(a)
+        }
+    }
+}
+
+/// `union` of BTrees: `None` stands for no set.
+fn union(a: Option<RoaringBitmap>, b: Option<RoaringBitmap>) -> Option<RoaringBitmap> {
+    match (a, b) {
+        (None, b) => b,
+        (a, None) => a,
+        (Some(mut a), Some(b)) => {
+            a |= b;
+            Some(a)
+        }
+    }
+}
+
+/// Why a query that reads `_index_items` takes the Python path.
+const INDEX_ITEMS: &str = "a lookup of _index_items, which the mirror does not read: it keeps one \
+     rid for each path and loses it when any row of the path leaves";
+
+impl<'v> PathVersion<'v> {
+    /// The base rows of a posting, without the changed rows, with `extra`.
+    fn patched(&self, base: Option<Posting<'_>>, extra: Option<&RoaringBitmap>) -> RoaringBitmap {
+        let mut rows = base.map(|p| p.to_bitmap()).unwrap_or_default();
+        if !self.over.touched.is_empty() {
+            rows -= &self.over.touched;
+        }
+        if let Some(extra) = extra {
+            rows |= extra;
+        }
+        rows
+    }
+
+    /// `_index[comp][level]`, `None` when no row has `comp` at `level`.
+    fn comp(&self, comp: &str, level: i64) -> Option<RoaringBitmap> {
+        let rows = self.patched(
+            self.base.comp_rows(comp, level),
+            self.over.comps.get(&(comp, level)),
+        );
+        (!rows.is_empty()).then_some(rows)
+    }
+
+    /// `_index[None][level]`, `None` when no row ends at `level`.
+    fn ends(&self, level: i64) -> Option<RoaringBitmap> {
+        let mut rows = self.base.ends_at(level).cloned().unwrap_or_default();
+        if !self.over.touched.is_empty() {
+            rows -= &self.over.touched;
+        }
+        if let Some(extra) = self.over.ends.get(&level) {
+            rows |= extra;
+        }
+        (!rows.is_empty()).then_some(rows)
+    }
+
+    /// `_index_parents.get(path, IISet())`.
+    fn parents(&self, path: &str) -> RoaringBitmap {
+        self.patched(self.base.parent_rows(path), self.over.parents.get(path))
+    }
+
+    /// The rows of `_unindex`.
+    fn all(&self) -> RoaringBitmap {
+        let mut rows = self.base.indexed.clone();
+        rows -= &self.over.touched;
+        rows |= &self.over.indexed;
+        rows
+    }
+
+    /// The deepest level at which a row may end.
+    fn deepest(&self) -> i64 {
+        self.base.deepest().max(self.over.deepest)
+    }
+
+    /// `ExtendedPathIndex.search` of `path` at `level`.
+    fn search(&self, path: &str, level: i64, q: &PathQuery<'_>) -> Result<RoaringBitmap, Fallback> {
+        if level < 0 {
+            // Each level, then the union.
+            let mut out = RoaringBitmap::new();
+            for level in 0..=self.base.depth {
+                out |= self.search(path, level, q)?;
+            }
+            return Ok(out);
+        }
+        let comps = components(path);
+        let mut depth = q.depth;
+        if q.navtree && depth == -1 {
+            depth = 1;
+        }
+        let pathlength = level + comps.len() as i64 - 1;
+        if q.navtree && q.start > (pathlength + depth).min(self.base.depth) {
+            return Ok(RoaringBitmap::new());
+        }
+        let multi = self.base.multi_valued;
+        if level == 0 && (depth == 0 || depth == 1) {
+            if q.navtree {
+                if depth == 1 && !multi {
+                    // The rows of each parent path along the path.
+                    let mut out = RoaringBitmap::new();
+                    let mut i = comps.len() as i64;
+                    while i >= q.start {
+                        out |= self.parents(&format!("/{}", comps[..i as usize].join("/")));
+                        i -= 1;
+                    }
+                    return Ok(out);
+                }
+                return fallback(Reason::IndexUnavailable, INDEX_ITEMS);
+            }
+            if depth == 0 && !multi {
+                return fallback(Reason::IndexUnavailable, INDEX_ITEMS);
+            }
+            return Ok(if path.starts_with('/') {
+                self.parents(path)
+            } else {
+                self.parents(&format!("/{path}"))
+            });
+        }
+        let mut level = level;
+        let mut comps = &comps[..];
+        if level == 0 {
+            // The components that the physical path of the index starts
+            // with: the search starts below them.
+            for (index, comp) in q.ip.iter().zip(comps) {
+                if index != comp {
+                    break;
+                }
+                level += 1;
+            }
+            comps = &comps[level as usize..];
+        }
+        if comps.is_empty() && depth == -1 {
+            return Ok(self.all());
+        }
+        let mut pathset: Option<RoaringBitmap> = None;
+        let mut depthset: Option<RoaringBitmap> = None;
+        if q.navtree && depth > 0 {
+            let mut rows = RoaringBitmap::new();
+            for at in q.start.min(level)..=q.start.max(level) {
+                if let Some(ends) = self.ends(at) {
+                    rows |= ends;
+                }
+            }
+            depthset = Some(rows);
+        }
+        let mut steps: Vec<(usize, &str)> = comps.iter().copied().enumerate().collect();
+        if !q.navtree {
+            // The last components first: the smaller sets.
+            steps.reverse();
+        }
+        for (k, comp) in steps {
+            let at = k as i64 + level;
+            let res = self.comp(comp, at);
+            if res.is_none() {
+                if !q.navtree {
+                    return Ok(RoaringBitmap::new());
+                }
+                pathset = Some(RoaringBitmap::new());
+            }
+            pathset = intersection(pathset, res.as_ref());
+            if q.navtree && at >= q.start {
+                let ends = self.ends(at);
+                depthset = union(depthset, intersection(pathset.clone(), ends.as_ref()));
+            }
+        }
+        if depth >= 0 {
+            let mut start = comps.len() as i64 - 1;
+            if q.navtree {
+                start = start.max(q.start - level);
+            }
+            let mut rows = depthset.unwrap_or_default();
+            let deepest = self.deepest();
+            for k in start..=start.saturating_add(depth) {
+                let at = k + level;
+                if at > deepest {
+                    // No row ends there: the intersection gives the whole
+                    // pathset, at this level and at each one after it.
+                    if let Some(p) = &pathset {
+                        rows |= p;
+                    }
+                    break;
+                }
+                if let Some(found) = intersection(pathset.clone(), self.ends(at).as_ref()) {
+                    rows |= found;
+                }
+            }
+            depthset = Some(rows);
+        }
+        if q.navtree || depth >= 0 {
+            return Ok(depthset.unwrap_or_default());
+        }
+        Ok(pathset.unwrap_or_default())
+    }
+}
+
+impl<'a> View<'a> {
+    /// The overrides of the ExtendedPathIndex at `i` in this version.
+    fn path_overrides(&self, i: usize) -> PathOverrides<'a> {
+        let mut over = PathOverrides {
+            deepest: -2,
+            ..PathOverrides::default()
+        };
+        for (row, value) in self.changed(Slot::Index(i)) {
+            over.touched.insert(row);
+            let Some(Val::Str(path)) = value else {
+                continue;
+            };
+            over.indexed.insert(row);
+            let comps = components(path);
+            for (level, comp) in comps.iter().enumerate() {
+                over.comps
+                    .entry((comp, level as i64))
+                    .or_default()
+                    .insert(row);
+            }
+            let end = comps.len() as i64 - 1;
+            over.deepest = over.deepest.max(end);
+            over.ends.entry(end).or_default().insert(row);
+            over.parents
+                .entry(parent_of(&comps))
+                .or_default()
+                .insert(row);
+        }
+        over
+    }
+
+    /// The rows of a clause on the ExtendedPathIndex at `i`, as
+    /// `ExtendedPathIndex.query_index` gives them.
+    fn path(&self, i: usize, p: &'a PathIndex, clause: &Clause) -> Result<RoaringBitmap, Fallback> {
+        let q = PathQuery::of(clause)?;
+        let version = PathVersion {
+            base: p,
+            over: self.path_overrides(i),
+        };
+        let mut result: Option<RoaringBitmap> = None;
+        for (path, level) in &q.paths {
+            let rows = version.search(path, level.unwrap_or(q.level), &q)?;
+            result = Some(match result {
+                None => rows,
+                Some(mut r) => {
+                    if q.and {
+                        r &= rows;
+                    } else {
+                        r |= rows;
+                    }
+                    r
+                }
+            });
+        }
+        Ok(result.unwrap_or_default())
     }
 }
 

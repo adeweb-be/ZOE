@@ -37,6 +37,11 @@ pub const BOOLEAN_INDEX: (&str, &str) = (
 );
 /// The class of a UUIDIndex.
 pub const UUID_INDEX: (&str, &str) = ("Products.PluginIndexes.UUIDIndex.UUIDIndex", "UUIDIndex");
+/// The class of an ExtendedPathIndex.
+pub const EXTENDED_PATH_INDEX: (&str, &str) = (
+    "Products.ExtendedPathIndex.ExtendedPathIndex",
+    "ExtendedPathIndex",
+);
 
 /// The class of a mirrored index. Each reads its `_unindex` tree and its
 /// `_length`, and no other tree.
@@ -55,6 +60,8 @@ pub enum Kind {
     Boolean,
     /// A UUIDIndex: `_unindex` maps a rid to its UUID.
     Uuid,
+    /// An ExtendedPathIndex: `_unindex` maps a rid to its path, a str.
+    Path,
 }
 
 impl Kind {
@@ -68,6 +75,7 @@ impl Kind {
             (DATE_RANGE_INDEX, Kind::DateRange),
             (BOOLEAN_INDEX, Kind::Boolean),
             (UUID_INDEX, Kind::Uuid),
+            (EXTENDED_PATH_INDEX, Kind::Path),
         ]
         .into_iter()
         .find(|((m, n), _)| *m == module && *n == name)
@@ -172,7 +180,9 @@ impl Rows {
             .map(|row| self.paths.get(row).to_owned())
             .collect();
         for (rid, path) in changed {
-            let row = match rows.row(*rid) {
+            // The rows of `self`: `rows.later` is in rid order only after
+            // the sort below.
+            let row = match self.row(*rid) {
                 Some(row) => row,
                 None => {
                     let row = rows.rids.len() as u32;
@@ -349,6 +359,12 @@ impl Postings {
         } else {
             Posting::One(head)
         }
+    }
+
+    /// Releases the spare capacity.
+    fn shrink(&mut self) {
+        self.heads.shrink_to_fit();
+        self.bitmaps.shrink_to_fit();
     }
 
     /// The bitmaps of the keys of more than one row.
@@ -834,6 +850,230 @@ impl DateRangeIndex {
     }
 }
 
+/// The components of a path, as ExtendedPathIndex splits it: the parts
+/// between the slashes that are not empty.
+pub fn components(path: &str) -> Vec<&str> {
+    path.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+/// The parent path of a path of `comps`, as `_index_parents` keys it: `/`
+/// and the components but the last, joined by slashes.
+pub fn parent_of(comps: &[&str]) -> String {
+    format!("/{}", comps[..comps.len().saturating_sub(1)].join("/"))
+}
+
+/// An ExtendedPathIndex: the structures that its `_index` and its
+/// `_index_parents` hold, made from `_unindex`. These are not a trie.
+///
+/// A path of `n` components has the component `i` at the level `i`, and
+/// ends at the level `n - 1`; a path without a component ends at the level
+/// -1. The mirror does not keep `_index_items`: a query that reads it takes
+/// the Python path.
+#[derive(Debug)]
+pub struct PathIndex {
+    /// The path of each row, as `_unindex` holds it: its place in `texts`,
+    /// or `NONE`. A row past its end has no path.
+    places: Vec<u32>,
+    /// The paths of the rows.
+    texts: StrArena,
+    /// The distinct components, in ascending order.
+    comps: StrArena,
+    /// The pairs (component, level) of the rows, in ascending order.
+    pairs: Vec<(u32, i32)>,
+    /// The rows of each pair.
+    pair_rows: Postings,
+    /// The rows that end at each level, from the level -1.
+    ends: Vec<RoaringBitmap>,
+    /// The distinct parent paths, in ascending order.
+    parents: StrArena,
+    /// The rows of each parent path.
+    parent_rows: Postings,
+    /// The rows with a path.
+    pub indexed: RoaringBitmap,
+    /// `_depth` of the index record: the deepest level that the index met
+    /// since its last `clear`. It does not go down when rows leave.
+    pub depth: i64,
+    /// `multi_valued` of the index record.
+    pub multi_valued: bool,
+}
+
+impl PathIndex {
+    /// The path of `row`.
+    pub fn path(&self, row: u32) -> Option<&str> {
+        self.places
+            .get(row as usize)
+            .filter(|p| **p != NONE)
+            .map(|p| self.texts.get(*p))
+    }
+
+    /// The rows with `comp` at `level`.
+    pub fn comp_rows(&self, comp: &str, level: i64) -> Option<Posting<'_>> {
+        let slot = self.comps.search(comp).ok()?;
+        let level = i32::try_from(level).ok()?;
+        let at = self.pairs.binary_search(&(slot, level)).ok()?;
+        Some(self.pair_rows.get(at as u32))
+    }
+
+    /// The rows that end at `level`.
+    pub fn ends_at(&self, level: i64) -> Option<&RoaringBitmap> {
+        let at = usize::try_from(level.checked_add(1)?).ok()?;
+        self.ends.get(at).filter(|rows| !rows.is_empty())
+    }
+
+    /// The deepest level at which a row ends.
+    pub fn deepest(&self) -> i64 {
+        self.ends.len() as i64 - 2
+    }
+
+    /// The rows whose parent path is `path`.
+    pub fn parent_rows(&self, path: &str) -> Option<Posting<'_>> {
+        let slot = self.parents.search(path).ok()?;
+        Some(self.parent_rows.get(slot))
+    }
+
+    /// The bytes that the index takes.
+    pub fn heap_bytes(&self) -> usize {
+        self.places.capacity() * 4
+            + self.texts.heap_bytes()
+            + self.comps.heap_bytes()
+            + self.pairs.capacity() * 8
+            + self.pair_rows.heap_bytes()
+            + self
+                .ends
+                .iter()
+                .map(|b| b.serialized_size() + 48)
+                .sum::<usize>()
+            + self.parents.heap_bytes()
+            + self.parent_rows.heap_bytes()
+            + self.indexed.serialized_size()
+    }
+
+    /// The transient bytes of a build from the paths of `items`, beside
+    /// the paths: the components of each row and their parent paths.
+    pub fn build_bytes(texts: &StrArena, items: &[(u32, u32)]) -> usize {
+        items.len() * 64 + texts.heap_bytes()
+    }
+
+    /// Builds the index from the path of each row of `items`, a place in
+    /// `texts`, for `rows` rows, with the `_depth` and the `multi_valued`
+    /// of the index record.
+    pub fn build(
+        mut texts: StrArena,
+        items: Vec<(u32, u32)>,
+        rows: usize,
+        depth: i64,
+        multi_valued: bool,
+    ) -> PathIndex {
+        texts.shrink();
+        let mut places = vec![NONE; rows];
+        let mut indexed = RoaringBitmap::new();
+        for (row, place) in items {
+            places[row as usize] = place;
+            indexed.insert(row);
+        }
+        let mut ids: HashMap<&str, u32> = HashMap::new();
+        let mut names: Vec<&str> = Vec::new();
+        let mut found: Vec<(u32, i32, u32)> = Vec::new();
+        let mut ends: Vec<Vec<u32>> = Vec::new();
+        let mut parents: HashMap<String, Vec<u32>> = HashMap::new();
+        for row in indexed.iter() {
+            let comps = components(texts.get(places[row as usize]));
+            for (level, comp) in comps.iter().enumerate() {
+                let id = *ids.entry(comp).or_insert_with(|| {
+                    names.push(comp);
+                    (names.len() - 1) as u32
+                });
+                found.push((id, level as i32, row));
+            }
+            // `ends[0]` holds the level -1.
+            let end = comps.len();
+            if ends.len() <= end {
+                ends.resize_with(end + 1, Vec::new);
+            }
+            ends[end].push(row);
+            parents.entry(parent_of(&comps)).or_default().push(row);
+        }
+        // The slot of each component, in ascending order of the components.
+        let mut order: Vec<u32> = (0..names.len() as u32).collect();
+        order.sort_unstable_by_key(|id| names[*id as usize]);
+        let mut slot_of = vec![0u32; names.len()];
+        let mut comps = StrArena::default();
+        for (slot, id) in order.iter().enumerate() {
+            slot_of[*id as usize] = slot as u32;
+            comps.push(names[*id as usize]);
+        }
+        comps.shrink();
+        for item in &mut found {
+            item.0 = slot_of[item.0 as usize];
+        }
+        found.sort_unstable();
+        let mut pairs = Vec::new();
+        let mut pair_rows = Postings::default();
+        let mut group: Vec<u32> = Vec::new();
+        for (k, (slot, level, row)) in found.iter().enumerate() {
+            group.push(*row);
+            let last = found
+                .get(k + 1)
+                .is_none_or(|next| (next.0, next.1) != (*slot, *level));
+            if last {
+                pairs.push((*slot, *level));
+                pair_rows.push(&group);
+                group.clear();
+            }
+        }
+        pairs.shrink_to_fit();
+        pair_rows.shrink();
+        let ends = ends
+            .into_iter()
+            .map(|rows| rows.into_iter().collect())
+            .collect();
+        let mut keys: Vec<(String, Vec<u32>)> = parents.into_iter().collect();
+        keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut parent_names = StrArena::default();
+        let mut parent_rows = Postings::default();
+        for (path, rows) in &keys {
+            parent_names.push(path);
+            parent_rows.push(rows);
+        }
+        parent_names.shrink();
+        parent_rows.shrink();
+        PathIndex {
+            places,
+            texts,
+            comps,
+            pairs,
+            pair_rows,
+            ends,
+            parents: parent_names,
+            parent_rows,
+            indexed,
+            depth,
+            multi_valued,
+        }
+    }
+
+    /// Builds the index of a new base: the paths of this index, with the
+    /// paths of `changed` over them, for `rows`.
+    pub fn rebuilt(&self, changed: &BTreeMap<i32, Option<Val>>, rows: &Rows) -> PathIndex {
+        let touched: RoaringBitmap = changed.keys().filter_map(|rid| rows.row(*rid)).collect();
+        let mut texts = StrArena::default();
+        let mut items = Vec::with_capacity(self.indexed.len() as usize);
+        for row in self.indexed.iter() {
+            if !touched.contains(row)
+                && let Some(path) = self.path(row)
+            {
+                items.push((row, texts.push(path)));
+            }
+        }
+        for (rid, value) in changed {
+            if let (Some(Val::Str(path)), Some(row)) = (value, rows.row(*rid)) {
+                items.push((row, texts.push(path)));
+            }
+        }
+        PathIndex::build(texts, items, rows.len(), self.depth, self.multi_valued)
+    }
+}
+
 /// The keys of an index as a build collects them, with their rows. A str
 /// goes into an arena, so the build keeps no allocation for each key; the
 /// arena is freed whole when the index is built.
@@ -965,6 +1205,8 @@ pub enum Index {
     Keyword(Arc<KeywordIndex>),
     /// A DateRangeIndex.
     DateRange(Arc<DateRangeIndex>),
+    /// An ExtendedPathIndex.
+    Path(Arc<PathIndex>),
     /// No structure: the reason.
     Unavailable(String),
 }
@@ -976,6 +1218,7 @@ impl Index {
             Index::Field(f) => f.slot(row).is_some(),
             Index::Keyword(k) => k.indexed.contains(row),
             Index::DateRange(d) => d.indexed.contains(row),
+            Index::Path(p) => p.indexed.contains(row),
             Index::Unavailable(_) => false,
         }
     }
@@ -986,6 +1229,7 @@ impl Index {
             Index::Field(f) => f.slot(row).map(|s| f.keys.get(s)),
             Index::Keyword(k) => k.value(row),
             Index::DateRange(d) => d.value(row),
+            Index::Path(p) => p.path(row).map(|path| Val::Str(path.into())),
             Index::Unavailable(_) => None,
         }
     }
@@ -999,6 +1243,10 @@ impl Index {
             Index::DateRange(_) => match date_range_of(&value) {
                 Some(_) => Ok(Some(value)),
                 None => Err(format!("a value of a DateRangeIndex: {value:?}")),
+            },
+            Index::Path(_) => match value {
+                Val::Str(_) => Ok(Some(value)),
+                other => Err(format!("a path that is not a str: {other:?}")),
             },
             _ => Ok(Some(value)),
         }
@@ -1017,6 +1265,7 @@ impl Index {
                 .rebuilt(changed, rows)
                 .map(|i| Index::Keyword(Arc::new(i))),
             Index::DateRange(d) => Ok(Index::DateRange(Arc::new(d.rebuilt(changed, rows)))),
+            Index::Path(p) => Ok(Index::Path(Arc::new(p.rebuilt(changed, rows)))),
             Index::Unavailable(_) => return None,
         })
     }
@@ -1027,6 +1276,7 @@ impl Index {
             Index::Field(f) => f.heap_bytes(),
             Index::Keyword(k) => k.heap_bytes(),
             Index::DateRange(d) => d.heap_bytes(),
+            Index::Path(p) => p.heap_bytes(),
             Index::Unavailable(r) => r.len(),
         }
     }

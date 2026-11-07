@@ -217,6 +217,21 @@ impl StrArena {
         self.ends.is_empty()
     }
 
+    /// Finds `text` in an arena whose strs are in ascending order:
+    /// `Ok(place)` when a str equals it, `Err(place)` where it would go.
+    pub fn search(&self, text: &str) -> Result<u32, u32> {
+        let (mut low, mut high) = (0u32, self.len() as u32);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match self.get(mid).cmp(text) {
+                Ordering::Less => low = mid + 1,
+                Ordering::Greater => high = mid,
+                Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(low)
+    }
+
     /// Appends each str of `other`.
     pub fn extend(&mut self, other: &StrArena) {
         let offset = self.bytes.len() as u32;
