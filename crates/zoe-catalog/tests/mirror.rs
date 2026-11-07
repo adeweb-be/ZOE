@@ -182,8 +182,8 @@ fn model_with(first_oid: u64, n: i32, fanout: Option<usize>) -> CatalogModel {
             (
                 "Subject",
                 IndexKind::Other(
-                    "Products.PluginIndexes.KeywordIndex.KeywordIndex",
-                    "KeywordIndex",
+                    "Products.ZCTextIndex.ZCTextIndex",
+                    "ZCTextIndex",
                 ),
             ),
         ],
