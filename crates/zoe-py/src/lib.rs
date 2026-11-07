@@ -22,7 +22,6 @@
 //! of the store (`catalog`, ADR 0059). Their thread starts at the open of a
 //! store with a registered catalog, never at the import of the module.
 
-
 mod catalog;
 mod cli;
 mod client;

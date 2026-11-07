@@ -977,11 +977,7 @@ impl Storage {
     /// a dict, or `None` when the store does not list it. This is a private
     /// hook for the tests.
     #[pyo3(name = "_catalog_status")]
-    fn catalog_status<'py>(
-        &self,
-        py: Python<'py>,
-        catalog: &[u8],
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn catalog_status<'py>(&self, py: Python<'py>, catalog: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         let oid = catalog::p64("catalog", catalog)?;
         let status = self.mirrors().and_then(|m| py.detach(|| m.status(oid)));
         catalog::status(py, status)
