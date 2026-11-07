@@ -219,7 +219,7 @@ class TestTheCatalogMirror(unittest.TestCase):
         with opened(self.db) as site:
             pc = site.portal_catalog
             pc.unrestrictedSearchResults(SearchableText="Item")
-            pc.unrestrictedSearchResults(path="/plone", portal_type="Document")
+            pc.unrestrictedSearchResults(Description="Item", portal_type="Document")
             pc.unrestrictedSearchResults(
                 portal_type="Document", sort_on="getObjPositionInParent"
             )

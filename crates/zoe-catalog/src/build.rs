@@ -16,11 +16,11 @@ use zoe_pickle::python::Value;
 
 use crate::base::{
     Base, CatalogTrees, DateRangeIndex, FieldIndex, Index, IndexEntry, KeywordIndex, Kind, Pairs,
-    Rows, date_range_of, rid_of,
+    PathIndex, Rows, date_range_of, rid_of,
 };
 use crate::change::{Owner, Shapes, Slot};
 use crate::read::{Reads, Record, TreeShape, oid_of, walk_tree};
-use crate::value::Val;
+use crate::value::{StrArena, Val};
 
 /// The class of the catalog object.
 pub const CATALOG: (&str, &str) = ("Products.ZCatalog.Catalog", "Catalog");
@@ -49,6 +49,9 @@ enum Part {
     Pairs(Pairs),
     /// The bounds of each row of a DateRangeIndex.
     Ranges(Vec<(u32, i64, i64)>),
+    /// The path of each row of an ExtendedPathIndex: the paths, and the row
+    /// and the place of each.
+    Paths(StrArena, Vec<(u32, u32)>),
 }
 
 impl Part {
@@ -56,6 +59,7 @@ impl Part {
         match self {
             Part::Pairs(p) => p.heap_bytes(),
             Part::Ranges(v) => v.capacity() * 24,
+            Part::Paths(texts, v) => texts.heap_bytes() + v.capacity() * 8,
         }
     }
 
@@ -63,6 +67,11 @@ impl Part {
         match (self, other) {
             (Part::Pairs(a), Part::Pairs(b)) => a.append(b),
             (Part::Ranges(a), Part::Ranges(b)) => a.extend(b),
+            (Part::Paths(texts, a), Part::Paths(other, b)) => {
+                let offset = texts.len() as u32;
+                texts.extend(&other);
+                a.extend(b.into_iter().map(|(r, p)| (r, p + offset)));
+            }
             _ => {}
         }
     }
@@ -75,6 +84,10 @@ impl Part {
                     .ok_or_else(|| format!("a value of a DateRangeIndex: {value:?}"))?;
                 v.push((row, since, until));
             }
+            (Part::Paths(texts, v), _) => match value {
+                Val::Str(path) => v.push((row, texts.push(&path))),
+                other => return Err(format!("a path that is not a str: {other:?}")),
+            },
             (Part::Pairs(p), Kind::Keyword) => match value {
                 Val::List(items) | Val::Tuple(items) => {
                     for key in items.into_vec() {
@@ -257,6 +270,8 @@ pub fn build(
                 length: -1,
                 index: Index::Unavailable(String::new()),
             };
+            // `_depth` and `multi_valued` of an ExtendedPathIndex.
+            let mut path_record = (0i64, false);
             let read = (|| -> Result<Option<(Part, TreeShape, Vec<u8>)>, String> {
                 let bytes = load(oid)?;
                 read_records += 1;
@@ -267,8 +282,12 @@ pub fn build(
                 let Some(kind) = entry.kind else {
                     return Ok(None);
                 };
+                if kind == Kind::Path {
+                    path_record = path_meta(&index_record)?;
+                }
                 let make = || match kind {
                     Kind::DateRange => Part::Ranges(Vec::new()),
+                    Kind::Path => Part::Paths(StrArena::default(), Vec::new()),
                     _ => Part::Pairs(Pairs::Empty),
                 };
                 let tree = index_record.attr_oid("_unindex").ok_or("no _unindex")?;
@@ -321,8 +340,14 @@ pub fn build(
                 }
                 Ok(Some((part, shape, bytes))) => {
                     let mut transient = part.heap_bytes() + shape.heap_bytes();
-                    if let (Some(Kind::Keyword), Part::Pairs(pairs)) = (entry.kind, &part) {
-                        transient += KeywordIndex::build_bytes(pairs);
+                    match (entry.kind, &part) {
+                        (Some(Kind::Keyword), Part::Pairs(pairs)) => {
+                            transient += KeywordIndex::build_bytes(pairs);
+                        }
+                        (_, Part::Paths(texts, items)) => {
+                            transient += PathIndex::build_bytes(texts, items);
+                        }
+                        _ => {}
                     }
                     if !room(held.load(AtomicOrdering::Relaxed) + transient) {
                         stopped = true;
@@ -336,6 +361,7 @@ pub fn build(
                     let held = &held;
                     let count = rows_ref.len();
                     let kind = entry.kind;
+                    let (depth, multi_valued) = path_record;
                     pending.push(Some(scope.spawn(move || {
                         let built = match (kind, part) {
                             (Some(Kind::Keyword), Part::Pairs(pairs)) => {
@@ -344,6 +370,9 @@ pub fn build(
                             }
                             (_, Part::Ranges(items)) => Ok(Index::DateRange(Arc::new(
                                 DateRangeIndex::build(items, count),
+                            ))),
+                            (_, Part::Paths(texts, items)) => Ok(Index::Path(Arc::new(
+                                PathIndex::build(texts, items, count, depth, multi_valued),
                             ))),
                             (_, Part::Pairs(pairs)) => {
                                 FieldIndex::build(pairs, count).map(|i| Index::Field(Arc::new(i)))
@@ -403,4 +432,20 @@ pub fn build(
         bytes: read_bytes,
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// `_depth` and `multi_valued` of the record of an ExtendedPathIndex. A
+/// record without `multi_valued` takes the default of the class: false.
+fn path_meta(record: &Record) -> Result<(i64, bool), String> {
+    let depth = match record.attr("_depth") {
+        Some(Value::Int(i)) => i64::try_from(i).map_err(|_| "a _depth beyond 64 bits")?,
+        other => return Err(format!("a _depth that is not an int: {other:?}")),
+    };
+    let multi_valued = match record.attr("multi_valued") {
+        None => false,
+        Some(Value::Bool(b)) => b,
+        Some(Value::Int(i)) => i != 0,
+        Some(other) => return Err(format!("a multi_valued that is not a bool: {other:?}")),
+    };
+    Ok((depth, multi_valued))
 }

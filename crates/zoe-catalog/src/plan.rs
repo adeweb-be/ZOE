@@ -3,7 +3,8 @@
 //! The form is a tree of msgpack values: `Wire`. The extension module
 //! makes it from a Python dict; the server makes it from msgpack. This
 //! version reads the clauses of keys (`"k": "v"`), of a BooleanIndex
-//! (`"k": "b"`) and of a DateRangeIndex (`"k": "d"`).
+//! (`"k": "b"`), of a DateRangeIndex (`"k": "d"`) and of an
+//! ExtendedPathIndex (`"k": "p"`).
 //!
 //! ```text
 //! plan   = {"c": [clause...], "s": [[index, reverse]...], "l": sort_limit | nil,
@@ -12,6 +13,9 @@
 //!           "r": [min | nil, max | nil] | nil, "not": [value...]}
 //!        | {"k": "b", "i": index, "q": bool | nil}
 //!        | {"k": "d", "i": index, "t": minutes | nil}
+//!        | {"k": "p", "i": index, "q": [[path, level | nil]...], "lv": level,
+//!           "and": bool, "d": depth, "nt": bool, "ns": navtree_start,
+//!           "ip": [component...]}
 //! value  = nil | bool | int | float | str | [value...] (a tuple)
 //! reply  = {"tid": tid, "r": rids, "n": len, "a": actual_result_count}
 //!        | {"tid": tid, "f": reason, "why": text}
@@ -142,12 +146,15 @@ fn clause(wire: &Wire) -> Result<Clause, PlanError> {
     let items = items(wire, "a clause")?;
     let kind = items.iter().find(|(k, _)| *k == "k").map(|(_, v)| *v);
     let kind = match kind {
-        Some(Wire::Str(k)) if matches!(k.as_str(), "v" | "b" | "d") => k.as_str(),
+        Some(Wire::Str(k)) if matches!(k.as_str(), "v" | "b" | "d" | "p") => k.as_str(),
         Some(Wire::Str(k)) => {
             return Err(PlanError::Unknown(format!("a clause of the kind {k:?}")));
         }
         _ => return malformed("a clause without a kind"),
     };
+    if kind == "p" {
+        return path_clause(&items);
+    }
     if kind != "v" {
         return one_key_clause(kind, &items);
     }
@@ -242,6 +249,96 @@ fn one_key_clause(kind: &str, items: &[(&str, &Wire)]) -> Result<Clause, PlanErr
     if !keyed {
         return malformed(format!("a clause {kind} without {what}"));
     }
+    Ok(clause)
+}
+
+/// Reads a clause on an ExtendedPathIndex (`"p"`). Its options go into
+/// its first key, the tuple `(lv, d, nt, ns, (component...))`, and each
+/// path of `q` into a key of its own, the tuple `(path, level or None)`.
+/// Each key of the clause is required.
+fn path_clause(items: &[(&str, &Wire)]) -> Result<Clause, PlanError> {
+    let mut clause = Clause {
+        index: String::new(),
+        keys: Vec::new(),
+        and: false,
+        range: None,
+        not: Vec::new(),
+    };
+    let mut paths = None;
+    let (mut level, mut depth, mut navtree, mut start, mut ip) = (None, None, None, None, None);
+    let mut named = false;
+    let mut joined = false;
+    for (key, v) in items {
+        match *key {
+            "k" => {}
+            "i" => match v {
+                Wire::Str(name) => {
+                    clause.index = name.clone();
+                    named = true;
+                }
+                _ => return malformed("the index of a clause is not a str"),
+            },
+            "q" => {
+                let mut out = Vec::new();
+                for item in array(v, "q")? {
+                    match array(item, "a path of q")? {
+                        [Wire::Str(path), Wire::Nil] => out.push(Val::Tuple(
+                            vec![Val::Str(path.as_str().into()), Val::None].into(),
+                        )),
+                        [Wire::Str(path), Wire::Int(level)] => out.push(Val::Tuple(
+                            vec![Val::Str(path.as_str().into()), Val::Int(*level)].into(),
+                        )),
+                        _ => return malformed("a path of q is not [str, int | nil]"),
+                    }
+                }
+                paths = Some(out);
+            }
+            "lv" => level = Some(int(v, "lv")?),
+            "d" => depth = Some(int(v, "d")?),
+            "ns" => start = Some(int(v, "ns")?),
+            "nt" => match v {
+                Wire::Bool(b) => navtree = Some(*b),
+                _ => return malformed("nt is not a bool"),
+            },
+            "and" => match v {
+                Wire::Bool(b) => {
+                    clause.and = *b;
+                    joined = true;
+                }
+                _ => return malformed("and is not a bool"),
+            },
+            "ip" => {
+                let mut out = Vec::new();
+                for c in array(v, "ip")? {
+                    match c {
+                        Wire::Str(c) => out.push(Val::Str(c.as_str().into())),
+                        _ => return malformed("a component of ip is not a str"),
+                    }
+                }
+                ip = Some(out);
+            }
+            other => return Err(PlanError::Unknown(format!("a clause key {other:?}"))),
+        }
+    }
+    if !named {
+        return malformed("a clause without an index");
+    }
+    let (Some(paths), Some(level), Some(depth), Some(navtree), Some(start), Some(ip), true) =
+        (paths, level, depth, navtree, start, ip, joined)
+    else {
+        return malformed("a clause p without each of q, lv, and, d, nt, ns and ip");
+    };
+    clause.keys.push(Val::Tuple(
+        vec![
+            Val::Int(level),
+            Val::Int(depth),
+            Val::Bool(navtree),
+            Val::Int(start),
+            Val::Tuple(ip.into()),
+        ]
+        .into(),
+    ));
+    clause.keys.extend(paths);
     Ok(clause)
 }
 

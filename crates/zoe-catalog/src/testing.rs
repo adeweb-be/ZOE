@@ -8,14 +8,15 @@
 //!   reference, and the oid bytes and the class shared in the record.
 //! - The record writers (`catalog_record`, `index_record`,
 //!   `date_index_record`, `uuid_index_record`, `boolean_index_record`,
-//!   `date_range_index_record`, `length_record`, `tree_record`,
-//!   `bucket_record`) give the records of the classes that a catalog
-//!   holds. A test compares them with records that CPython wrote.
+//!   `date_range_index_record`, `extended_path_index_record`,
+//!   `length_record`, `tree_record`, `bucket_record`) give the records of
+//!   the classes that a catalog holds. A test compares them with records
+//!   that CPython wrote.
 //! - `CatalogModel` keeps a catalog with its indexes and its trees, as
 //!   `Catalog.catalogObject` and `uncatalogObject` change them, and gives
 //!   the records that changed since the last call. Its indexes are
-//!   FieldIndexes, KeywordIndexes, DateIndexes, UUIDIndexes, BooleanIndexes
-//!   and DateRangeIndexes, each with its own trees. Its trees split a
+//!   FieldIndexes, KeywordIndexes, DateIndexes, UUIDIndexes, BooleanIndexes,
+//!   DateRangeIndexes and ExtendedPathIndexes, each with its own trees. Its trees split a
 //!   bucket at half of its items, past the largest bucket of the family,
 //!   and an inner node at half of its children, past the largest inner
 //!   node of the family or the fan-out of `with_fanout`; the root splits as
@@ -582,6 +583,8 @@ enum Attr<'a> {
     Tree(u64, Family),
     /// A persistent reference to a `BTrees.Length.Length`.
     Length(u64),
+    /// A bool.
+    Bool(bool),
 }
 
 /// The record of an index of the class `class` with the id `id` and the
@@ -603,6 +606,7 @@ fn index_object(class: (&str, &str), id: &str, attrs: &[(&str, Attr<'_>)]) -> Ve
             }
             Attr::Tree(oid, family) => p.reference(*oid, family.module, family.tree),
             Attr::Length(oid) => p.reference(*oid, "BTrees.Length", "Length"),
+            Attr::Bool(b) => Py::Bool(*b),
         };
         items.push((key, value));
     }
@@ -727,6 +731,43 @@ pub fn date_range_index_record(id: &str, oids: &DateRangeOids<'_>) -> Vec<u8> {
     )
 }
 
+/// The `_depth`, the oids and the `multi_valued` of an `ExtendedPathIndex`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathOids {
+    /// `_depth`.
+    pub depth: i64,
+    /// `_index`, an `OOBTree`.
+    pub index: u64,
+    /// `_unindex`, an `IOBTree`.
+    pub unindex: u64,
+    /// `_length`.
+    pub length: u64,
+    /// `_index_parents`, an `OOBTree`.
+    pub parents: u64,
+    /// `_index_items`, an `OIBTree`.
+    pub items: u64,
+    /// `multi_valued`.
+    pub multi_valued: bool,
+}
+
+/// The record of an `ExtendedPathIndex`.
+pub fn extended_path_index_record(id: &str, oids: &PathOids) -> Vec<u8> {
+    index_object(
+        crate::base::EXTENDED_PATH_INDEX,
+        id,
+        &[
+            ("id", Attr::Id),
+            ("_depth", Attr::Int(oids.depth)),
+            ("_index", Attr::Tree(oids.index, OO)),
+            ("_unindex", Attr::Tree(oids.unindex, IO)),
+            ("_length", Attr::Length(oids.length)),
+            ("_index_parents", Attr::Tree(oids.parents, OO)),
+            ("_index_items", Attr::Tree(oids.items, OI)),
+            ("multi_valued", Attr::Bool(oids.multi_valued)),
+        ],
+    )
+}
+
 /// A bucket of a tree of the model.
 #[derive(Clone, Debug)]
 struct Bucket {
@@ -781,8 +822,15 @@ pub struct Tree {
     splits: (usize, usize),
 }
 
+/// The order of two keys of a tree. `None` comes before each other key,
+/// as BTrees orders it.
 fn order(a: &Val, b: &Val) -> Ordering {
-    py_cmp(a, b).expect("keys that the model orders")
+    match (a, b) {
+        (Val::None, Val::None) => Ordering::Equal,
+        (Val::None, _) => Ordering::Less,
+        (_, Val::None) => Ordering::Greater,
+        _ => py_cmp(a, b).expect("keys that the model orders"),
+    }
 }
 
 /// The place of the child of `key` in `node`.
@@ -1072,6 +1120,9 @@ pub enum IndexKind {
     /// A DateRangeIndex on the attributes `since` and `until`: the value of
     /// a row is the tuple `(since, until)`, each in minutes or `None`.
     DateRange(&'static str, &'static str),
+    /// An ExtendedPathIndex: the value of a row is its path, a str. A row
+    /// without a value in `catalog` takes the path of the entry.
+    Path,
     /// An index of another class, `module.name`, whose trees stay empty.
     Other(&'static str, &'static str),
 }
@@ -1081,7 +1132,9 @@ impl IndexKind {
     /// DateRangeIndex is its `_always`.
     fn families(self) -> (Family, Family) {
         match self {
-            IndexKind::Field | IndexKind::Keyword | IndexKind::Other(..) => (OO, IO),
+            IndexKind::Field | IndexKind::Keyword | IndexKind::Path | IndexKind::Other(..) => {
+                (OO, IO)
+            }
             IndexKind::Date => (IO, II),
             IndexKind::Uuid => (OI, IO),
             IndexKind::Boolean => (II_SET, II),
@@ -1108,7 +1161,30 @@ struct IndexModel {
     /// A DateRangeIndex: `_since_only`, `_until_only`, `_since` and
     /// `_until`, with the tree set of each of their keys.
     ranges: Vec<(Tree, Vec<(Val, Tree)>)>,
+    /// An ExtendedPathIndex: its trees beyond `_index` and `_unindex`.
+    path: Option<PathTrees>,
+    /// The `_length` that the last records gave, for an index whose
+    /// `_length` changes without its record.
+    length_written: Option<i64>,
     dirty: bool,
+}
+
+/// A component of `_index` of an ExtendedPathIndex, `None` for the end of
+/// a path: its `IOBTree`, with the tree set of each level.
+type Levels = (Val, Tree, Vec<(i64, Tree)>);
+
+/// The trees of an ExtendedPathIndex beyond `_index` and `_unindex`, and
+/// its `_depth`.
+#[derive(Clone, Debug)]
+struct PathTrees {
+    depth: i64,
+    /// The components of `_index`.
+    levels: Vec<Levels>,
+    /// `_index_parents`, with the tree set of each parent path.
+    parents: Tree,
+    parent_sets: Vec<(Val, Tree)>,
+    /// `_index_items`.
+    items: Tree,
 }
 
 impl IndexModel {
@@ -1131,6 +1207,8 @@ impl IndexModel {
             boolean: ((0, 0), 1),
             written: None,
             ranges: Vec::new(),
+            path: None,
+            length_written: None,
             dirty: true,
         };
         model.clear_extra(next, fanout);
@@ -1147,6 +1225,15 @@ impl IndexModel {
                     .map(|_| (Tree::new(take(next), IO, fanout), Vec::new()))
                     .collect();
             }
+            IndexKind::Path => {
+                self.path = Some(PathTrees {
+                    depth: 0,
+                    levels: Vec::new(),
+                    parents: Tree::new(take(next), OO, fanout),
+                    parent_sets: Vec::new(),
+                    items: Tree::new(take(next), OI, fanout),
+                });
+            }
             _ => {}
         }
     }
@@ -1159,6 +1246,7 @@ impl IndexModel {
             IndexKind::Uuid => crate::base::UUID_INDEX,
             IndexKind::Boolean => crate::base::BOOLEAN_INDEX,
             IndexKind::DateRange(..) => crate::base::DATE_RANGE_INDEX,
+            IndexKind::Path => crate::base::EXTENDED_PATH_INDEX,
             IndexKind::Other(module, name) => (module, name),
         }
     }
@@ -1201,6 +1289,21 @@ impl IndexModel {
                     counter: self.counter.0,
                 },
             ),
+            IndexKind::Path => {
+                let trees = self.path.as_ref().expect("the trees of a path index");
+                extended_path_index_record(
+                    &self.id,
+                    &PathOids {
+                        depth: trees.depth,
+                        index: self.index.root,
+                        unindex: self.unindex.root,
+                        length: self.length.0,
+                        parents: trees.parents.root,
+                        items: trees.items.root,
+                        multi_valued: false,
+                    },
+                )
+            }
             IndexKind::DateRange(since_field, until_field) => date_range_index_record(
                 &self.id,
                 &DateRangeOids {
@@ -1236,6 +1339,47 @@ impl IndexModel {
         let old = self.old(&doc);
         match self.kind {
             IndexKind::Other(..) => false,
+            IndexKind::Path => {
+                let Some(Val::Str(path)) = datum else {
+                    return false;
+                };
+                match &old {
+                    Some(Val::Str(old)) if **old != *path => {
+                        // `unindex_object` takes one from `_length`.
+                        self.path_unindex(rid, old);
+                        self.length.1 += 1;
+                    }
+                    Some(_) => {}
+                    None => self.length.1 += 1,
+                }
+                let comps = crate::base::components(&path);
+                for (level, comp) in comps.iter().enumerate() {
+                    self.insert_entry(Val::Str((*comp).into()), rid, level as i64, new_oid);
+                }
+                self.insert_entry(Val::None, rid, comps.len() as i64 - 1, new_oid);
+                let parent = Val::Str(crate::base::parent_of(&comps).into());
+                let trees = self.path.as_mut().expect("the trees of a path index");
+                let row = Val::Int(i64::from(rid));
+                match trees.parent_sets.iter().position(|(k, _)| *k == parent) {
+                    Some(i) => trees.parent_sets[i]
+                        .1
+                        .set(row, Item::Val(Val::None), new_oid),
+                    None => {
+                        let mut set = Tree::new(new_oid(), II_SET, None);
+                        set.set(row, Item::Val(Val::None), new_oid);
+                        let reference = Item::Ref(set.root, II_SET.module, II_SET.tree);
+                        trees.parents.set(parent.clone(), reference, new_oid);
+                        trees.parent_sets.push((parent, set));
+                    }
+                }
+                trees.items.set(
+                    Val::Str(path.clone()),
+                    Item::Val(Val::Int(i64::from(rid))),
+                    new_oid,
+                );
+                self.unindex.set(doc, Item::Val(Val::Str(path)), new_oid);
+                true
+            }
             IndexKind::Field | IndexKind::Date | IndexKind::Uuid => {
                 if old == datum {
                     return false;
@@ -1332,6 +1476,12 @@ impl IndexModel {
         };
         match self.kind {
             IndexKind::Other(..) => return false,
+            IndexKind::Path => {
+                if let Val::Str(path) = &old {
+                    self.path_unindex(rid, path);
+                }
+                return true;
+            }
             IndexKind::Field | IndexKind::Date | IndexKind::Uuid => self.remove_forward(&old, rid),
             IndexKind::Keyword => {
                 for key in crate::base::keywords_of(&old).to_vec() {
@@ -1346,6 +1496,89 @@ impl IndexModel {
         }
         self.unindex.remove(&doc);
         true
+    }
+
+    /// `insertEntry` of an ExtendedPathIndex: adds `rid` to the rows of
+    /// `comp` at `level` in `_index`, and raises `_depth` to `level`.
+    fn insert_entry(&mut self, comp: Val, rid: i32, level: i64, new_oid: &mut impl FnMut() -> u64) {
+        let trees = self.path.as_mut().expect("the trees of a path index");
+        let i = match trees.levels.iter().position(|(k, _, _)| *k == comp) {
+            Some(i) => i,
+            None => {
+                let tree = Tree::new(new_oid(), IO, None);
+                let reference = Item::Ref(tree.root, IO.module, IO.tree);
+                self.index.set(comp.clone(), reference, new_oid);
+                trees.levels.push((comp, tree, Vec::new()));
+                trees.levels.len() - 1
+            }
+        };
+        let (_, tree, sets) = &mut trees.levels[i];
+        let row = Val::Int(i64::from(rid));
+        match sets.iter().position(|(l, _)| *l == level) {
+            Some(j) => sets[j].1.set(row, Item::Val(Val::None), new_oid),
+            None => {
+                let mut set = Tree::new(new_oid(), II_SET, None);
+                set.set(row, Item::Val(Val::None), new_oid);
+                let reference = Item::Ref(set.root, II_SET.module, II_SET.tree);
+                tree.set(Val::Int(level), reference, new_oid);
+                sets.push((level, set));
+            }
+        }
+        if level > trees.depth {
+            trees.depth = level;
+            self.dirty = true;
+        }
+    }
+
+    /// Removes `rid` from the rows of `comp` at `level` in `_index`. `None`
+    /// where ExtendedPathIndex meets a `KeyError`.
+    fn remove_entry(&mut self, comp: &Val, rid: i32, level: i64) -> Option<()> {
+        let trees = self.path.as_mut().expect("the trees of a path index");
+        let i = trees.levels.iter().position(|(k, _, _)| k == comp)?;
+        let (_, tree, sets) = &mut trees.levels[i];
+        let j = sets.iter().position(|(l, _)| *l == level)?;
+        sets[j].1.remove(&Val::Int(i64::from(rid)))?;
+        if sets[j].1.is_empty() {
+            sets.remove(j);
+            tree.remove(&Val::Int(level));
+        }
+        if tree.is_empty() {
+            trees.levels.remove(i);
+            self.index.remove(comp);
+        }
+        Some(())
+    }
+
+    /// `unindex_object` of an ExtendedPathIndex for `rid` at `path`. Its
+    /// steps stop at the first `KeyError`, as the `try` of the class does;
+    /// `_length` and `_unindex` change then all the same.
+    fn path_unindex(&mut self, rid: i32, path: &str) {
+        let comps = crate::base::components(path);
+        let _ = (|| -> Option<()> {
+            for (level, comp) in comps.iter().enumerate() {
+                self.remove_entry(&Val::Str((*comp).into()), rid, level as i64)?;
+            }
+            self.remove_entry(&Val::None, rid, comps.len() as i64 - 1)?;
+            let parent = crate::base::parent_of(&comps);
+            let trees = self.path.as_mut().expect("the trees of a path index");
+            let key = Val::Str(parent.as_str().into());
+            if let Some(i) = trees.parent_sets.iter().position(|(k, _)| *k == key) {
+                trees.parent_sets[i].1.remove(&Val::Int(i64::from(rid)))?;
+                if trees.parent_sets[i].1.is_empty() {
+                    trees.parent_sets.remove(i);
+                    trees.parents.remove(&key);
+                }
+            }
+            // The key of `_index_items` joins the parent path and the last
+            // component with a slash: `//name` for a path of one component.
+            let last = comps.last().expect("a path with a component");
+            trees
+                .items
+                .remove(&Val::Str(format!("{parent}/{last}").into()))?;
+            Some(())
+        })();
+        self.length.1 -= 1;
+        self.unindex.remove(&Val::Int(i64::from(rid)));
     }
 
     /// Adds `rid` to the rows of `key` in `_index`.
@@ -1533,6 +1766,19 @@ impl IndexModel {
                 set.records(out);
             }
         }
+        if let Some(trees) = &mut self.path {
+            for (_, tree, sets) in &mut trees.levels {
+                tree.records(out);
+                for (_, set) in sets {
+                    set.records(out);
+                }
+            }
+            trees.parents.records(out);
+            for (_, set) in &mut trees.parent_sets {
+                set.records(out);
+            }
+            trees.items.records(out);
+        }
     }
 }
 
@@ -1688,8 +1934,9 @@ impl CatalogModel {
             &mut new_oid,
         );
         for index in &mut self.indexes {
-            let datum = value_of(&index.id);
-            if index.index_object(rid, datum, &mut new_oid) {
+            let datum = value_of(&index.id)
+                .or_else(|| (index.kind == IndexKind::Path).then(|| Val::Str(path.into())));
+            if index.index_object(rid, datum, &mut new_oid) && index.kind != IndexKind::Path {
                 index.counter.1 += 1;
                 self.dirty.insert(index.counter.0);
             }
@@ -1704,7 +1951,7 @@ impl CatalogModel {
         let next = &mut self.next;
         let mut new_oid = || take(next);
         for index in &mut self.indexes {
-            if index.unindex_object(rid, &mut new_oid) {
+            if index.unindex_object(rid, &mut new_oid) && index.kind != IndexKind::Path {
                 index.counter.1 += 1;
                 self.dirty.insert(index.counter.0);
             }
@@ -1730,7 +1977,7 @@ impl CatalogModel {
             .iter_mut()
             .find(|i| i.id == id)
             .expect("an index of the model");
-        if index.unindex_object(rid, &mut new_oid) {
+        if index.unindex_object(rid, &mut new_oid) && index.kind != IndexKind::Path {
             index.counter.1 += 1;
             self.dirty.insert(index.counter.0);
         }
@@ -1793,7 +2040,14 @@ impl CatalogModel {
             if std::mem::take(&mut index.dirty) {
                 out.push((index.oid, index.record()));
                 self.dirty.insert(index.length.0);
-                self.dirty.insert(index.counter.0);
+                // An ExtendedPathIndex has no `_counter`.
+                if index.kind != IndexKind::Path {
+                    self.dirty.insert(index.counter.0);
+                }
+            }
+            if index.kind == IndexKind::Path && index.length_written != Some(index.length.1) {
+                index.length_written = Some(index.length.1);
+                self.dirty.insert(index.length.0);
             }
             if self.dirty.remove(&index.length.0) {
                 out.push((index.length.0, length_record(index.length.1)));
