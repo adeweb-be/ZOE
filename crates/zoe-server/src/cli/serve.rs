@@ -1176,7 +1176,7 @@ mod tests {
         for refused in [
             &["--catalog-memory", "0"][..],
             &["--catalog-window-tids", "0"],
-            &["--catalog-wait", "-1"],
+            &["--catalog-wait", "1x"],
         ] {
             let error = serve(refused).unwrap_err();
             assert_eq!(
