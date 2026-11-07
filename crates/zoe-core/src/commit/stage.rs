@@ -165,6 +165,151 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.stage_kv(flavour, row, None, 0, stored_bytes)
     }
 
+    /// Stage a text delta: the text `text` in the language `language` of
+    /// the document `rid` in the text index `index` of the catalog
+    /// `catalog`. `before` is the snapshot of the transaction: the tid
+    /// that its Connection loads before.
+    ///
+    /// The delta takes no lock. The vote reserves its key and checks it
+    /// against the deltas committed since `before` (ADR 0060, section 8).
+    /// A later delta of the same key in this transaction replaces this one,
+    /// and an abort drops it.
+    ///
+    /// The language and the text count toward `max-record-size`, and the
+    /// key and the payload toward `max-transaction-size` and
+    /// `staging-memory`: a refusal is `TextTooLarge`. A bad index id or
+    /// language is `InvalidText`. A call from another thread is
+    /// `WrongThread`. A call after the vote, or in a restore transaction,
+    /// is `Protocol`. A refused call stages nothing.
+    pub fn text_set(
+        &mut self,
+        catalog: Oid,
+        index: &str,
+        rid: i32,
+        language: &str,
+        text: &str,
+        before: Tid,
+    ) -> Result<()> {
+        self.check_text(index, false)?;
+        crate::text::check_language(language)?;
+        let payload = format::text::encode_payload(language, text);
+        let key = format::text::text_prefix(catalog, index, rid);
+        let stored_bytes = self.check_text_size(&key, payload.len())?;
+        self.stage_text(key, Some(&payload), before, false, stored_bytes)
+    }
+
+    /// Stage an unindex: the document `rid` leaves the text index `index`
+    /// of the catalog `catalog`, with the rules of `text_set`.
+    pub fn text_unindex(&mut self, catalog: Oid, index: &str, rid: i32, before: Tid) -> Result<()> {
+        self.check_text(index, false)?;
+        let key = format::text::text_prefix(catalog, index, rid);
+        let stored_bytes = self.check_text_size(&key, 0)?;
+        self.stage_text(key, None, before, false, stored_bytes)
+    }
+
+    /// Stage a clear delta, which empties the text index `index` of the
+    /// catalog `catalog`, with the rules of `text_set`. The call drops the
+    /// text deltas of the index that the transaction staged before it. A
+    /// text delta staged after it commits at the same tid and stays live.
+    /// The vote checks nothing for a clear delta.
+    pub fn text_clear(&mut self, catalog: Oid, index: &str) -> Result<()> {
+        self.check_text(index, false)?;
+        let key = format::text::clear_prefix(catalog, index);
+        let stored_bytes = self.check_text_size(&key, 0)?;
+        // The keys of the text deltas of the index: the catalog, the
+        // length of the index id and the index id, then the rid.
+        let mut texts = catalog.0.to_be_bytes().to_vec();
+        texts.push(index.len() as u8);
+        texts.extend_from_slice(index.as_bytes());
+        let dropped = self.staged.remove_texts(&texts);
+        let stored_bytes = stored_bytes.saturating_sub(dropped);
+        self.stage_text(key, None, Tid::ZERO, false, stored_bytes)
+    }
+
+    /// Stage a text delta in a restore transaction, at the tid of the
+    /// transaction: the text `text` of `rid`, or an unindex for `None`. The
+    /// vote checks nothing for it, and the call checks no size limit. A
+    /// bad index id or language is `InvalidText`. A normal transaction
+    /// refuses it with `Protocol`.
+    pub fn restore_text(
+        &mut self,
+        catalog: Oid,
+        index: &str,
+        rid: i32,
+        language: &str,
+        text: Option<&str>,
+    ) -> Result<()> {
+        self.check_text(index, true)?;
+        crate::text::check_language(language)?;
+        let key = format::text::text_prefix(catalog, index, rid);
+        let payload = text.map(|text| format::text::encode_payload(language, text));
+        let stored_bytes = self.stored_bytes;
+        self.stage_text(key, payload.as_deref(), Tid::ZERO, true, stored_bytes)
+    }
+
+    /// Stage a clear delta in a restore transaction, at the tid of the
+    /// transaction, as `restore_text` does. It drops no staged delta.
+    pub fn restore_clear(&mut self, catalog: Oid, index: &str) -> Result<()> {
+        self.check_text(index, true)?;
+        let key = format::text::clear_prefix(catalog, index);
+        let stored_bytes = self.stored_bytes;
+        self.stage_text(key, None, Tid::ZERO, true, stored_bytes)
+    }
+
+    /// Check that the transaction can stage a delta of `index`: a restore
+    /// delta when `restore` is true, else a delta of a normal transaction.
+    /// A refused call changes nothing.
+    fn check_text(&self, index: &str, restore: bool) -> Result<()> {
+        self.check_thread()?;
+        if self.is_restore() != restore {
+            return Err(ZoeError::Protocol(if restore {
+                "a restored delta in a normal transaction"
+            } else {
+                "a text delta in a restore transaction"
+            }));
+        }
+        if self.locked() {
+            return Err(ZoeError::Protocol("a text delta after vote"));
+        }
+        crate::text::check_index(index)
+    }
+
+    /// Check a payload of `size` bytes for the delta `key` against
+    /// `max-record-size` and `max-transaction-size`, as `check_kv_size`
+    /// does for a namespace write. Return the new value of `stored_bytes`.
+    fn check_text_size(&self, key: &[u8], size: usize) -> Result<u64> {
+        let guardrails = &self.store.guardrails;
+        guardrails.check_text(SizeLimit::Record, size as u64)?;
+        let size = (key.len() + size) as u64;
+        let staged = self
+            .staged
+            .text(key)
+            .map_or(0, |staged| (key.len() + staged.payload_len()) as u64);
+        let stored_bytes = self
+            .stored_bytes
+            .saturating_sub(staged)
+            .saturating_add(size);
+        guardrails.check_text(SizeLimit::Transaction, stored_bytes)?;
+        Ok(stored_bytes)
+    }
+
+    /// Stage the delta `key` with `payload`, and make `stored_bytes` the
+    /// transaction size. A stage that fails keeps the size and the staged
+    /// deltas.
+    fn stage_text(
+        &mut self,
+        key: Vec<u8>,
+        payload: Option<&[u8]>,
+        before: Tid,
+        restored: bool,
+        stored_bytes: u64,
+    ) -> Result<()> {
+        let area = &self.store.backend.staging;
+        self.staged.put_text(area, key, payload, before, restored)?;
+        self.stored_bytes = stored_bytes;
+        Ok(())
+    }
+
     /// Stage `data` for `oid` with `serial`, and make `stored_bytes` the
     /// transaction size: the size of the staged pickles with `data`, as
     /// `check_size` gives it. A stage that fails keeps the size.

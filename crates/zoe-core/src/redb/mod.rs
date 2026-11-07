@@ -4,7 +4,9 @@
 //! `txn_oids`, `blobs`, `txns`, `sequences` and `meta`. Three more hold
 //! the KV namespaces: `kv_ephemeral`, `kv_durable` and `kv_expiry`. The
 //! first write of a flavour creates its tables, so a store that never
-//! writes a namespace has none of them. `format` says how keys and
+//! writes a namespace has none of them. Two more hold the text deltas:
+//! `text_deltas` and `text_txn` (`text`, ADR 0060). `initialise` and the
+//! move of `zoe migrate` create them. `format` says how keys and
 //! values are written. `txn_oids` is the transaction index: `put_record`
 //! writes the index key of each record in the write transaction of the
 //! record, and `remove_record` removes the key with the record.
@@ -19,7 +21,8 @@
 //! updates it.
 //!
 //! `read` holds the `Backend` trait of the backend, `write` its write
-//! transaction, and `kv` the tables of the KV namespaces.
+//! transaction, `kv` the tables of the KV namespaces and `text` the
+//! tables of the text deltas.
 
 use std::ops::Bound::{self, Excluded};
 use std::ops::RangeBounds;
@@ -38,6 +41,7 @@ mod kv;
 mod read;
 #[cfg(test)]
 mod tests;
+pub(crate) mod text;
 mod write;
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
@@ -271,6 +275,7 @@ impl RedbBackend {
             txn.open_table(BLOBS).map_err(backend)?;
             txn.open_table(TXNS).map_err(backend)?;
             txn.open_table(SEQUENCES).map_err(backend)?;
+            text::create(&txn)?;
             let mut meta = txn.open_table(META).map_err(backend)?;
             meta.insert(META_FORMAT, format::FORMAT_NAME)
                 .map_err(backend)?;
@@ -286,13 +291,20 @@ impl RedbBackend {
 
     /// Open a store that `initialise` wrote, and check its format.
     pub(crate) fn open(db: Database) -> Result<Self> {
-        Self::open_db(Db::ReadWrite(db))
+        Self::open_db(Db::ReadWrite(db), false).map(|(backend, _)| backend)
+    }
+
+    /// Open a store for `zoe migrate`: a store of the format before this
+    /// one opens too. Return the backend, and true when the store has the
+    /// format before this one.
+    pub(crate) fn open_migrating(db: Database) -> Result<(Self, bool)> {
+        Self::open_db(Db::ReadWrite(db), true)
     }
 
     /// Open a store that `initialise` wrote, for reads only, and check its
     /// format. `begin_write` fails with `ReadOnly`.
     pub(crate) fn open_read_only(db: ReadOnlyDatabase) -> Result<Self> {
-        Self::open_db(Db::ReadOnly(db))
+        Self::open_db(Db::ReadOnly(db), false).map(|(backend, _)| backend)
     }
 
     /// Open the store in `db` and check its format.
@@ -306,16 +318,26 @@ impl RedbBackend {
     /// checksum under its key. So a damaged key cannot raise the last tid.
     ///
     /// A store of the current format must have `object_count`. Any other
-    /// format name fails the open with `Format`.
-    fn open_db(db: Db) -> Result<Self> {
-        let (last_tid, object_count) = {
+    /// format name fails the open with `Format`. The message of the format
+    /// before this one names `zoe migrate`. With `migrating`, a store of
+    /// that format opens, and the call returns true for it.
+    fn open_db(db: Db, migrating: bool) -> Result<(Self, bool)> {
+        let (last_tid, object_count, previous) = {
             let txn = db.begin_read().map_err(backend)?;
             let meta = txn.open_table(META).map_err(backend)?;
             let read = |key: &str| -> Result<Option<Vec<u8>>> {
                 Ok(meta.get(key).map_err(backend)?.map(|v| v.value().to_vec()))
             };
             let format_name = read(META_FORMAT)?.unwrap_or_default();
-            if format_name != format::FORMAT_NAME {
+            let previous = format_name == format::PREVIOUS_FORMAT_NAME;
+            if previous && !migrating {
+                return Err(ZoeError::Format(format!(
+                    "{}: run `zoe migrate STORE` to move the store to {}",
+                    String::from_utf8_lossy(&format_name),
+                    String::from_utf8_lossy(format::FORMAT_NAME)
+                )));
+            }
+            if format_name != format::FORMAT_NAME && !previous {
                 return Err(ZoeError::Format(
                     String::from_utf8_lossy(&format_name).into_owned(),
                 ));
@@ -342,15 +364,16 @@ impl RedbBackend {
             });
             let last_tid =
                 stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())));
-            (last_tid, object_count)
+            (last_tid, object_count, previous)
         };
-        Ok(Self {
+        let backend = Self {
             db,
             last_tid: AtomicU64::new(last_tid),
             object_count: AtomicU64::new(object_count),
             unsynced: AtomicBool::new(false),
             compression: Compression::default(),
-        })
+        };
+        Ok((backend, previous))
     }
 
     /// Tell if the tables hold a deferred commit that no sync covered yet.

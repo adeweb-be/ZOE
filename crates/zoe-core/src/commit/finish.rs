@@ -100,6 +100,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // locks that it did not hand off before the end of the commit wakes
         // the votes that wait for it, so a woken vote finds them free. The
         // release reads no clock.
+        // The reservations go before the locks, so a vote that the end of
+        // the commit wakes finds its keys free too.
+        store
+            .text_reservations
+            .release(&std::mem::take(&mut self.reserved));
         let mut own = self.locks.take().unwrap_or_default();
         own.append(&mut self.intents);
         store.locks.release(&own);
@@ -169,14 +174,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
         (Some(commit), handoffs)
     }
 
-    /// Abort the transaction: drop the staged records, remove the spill
-    /// file and release the locks.
+    /// Abort the transaction: drop the staged records and deltas, remove
+    /// the spill file and release the reservations and the locks.
     pub fn abort(mut self) {
         self.release();
     }
 
-    /// Release the locks, then log each lock held past `lock-warn`.
+    /// Release the reservations of the text deltas and the locks, then log
+    /// each lock held past `lock-warn`.
     pub(super) fn release(&mut self) {
+        self.store
+            .text_reservations
+            .release(&std::mem::take(&mut self.reserved));
         let mut held = self.locks.take().unwrap_or_default();
         held.append(&mut self.intents);
         if !held.is_empty() {

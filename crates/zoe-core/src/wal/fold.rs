@@ -257,6 +257,11 @@ pub(super) fn check(picked: &[Picked]) -> Result<()> {
                         .map_err(|_| crate::kv::corrupt(flavour, key))
                 }
                 OpKind::RemoveEphemeral | OpKind::RemoveDurable | OpKind::Expiry => Ok(()),
+                OpKind::Text => {
+                    let key = entry.key(op);
+                    format::verify_frame(KeySpace::TextDeltas, key, frame)
+                        .map_err(|_| crate::text::corrupt_key(key))
+                }
             };
             checked?;
         }
@@ -283,6 +288,7 @@ pub(super) fn write_commits(write: &mut dyn WriteTxn, picked: &[Picked]) -> Resu
                 OpKind::RemoveEphemeral => write.remove_kv(Flavour::Ephemeral, entry.key(op))?,
                 OpKind::RemoveDurable => write.remove_kv(Flavour::Durable, entry.key(op))?,
                 OpKind::Expiry => write.put_kv_expiry(entry.key(op))?,
+                OpKind::Text => write.put_frame(Framed::Text(entry.key(op), frame))?,
             }
         }
     }

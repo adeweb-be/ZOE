@@ -174,11 +174,11 @@ fn a_count_that_is_not_8_bytes_does_not_open() {
 fn another_format_name_does_not_open() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
-    testing::write_meta(&store, "format", b"ZOE format 4").unwrap();
+    testing::write_meta(&store, "format", b"ZOE format 5").unwrap();
     drop(store);
     let error = Store::open_vfs(vfs).err();
     assert!(
-        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 4"),
+        matches!(&error, Some(ZoeError::Format(text)) if text == "ZOE format 5"),
         "{error:?}"
     );
 }

@@ -13,7 +13,7 @@ use super::write::RedbWrite;
 use super::{
     BLOBS, Bounds, Db, META, META_PACK_WATERMARK, RECORDS, RedbBackend, SEQUENCES, TXN_OIDS, TXNS,
     backend, corrupt_index, corrupt_record, corrupt_txn, inside, kv, newest, open_optional,
-    refused,
+    refused, text,
 };
 use crate::backend::{
     Backend, BlobRecord, Bytes, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnRecords,
@@ -566,5 +566,53 @@ impl Backend for RedbBackend {
 
     fn has_kv(&self, flavour: Flavour) -> Result<bool> {
         kv::has(&self.db, flavour)
+    }
+
+    fn text_newest(&self, prefix: &[u8], before: Tid) -> Result<Option<(Bytes, Bytes)>> {
+        text::newest(&self.db, prefix, before)
+    }
+
+    fn text_rows(
+        &self,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        text::rows(&self.db, from, to, limit)
+    }
+
+    fn text_txn_keys(
+        &self,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<Bytes>> {
+        text::txn_keys(&self.db, from, to, limit)
+    }
+
+    #[cfg(feature = "testing")]
+    fn write_text_stored(&self, index: bool, key: &[u8], bytes: Option<&[u8]>) -> Result<()> {
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        text::write_stored(&txn, index, key, bytes)?;
+        txn.commit().map_err(backend)
+    }
+
+    #[cfg(feature = "testing")]
+    fn write_previous_format_for_test(&self) -> Result<()> {
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        txn.delete_table(text::TEXT_DELTAS).map_err(backend)?;
+        txn.delete_table(text::TEXT_TXN).map_err(backend)?;
+        {
+            let mut meta = txn.open_table(META).map_err(backend)?;
+            meta.insert(super::META_FORMAT, format::PREVIOUS_FORMAT_NAME)
+                .map_err(backend)?;
+        }
+        txn.commit().map_err(backend)
     }
 }

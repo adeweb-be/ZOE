@@ -1,6 +1,6 @@
-//! The unfolded table: the records, the blob records, the namespace ops and
-//! the expiry keys of the backlog in memory, and the backlog itself (ADR
-//! 0056, section 7). One `RwLock` holds the table. The leader inserts a
+//! The unfolded table: the records, the blob records, the namespace ops,
+//! the expiry keys and the deltas of the backlog in memory, and the
+//! backlog itself (ADR 0056, section 7; ADR 0060, section 3). One `RwLock` holds the table. The leader inserts a
 //! whole batch under one write lock, and a slice of the fold leaves it
 //! under one write lock.
 //!
@@ -136,6 +136,10 @@ pub(super) struct Table {
     rows: [BTreeMap<Vec<u8>, Vec<RowOp>>; 2],
     /// The keys of the index of the expiries, with the tids that wrote them.
     expiry: BTreeMap<Vec<u8>, Vec<Tid>>,
+    /// The deltas, by key of `text_deltas`. The key ends in the tid.
+    texts: BTreeMap<Vec<u8>, Place>,
+    /// The keys of `text_txn` of the deltas. The key starts with the tid.
+    text_txn: BTreeMap<Vec<u8>, ()>,
     /// The commits after the folded tid, in tid order.
     backlog: VecDeque<Commit>,
 }
@@ -191,6 +195,13 @@ impl Table {
                                 self.expiry.insert(key.to_vec(), vec![op.tid]);
                             }
                         }
+                    }
+                    OpKind::Text => {
+                        let key = entry.key(op);
+                        if let Some(index) = crate::format::text::txn_key_of(key) {
+                            self.text_txn.insert(index, ());
+                        }
+                        self.texts.insert(key.to_vec(), place);
                     }
                     kind => {
                         let flavour = kind.flavour().expect("a namespace op");
@@ -288,6 +299,13 @@ impl Table {
                                 self.expiry.remove(key);
                             }
                         }
+                    }
+                    OpKind::Text => {
+                        let key = entry.key(op);
+                        if let Some(index) = crate::format::text::txn_key_of(key) {
+                            self.text_txn.remove(&index);
+                        }
+                        self.texts.remove(key);
                     }
                     kind => {
                         let flavour = kind.flavour().expect("a namespace op");
@@ -504,6 +522,70 @@ impl Table {
 
     /// Tell if the backlog wrote `key` of the index of the expiries at or
     /// before `p`.
+    /// Return the newest delta of `prefix`, a key of `text_deltas` without
+    /// its tid, before `before` and at or before `p`: its key and its frame.
+    pub(super) fn text_newest(
+        &self,
+        prefix: &[u8],
+        before: Tid,
+        p: Tid,
+    ) -> Option<(&[u8], &[u8])> {
+        let end = before.min(after(p));
+        if end == Tid::ZERO {
+            return None;
+        }
+        let start = crate::format::text::delta_key(prefix, Tid::ZERO);
+        let end = crate::format::text::delta_key(prefix, end);
+        self.texts
+            .range::<[u8], _>((Bound::Included(&start[..]), Bound::Excluded(&end[..])))
+            .next_back()
+            .map(|(key, place)| (key.as_slice(), self.bytes(place)))
+    }
+
+    /// Return the deltas from `from` to `to` at or before `p`, in key
+    /// order, at most `limit` of them: the key and a copy of the frame of
+    /// each.
+    pub(super) fn text_rows(
+        &self,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        p: Tid,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if empty_range(from, to) {
+            return Vec::new();
+        }
+        self.texts
+            .range::<[u8], _>((from, to))
+            .filter(|(key, _)| crate::format::text::key_tid(key).is_some_and(|tid| tid <= p))
+            .take(limit)
+            .map(|(key, place)| (key.clone(), self.bytes(place).to_vec()))
+            .collect()
+    }
+
+    /// Return the keys of `text_txn` of the deltas from `from` to `to` at or
+    /// before `p`, in key order, at most `limit` of them.
+    pub(super) fn text_txn_keys(
+        &self,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        p: Tid,
+        limit: usize,
+    ) -> Vec<Vec<u8>> {
+        if empty_range(from, to) {
+            return Vec::new();
+        }
+        self.text_txn
+            .range::<[u8], _>((from, to))
+            .map(|(key, ())| key)
+            .filter(|key| {
+                crate::format::text::split_txn_key(key).is_some_and(|(tid, _)| tid <= p)
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn has_expiry(&self, key: &[u8], p: Tid) -> bool {
         self.expiry
             .get(key)

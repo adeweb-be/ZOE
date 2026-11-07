@@ -1,10 +1,12 @@
 //! The on-disk format: the frame and its checksum, the keys, and the
 //! values of the transaction rows, the sequence rows, the rows of the KV
 //! namespaces and the `meta` rows. `blob` gives the format of the blob
-//! store and of the blob records. This module is a red zone.
+//! store and of the blob records, and `text` the keys and the payloads of
+//! the text deltas. This module is a red zone.
 //!
 //! Every record, every blob record, every transaction row, every sequence
-//! row, every row of a KV namespace and every intent file is a frame: a
+//! row, every row of a KV namespace, every text delta and every intent
+//! file is a frame: a
 //! 32-byte header, the typed-field slots, then the payload. The header
 //! fields are little-endian:
 //!
@@ -28,7 +30,8 @@
 //! bytes of `record_key`. The key of a transaction row and of an intent
 //! file is the 8 bytes of `txn_key`. The key of a sequence row is the
 //! UTF-8 bytes of the name of the sequence. The key of a row of a KV
-//! namespace is the bytes of `kv_key`. So a frame that is read under
+//! namespace is the bytes of `kv_key`. The key of a text delta is its key
+//! in `text_deltas` (`text`). So a frame that is read under
 //! another key, or in another key space, fails the check.
 //!
 //! The payload holds the data in the form that the codec byte gives. The
@@ -60,8 +63,13 @@
 //! index of the expiries: its key is `kv_expiry_key`, the expiry
 //! big-endian, then the key of the ephemeral row. Its value is empty, so it
 //! has no frame and no tag, as the transaction index.
+//!
+//! The text deltas have two key spaces (ADR 0060): `text_deltas`, whose
+//! frames have the tag 9, and `text_txn`, the index of the deltas by tid,
+//! with an empty value and no frame. `text` gives their keys.
 
 pub mod blob;
+pub(crate) mod text;
 pub(crate) mod wal;
 
 use std::borrow::Cow;
@@ -82,10 +90,17 @@ pub(crate) use codec::compressions;
 pub(crate) use codec::{decode as decode_payload, encode as encode_payload};
 
 /// The name and version of the format, in the `format` row of `meta`.
-/// A store of this format has the row `object_count` in `meta`, and its
-/// write-ahead log in `wal/` (`wal`, ADR 0056). An open refuses a store
-/// with another name.
-pub const FORMAT_NAME: &[u8] = b"ZOE format 3";
+/// A store of this format has the row `object_count` in `meta`, the
+/// tables `text_deltas` and `text_txn` (ADR 0060), and its write-ahead log
+/// in `wal/`, with the op of a delta (`wal`, ADR 0056). An open refuses a
+/// store with another name. `zoe migrate` moves a store of
+/// `PREVIOUS_FORMAT_NAME` to this format.
+pub const FORMAT_NAME: &[u8] = b"ZOE format 4";
+
+/// The name of the format before `FORMAT_NAME`: the same tables without
+/// the text deltas, and the same log without the op of a delta. An open
+/// refuses it with a message that names `zoe migrate`.
+pub const PREVIOUS_FORMAT_NAME: &[u8] = b"ZOE format 3";
 
 /// The key space of a frame. Its tag is the first byte of the checksum
 /// input, so a frame verifies only in the key space that wrote it.
@@ -93,7 +108,7 @@ pub const FORMAT_NAME: &[u8] = b"ZOE format 3";
 /// A tag never changes, and no key space takes the tag of another, also
 /// after one is removed. 0 is not a tag. The tag 6 is reserved for the
 /// key space `vectors` that the specification plans. A later frame kind
-/// takes the next free tag: 9.
+/// takes the next free tag: 10.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum KeySpace {
@@ -111,6 +126,8 @@ pub enum KeySpace {
     KvEphemeral = 7,
     /// The rows of the durable KV namespaces, in `kv_durable`.
     KvDurable = 8,
+    /// The text deltas, in `text_deltas`.
+    TextDeltas = 9,
 }
 
 impl KeySpace {
@@ -676,7 +693,7 @@ mod tests {
     }
 
     /// Every key space of this build.
-    const SPACES: [KeySpace; 7] = [
+    const SPACES: [KeySpace; 8] = [
         KeySpace::Records,
         KeySpace::Blobs,
         KeySpace::Txns,
@@ -684,12 +701,13 @@ mod tests {
         KeySpace::Sequences,
         KeySpace::KvEphemeral,
         KeySpace::KvDurable,
+        KeySpace::TextDeltas,
     ];
 
     #[test]
     fn the_tags_of_the_key_spaces_never_change() {
         let tags = SPACES.map(KeySpace::tag);
-        assert_eq!(tags, [1, 2, 3, 4, 5, 7, 8]);
+        assert_eq!(tags, [1, 2, 3, 4, 5, 7, 8, 9]);
     }
 
     #[test]

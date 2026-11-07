@@ -304,6 +304,15 @@ impl Default for Options {
     }
 }
 
+/// What `Store::migrate` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Migrated {
+    /// The store had the format before this one, and has this format now.
+    Moved,
+    /// The store had this format already. The call changed nothing.
+    Current,
+}
+
 /// The open database of a store, its blob store and its staging area.
 /// The blob store and the staging area share the directory, and the
 /// directory holds the lock of the store. Nothing else holds the
@@ -363,6 +372,10 @@ pub struct Store {
     /// The settings of the write-ahead log. The leader reads the size of a
     /// large record from them.
     pub(crate) write_log: WriteLog,
+    /// The keys of the text deltas that the votes reserve (ADR 0060).
+    pub(crate) text_reservations: crate::text::Reservations,
+    /// The clear deltas of the indexes that the reads asked for.
+    pub(crate) text_clears: crate::text::Clears,
 }
 
 impl Store {
@@ -497,6 +510,57 @@ impl Store {
             false,
             relocated,
         )
+    }
+
+    /// Move the store in the directory `dir` to the format of this build:
+    /// the work of `zoe migrate` (ADR 0060, section 2). The call takes the
+    /// lock of the store, so a store that another process holds fails with
+    /// `Locked`, and a directory without a store fails and gets nothing.
+    ///
+    /// A store of the format before this one opens with the rules of that
+    /// format. The call folds its write-ahead log, then writes the row
+    /// `format` and creates the tables of the text deltas in one backend
+    /// write with a sync. A crash before that write leaves a store of the
+    /// format before, and a crash after it a store of this format. A store
+    /// of this format gives `Migrated::Current` and changes nothing. Any
+    /// other format fails with `Format` and gets no write.
+    pub fn migrate(dir: impl AsRef<Path>) -> Result<Migrated> {
+        let dir = dir.as_ref();
+        if !Self::exists(dir) {
+            let text = format!("no store in {}", dir.display());
+            return Err(ZoeError::Io(io::Error::new(io::ErrorKind::NotFound, text)));
+        }
+        Self::migrate_in(OsVfs::new(dir)?, SystemClock)
+    }
+
+    /// Move the store in `vfs` to the format of this build, as `migrate`
+    /// does, with the clock `clock`.
+    pub fn migrate_in<V: Vfs>(vfs: V, clock: impl Clock + 'static) -> Result<Migrated> {
+        if !vfs.exists(DATABASE)? {
+            let text = "no store in the directory";
+            return Err(ZoeError::Io(io::Error::new(io::ErrorKind::NotFound, text)));
+        }
+        let db = redb::Builder::new()
+            .create_with_backend(vfs.open(DATABASE)?)
+            .map_err(|e| ZoeError::Backend(Box::new(e)))?;
+        let (backend, previous) = RedbBackend::open_migrating(db)?;
+        if !previous {
+            return Ok(Migrated::Current);
+        }
+        let clock: Arc<dyn Clock> = Arc::new(clock);
+        let dir: Arc<dyn Dir> = Arc::new(vfs);
+        let logged = Logged::open(backend, dir, clock, WriteLog::default())?;
+        logged.fold(logged.last_tid())?;
+        logged.close(true);
+        if logged.fold_failed() || logged.backlog_bytes() != 0 {
+            return Err(ZoeError::Halted);
+        }
+        // The backlog is empty, so this write goes to the tables alone.
+        let mut write = logged.begin_write()?;
+        write.migrate_format()?;
+        write.commit()?;
+        drop(logged);
+        Ok(Migrated::Moved)
     }
 
     /// Open the existing store in the directory `dir` for reads only.
@@ -699,6 +763,8 @@ impl Store {
             structural_merges: options.structural_merges,
             policy: Mutex::new(PolicyCache::default()),
             write_log: options.write_log,
+            text_reservations: crate::text::Reservations::default(),
+            text_clears: crate::text::Clears::default(),
         })
     }
 
