@@ -14,9 +14,11 @@ below the site, MEMBER and OTHER are two user ids. The script:
 4. puts a `ZoeSecurityIndex` in place of the stock index;
 5. compares the resolved value of every entry with the value of the
    indexer, and the results of four queries;
-6. makes four changes of security below FOLDER, then deletes the local
-   roles of MEMBER on the whole site, as the deletion of a user does, and
-   after each change compares again;
+6. makes four changes of security below FOLDER, then two that make
+   opaque entries (a local role provider that is not the default adapter,
+   on a leaf Folder, and a permission setting that is a str on another),
+   then deletes the local roles of MEMBER on the whole site, as the
+   deletion of a user does, and after each change compares again;
 7. writes OUT_DIR/summary.json, and OUT_DIR/entries.tsv for the check of
    the mirror.
 
@@ -36,11 +38,13 @@ import transaction
 from AccessControl.SecurityManagement import newSecurityManager
 from AccessControl.SpecialUsers import system
 from borg.localrole.interfaces import ILocalRoleProvider
+from plone.app.contenttypes.interfaces import IFolder
 from Products.PlonePAS.interfaces.plugins import ILocalRolesPlugin
 from Products.ZCatalog.query import IndexQuery
 from zoe.plone import security
 from zope.component import getGlobalSiteManager, getSiteManager
 from zope.component.hooks import setSite
+from zope.interface import implementer
 
 out_dir, folder_path, member, other = sys.argv[1:5]
 os.makedirs(out_dir, exist_ok=True)
@@ -349,6 +353,37 @@ change(
     "document local role",
     private_doc,
     lambda obj: obj.manage_setLocalRoles(other, ["Reader"]),
+)
+
+
+@implementer(ILocalRoleProvider)
+class Provider:
+    """A provider that is not the default adapter: Reader for OTHER on the
+    Folder at `granted`, nothing elsewhere."""
+
+    granted = None
+
+    def __init__(self, context):
+        self.context = context
+
+    def getRoles(self, principal):
+        return dict(self.getAllRoles()).get(principal, [])
+
+    def getAllRoles(self):
+        if "/".join(self.context.getPhysicalPath()) == Provider.granted:
+            yield other, ["Reader"]
+
+
+# Every Folder gets the provider, so its next index makes it opaque.
+Provider.granted = sorted(leaves)[0]
+getGlobalSiteManager().registerAdapter(
+    Provider, (IFolder,), ILocalRoleProvider, name="zoe-check"
+)
+change("opaque provider", Provider.granted, lambda obj: None)
+change(
+    "str setting",
+    sorted(leaves)[-1],
+    lambda obj: setattr(obj, security.ATTRIBUTE, "View"),
 )
 # A user deletion of the control panel: the local roles of MEMBER go,
 # on every object of the site.

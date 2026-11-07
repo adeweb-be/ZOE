@@ -13,9 +13,9 @@ the value of each entry through the paths of the catalog, as the indexer
 computes it. So a change of security on a folder changes the entry of the
 folder alone, and `reindexObjectSecurity` reindexes the folder alone.
 
-An object whose local roles come from a provider other than the default
-adapter of borg.localrole keeps its value whole. Such an entry is opaque:
-`reindexObjectSecurity` of a container reindexes it.
+An entry is opaque when its object or one of its containers has an input
+that the index does not read. An opaque entry keeps the value of the
+indexer whole, and `reindexObjectSecurity` of a container reindexes it.
 """
 
 from Acquisition import aq_base, aq_inner, aq_parent
@@ -38,7 +38,6 @@ LIST = "l"  # these roles and the roles of the container
 NONE = "a"  # the setting None: Anonymous
 OPAQUE = "v"  # the whole value, from a provider that the index cannot read
 
-EMPTY = (MISSING, (), (), False)
 ANONYMOUS = "anonymous"
 
 
@@ -49,25 +48,37 @@ def _default_adapter():
 
 
 def inputs_of(obj):
-    """Return the inputs that `obj` holds itself.
+    """Return the inputs that `obj` holds itself, or None when the index
+    does not read them.
 
     The inputs are a tuple `(kind, roles, local, block)`: the kind of the
     permission setting, its roles, the local roles of the object as sorted
-    pairs `(principal, roles)`, and the block flag.
+    pairs `(principal, roles)`, and the block flag. The setting follows
+    `rolesForPermissionOn`: a str names another permission, and the index
+    does not read it.
     """
+    from borg.localrole.bbb.interfaces import IGroupAwareWorkspace, IWorkspace
     from borg.localrole.interfaces import ILocalRoleProvider
     from zope.component import getAdapters
 
-    roles = getattr(aq_base(obj), ATTRIBUTE, None)
-    if not hasattr(aq_base(obj), ATTRIBUTE):
+    base = aq_base(obj)
+    roles = getattr(base, ATTRIBUTE, None)
+    if not hasattr(base, ATTRIBUTE):
         kind, roles = MISSING, ()
     elif roles is None:
         kind, roles = NONE, ()
-    elif isinstance(roles, tuple):
+    elif type(roles) is tuple:
         kind, roles = TUPLE, tuple(sorted(roles))
-    elif isinstance(roles, list):
-        kind, roles = LIST, tuple(sorted(roles))
+    elif isinstance(roles, str):
+        return None
     else:
+        try:
+            kind, roles = LIST, tuple(sorted(roles))
+        except TypeError:
+            return None
+    if callable(getattr(base, "__ac_local_roles__", None)):
+        return None
+    if IGroupAwareWorkspace(obj, IWorkspace(obj, None)) is not None:
         return None
     default = _default_adapter()
     local = {}
@@ -79,6 +90,38 @@ def inputs_of(obj):
     pairs = tuple(sorted((p, tuple(sorted(r))) for p, r in local.items() if r))
     block = bool(getattr(obj, "__ac_local_roles_block__", None))
     return (kind, roles, pairs, block)
+
+
+def _stock_entry(obj, catalog_tool):
+    """Return True when the indexer of Plone and its stock local role
+    plugin give the value of the entry of `obj`.
+
+    `obj` is the object that the catalog indexes, which may be the wrapper
+    of plone.indexer.
+    """
+    from plone.indexer.interfaces import IIndexer
+    from Products.CMFCore.utils import getToolByName
+    from Products.CMFPlone.CatalogTool import allowedRolesAndUsers
+    from Products.PlonePAS.interfaces.plugins import ILocalRolesPlugin
+    from zope.component import queryMultiAdapter
+
+    unwrap = getattr(obj, "_getWrappedObject", None)
+    if unwrap is None:
+        return False
+    target = unwrap()
+    found = queryMultiAdapter((target, catalog_tool), IIndexer, name=INDEX)
+    if getattr(found, "callable", None) is not allowedRolesAndUsers.callable:
+        return False
+    acl_users = getToolByName(target, "acl_users", None)
+    plugins = getattr(aq_base(acl_users), "plugins", None)
+    if plugins is None:
+        return False
+    from borg.localrole.workspace import WorkspaceLocalRoleManager
+
+    active = acl_users.plugins.listPlugins(ILocalRolesPlugin)
+    return len(active) == 1 and isinstance(
+        aq_base(active[0][1]), WorkspaceLocalRoleManager
+    )
 
 
 def stock_value(obj):
@@ -108,14 +151,33 @@ class Resolver:
         self._uids = uids
         self._roles = {}
         self._local = {}
+        self._closed = {}
 
     def inputs(self, path):
+        """Return the inputs at `path`, or None for a path that is neither
+        an entry nor a recorded container."""
         rid = self._uids.get(path)
         if rid is not None:
             found = self._inputs.get(rid)
             if found is not None:
                 return found
-        return self._outer.get(path, EMPTY)
+        return self._outer.get(path)
+
+    def closed(self, path):
+        """Return True when `path` or a container of it is opaque or
+        unknown. An entry below such a path gives no token."""
+        if path is None:
+            return False
+        memo = self._closed
+        if path in memo:
+            return memo[path]
+        found = self.inputs(path)
+        if found is None or found[0] == OPAQUE:
+            result = True
+        else:
+            result = self.closed(_parent(path))
+        memo[path] = result
+        return result
 
     def roles(self, path):
         """Return the roles of the permission at `path`: a frozenset,
@@ -167,9 +229,14 @@ class Resolver:
 
     def value_at(self, path):
         """Return the value at `path` as the indexer of Plone computes it."""
-        kind, roles, _local, _block = self.inputs(path)
+        found = self.inputs(path)
+        if found is None:
+            return frozenset()
+        kind, roles, _local, _block = found
         if kind == OPAQUE:
             return frozenset(roles)
+        if self.closed(_parent(path)):
+            return frozenset()
         found = self.roles(path)
         if found == ANONYMOUS:
             allowed = {"Anonymous"}
@@ -226,9 +293,14 @@ class ZoeSecurityIndex(KeywordIndex):
         unwrap = getattr(obj, "_getWrappedObject", None)
         if unwrap is not None:
             target = unwrap()
-        inputs = inputs_of(target)
+        self.record_outer(target)
+        inputs = None
+        if _stock_entry(obj, self._tool()):
+            if not self._below_opaque(_path(target)):
+                inputs = inputs_of(target)
         if inputs is None:
-            inputs = (OPAQUE, stock_value(target), (), False)
+            value = tuple(sorted(self._get_object_keywords(obj, INDEX)))
+            inputs = (OPAQUE, value, (), False)
         changed = self._inputs.get(documentId) != inputs
         if changed:
             self._inputs[documentId] = inputs
@@ -237,8 +309,41 @@ class ZoeSecurityIndex(KeywordIndex):
             elif documentId in self._opaque:
                 self._opaque.remove(documentId)
             self._increment_counter()
-        self.record_outer(target)
         return changed
+
+    def _tool(self):
+        return aq_parent(aq_inner(self._catalog()))
+
+    def opaque(self, obj):
+        """Return True when `obj` gives an opaque entry. The answer reads
+        the object and the entries of its containers, not the entry of the
+        object, which a queue may not have applied yet."""
+        from plone.indexer.interfaces import IIndexableObject
+        from zope.component import queryMultiAdapter
+
+        tool = self._tool()
+        wrapper = queryMultiAdapter((obj, tool), IIndexableObject, default=obj)
+        if not _stock_entry(wrapper, tool):
+            return True
+        if self._below_opaque(_path(obj)):
+            return True
+        return inputs_of(obj) is None
+
+    def _below_opaque(self, path):
+        """Return True when a container of `path` is opaque."""
+        uids = self._catalog().uids
+        above = _parent(path)
+        while above is not None:
+            rid = uids.get(above)
+            if rid is not None:
+                if rid in self._opaque:
+                    return True
+            else:
+                found = self._outer.get(above)
+                if found is not None and found[0] == OPAQUE:
+                    return True
+            above = _parent(above)
+        return False
 
     def record_outer(self, obj):
         """Keep the inputs of the containers of `obj` that are outside the
@@ -254,7 +359,7 @@ class ZoeSecurityIndex(KeywordIndex):
 
     def record(self, path, obj):
         """Keep the inputs of `obj`, which is outside the catalog."""
-        inputs = inputs_of(obj) or EMPTY
+        inputs = inputs_of(obj) or (OPAQUE, (), (), False)
         if self._outer.get(path) != inputs:
             self._outer[path] = inputs
             self._increment_counter()
@@ -361,25 +466,29 @@ def reindexObjectSecurity(self, skip_self=False):
 
     With a `ZoeSecurityIndex`, the entries below this object resolve
     through it, so only this object and the opaque entries below it get a
-    reindex. Otherwise the stock method of CMFCore runs.
+    reindex. When the entry of this object is opaque, every entry below it
+    gets a reindex. Otherwise the stock method of CMFCore runs.
     """
     catalog = self._getCatalogTool()
     if catalog is None:
         return None
     index = security_index(catalog)
-    if index is None:
+    if index is None or tuple(self._cmf_security_indexes) != (INDEX,):
         return _stock(self, skip_self)
     path = _path(self)
-    inner = catalog._catalog
-    if not skip_self:
-        if _is_site(self) and inner.uids.get(path) is None:
-            index.record(path, self)
-        else:
+    if _is_site(self) and catalog._catalog.uids.get(path) is None:
+        index.record(path, self)
+        every = index._outer[path][0] == OPAQUE
+    else:
+        if not skip_self:
             self.reindexObject(idxs=[INDEX], update_metadata=0)
-    if index._opaque:
+        every = index.opaque(self)
+    if every or index._opaque:
         below = catalog.unrestrictedSearchResults(path=path)
         for brain in below:
-            if brain.getRID() in index._opaque and brain.getPath() != path:
+            if brain.getPath() == path:
+                continue
+            if every or brain.getRID() in index._opaque:
                 obj = brain._unrestrictedGetObject()
                 obj.reindexObject(idxs=[INDEX], update_metadata=0)
     return None

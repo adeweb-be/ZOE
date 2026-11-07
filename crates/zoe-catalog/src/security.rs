@@ -7,6 +7,9 @@
 //! index keeps the inputs of each node and resolves the value of every
 //! entry through the parent of each node. A change of the inputs of one
 //! folder changes one node; a new resolution gives the values below it.
+//!
+//! An opaque node gives its own value. A node below an opaque node, or
+//! below a node whose inputs were never set, gives no token.
 
 use std::collections::HashMap;
 
@@ -70,6 +73,7 @@ pub struct SecurityIndex {
     nodes: HashMap<String, usize>,
     parents: Vec<Option<usize>>,
     inputs: Vec<Inputs>,
+    known: Vec<bool>,
 }
 
 impl SecurityIndex {
@@ -109,6 +113,7 @@ impl SecurityIndex {
         let node = self.parents.len();
         self.parents.push(parent);
         self.inputs.push(Inputs::empty());
+        self.known.push(false);
         self.nodes.insert(path.to_owned(), node);
         node
     }
@@ -117,6 +122,7 @@ impl SecurityIndex {
     pub fn set(&mut self, path: &str, inputs: Inputs) -> usize {
         let node = self.node(path);
         self.inputs[node] = inputs;
+        self.known[node] = true;
         node
     }
 
@@ -132,14 +138,29 @@ impl SecurityIndex {
         let mut local: Vec<Option<LocalRoles>> = vec![None; count];
         let mut users: HashMap<u32, u32> = HashMap::new();
         let mut values = Vec::with_capacity(count);
+        // A node is closed when it is opaque or unknown, or when its
+        // parent is closed. A parent comes before its child.
+        let mut closed = vec![false; count];
+        for node in 0..count {
+            let own = !self.known[node] || self.inputs[node].kind == Kind::Opaque;
+            closed[node] = own || self.parents[node].is_some_and(|parent| closed[parent]);
+        }
         for node in 0..count {
             self.roles_at(node, &mut roles);
             self.local_at(node, &mut local);
         }
         for node in 0..count {
             let inputs = &self.inputs[node];
+            if !self.known[node] {
+                values.push(Vec::new());
+                continue;
+            }
             if inputs.kind == Kind::Opaque {
                 values.push(inputs.roles.clone());
+                continue;
+            }
+            if self.parents[node].is_some_and(|parent| closed[parent]) {
+                values.push(Vec::new());
                 continue;
             }
             let mut allowed: Vec<u32> = match roles[node].as_ref().expect("resolved") {
@@ -350,6 +371,10 @@ mod tests {
     #[test]
     fn a_child_follows_a_change_of_its_folder() {
         let mut index = SecurityIndex::new();
+        for path in ["", "/site"] {
+            let above = inputs(&mut index, Kind::Missing, &[], &[]);
+            index.set(path, above);
+        }
         let private = ["Manager", "Owner", "Reader", "Editor"];
         let folder = inputs(&mut index, Kind::Tuple, &private, &[("alice", &["Owner"])]);
         index.set("/site/folder", folder);
@@ -384,5 +409,23 @@ mod tests {
             names(&index, &values[child]),
             ["Editor", "Manager", "Reader"]
         );
+    }
+
+    #[test]
+    fn a_node_below_an_opaque_or_unknown_node_gives_no_token() {
+        let mut index = SecurityIndex::new();
+        let root = inputs(&mut index, Kind::Tuple, &["Anonymous"], &[]);
+        index.set("", root);
+        let site = inputs(&mut index, Kind::Missing, &[], &[]);
+        index.set("/site", site);
+        let opaque = inputs(&mut index, Kind::Opaque, &["Reader", "user:bob"], &[]);
+        let workspace = index.set("/site/workspace", opaque);
+        let doc = inputs(&mut index, Kind::Missing, &[], &[]);
+        let below = index.set("/site/workspace/doc", doc.clone());
+        let lost = index.set("/site/gap/doc", doc);
+        let values = index.resolve();
+        assert_eq!(names(&index, &values[workspace]), ["Reader", "user:bob"]);
+        assert!(values[below].is_empty());
+        assert!(values[lost].is_empty());
     }
 }
