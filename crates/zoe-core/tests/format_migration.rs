@@ -253,3 +253,32 @@ fn a_crash_during_the_tool_leaves_a_store_of_format_3_or_of_format_4() {
     }
     assert!(old > 0 && new > 0, "{old} {new}");
 }
+
+#[test]
+fn a_store_of_format_3_whose_log_holds_commits_moves_with_the_tool() {
+    let vfs = MemVfs::new();
+    let store = Store::open_full(vfs.clone(), SystemClock, held()).unwrap();
+    let a = new_oid(&store);
+    let t1 = commit(&store, a, Tid::ZERO, PICKLE);
+    testing::write_previous_format(&store).unwrap();
+    let t2 = commit(&store, a, t1, OTHER);
+    assert!(store.backlog_bytes() > 0);
+    // A crash: the log holds the last commit, and no close folds it.
+    let image = vfs.crash_now(|_| 0);
+    drop(store);
+    assert_eq!(
+        Store::migrate_in(image.clone(), SystemClock).unwrap(),
+        Migrated::Moved
+    );
+    let store = Store::open_vfs(image).unwrap();
+    assert_eq!(store.load(a).unwrap(), (OTHER.to_vec(), t2));
+    assert_eq!(store.load_serial(a, t1).unwrap(), PICKLE);
+    let tids: Vec<Tid> = store
+        .iterator(None, None)
+        .unwrap()
+        .map(|txn| txn.unwrap().tid)
+        .collect();
+    assert_eq!(tids, [t1, t2]);
+    let checked = store.verify_text().unwrap();
+    assert!(checked.findings.is_empty(), "{checked:?}");
+}

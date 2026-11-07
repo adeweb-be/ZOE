@@ -27,6 +27,16 @@
 //! checks each serial: a transaction that changed an oid after the undo
 //! read it is a conflict of the vote, as for any store.
 //!
+//! The text deltas of T (ADR 0060, section 5) have no merge. For each
+//! text delta of T, the undo reads the live text of its key as the
+//! transaction sees it: the delta that it staged, else the newest
+//! committed one. When that text is the text of T, it stages the live text
+//! before T, or an unindex when there is none. No live text equals an
+//! unindex. Else the undo fails. A clear delta of the index after T fails
+//! the undo, and so does a clear delta in T. The `before` of each staged
+//! delta is the snapshot of its read, so the vote checks the key against
+//! the commits after the read.
+//!
 //! Nothing is undoable at or before the last pack (`pack_watermark`). The
 //! vote checks it again with its locks held, and the finish under the
 //! commit sequencer, so a pack that runs between the undo and its finish
@@ -87,6 +97,13 @@ pub(crate) const CREATION_CHANGED: &str =
 /// The reason of an undo that a later transaction stops. FileStorage
 /// gives the same text.
 pub(crate) const CHANGED_LATER: &str = "Some data were modified by a later transaction";
+
+/// The reason of an undo of a transaction that holds a clear delta.
+pub(crate) const CLEARS_INDEX: &str = "the transaction clears a text index";
+
+/// The reason of an undo of a text delta whose index a clear delta after
+/// the transaction empties.
+pub(crate) const CLEARED_LATER: &str = "a later transaction clears the text index";
 
 impl Store {
     /// Return the rows of at most `limit` transactions before `before`

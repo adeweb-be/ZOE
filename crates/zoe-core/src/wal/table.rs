@@ -1,8 +1,8 @@
 //! The unfolded table: the records, the blob records, the namespace ops,
 //! the expiry keys and the deltas of the backlog in memory, and the
-//! backlog itself (ADR 0056, section 7; ADR 0060, section 3). One `RwLock` holds the table. The leader inserts a
-//! whole batch under one write lock, and a slice of the fold leaves it
-//! under one write lock.
+//! backlog itself (ADR 0056, section 7; ADR 0060, section 3). One
+//! `RwLock` holds the table. The leader inserts a whole batch under one
+//! write lock, and a slice of the fold leaves it under one write lock.
 //!
 //! The frames stay in the bytes of their entry. The commits of an entry
 //! share these bytes, and the table keeps the places of the frames. An
@@ -520,8 +520,6 @@ impl Table {
         (out, false)
     }
 
-    /// Tell if the backlog wrote `key` of the index of the expiries at or
-    /// before `p`.
     /// Return the newest delta of `prefix`, a key of `text_deltas` without
     /// its tid, before `before` and at or before `p`: its key and its frame.
     pub(super) fn text_newest(&self, prefix: &[u8], before: Tid, p: Tid) -> Option<(&[u8], &[u8])> {
@@ -579,6 +577,8 @@ impl Table {
             .collect()
     }
 
+    /// Tell if the backlog wrote `key` of the index of the expiries at or
+    /// before `p`.
     pub(super) fn has_expiry(&self, key: &[u8], p: Tid) -> bool {
         self.expiry
             .get(key)

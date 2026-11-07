@@ -572,6 +572,10 @@ impl Backend for RedbBackend {
         text::newest(&self.db, prefix, before)
     }
 
+    fn text_newest_key(&self, prefix: &[u8], before: Tid) -> Result<Option<Bytes>> {
+        text::newest_key(&self.db, prefix, before)
+    }
+
     fn text_rows(
         &self,
         from: Bound<&[u8]>,
