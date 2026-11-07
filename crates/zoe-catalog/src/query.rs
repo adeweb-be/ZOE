@@ -20,8 +20,10 @@ use crate::base::{
     Base, DateRangeIndex, FieldIndex, Index, Keys, KeywordIndex, Kind, PathIndex, Posting,
     Postings, components, covers, date_range_of, keywords_of, parent_of,
 };
-use crate::change::{Overrides, Slot, same};
+use crate::cell;
+use crate::change::{Overrides, Slot, same, value};
 use crate::reason::{Fallback, Reason};
+use crate::table::Cell;
 use crate::value::{Val, py_cmp};
 
 /// A clause of a plan, typed by the client with ZCatalog's `IndexQuery`
@@ -64,6 +66,16 @@ pub struct Plan {
     pub b_size: Option<i64>,
 }
 
+/// The rows that the reply of a plan gives: the cells of the columns
+/// `cols` and the path of each of the first `rn` rids of the result.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Columns {
+    /// The columns, by name; `None` for a reply without rows.
+    pub cols: Option<Vec<String>>,
+    /// The number of rids of the result that get their rows.
+    pub rn: usize,
+}
+
 /// The answer of a plan.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reply {
@@ -75,6 +87,12 @@ pub struct Reply {
     pub actual: i64,
     /// How the range clauses ran.
     pub trace: Trace,
+    /// The row of each of the first rids, when the plan names columns: a
+    /// msgpack array of the cells of the columns, or `None` when the
+    /// brain of the rid must come from `data`.
+    pub rows: Option<Vec<Option<Vec<u8>>>>,
+    /// The path of each rid of `rows`.
+    pub paths: Option<Vec<Option<String>>>,
 }
 
 /// How the range clauses of a query ran.
@@ -246,6 +264,68 @@ impl<'a> View<'a> {
             .get(&i)
             .copied()
             .unwrap_or(self.base.indexes[i].length)
+    }
+
+    /// Answers `plan`, with the rows of `columns`.
+    pub fn query_rows(&self, plan: &Plan, columns: &Columns) -> Result<Reply, Fallback> {
+        let mut reply = self.query(plan)?;
+        self.fill_rows(&mut reply, columns);
+        Ok(reply)
+    }
+
+    /// Gives `reply` the rows of `columns`: the path and the row of each of
+    /// the first `rn` rids. A column that the schema of the catalog does not
+    /// name makes each row `None`.
+    pub fn fill_rows(&self, reply: &mut Reply, columns: &Columns) {
+        let Some(cols) = &columns.cols else {
+            return;
+        };
+        let schema = &self.base.table.schema;
+        let places: Option<Vec<usize>> = cols.iter().map(|c| schema.get(c).copied()).collect();
+        let n = columns.rn.min(reply.rids.len());
+        let mut rows = Vec::with_capacity(n);
+        let mut paths = Vec::with_capacity(n);
+        for rid in &reply.rids[..n] {
+            let path = value(self.base, self.over, Slot::Paths, *rid);
+            paths.push(path.as_ref().and_then(Val::text).map(str::to_owned));
+            rows.push(places.as_deref().and_then(|p| self.row(*rid, p)));
+        }
+        reply.rows = Some(rows);
+        reply.paths = Some(paths);
+    }
+
+    /// The row of `rid` with the cells at `places`, as a msgpack array.
+    /// `None` when the record of the rid does not have one value for each
+    /// column of the schema, or when a cell has another type: the brain then
+    /// comes from `data`, as `Catalog.__getitem__` makes it.
+    fn row(&self, rid: i32, places: &[usize]) -> Option<Vec<u8>> {
+        let table = &self.base.table;
+        let row = self.base.rows.row(rid);
+        let over = |slot: Slot| self.over.trees.get(&slot).and_then(|rows| rows.get(&rid));
+        let width = match over(Slot::Width) {
+            Some(Some(Val::Int(w))) => Some(*w),
+            Some(_) => None,
+            None => row.and_then(|r| table.record_width(r)).map(i64::from),
+        };
+        if width != Some(table.width() as i64) {
+            return None;
+        }
+        let mut out = Vec::new();
+        cell::array_head(places.len(), &mut out);
+        for place in places {
+            let cell = match over(Slot::Column(*place)) {
+                Some(found) => Cell::of_val(found.as_ref()),
+                None => match (row, table.columns.get(*place)) {
+                    (Some(row), Some(column)) => column.cell(row),
+                    _ => Cell::Absent,
+                },
+            };
+            match cell {
+                Cell::Encoded(bytes) => out.extend_from_slice(bytes),
+                Cell::Absent | Cell::Other => return None,
+            }
+        }
+        Some(out)
     }
 
     /// Answers `plan`.
@@ -993,7 +1073,7 @@ impl<'a> View<'a> {
             rids: result,
             len,
             actual,
-            trace: Trace::default(),
+            ..Reply::default()
         })
     }
 
@@ -1002,7 +1082,7 @@ impl<'a> View<'a> {
             rids: rows.iter().map(|r| self.rid_of(*r)).collect(),
             len,
             actual,
-            trace: Trace::default(),
+            ..Reply::default()
         }
     }
 }
@@ -1137,6 +1217,10 @@ fn union(a: Option<RoaringBitmap>, b: Option<RoaringBitmap>) -> Option<RoaringBi
     }
 }
 
+/// Why a query whose level or depth takes a sum past the ints of 64 bits
+/// takes the Python path.
+const BEYOND: &str = "a level or a depth whose sum passes the ints of 64 bits";
+
 /// Why a query that reads `_index_items` takes the Python path.
 const INDEX_ITEMS: &str = "a lookup of _index_items, which the mirror does not read: it keeps one \
      rid for each path and loses it when any row of the path leaves";
@@ -1208,8 +1292,13 @@ impl<'v> PathVersion<'v> {
         if q.navtree && depth == -1 {
             depth = 1;
         }
-        let pathlength = level + comps.len() as i64 - 1;
-        if q.navtree && q.start > (pathlength + depth).min(self.base.depth) {
+        let Some(pathlength) = level.checked_add(comps.len() as i64 - 1) else {
+            return fallback(Reason::Option, BEYOND);
+        };
+        let Some(reach) = pathlength.checked_add(depth) else {
+            return fallback(Reason::Option, BEYOND);
+        };
+        if q.navtree && q.start > reach.min(self.base.depth) {
             return Ok(RoaringBitmap::new());
         }
         let multi = self.base.multi_valued;
@@ -1256,7 +1345,10 @@ impl<'v> PathVersion<'v> {
         let mut depthset: Option<RoaringBitmap> = None;
         if q.navtree && depth > 0 {
             let mut rows = RoaringBitmap::new();
-            for at in q.start.min(level)..=q.start.max(level) {
+            // No row ends below the level -1 or past the deepest level.
+            let low = q.start.min(level).max(-1);
+            let high = q.start.max(level).min(self.deepest());
+            for at in low..=high {
                 if let Some(ends) = self.ends(at) {
                     rows |= ends;
                 }
@@ -1269,7 +1361,9 @@ impl<'v> PathVersion<'v> {
             steps.reverse();
         }
         for (k, comp) in steps {
-            let at = k as i64 + level;
+            let Some(at) = level.checked_add(k as i64) else {
+                return fallback(Reason::Option, BEYOND);
+            };
             let res = self.comp(comp, at);
             if res.is_none() {
                 if !q.navtree {
@@ -1291,7 +1385,9 @@ impl<'v> PathVersion<'v> {
             let mut rows = depthset.unwrap_or_default();
             let deepest = self.deepest();
             for k in start..=start.saturating_add(depth) {
-                let at = k + level;
+                let Some(at) = k.checked_add(level) else {
+                    return fallback(Reason::Option, BEYOND);
+                };
                 if at > deepest {
                     // No row ends there: the intersection gives the whole
                     // pathset, at this level and at each one after it.
@@ -1401,7 +1497,7 @@ fn truth(value: &Val) -> bool {
         Val::Bytes(b) => !b.is_empty(),
         Val::Tuple(v) | Val::List(v) => !v.is_empty(),
         Val::Message(_) => value.text().is_some_and(|t| !t.is_empty()),
-        Val::DateTime(..) => true,
+        Val::DateTime(..) | Val::Cell(_) => true,
     }
 }
 

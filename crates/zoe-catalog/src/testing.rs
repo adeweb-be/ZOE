@@ -139,8 +139,8 @@ impl Pickle {
                 self.list(items)
             }
             Val::Missing => self.class("Missing", "V"),
-            Val::DateTime(..) | Val::Message(_) => {
-                panic!("the testing pickler writes no DateTime and no Message")
+            Val::DateTime(..) | Val::Message(_) | Val::Cell(_) => {
+                panic!("the testing pickler writes no DateTime, no Message and no cell")
             }
         }
     }

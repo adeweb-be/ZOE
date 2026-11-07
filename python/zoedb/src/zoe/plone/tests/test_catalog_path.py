@@ -187,6 +187,14 @@ class TestThePathIndexOfTheCatalogMirror(unittest.TestCase):
                     )
                 if "sub-renamed" in site["pth-1"].objectIds():
                     site["pth-1"].manage_renameObject("sub-renamed", "sub-2")
+                if "sub-0" not in site["pth-2"].objectIds():
+                    # The subfolder of `make_content`, with its Documents.
+                    folder = site["pth-2"]
+                    folder.invokeFactory("Folder", "sub-0", title="Sub 20")
+                    for k in range(3):
+                        folder["sub-0"].invokeFactory(
+                            "Document", f"doc-{k}", title=f"Doc {(14 + k) % 10}"
+                        )
                 transaction.commit()
 
     def test_a_sort_on_path_and_a_search_of_one_object_take_the_python_path(self):

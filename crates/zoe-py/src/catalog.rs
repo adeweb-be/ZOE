@@ -1,15 +1,18 @@
 //! The catalog mirrors of a `zoe.Storage` (ADR 0059): the plan of
-//! `catalog_query` from a Python dict, its reply as a dict, the state and
-//! the counts of the mirrors, and the log of their events.
+//! `catalog_query` from a Python dict, its reply as a dict with the rows of
+//! the metadata table as Python values, the state and the counts of the
+//! mirrors, and the log of their events.
 //!
 //! The mirrors of a store live in `zoe-catalog`. `storage` starts them at
 //! the open of a store whose namespace `zoe.catalog` holds a registration
 //! key, or at the first write of that namespace, never at import. It hands
 //! each commit to them after its publication.
 
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use zoe_catalog::cell::{self, EXT_DATE_TIME, EXT_MESSAGE, EXT_MISSING};
 use zoe_catalog::counts::{Counts, LATENCY_BUCKETS};
 use zoe_catalog::{Fallback, Reply, Status, Wire};
 
@@ -74,8 +77,111 @@ fn wire_at(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Wire> {
     )))
 }
 
-/// The reply of a query at `tid`, as a dict: `r` as a list of ints, `n`
-/// and `a`, or `f` and `why`.
+/// The classes of the ext types of the cells, imported at their first use.
+#[derive(Default)]
+struct Classes<'py> {
+    missing: Option<Bound<'py, PyAny>>,
+    date_time: Option<Bound<'py, PyAny>>,
+    message: Option<Bound<'py, PyAny>>,
+}
+
+/// The object `name` of the module `module`, as the unpickler finds the
+/// GLOBAL of a pickle.
+fn global<'py>(
+    py: Python<'py>,
+    slot: &mut Option<Bound<'py, PyAny>>,
+    module: &str,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(found) = slot {
+        return Ok(found.clone());
+    }
+    let found = py.import(module)?.getattr(name)?;
+    *slot = Some(found.clone());
+    Ok(found)
+}
+
+/// The Python value of the cell `value`, as the unpickler makes it from the
+/// record of `data`: a tuple for an array, a dict for a map, `Missing.V`
+/// for the ext 1, a `DateTime` given its state by `__setstate__` for the
+/// ext 2, and the `Message` of its arguments for the ext 3.
+fn cell_value<'py>(
+    py: Python<'py>,
+    classes: &mut Classes<'py>,
+    value: &Wire,
+) -> PyResult<Bound<'py, PyAny>> {
+    let bad = || PyValueError::new_err("a cell of another form");
+    Ok(match value {
+        Wire::Nil => py.None().into_bound(py),
+        Wire::Bool(b) => b.into_bound_py_any(py)?,
+        Wire::Int(i) => i.into_bound_py_any(py)?,
+        Wire::Float(f) => f.into_bound_py_any(py)?,
+        Wire::Str(s) => PyString::new(py, s).into_any(),
+        Wire::Bin(b) => PyBytes::new(py, b).into_any(),
+        Wire::Array(items) => {
+            let items = items
+                .iter()
+                .map(|item| cell_value(py, classes, item))
+                .collect::<PyResult<Vec<_>>>()?;
+            PyTuple::new(py, items)?.into_any()
+        }
+        Wire::Map(items) => {
+            let out = PyDict::new(py);
+            for (k, v) in items {
+                out.set_item(cell_value(py, classes, k)?, cell_value(py, classes, v)?)?;
+            }
+            out.into_any()
+        }
+        Wire::Ext(EXT_MISSING, data) if data.is_empty() => {
+            global(py, &mut classes.missing, "Missing", "V")?
+        }
+        Wire::Ext(EXT_DATE_TIME, data) => {
+            let (micros, naive, tz) = cell::date_time(data).ok_or_else(bad)?;
+            let class = global(py, &mut classes.date_time, "DateTime.DateTime", "DateTime")?;
+            let made = class.call_method1("__new__", (&class,))?;
+            made.call_method1("__setstate__", ((micros, naive, tz),))?;
+            made
+        }
+        Wire::Ext(EXT_MESSAGE, data) => {
+            let args = cell::message_args(data).ok_or_else(bad)?;
+            let args = args
+                .iter()
+                .map(|arg| cell_value(py, classes, arg))
+                .collect::<PyResult<Vec<_>>>()?;
+            let class = global(
+                py,
+                &mut classes.message,
+                "zope.i18nmessageid.message",
+                "Message",
+            )?;
+            class.call1(PyTuple::new(py, args)?)?
+        }
+        Wire::Ext(..) => return Err(bad()),
+    })
+}
+
+/// The tuple of the cells of the row `bytes`, a msgpack array. `None` when
+/// a cell does not make a Python value: the brain then comes from `data`.
+fn row<'py>(py: Python<'py>, classes: &mut Classes<'py>, bytes: &[u8]) -> Bound<'py, PyAny> {
+    let made = match cell::decode(bytes) {
+        Some(Wire::Array(cells)) => cells
+            .iter()
+            .map(|c| cell_value(py, classes, c))
+            .collect::<PyResult<Vec<_>>>()
+            .and_then(|cells| PyTuple::new(py, cells)),
+        _ => Err(PyValueError::new_err("a row of another form")),
+    };
+    match made {
+        Ok(cells) => cells.into_any(),
+        Err(_) => py.None().into_bound(py),
+    }
+}
+
+/// The reply of a query at `tid`, as a dict: `r` as a list of ints, `n`,
+/// `a`, `rows` and `paths`, or `f` and `why`. `rows` holds a tuple of the
+/// cells of each of the first rids, or `None` for a rid whose brain comes
+/// from `data`; `paths` holds the path of each. Both are `None` when the
+/// plan names no columns.
 pub(crate) fn reply<'py>(
     py: Python<'py>,
     tid: &[u8],
@@ -88,6 +194,24 @@ pub(crate) fn reply<'py>(
             out.set_item("r", PyList::new(py, &reply.rids)?)?;
             out.set_item("n", reply.len)?;
             out.set_item("a", reply.actual)?;
+            match (&reply.rows, &reply.paths) {
+                (Some(rows), Some(paths)) => {
+                    let mut classes = Classes::default();
+                    let made = PyList::empty(py);
+                    for each in rows {
+                        made.append(match each {
+                            Some(bytes) => row(py, &mut classes, bytes),
+                            None => py.None().into_bound(py),
+                        })?;
+                    }
+                    out.set_item("rows", made)?;
+                    out.set_item("paths", PyList::new(py, paths)?)?;
+                }
+                _ => {
+                    out.set_item("rows", py.None())?;
+                    out.set_item("paths", py.None())?;
+                }
+            }
         }
         Err(fallback) => {
             out.set_item("f", fallback.reason.name())?;

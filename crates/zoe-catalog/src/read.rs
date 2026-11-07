@@ -130,8 +130,19 @@ pub struct Record {
 }
 
 impl Record {
-    /// Decodes `bytes`.
+    /// Decodes `bytes` on a heap that models `DateTime`, `Message` and
+    /// `Missing.Value`, and no other object of another class.
     pub fn decode(bytes: &[u8]) -> Result<Record, Refused> {
+        Self::decode_on(bytes, Heap::with_values())
+    }
+
+    /// Decodes `bytes` on a heap that also holds the objects of other
+    /// classes and the sets, as the values of a record of `data` can be.
+    pub fn decode_data(bytes: &[u8]) -> Result<Record, Refused> {
+        Self::decode_on(bytes, Heap::with_instances())
+    }
+
+    fn decode_on(bytes: &[u8], mut heap: Heap) -> Result<Record, Refused> {
         let tree = decode_record_with(
             bytes,
             Limits {
@@ -143,7 +154,6 @@ impl Record {
             .class_name()
             .map(|(m, n)| (m.to_owned(), n.to_owned()))
             .ok_or_else(|| Refused("a record without a class".into()))?;
-        let mut heap = Heap::with_values();
         let (_, state) = heap
             .load(&tree)
             .map_err(|e| Refused(format!("load: {e}")))?;
@@ -206,8 +216,39 @@ pub enum Node {
     Items(Vec<(Val, Val)>),
 }
 
+/// How a walk reads the values of a bucket.
+pub type ReadValue = fn(&Heap, Value) -> Result<Val, Refused>;
+
+/// How a walk reads the records of a tree: the decode of a record and the
+/// read of a value.
+#[derive(Clone, Copy)]
+pub struct Reader {
+    /// The decode of a record.
+    pub decode: fn(&[u8]) -> Result<Record, Refused>,
+    /// The read of a value of a bucket.
+    pub value: ReadValue,
+}
+
+/// The reader of the trees of the indexes, of `paths` and of `uids`.
+pub const KEYS: Reader = Reader {
+    decode: Record::decode,
+    value: Val::read,
+};
+
+/// The reader of `data`: each record is a tuple of cells (`table`).
+pub const RECORDS: Reader = Reader {
+    decode: Record::decode_data,
+    value: |heap, value| Ok(crate::table::record_of(heap, value)),
+};
+
 /// Reads the node of a BTree in `record`.
 pub fn node(record: &Record) -> Result<Node, Refused> {
+    node_with(record, Val::read)
+}
+
+/// Reads the node of a BTree in `record`, each value of a bucket with
+/// `value`.
+pub fn node_with(record: &Record, value: ReadValue) -> Result<Node, Refused> {
     let class = btrees::classify(&record.module, &record.name)
         .ok_or_else(|| Refused(format!("not a BTree: {}.{}", record.module, record.name)))?;
     let Class::Family(shape, _) = class else {
@@ -219,7 +260,7 @@ pub fn node(record: &Record) -> Result<Node, Refused> {
         Shape::Bucket | Shape::Set => {
             let state = btrees::bucket_state(heap, record.state, mapping)
                 .ok_or_else(|| Refused("a bucket state".into()))?;
-            Ok(Node::Items(items(heap, &state.items, mapping)?))
+            Ok(Node::Items(items(heap, &state.items, mapping, value)?))
         }
         Shape::Tree | Shape::TreeSet => match btrees::tree_state(heap, record.state)
             .ok_or_else(|| Refused("a tree state".into()))?
@@ -228,7 +269,7 @@ pub fn node(record: &Record) -> Result<Node, Refused> {
             TreeState::Inline(bucket) => {
                 let state = btrees::bucket_state(heap, bucket, mapping)
                     .ok_or_else(|| Refused("an inline bucket".into()))?;
-                Ok(Node::Items(items(heap, &state.items, mapping)?))
+                Ok(Node::Items(items(heap, &state.items, mapping, value)?))
             }
             TreeState::Split => {
                 let state = heap.tuple(record.state).unwrap_or(&[]);
@@ -249,13 +290,18 @@ pub fn node(record: &Record) -> Result<Node, Refused> {
     }
 }
 
-fn items(heap: &Heap, flat: &[Value], mapping: bool) -> Result<Vec<(Val, Val)>, Refused> {
+fn items(
+    heap: &Heap,
+    flat: &[Value],
+    mapping: bool,
+    read_value: ReadValue,
+) -> Result<Vec<(Val, Val)>, Refused> {
     let step = if mapping { 2 } else { 1 };
     let mut out = Vec::with_capacity(flat.len() / step);
     for pair in flat.chunks(step) {
         let key = Val::read(heap, pair[0])?;
         let value = if mapping {
-            Val::read(heap, pair[1])?
+            read_value(heap, pair[1])?
         } else {
             Val::None
         };
@@ -298,16 +344,36 @@ struct Queue {
     failed: Option<String>,
 }
 
-/// Walks the tree at `root` as of before `tid` with `threads` threads.
-/// Each thread keeps a state that `make` gives, and calls `each` with it
-/// for the items of each bucket that it reads. Returns the shape of the
-/// tree, the state of each thread and what the walk read. A record that
-/// does not decode, or that `each` refuses, fails the walk.
+/// Walks the tree at `root` as of before `tid` with `threads` threads, as
+/// `walk_tree_with` does, with the reader `KEYS`.
 pub fn walk_tree<W, M, F>(
     reads: &dyn Reads,
     tid: u64,
     root: u64,
     threads: usize,
+    make: M,
+    each: F,
+) -> Result<(TreeShape, Vec<W>, WalkStats), String>
+where
+    W: Send,
+    M: Fn() -> W + Sync,
+    F: Fn(&mut W, Vec<(Val, Val)>) -> Result<(), String> + Sync,
+{
+    walk_tree_with(reads, tid, root, threads, KEYS, make, each)
+}
+
+/// Walks the tree at `root` as of before `tid` with `threads` threads.
+/// Each thread keeps a state that `make` gives, and calls `each` with it
+/// for the items of each bucket that it reads. `reader` decodes the
+/// records and reads the values. Returns the shape of the tree, the state
+/// of each thread and what the walk read. A record that does not decode,
+/// or that `each` refuses, fails the walk.
+pub fn walk_tree_with<W, M, F>(
+    reads: &dyn Reads,
+    tid: u64,
+    root: u64,
+    threads: usize,
+    reader: Reader,
     make: M,
     each: F,
 ) -> Result<(TreeShape, Vec<W>, WalkStats), String>
@@ -354,8 +420,8 @@ where
                             let data = data.ok_or_else(|| format!("no record {oid:#x}"))?;
                             records.fetch_add(1, AtomicOrdering::Relaxed);
                             bytes.fetch_add(data.len(), AtomicOrdering::Relaxed);
-                            let record = Record::decode(&data).map_err(|e| e.0)?;
-                            node(&record).map_err(|e| e.0)
+                            let record = (reader.decode)(&data).map_err(|e| e.0)?;
+                            node_with(&record, reader.value).map_err(|e| e.0)
                         });
                         let result = match result {
                             Ok(Node::Items(items)) => {

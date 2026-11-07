@@ -362,6 +362,79 @@ fn each_option_gives_the_answer_of_zcatalog_after_each_commit_and_at_older_tids(
 }
 
 #[test]
+fn with_multi_valued_each_option_gives_the_answer_of_zcatalog_after_each_commit() {
+    // `path-multi.json` holds the data of `path.json` with `multi_valued`
+    // set on the index: a search at the level 0 with a depth of 0 reads
+    // `_index_parents`, and a navtree of depth 1 reads `_index_items`.
+    let data = data("path-multi.json");
+    let store = store();
+    let catalog = u64::from_str_radix(data["catalog"].as_str().unwrap(), 16).unwrap();
+    let tid = commit(
+        &store,
+        None,
+        &records(&data["base"]),
+        &[catalog.to_be_bytes()],
+    );
+    let mirrors = mirrors(&store, Config::default());
+    assert!(ready_at(&mirrors, catalog, tid));
+    check_answers(&mirrors, catalog, tid, &data, 0, "multi_valued, the base");
+    let mut tids = vec![tid];
+    for (at, c) in data["commits"].as_array().unwrap().iter().enumerate() {
+        let tid = commit(&store, Some(&mirrors), &records(&c["records"]), &[]);
+        assert!(ready_at(&mirrors, catalog, tid));
+        check_answers(&mirrors, catalog, tid, &data, at + 1, "multi_valued");
+        tids.push(tid);
+    }
+    for (at, tid) in tids.iter().enumerate() {
+        check_answers(
+            &mirrors,
+            catalog,
+            *tid,
+            &data,
+            at,
+            "multi_valued, an older tid",
+        );
+    }
+    // The searches of `_index_parents` that the index without
+    // `multi_valued` refuses are native here.
+    let served = data["answers"]["depth-0"][0]["r"].as_array();
+    assert!(served.is_some_and(|r| !r.is_empty()));
+    mirrors.stop();
+}
+
+#[test]
+fn a_level_or_a_depth_whose_sum_passes_the_ints_of_64_bits_gives_option() {
+    let (_store, mirrors, catalog, tid, _data) = path_store(Config::default());
+    let reason = |json: Json| {
+        let plan = decode_plan(&wire(&json)).unwrap();
+        mirrors
+            .query(catalog, tid + 1, &plan)
+            .map_err(|f| f.reason)
+            .err()
+    };
+    let max = i64::MAX;
+    for (paths, options) in [
+        // `level + len(comps) - 1`.
+        (
+            serde_json::json!([["folder-0/sub-1", max]]),
+            serde_json::json!({}),
+        ),
+        // `pathlength + depth`.
+        (
+            serde_json::json!([["folder-0", 1]]),
+            serde_json::json!({"d": max}),
+        ),
+    ] {
+        assert_eq!(
+            reason(path_json(paths.clone(), options.clone())),
+            Some(Reason::Option),
+            "{paths} {options}"
+        );
+    }
+    mirrors.stop();
+}
+
+#[test]
 fn a_rebase_of_the_path_index_gives_the_answers_of_each_tid() {
     let config = Config {
         rebase_rows: 1,

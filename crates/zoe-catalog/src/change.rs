@@ -10,13 +10,18 @@
 //! the new buckets that a changed inner node names, and compares the items
 //! of each changed bucket with the rows of the old key range of the
 //! bucket. A record of another object costs one lookup.
+//!
+//! A record of `data` is a row of the metadata table. Its change goes into
+//! the change set cell by cell: one change for each column whose cell
+//! changed, and one for the length of the record when it changed.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use crate::base::{Base, rid_of};
-use crate::read::{Node, Record, TreeShape, node};
+use crate::read::{KEYS, Node, RECORDS, TreeShape, node_with};
+use crate::table::{Cell, width_of};
 use crate::value::{Val, py_cmp};
 
 /// The place of a tree in a mirror.
@@ -26,6 +31,14 @@ pub enum Slot {
     Paths,
     /// The `_unindex` of the index at this place.
     Index(usize),
+    /// `data` of the catalog: its nodes. The changes of its records go to
+    /// `Column` and `Width`.
+    Data,
+    /// The column of the metadata table at this position: the cell of each
+    /// row.
+    Column(usize),
+    /// The length of the record of `data` of each row.
+    Width,
 }
 
 /// What a record is to the mirror.
@@ -217,6 +230,8 @@ pub fn base_value(base: &Base, slot: Slot, rid: i32) -> Option<Val> {
             .contains(row)
             .then(|| Val::Str(base.rows.paths.get(row).into())),
         Slot::Index(i) => base.indexes.get(i)?.index.value(row),
+        Slot::Column(c) => base.table.columns.get(c)?.cell(row).to_val(),
+        Slot::Width | Slot::Data => base.table.record_width(row).map(|w| Val::Int(i64::from(w))),
     }
 }
 
@@ -245,6 +260,12 @@ fn rids_between(base: &Base, overrides: &Overrides, slot: Slot, low: i64, high: 
         let has = match slot {
             Slot::Paths => base.rows.live.contains(row),
             Slot::Index(i) => base.indexes[i].index.has(row),
+            Slot::Column(c) => base
+                .table
+                .columns
+                .get(c)
+                .is_some_and(|column| column.cell(row) != Cell::Absent),
+            Slot::Width | Slot::Data => base.table.record_width(row).is_some(),
         };
         if has {
             out.push(rid);
@@ -331,7 +352,12 @@ pub fn read_records(
                 }
                 continue;
             }
-            let record = match Record::decode(data) {
+            let reader = if who == Owner::Node(Slot::Data) {
+                RECORDS
+            } else {
+                KEYS
+            };
+            let record = match (reader.decode)(data) {
                 Ok(r) => r,
                 Err(e) => {
                     out.stale = Some(format!("oid {oid:#x}: {}", e.0));
@@ -359,7 +385,7 @@ pub fn read_records(
                         .get(oid)
                         .copied()
                         .unwrap_or_else(|| shapes.buckets.get(oid).copied());
-                    match node(&record) {
+                    match node_with(&record, reader.value) {
                         Err(e) => out.stale = Some(format!("oid {oid:#x}: {}", e.0)),
                         Ok(Node::Inner(children)) => {
                             let old = edits
@@ -406,7 +432,6 @@ pub fn read_records(
                                 let r = i64::from(rid);
                                 range = Some(range.map_or((r, r), |(a, _)| (a, r)));
                                 let value = match slot {
-                                    Slot::Paths => Some(value),
                                     Slot::Index(i) => {
                                         match base.indexes[i].index.normalize(value) {
                                             Ok(value) => value,
@@ -416,6 +441,7 @@ pub fn read_records(
                                             }
                                         }
                                     }
+                                    _ => Some(value),
                                 };
                                 // A row without a key is a row without a value.
                                 if let Some(value) = value {
@@ -464,12 +490,22 @@ pub fn read_records(
         .collect();
     for slot in slots {
         let items = new_items.remove(&slot).unwrap_or_default();
+        // The rows of `data` are the rows with a record.
+        let held = if slot == Slot::Data {
+            Slot::Width
+        } else {
+            slot
+        };
         let mut olds: Vec<i32> = Vec::new();
         for (low, high) in old_ranges.remove(&slot).unwrap_or_default() {
-            olds.extend(rids_between(base, overrides, slot, low, high));
+            olds.extend(rids_between(base, overrides, held, low, high));
         }
         olds.sort_unstable();
         olds.dedup();
+        if slot == Slot::Data {
+            record_changes(base, overrides, &olds, items, &mut out.changes);
+            continue;
+        }
         for rid in olds.iter().filter(|r| !items.contains_key(r)) {
             let old = value(base, overrides, slot, *rid);
             if old.is_some() {
@@ -500,6 +536,46 @@ pub fn read_records(
     out
 }
 
+/// The changes of the records of `data`: for each rid of `olds` that
+/// `items` does not hold, the removal of its record; for each item, its
+/// new record. A change holds one cell, or the length of the record.
+fn record_changes(
+    base: &Base,
+    overrides: &Overrides,
+    olds: &[i32],
+    items: BTreeMap<i32, Val>,
+    out: &mut Vec<Change>,
+) {
+    let width = base.table.width();
+    let mut record = |rid: i32, new: Option<&Val>| {
+        let mut change = |slot: Slot, new: Option<Val>| {
+            let old = value(base, overrides, slot, rid);
+            if old != new {
+                out.push(Change {
+                    slot,
+                    rid,
+                    old,
+                    new,
+                });
+            }
+        };
+        change(Slot::Width, new.map(|r| Val::Int(i64::from(width_of(r)))));
+        let cells: &[Val] = match new {
+            Some(Val::Tuple(cells)) => cells,
+            _ => &[],
+        };
+        for c in 0..width {
+            change(Slot::Column(c), cells.get(c).cloned());
+        }
+    };
+    for rid in olds.iter().filter(|r| !items.contains_key(r)) {
+        record(*rid, None);
+    }
+    for (rid, new) in &items {
+        record(*rid, Some(new));
+    }
+}
+
 /// The kind of a value, so a key of another type is a change, as a new
 /// object in the tree is.
 fn kind(value: &Val) -> u8 {
@@ -513,5 +589,6 @@ fn kind(value: &Val) -> u8 {
         Val::Tuple(_) => 6,
         Val::List(_) => 7,
         Val::DateTime(..) => 8,
+        Val::Cell(_) => 9,
     }
 }
