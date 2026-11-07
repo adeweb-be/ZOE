@@ -85,7 +85,7 @@
   - [0055. zoe-wire: the ZEO frame codec and the TLS certificate reader](adr/0055-zoe-wire.md)
   - [0056. A write-ahead log with a background fold: ZOE format 3](adr/0056-the-write-ahead-log.md)
   - [0057. The reader of ZOE: a record decodes in Rust in place of ObjectReader](adr/0057-the-reader-of-zoe.md)
-  - [0061. The security index: `allowedRolesAndUsers` keeps the inputs of each object](adr/0061-the-security-index.md)
+  - [0061. The security index: the inherited inputs of `allowedRolesAndUsers`](adr/0061-the-security-index.md)
 
 # Reference
 
