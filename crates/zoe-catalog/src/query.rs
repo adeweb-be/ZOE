@@ -23,6 +23,7 @@ use crate::base::{
 use crate::cell;
 use crate::change::{Overrides, Slot, same, value};
 use crate::reason::{Fallback, Reason};
+use crate::security::{Overlay, Resolver, SecurityIndex, Version, value_matches};
 use crate::table::Cell;
 use crate::value::{Val, py_cmp};
 
@@ -515,6 +516,7 @@ impl<'a> View<'a> {
                 self.values(i, Keyed::One(f), clause, rs, trace)
             }
             (Kind::Path, Index::Path(p)) => self.path(i, p, clause),
+            (Kind::Security, Index::Security(s)) => self.security(i, s, clause, rs),
             _ => fallback(
                 Reason::IndexUnavailable,
                 format!(
@@ -523,6 +525,87 @@ impl<'a> View<'a> {
                 ),
             ),
         }
+    }
+
+    /// The rows of a clause on a `ZoeSecurityIndex`: the rows whose value
+    /// holds one of the keys, or each of them with `and`, as a KeywordIndex
+    /// of the values gives them. The rows of the base keep the value of the
+    /// base, except the rows whose inputs or path the overrides changed and
+    /// the rows below them, which resolve again with the inputs of the
+    /// version. A range or `not` takes the Python path.
+    fn security(
+        &self,
+        i: usize,
+        s: &SecurityIndex,
+        clause: &Clause,
+        rs: Option<&RoaringBitmap>,
+    ) -> Result<RoaringBitmap, Fallback> {
+        if clause.range.is_some() || !clause.not.is_empty() {
+            return fallback(
+                Reason::Option,
+                "a range or not on a ZoeSecurityIndex",
+            );
+        }
+        let mut keys = Vec::with_capacity(clause.keys.len());
+        for key in &clause.keys {
+            match key {
+                Val::None => {}
+                Val::Str(text) => keys.push(text.as_ref()),
+                _ => {
+                    return fallback(
+                        Reason::Option,
+                        "a key of a ZoeSecurityIndex that is not a str",
+                    );
+                }
+            }
+        }
+        if keys.is_empty() {
+            // `and` with no key gives the result set, `or` no row.
+            return Ok(match (clause.and, rs) {
+                (true, Some(rs)) => rs.clone(),
+                _ => RoaringBitmap::new(),
+            });
+        }
+        let mut names = Overlay::new(s.names());
+        let version = Version::new(
+            s,
+            &self.base.rows,
+            &mut names,
+            self.changed(Slot::Index(i)),
+            self.changed(Slot::Paths),
+        )
+        .map_err(|e| Fallback::new(Reason::IndexUnavailable, e))?;
+        let mut values = Vec::new();
+        let dirty = if version.changed() {
+            let dirty = version.dirty();
+            let live = self.all_rows();
+            let mut resolver = Resolver::new(&version);
+            for row in dirty.iter().filter(|row| live.contains(*row)) {
+                if let Some(value) = resolver.value(row, &mut names) {
+                    values.push((row, value));
+                }
+            }
+            dirty
+        } else {
+            RoaringBitmap::new()
+        };
+        let mut ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            match names.find(key) {
+                Some(id) => ids.push(id),
+                // No row holds the key.
+                None if clause.and => return Ok(RoaringBitmap::new()),
+                None => {}
+            }
+        }
+        let mut rows = version.base_matching(&ids, clause.and);
+        rows -= &dirty;
+        for (row, value) in values {
+            if value_matches(&value, &ids, clause.and) {
+                rows.insert(row);
+            }
+        }
+        Ok(rows)
     }
 
     /// The rows of a clause on a BooleanIndex: the rows whose value has the

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
+use crate::security::{SECURITY_INDEX, SecurityIndex};
 use crate::table::Table;
 use crate::value::{StrArena, Val, py_cmp};
 
@@ -63,6 +64,10 @@ pub enum Kind {
     Uuid,
     /// An ExtendedPathIndex: `_unindex` maps a rid to its path, a str.
     Path,
+    /// The `ZoeSecurityIndex` of `zoe.plone`: `_inputs` maps a rid to the
+    /// inputs of its value (`security`). It reads `_inputs` in the place
+    /// of `_unindex`.
+    Security,
 }
 
 impl Kind {
@@ -77,10 +82,19 @@ impl Kind {
             (BOOLEAN_INDEX, Kind::Boolean),
             (UUID_INDEX, Kind::Uuid),
             (EXTENDED_PATH_INDEX, Kind::Path),
+            (SECURITY_INDEX, Kind::Security),
         ]
         .into_iter()
         .find(|((m, n), _)| *m == module && *n == name)
         .map(|(_, kind)| kind)
+    }
+
+    /// The tree of the rows of an index of this kind.
+    pub fn tree(self) -> &'static str {
+        match self {
+            Kind::Security => "_inputs",
+            _ => "_unindex",
+        }
     }
 
     /// Tells if the mirror serves a sort on an index of this kind.
@@ -1208,6 +1222,8 @@ pub enum Index {
     DateRange(Arc<DateRangeIndex>),
     /// An ExtendedPathIndex.
     Path(Arc<PathIndex>),
+    /// A `ZoeSecurityIndex`.
+    Security(Arc<SecurityIndex>),
     /// No structure: the reason.
     Unavailable(String),
 }
@@ -1220,6 +1236,7 @@ impl Index {
             Index::Keyword(k) => k.indexed.contains(row),
             Index::DateRange(d) => d.indexed.contains(row),
             Index::Path(p) => p.indexed.contains(row),
+            Index::Security(s) => s.indexed.contains(row),
             Index::Unavailable(_) => false,
         }
     }
@@ -1231,6 +1248,7 @@ impl Index {
             Index::Keyword(k) => k.value(row),
             Index::DateRange(d) => d.value(row),
             Index::Path(p) => p.path(row).map(|path| Val::Str(path.into())),
+            Index::Security(s) => s.value(row),
             Index::Unavailable(_) => None,
         }
     }
@@ -1249,6 +1267,7 @@ impl Index {
                 Val::Str(_) => Ok(Some(value)),
                 other => Err(format!("a path that is not a str: {other:?}")),
             },
+            Index::Security(_) => crate::security::normalize(&value).map(Some),
             _ => Ok(Some(value)),
         }
     }
@@ -1267,6 +1286,9 @@ impl Index {
                 .map(|i| Index::Keyword(Arc::new(i))),
             Index::DateRange(d) => Ok(Index::DateRange(Arc::new(d.rebuilt(changed, rows)))),
             Index::Path(p) => Ok(Index::Path(Arc::new(p.rebuilt(changed, rows)))),
+            Index::Security(s) => s
+                .rebuilt(Some(changed), rows)
+                .map(|i| Index::Security(Arc::new(i))),
             Index::Unavailable(_) => return None,
         })
     }
@@ -1278,6 +1300,7 @@ impl Index {
             Index::Keyword(k) => k.heap_bytes(),
             Index::DateRange(d) => d.heap_bytes(),
             Index::Path(p) => p.heap_bytes(),
+            Index::Security(s) => s.heap_bytes(),
             Index::Unavailable(r) => r.len(),
         }
     }

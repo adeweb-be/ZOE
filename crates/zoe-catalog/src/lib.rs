@@ -11,6 +11,8 @@
 //! - `change`: the change sets of the commits, and the read of a commit.
 //! - `mirror`: the versions of a mirror, the window and the rebase.
 //! - `query`: the clauses and the four sort paths of ZCatalog.
+//! - `security`: the `ZoeSecurityIndex` of `zoe.plone`, resolved from the
+//!   inherited inputs of each entry.
 //! - `plan`: the codec of a plan and of a reply.
 //! - `mirrors`: the mirrors of a store, their registration, their thread
 //!   and the memory bound.
@@ -32,6 +34,7 @@ pub mod plan;
 pub mod query;
 pub mod read;
 pub mod reason;
+pub mod security;
 pub mod table;
 #[cfg(feature = "testing")]
 pub mod testing;
