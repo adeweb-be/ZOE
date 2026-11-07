@@ -11,7 +11,9 @@ use roaring::RoaringBitmap;
 use tantivy::collector::{Count, FilterCollector, TopDocs};
 use tantivy::{Order, Searcher};
 use zoe_catalog::text::compat::{self, Compat, Node, Stats};
+use tantivy::query::{BooleanQuery, Occur};
 use zoe_catalog::text::enhanced::{Options, Translator};
+use zoe_catalog::text::filter::{DocBits, InFilter, RidMap, SortArray, TopInFilter, count_and_top};
 use zoe_catalog::text::index::{self, Doc, INDEXES, Mode};
 use zoe_catalog::text::overlay::{self, Counts, Overlay};
 use zoe_core::Compression;
@@ -170,10 +172,29 @@ struct Bench {
     editor: Arc<RoaringBitmap>,
     stats: Vec<Stats>,
     translator: Translator,
+    /// The filter and the sort inside the search, in place of a check of
+    /// each hit after the scores.
+    inside: bool,
+    fuzzy: u8,
+    map: RidMap,
+    sort: SortArray,
+    /// The lengths of each index, each segment, in memory.
+    lens: Vec<Vec<Vec<u32>>>,
 }
+
+/// The count of a run and its first hits: (rid, score) or, with a sort,
+/// (rid, key of the sort).
+type Outcome = (usize, Vec<(u64, f64)>);
 
 impl Bench {
     fn run(&mut self, index_name: &str, tree: &Node, v: Variant, limit: usize) -> usize {
+        self.outcome(index_name, tree, v, limit).0
+    }
+
+    fn outcome(&mut self, index_name: &str, tree: &Node, v: Variant, limit: usize) -> Outcome {
+        if self.inside && !matches!(v, Variant::Alone) {
+            return self.inside(index_name, tree, v, limit);
+        }
         let i = INDEXES.iter().position(|n| *n == index_name).unwrap();
         let bm = match v {
             Variant::Filter | Variant::FilterSort => Some(self.listing.clone()),
@@ -185,7 +206,7 @@ impl Bench {
             Mode::Compat => {
                 let len_name = format!("n_{index_name}");
                 let mut c = Compat::new(&self.searcher, self.fields.text[i], &len_name, self.stats[i]).with_pairs(self.fields.pairs[i]);
-                let Some(hits) = c.run(tree).unwrap() else { return 0 };
+                let Some(hits) = c.run(tree).unwrap() else { return (0, Vec::new()) };
                 if sort {
                     // The mirror sorts: here, the effective date of each hit.
                     let mut all = Vec::new();
@@ -207,47 +228,181 @@ impl Bench {
                         all.truncate(limit);
                     }
                     all.sort_by(cmp);
-                    n
+                    (n, all.into_iter().map(|(e, r)| (r, e as f64)).collect())
                 } else {
-                    let (n, _) = compat::rank(
+                    let (n, top) = compat::rank(
                         &self.searcher,
                         &hits,
                         |rid| bm.as_ref().is_none_or(|b| b.contains(rid as u32)),
                         limit,
                     )
                     .unwrap();
-                    n
+                    (n, top.into_iter().map(|(r, s)| (r, s as f64)).collect())
                 }
             }
             Mode::Enhanced => {
-                let Some(q) = self.translator.translate(tree) else { return 0 };
+                let Some(q) = self.translator.translate(tree) else { return (0, Vec::new()) };
                 let keep = move |rid: u64| bm.as_ref().is_none_or(|b| b.contains(rid as u32));
                 if sort {
                     let col = (
                         Count,
                         TopDocs::with_limit(limit).order_by_fast_field::<i64>("effective", Order::Desc),
                     );
-                    let (n, _) = self
+                    let (n, top) = self
                         .searcher
                         .search(&q, &FilterCollector::new("rid".to_string(), keep, col))
                         .unwrap();
-                    n
+                    let top = top
+                        .into_iter()
+                        .map(|(e, a)| (u64::from(self.map.doc_to_rid[a.segment_ord as usize][a.doc_id as usize]), e.unwrap_or(0) as f64))
+                        .collect();
+                    (n, top)
                 } else if matches!(v, Variant::Alone) {
                     // No filter: the count, then the first hits with the
                     // pruning of tantivy (block-max WAND).
                     let n = self.searcher.search(&q, &Count).unwrap();
-                    let _ = self.searcher.search(&q, &TopDocs::with_limit(limit).order_by_score()).unwrap();
-                    n
+                    let top = self.searcher.search(&q, &TopDocs::with_limit(limit).order_by_score()).unwrap();
+                    let top = top
+                        .into_iter()
+                        .map(|(s, a)| (u64::from(self.map.doc_to_rid[a.segment_ord as usize][a.doc_id as usize]), f64::from(s)))
+                        .collect();
+                    (n, top)
                 } else {
-                    let (n, _) = overlay::enhanced(&self.searcher, None, &*q, keep, limit).unwrap();
-                    n
+                    overlay::enhanced(&self.searcher, None, &*q, keep, limit).unwrap()
+                }
+            }
+        }
+    }
+
+    /// The filter and the sort inside the search.
+    fn inside(&mut self, index_name: &str, tree: &Node, v: Variant, limit: usize) -> Outcome {
+        let i = INDEXES.iter().position(|n| *n == index_name).unwrap();
+        let rids = match v {
+            Variant::Filter | Variant::FilterSort => Some(self.listing.clone()),
+            Variant::Selective => Some(self.editor.clone()),
+            _ => None,
+        };
+        let sort = matches!(v, Variant::Sort | Variant::FilterSort);
+        let to_rid = |map: &RidMap, a: tantivy::DocAddress| u64::from(map.doc_to_rid[a.segment_ord as usize][a.doc_id as usize]);
+        match self.mode {
+            Mode::Compat => {
+                let len_name = format!("n_{index_name}");
+                let mut c = Compat::new(&self.searcher, self.fields.text[i], &len_name, self.stats[i])
+                    .with_pairs(self.fields.pairs[i])
+                    .with_lens(&self.lens[i]);
+                // The other clauses give rids: their documents in the text
+                // index, unless the hits are few.
+                let filter = match &rids {
+                    Some(r) => Some(self.map.filter(r, c.estimate(tree).unwrap())),
+                    None => None,
+                };
+                if sort {
+                    // No score: the hits as a set, the filter, the sort.
+                    let Some(mut sets) = c.run_set(tree).unwrap() else { return (0, Vec::new()) };
+                    if let Some(f) = &filter {
+                        match &f.bits {
+                            Some(bits) => sets.iter_mut().zip(bits).for_each(|(s, b)| s.and_with(b)),
+                            None => {
+                                for (ord, s) in sets.iter_mut().enumerate() {
+                                    let rids = &self.map.doc_to_rid[ord];
+                                    let mut kept = DocBits::new(self.map.max_docs[ord]);
+                                    s.iter().filter(|d| f.rids.contains(rids[*d as usize])).for_each(|d| kept.insert(d));
+                                    *s = kept;
+                                }
+                            }
+                        }
+                    }
+                    let n: u64 = sets.iter().map(DocBits::len).sum();
+                    let top = self.sort.top(&self.map, &sets, n, limit);
+                    (n as usize, top.into_iter().map(|r| (u64::from(r), self.sort.key(r) as f64)).collect())
+                } else {
+                    let f = filter.as_ref().expect("a filter");
+                    let (n, top) = if f.bits.is_some() {
+                        let mut c = c.with_filter(f);
+                        let Some(hits) = c.run(tree).unwrap() else { return (0, Vec::new()) };
+                        compat::top_map(&self.map, &hits, limit)
+                    } else {
+                        let Some(hits) = c.run(tree).unwrap() else { return (0, Vec::new()) };
+                        compat::top_map_in(&self.map, &hits, limit, |rid| f.rids.contains(rid))
+                    };
+                    (n, top.into_iter().map(|(r, s)| (r, s as f64)).collect())
+                }
+            }
+            Mode::Enhanced => {
+                let Some(q) = self.translator.translate(tree) else { return (0, Vec::new()) };
+                let filter = rids.as_ref().map(|r| {
+                    // The sum of the frequencies of the terms bounds the
+                    // hits; a glob or fuzzy matching has no such bound here.
+                    let estimate = if self.fuzzy == 0 { estimate(&mut self.translator, &self.searcher, tree) } else { None };
+                    self.map.filter(r, estimate)
+                });
+                if sort {
+                    let col = InFilter {
+                        sets: filter.as_ref().map(|f| f.sets(&self.map)),
+                        max_docs: self.map.max_docs.clone(),
+                        keep: true,
+                    };
+                    let (n, sets) = self.searcher.search(&q, &col).unwrap();
+                    let sets: Vec<DocBits> = sets.into_iter().map(Option::unwrap).collect();
+                    let top = self.sort.top(&self.map, &sets, n, limit);
+                    (n as usize, top.into_iter().map(|r| (u64::from(r), self.sort.key(r) as f64)).collect())
+                } else {
+                    let f = filter.as_ref().expect("a filter");
+                    if f.docs.is_some() {
+                        // A small filter leads the intersection.
+                        let fq: Box<dyn tantivy::query::Query> = Box::new(f.query(&self.searcher));
+                        let bq = BooleanQuery::new(vec![(Occur::Must, q), (Occur::Must, fq)]);
+                        let (n, top) = self
+                            .searcher
+                            .search(&bq, &(Count, TopDocs::with_limit(limit).order_by_score()))
+                            .unwrap();
+                        (n, top.into_iter().map(|(s, a)| (to_rid(&self.map, a), f64::from(s))).collect())
+                    } else {
+                        let (n, top) =
+                            count_and_top(&self.searcher, &*q, f.sets(&self.map), self.map.max_docs.clone(), limit).unwrap();
+                        (n as usize, top.into_iter().map(|(s, a)| (to_rid(&self.map, a), f64::from(s))).collect())
+                    }
                 }
             }
         }
     }
 }
 
-fn open_bench(mode: Mode, dir: &Path, fuzzy: u8, boosts: bool) -> Bench {
+/// A bound of the number of hits of `node` in the enhanced mode, as
+/// `Compat::estimate`: a leaf gives the sum of the frequencies of its terms
+/// (a phrase the least), `AND` the least of its items, `OR` the sum. `None`
+/// for a glob, whose terms the query does not list.
+fn estimate(tr: &mut Translator, searcher: &Searcher, node: &Node) -> Option<u64> {
+    let terms = |tr: &mut Translator, n: &Node, least: bool| -> Option<u64> {
+        let q = tr.translate(n)?;
+        let mut acc: Option<u64> = None;
+        q.query_terms(&mut |t, _| {
+            let df = searcher.doc_freq(t).unwrap_or(0);
+            acc = Some(match acc {
+                None => df,
+                Some(a) if least => a.min(df),
+                Some(a) => a + df,
+            });
+        });
+        Some(acc.unwrap_or(0))
+    };
+    match node {
+        Node::Glob { .. } => None,
+        Node::Atom { .. } => terms(tr, node, false),
+        Node::Phrase { .. } => terms(tr, node, true),
+        Node::And { items, .. } => {
+            let mut min: Option<u64> = None;
+            for n in items {
+                let e = estimate(tr, searcher, n)?;
+                min = Some(min.map_or(e, |m| m.min(e)));
+            }
+            min
+        }
+        Node::Or { items } => items.iter().map(|n| estimate(tr, searcher, n)).sum(),
+    }
+}
+
+fn open_bench(mode: Mode, dir: &Path, fuzzy: u8, boosts: bool, inside: bool) -> Bench {
     let (idx, fields) = index::open(mode, dir).unwrap();
     let searcher = index::reader(&idx).unwrap().searcher();
     let stats = INDEXES
@@ -268,6 +423,25 @@ fn open_bench(mode: Mode, dir: &Path, fuzzy: u8, boosts: bool) -> Bench {
         fuzzy,
     };
     let translator = Translator::new(&idx, opts);
+    let map = RidMap::build(&searcher).unwrap();
+    let sort = SortArray::build(&searcher, &map, "effective").unwrap();
+    let lens = if mode == Mode::Compat {
+        INDEXES
+            .iter()
+            .map(|n| {
+                searcher
+                    .segment_readers()
+                    .iter()
+                    .map(|seg| {
+                        let col = seg.fast_fields().u64(&format!("n_{n}")).unwrap();
+                        (0..seg.max_doc()).map(|d| col.first(d).unwrap_or(1) as u32).collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Bench {
         mode,
         searcher,
@@ -276,6 +450,11 @@ fn open_bench(mode: Mode, dir: &Path, fuzzy: u8, boosts: bool) -> Bench {
         editor: load_bitmap(&dir.with_extension("editor.roar")),
         stats,
         translator,
+        inside,
+        fuzzy,
+        map,
+        sort,
+        lens,
     }
 }
 
@@ -288,8 +467,9 @@ fn bench(args: &[String]) {
     let rounds: usize = args[3].parse().unwrap();
     let fuzzy: u8 = args.get(4).map_or(0, |s| s.parse().unwrap());
     let boosts = args.get(5).is_some_and(|s| s == "boosts");
+    let inside = args.get(6).is_some_and(|s| s == "inside");
     let t = Instant::now();
-    let mut b = open_bench(mode, &dir, fuzzy, boosts);
+    let mut b = open_bench(mode, &dir, fuzzy, boosts, inside);
     let open_ms = t.elapsed().as_secs_f64() * 1000.0;
     let mut by_variant: Vec<Vec<Duration>> = vec![Vec::new(); VARIANTS.len()];
     let mut by_kind: std::collections::BTreeMap<(String, usize), Vec<Duration>> = Default::default();
@@ -317,7 +497,7 @@ fn bench(args: &[String]) {
         }
     }
     let mut out = format!(
-        "{{\"mode\":\"{mode:?}\",\"fuzzy\":{fuzzy},\"boosts\":{boosts},\"queries\":{},\"rounds\":{rounds},\"open_ms\":{open_ms:.1},\"rss\":\"{}\",\"threads\":{},\"variants\":{{",
+        "{{\"mode\":\"{mode:?}\",\"fuzzy\":{fuzzy},\"boosts\":{boosts},\"inside\":{inside},\"queries\":{},\"rounds\":{rounds},\"open_ms\":{open_ms:.1},\"rss\":\"{}\",\"threads\":{},\"variants\":{{",
         queries.len(),
         status("VmRSS:"),
         threads()
@@ -331,6 +511,23 @@ fn bench(args: &[String]) {
             pct(d, 0.5),
             pct(d, 0.99),
             pct(d, 1.0)
+        );
+    }
+    // The 12 terms of the plan: the four bands, pooled.
+    out += "},\"bands\":{";
+    for (vi, v) in VARIANTS.iter().enumerate() {
+        let mut d: Vec<Duration> = by_kind
+            .iter()
+            .filter(|((k, i), _)| *i == vi && ["word-low", "word-mid", "word-high", "word-top"].contains(&k.as_str()))
+            .flat_map(|(_, d)| d.iter().copied())
+            .collect();
+        out += &format!(
+            "{}\"{:?}\":{{\"p50\":{:.2},\"p99\":{:.2},\"max\":{:.2}}}",
+            if vi > 0 { "," } else { "" },
+            v,
+            pct(&mut d, 0.5),
+            pct(&mut d, 0.99),
+            pct(&mut d, 1.0)
         );
     }
     out += "},\"kinds\":{";
@@ -350,6 +547,323 @@ fn bench(args: &[String]) {
     println!("{out}");
     let total: usize = counts.iter().sum();
     eprintln!("mean count {}", total / counts.len().max(1));
+}
+
+/// check MODE DIR QUERIES FUZZY BOOSTS: the filter and the sort inside the
+/// search against the check of each hit after the scores, on every query
+/// and every variant with a filter or a sort: the count and the first 20.
+fn check(args: &[String]) {
+    let mode = mode_of(&args[0]);
+    let dir = PathBuf::from(&args[1]);
+    let queries: Vec<serde_json::Value> =
+        lines(Path::new(&args[2])).map(|l| serde_json::from_str(&l).unwrap()).collect();
+    let fuzzy: u8 = args.get(3).map_or(0, |s| s.parse().unwrap());
+    let boosts = args.get(4).is_some_and(|s| s == "boosts");
+    let mut old = open_bench(mode, &dir, fuzzy, boosts, false);
+    let mut new = open_bench(mode, &dir, fuzzy, boosts, true);
+    let (mut same, mut ties, mut differ) = (0, 0, 0);
+    let mut ties_by: std::collections::BTreeMap<String, usize> = Default::default();
+    for q in &queries {
+        let tree: Node = serde_json::from_value(q["tree"].clone()).unwrap();
+        let index = q["index"].as_str().unwrap();
+        for v in &VARIANTS[1..] {
+            let a = old.outcome(index, &tree, *v, 20);
+            let b = new.outcome(index, &tree, *v, 20);
+            if a == b {
+                same += 1;
+                continue;
+            }
+            // The same count and the same scores or keys, in the same order:
+            // only the order of equal scores or keys differs.
+            let keys = |o: &Outcome| o.1.iter().map(|p| p.1).collect::<Vec<_>>();
+            let last = a.1.last().map(|p| p.1);
+            let above = |o: &Outcome| {
+                let mut r: Vec<u64> = o.1.iter().filter(|p| Some(p.1) != last).map(|p| p.0).collect();
+                r.sort_unstable();
+                r
+            };
+            if a.0 == b.0 && keys(&a) == keys(&b) && above(&a) == above(&b) {
+                ties += 1;
+                *ties_by.entry(format!("{v:?}")).or_default() += 1;
+            } else {
+                differ += 1;
+                eprintln!("DIFFER {} {:?} {:?}\n  old {:?}\n  new {:?}", q["query"], index, v, a, b);
+            }
+        }
+    }
+    println!("{{\"mode\":\"{mode:?}\",\"boosts\":{boosts},\"fuzzy\":{fuzzy},\"identical\":{same},\"ties_only\":{ties},\"ties_by_variant\":{},\"differ\":{differ}}}", serde_json::json!(ties_by));
+}
+
+/// parts MODE DIR QUERIES ROUNDS: the parts of the path inside the search
+/// for the 3 words of the top band, median in ms over the runs.
+fn parts(args: &[String]) {
+    let mode = mode_of(&args[0]);
+    let dir = PathBuf::from(&args[1]);
+    let queries: Vec<serde_json::Value> = lines(Path::new(&args[2]))
+        .map(|l| serde_json::from_str::<serde_json::Value>(&l).unwrap())
+        .filter(|q| q["kind"] == "word-top")
+        .collect();
+    let rounds: usize = args[3].parse().unwrap();
+    let b = open_bench(mode, &dir, 0, false, true);
+    let mut t: std::collections::BTreeMap<&str, Vec<Duration>> = Default::default();
+    let mut time = |name: &'static str, f: &mut dyn FnMut()| {
+        let s = Instant::now();
+        f();
+        t.entry(name).or_default().push(s.elapsed());
+    };
+    for _ in 0..rounds + 1 {
+        for q in &queries {
+            let tree: Node = serde_json::from_value(q["tree"].clone()).unwrap();
+            let mut broad = None;
+            time("filter of the listing, rids to documents", &mut || broad = Some(b.map.filter(&b.listing, None)));
+            time("filter of editor-000, rids to documents", &mut || {
+                let _ = b.map.filter(&b.editor, None);
+            });
+            let broad = broad.unwrap();
+            let mut sets = None;
+            match mode {
+                Mode::Compat => {
+                    let mut c = Compat::new(&b.searcher, b.fields.text[0], "n_SearchableText", b.stats[0])
+                        .with_pairs(b.fields.pairs[0]);
+                    time("hits as a set, no score", &mut || sets = c.run_set(&tree).unwrap());
+                    let mut c = Compat::new(&b.searcher, b.fields.text[0], "n_SearchableText", b.stats[0])
+                        .with_pairs(b.fields.pairs[0])
+                        .with_lens(&b.lens[0])
+                        .with_filter(&broad);
+                    let mut hits = None;
+                    time("scores of the hits in the listing", &mut || hits = c.run(&tree).unwrap());
+                    let hits = hits.unwrap();
+                    time("first 20 by score of the hits in the listing", &mut || {
+                        let _ = compat::top_map(&b.map, &hits, 20);
+                    });
+                    time("every hit in the listing in the order of the score", &mut || {
+                        let _ = compat::rank_map(&b.map, &hits, usize::MAX);
+                    });
+                }
+                Mode::Enhanced => {
+                    let mut tr = Translator::new(
+                        &b.searcher.index().clone(),
+                        Options { fields: vec![(b.fields.text[0], 1.0)], pairs: vec![b.fields.pairs[0]], fuzzy: 0 },
+                    );
+                    let q = tr.translate(&tree).unwrap();
+                    time("hits as a set, no score", &mut || {
+                        let col = InFilter { sets: None, max_docs: b.map.max_docs.clone(), keep: true };
+                        let (_, s) = b.searcher.search(&q, &col).unwrap();
+                        sets = Some(s.into_iter().map(Option::unwrap).collect());
+                    });
+                    time("count of the hits in the listing", &mut || {
+                        let col = InFilter { sets: Some(broad.sets(&b.map)), max_docs: b.map.max_docs.clone(), keep: false };
+                        let _ = b.searcher.search(&q, &col).unwrap();
+                    });
+                    time("first 20 by score in the listing, pruned", &mut || {
+                        let _ = b.searcher.search(&q, &TopInFilter { sets: broad.sets(&b.map), limit: 20 }).unwrap();
+                    });
+                    time("every hit in the listing in the order of the score", &mut || {
+                        let _ = b.searcher.search(&q, &TopInFilter { sets: broad.sets(&b.map), limit: 1 << 20 }).unwrap();
+                    });
+                }
+            }
+            let mut sets = sets.unwrap();
+            let all: u64 = sets.iter().map(DocBits::len).sum();
+            time("sort of all hits, walk of the sort order", &mut || {
+                let _ = b.sort.top(&b.map, &sets, all, 20);
+            });
+            time("sort of all hits, best 20 of the set", &mut || {
+                let _ = b.sort.nbest(&b.map, &sets, 20);
+            });
+            time("and with the listing, count", &mut || {
+                sets.iter_mut().zip(broad.bits.as_ref().unwrap()).for_each(|(s, f)| s.and_with(f));
+                let _: u64 = sets.iter().map(DocBits::len).sum();
+            });
+            let n: u64 = sets.iter().map(DocBits::len).sum();
+            time("sort of the hits in the listing, walk", &mut || {
+                let _ = b.sort.top(&b.map, &sets, n, 20);
+            });
+            time("sort of the hits in the listing, best 20", &mut || {
+                let _ = b.sort.nbest(&b.map, &sets, 20);
+            });
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (k, mut v) in t {
+        v.drain(..queries.len());
+        out.insert(k.to_owned(), serde_json::json!({"p50": pct(&mut v, 0.5), "max": pct(&mut v, 1.0)}));
+    }
+    println!("{}", serde_json::Value::Object(out));
+}
+
+/// expt DIR QUERIES: variants of the parts of the compatibility path for
+/// the first word of the top band, median of 15 runs in ms.
+fn expt(args: &[String]) {
+    use tantivy::postings::Postings;
+    use tantivy::schema::IndexRecordOption;
+    use tantivy::{DocSet, TERMINATED, Term};
+    let dir = PathBuf::from(&args[0]);
+    let q: serde_json::Value = lines(Path::new(&args[1]))
+        .map(|l| serde_json::from_str::<serde_json::Value>(&l).unwrap())
+        .find(|q| q["kind"] == "word-top")
+        .unwrap();
+    let word = q["tree"]["words"][0].as_str().unwrap().to_owned();
+    let b = open_bench(Mode::Compat, &dir, 0, false, true);
+    let seg = &b.searcher.segment_readers()[0];
+    let max_doc = seg.max_doc();
+    let mut t: std::collections::BTreeMap<&str, Vec<Duration>> = Default::default();
+    let mut time = |name: &'static str, f: &mut dyn FnMut()| {
+        let s = Instant::now();
+        f();
+        t.entry(name).or_default().push(s.elapsed());
+    };
+    // A map of rids to documents as u32, one segment.
+    let mut r2d = vec![u32::MAX; b.map.doc_to_rid[0].len()];
+    for (d, r) in b.map.doc_to_rid[0].iter().enumerate() {
+        if *r != u32::MAX {
+            r2d[*r as usize] = d as u32;
+        }
+    }
+    let f = b.map.filter(&b.listing, None);
+    let fb = f.bits.clone().unwrap();
+    let lens_col = seg.fast_fields().u64("n_SearchableText").unwrap();
+    let lens: Vec<u32> = (0..max_doc).map(|d| lens_col.first(d).unwrap_or(1) as u32).collect();
+    let term = Term::from_field_text(b.fields.text[0], &word);
+    let inv = seg.inverted_index(b.fields.text[0]).unwrap();
+    for _ in 0..16 {
+        time("filter: map of u64, as built", &mut || {
+            let _ = b.map.filter(&b.listing, None);
+        });
+        time("filter: map of u32", &mut || {
+            let mut bits = DocBits::new(max_doc);
+            for rid in b.listing.iter() {
+                let d = r2d[rid as usize];
+                if d != u32::MAX {
+                    bits.insert(d);
+                }
+            }
+        });
+        time("filter: documents in rid order, copied in batches", &mut || {
+            let mut bits = DocBits::new(max_doc);
+            let mut it = b.listing.iter();
+            let mut buf = [0u32; 1024];
+            loop {
+                let batch = it.next_many(&mut buf);
+                if batch.is_empty() {
+                    break;
+                }
+                batch.iter().for_each(|r| bits.insert(*r));
+            }
+        });
+        time("filter: documents in rid order, bitmap copied", &mut || {
+            let mut bits = DocBits::new(max_doc);
+            for rid in b.listing.iter() {
+                bits.insert(rid);
+            }
+        });
+        time("postings with freqs, no score", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut s = 0u64;
+            let mut d = p.doc();
+            while d != TERMINATED {
+                s += u64::from(p.term_freq());
+                d = p.advance();
+            }
+            std::hint::black_box(s);
+        });
+        time("postings with freqs, in the filter, no score", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut s = 0u64;
+            let mut d = p.doc();
+            while d != TERMINATED {
+                if fb[0].contains(d) {
+                    s += u64::from(p.term_freq());
+                }
+                d = p.advance();
+            }
+            std::hint::black_box(s);
+        });
+        let score = |f: u32, len: u32| {
+            let (bb, k1) = (0.75f64, 1.2f64);
+            let lenweight = (1.0 - bb) + bb * f64::from(len) / 300.0;
+            let f = f64::from(f);
+            (f * (k1 + 1.0) / (f + k1 * lenweight) * 1000.0 + 0.5) as i64
+        };
+        time("scores in the filter, length from the fast field", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut out = Vec::new();
+            let mut d = p.doc();
+            while d != TERMINATED {
+                if fb[0].contains(d) {
+                    out.push((d, score(p.term_freq(), lens_col.first(d).unwrap_or(1) as u32)));
+                }
+                d = p.advance();
+            }
+            std::hint::black_box(out);
+        });
+        time("scores in the filter, length from an array", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut out = Vec::new();
+            let mut d = p.doc();
+            while d != TERMINATED {
+                if fb[0].contains(d) {
+                    out.push((d, score(p.term_freq(), lens[d as usize])));
+                }
+                d = p.advance();
+            }
+            std::hint::black_box(out);
+        });
+        let n_post = inv.get_term_info(&term).unwrap().unwrap().doc_freq as usize;
+        time("scores in the filter, branchless, length from the fast field", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut out = vec![(0u32, 0i64); n_post];
+            let mut n = 0;
+            let mut d = p.doc();
+            while d != TERMINATED {
+                out[n] = (d, score(p.term_freq(), lens_col.first(d).unwrap_or(1) as u32));
+                n += usize::from(fb[0].contains(d));
+                d = p.advance();
+            }
+            out.truncate(n);
+            std::hint::black_box(out);
+        });
+        time("scores in the filter, branchless, length from an array", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut out = vec![(0u32, 0i64); n_post];
+            let mut n = 0;
+            let mut d = p.doc();
+            while d != TERMINATED {
+                out[n] = (d, score(p.term_freq(), lens[d as usize]));
+                n += usize::from(fb[0].contains(d));
+                d = p.advance();
+            }
+            out.truncate(n);
+            std::hint::black_box(out);
+        });
+        time("scores of all, length from the fast field", &mut || {
+            let mut p = inv.read_postings(&term, IndexRecordOption::WithFreqs).unwrap().unwrap();
+            let mut out = Vec::with_capacity(n_post);
+            let mut d = p.doc();
+            while d != TERMINATED {
+                out.push((d, score(p.term_freq(), lens_col.first(d).unwrap_or(1) as u32)));
+                d = p.advance();
+            }
+            std::hint::black_box(out);
+        });
+        let mut c = Compat::new(&b.searcher, b.fields.text[0], "n_SearchableText", b.stats[0]).with_filter(&f);
+        let tree: Node = serde_json::from_value(q["tree"].clone()).unwrap();
+        let mut hits = None;
+        time("Compat::run in the filter", &mut || hits = c.run(&tree).unwrap());
+        let hits = hits.unwrap();
+        time("first 20: select of all", &mut || {
+            let _ = compat::rank_map(&b.map, &hits, 20);
+        });
+        time("first 20: heap", &mut || {
+            let _ = compat::top_map(&b.map, &hits, 20);
+        });
+    }
+    let mut out = serde_json::Map::new();
+    for (k, mut v) in t {
+        v.remove(0);
+        out.insert(k.to_owned(), serde_json::json!(pct(&mut v, 0.5)));
+    }
+    println!("{}", serde_json::Value::Object(out));
 }
 
 /// compat DIR CASES
@@ -715,6 +1229,9 @@ fn main() {
     match args[1].as_str() {
         "build" => build(rest),
         "bench" => bench(rest),
+        "check" => check(rest),
+        "parts" => parts(rest),
+        "expt" => expt(rest),
         "compat" => compat_check(rest),
         "deltas" => deltas(rest),
         "window" => window(rest),

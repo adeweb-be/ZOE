@@ -3,5 +3,6 @@
 pub mod analysis;
 pub mod compat;
 pub mod enhanced;
+pub mod filter;
 pub mod index;
 pub mod overlay;

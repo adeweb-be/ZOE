@@ -13,6 +13,9 @@ Not for merge. The finding is `docs/spikes/text-index.md` on `main`.
 - `zcsave.py VENDOR DATA_FS CORPUS SAVES`: the records of one save of
   ZCTextIndex on the `Data.fs` of `catalog-1m`.
 - `examples/textspike.rs`: `build`, `bench`, `compat`, `deltas`,
-  `window`, `threads`, `words`, `overlaycost`.
+  `window`, `threads`, `words`, `overlaycost`, `compat1m`, and for the
+  filter and the sort inside the search (`src/text/filter.rs`): `bench`
+  with the last argument `inside`, `check` (the results of both paths),
+  `parts` and `expt` (the parts of the path for the top band).
 - `ZOE_UNIDECODE_TABLE` names a JSON list of the transliteration of each
   character of the basic plane by Python's Unidecode.

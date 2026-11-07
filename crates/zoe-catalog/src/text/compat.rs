@@ -19,6 +19,8 @@ use tantivy::postings::Postings;
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::{DocId, DocSet, Searcher, SegmentReader, TERMINATED, Term};
 
+use super::filter::{DocBits, Filter, RidMap};
+
 /// A node of the parse tree of ZCTextIndex.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -193,6 +195,11 @@ pub struct Compat<'a> {
     df: HashMap<String, u64>,
     mean: f64,
     pairs: Option<Field>,
+    /// The filter of the other clauses: a hit outside it is not kept.
+    pub restrict: Option<&'a Filter>,
+    /// The number of words plus one of each document of each segment, in
+    /// memory: the same values as the fast field, read faster.
+    lens: Option<&'a [Vec<u32>]>,
 }
 
 impl<'a> Compat<'a> {
@@ -208,7 +215,79 @@ impl<'a> Compat<'a> {
             df: HashMap::new(),
             mean: 0.0,
             pairs: None,
+            restrict: None,
+            lens: None,
         }
+    }
+
+    /// Read the lengths from `lens` in place of the fast field.
+    pub fn with_lens(mut self, lens: &'a [Vec<u32>]) -> Self {
+        self.lens = Some(lens);
+        self
+    }
+
+    /// Score only the documents of `filter`.
+    pub fn with_filter(mut self, filter: &'a Filter) -> Self {
+        self.restrict = Some(filter);
+        self
+    }
+
+    /// The documents of the filter in segment `ord` when the filter drives
+    /// the search.
+    fn driving(&self, ord: usize) -> Option<&'a [DocId]> {
+        self.restrict.and_then(|f| f.docs.as_ref()).map(|d| d[ord].as_slice())
+    }
+
+    /// Tell if the filter keeps `doc` of segment `ord`.
+    #[inline]
+    fn in_filter(&self, ord: usize, doc: DocId) -> bool {
+        self.restrict.and_then(|f| f.bits.as_ref()).is_none_or(|b| b[ord].contains(doc))
+    }
+
+    /// A bound of the number of hits of `node`: a word gives its document
+    /// frequency, `AND` and a phrase the least of their parts, `OR` the sum.
+    /// `None` when every document matches.
+    pub fn estimate(&mut self, node: &Node) -> tantivy::Result<Option<u64>> {
+        Ok(match node {
+            Node::Atom { words } if words.is_empty() => None,
+            Node::Atom { words } => {
+                let mut sum = 0;
+                for w in words {
+                    sum += self.doc_freq(w)?;
+                }
+                Some(sum)
+            }
+            Node::Glob { pattern } => {
+                let mut sum = 0;
+                for w in &self.expand_glob(pattern)? {
+                    sum += self.doc_freq(w)?;
+                }
+                Some(sum)
+            }
+            Node::Phrase { words } => {
+                let mut min = u64::MAX;
+                for w in words {
+                    min = min.min(self.doc_freq(w)?);
+                }
+                Some(min)
+            }
+            Node::And { items, .. } => {
+                let mut min: Option<u64> = None;
+                for n in items {
+                    if let Some(e) = self.estimate(n)? {
+                        min = Some(min.map_or(e, |m| m.min(e)));
+                    }
+                }
+                Some(min.unwrap_or(0))
+            }
+            Node::Or { items } => {
+                let mut sum = 0;
+                for n in items {
+                    sum += self.estimate(n)?.unwrap_or(0);
+                }
+                Some(sum)
+            }
+        })
     }
 
     /// Match a phrase through the field of the pairs of words.
@@ -310,9 +389,54 @@ impl<'a> Compat<'a> {
         };
         let (b, k1) = (0.75f64, 1.2f64);
         let (b_from1, k1_plus1) = (1.0 - b, k1 + 1.0);
+        if let Some(docs) = self.driving(ord) {
+            // A small filter: its documents seek the postings.
+            for &d in docs {
+                if p.doc() < d {
+                    p.seek(d);
+                }
+                if p.doc() == TERMINATED {
+                    break;
+                }
+                if p.doc() == d && self.alive(ord, seg, d) {
+                    let f = f64::from(p.term_freq());
+                    let len = lens.first(d).unwrap_or(1).saturating_sub(1) as f64;
+                    let lenweight = b_from1 + b * len / mean;
+                    let tf = f * k1_plus1 / (f + k1 * lenweight);
+                    out.push((d, (tf * idf + 0.5) as i64));
+                }
+            }
+            return Ok(out);
+        }
+        if let (Some(Some(bits)), Some(lens), None, None) =
+            (self.restrict.map(|f| f.bits.as_ref()), self.lens, seg.alive_bitset(), self.exclude)
+        {
+            // A broad filter, no delete: every hit is scored, and the filter
+            // only moves the end of the list. A check that keeps one hit in
+            // two cannot be predicted, so the loop has no branch on it.
+            let bits = &bits[ord];
+            let lens = &lens[ord];
+            out = vec![(0, 0); p.size_hint() as usize];
+            let mut n = 0;
+            let mut d = p.doc();
+            while d != TERMINATED {
+                let f = f64::from(p.term_freq());
+                let len = f64::from(lens[d as usize].saturating_sub(1));
+                let lenweight = b_from1 + b * len / mean;
+                let tf = f * k1_plus1 / (f + k1 * lenweight);
+                if n == out.len() {
+                    out.push((0, 0));
+                }
+                out[n] = (d, (tf * idf + 0.5) as i64);
+                n += usize::from(bits.contains(d));
+                d = p.advance();
+            }
+            out.truncate(n);
+            return Ok(out);
+        }
         let mut d = p.doc();
         while d != TERMINATED {
-            if self.alive(ord, seg, d) {
+            if self.in_filter(ord, d) && self.alive(ord, seg, d) {
                 let f = f64::from(p.term_freq());
                 let len = lens.first(d).unwrap_or(1).saturating_sub(1) as f64;
                 let lenweight = b_from1 + b * len / mean;
@@ -335,6 +459,7 @@ impl<'a> Compat<'a> {
         let lens = seg.fast_fields().u64(&self.len_name)?;
         let term = Term::from_field_text(self.field, word);
         let mut out = Vec::with_capacity(docs.len());
+        let mem = self.lens.map(|l| &l[ord]);
         let Some(mut p) = seg.inverted_index(self.field)?.read_postings(&term, IndexRecordOption::WithFreqs)?
         else {
             return Ok(docs.iter().map(|d| (*d, 0)).collect());
@@ -348,7 +473,10 @@ impl<'a> Compat<'a> {
             let mut score = 0;
             if p.doc() == d {
                 let f = f64::from(p.term_freq());
-                let len = lens.first(d).unwrap_or(1).saturating_sub(1) as f64;
+                let len = match mem {
+                    Some(m) => f64::from(m[d as usize].saturating_sub(1)),
+                    None => lens.first(d).unwrap_or(1).saturating_sub(1) as f64,
+                };
                 let lenweight = b_from1 + b * len / mean;
                 let tf = f * k1_plus1 / (f + k1 * lenweight);
                 score = (tf * idf + 0.5) as i64;
@@ -473,12 +601,26 @@ impl<'a> Compat<'a> {
                         let term = Term::from_field_text(pf, &super::index::pair(&w[0], &w[1]));
                         let mut docs = Vec::new();
                         if let Some(mut p) = inv.read_postings(&term, IndexRecordOption::Basic)? {
-                            let mut d = p.doc();
-                            while d != TERMINATED {
-                                if self.alive(ord, seg, d) {
-                                    docs.push(d);
+                            if let Some(fd) = self.driving(ord) {
+                                for &d in fd {
+                                    if p.doc() < d {
+                                        p.seek(d);
+                                    }
+                                    if p.doc() == TERMINATED {
+                                        break;
+                                    }
+                                    if p.doc() == d && self.alive(ord, seg, d) {
+                                        docs.push(d);
+                                    }
                                 }
-                                d = p.advance();
+                            } else {
+                                let mut d = p.doc();
+                                while d != TERMINATED {
+                                    if self.in_filter(ord, d) && self.alive(ord, seg, d) {
+                                        docs.push(d);
+                                    }
+                                    d = p.advance();
+                                }
                             }
                         }
                         cand = Some(match cand {
@@ -562,6 +704,143 @@ impl<'a> Compat<'a> {
         })
     }
 
+    /// The documents of segment `ord` that hold `word`, with no score.
+    fn word_set(&mut self, ord: usize, word: &str) -> tantivy::Result<DocBits> {
+        let seg = &self.searcher.segment_readers()[ord];
+        let mut out = DocBits::new(seg.max_doc());
+        if self.doc_freq(word)? == 0 {
+            return Ok(out);
+        }
+        let term = Term::from_field_text(self.field, word);
+        if let Some(mut p) = seg.inverted_index(self.field)?.read_postings(&term, IndexRecordOption::Basic)? {
+            let mut buf = [0u32; tantivy::COLLECT_BLOCK_BUFFER_LEN];
+            loop {
+                let n = p.fill_buffer(&mut buf);
+                for &d in &buf[..n] {
+                    if self.alive(ord, seg, d) {
+                        out.insert(d);
+                    }
+                }
+                if n < buf.len() {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn eval_set(&mut self, ord: usize, node: &Node) -> tantivy::Result<Option<DocBits>> {
+        let max_doc = self.searcher.segment_readers()[ord].max_doc();
+        Ok(match node {
+            Node::Atom { words } => {
+                if words.is_empty() {
+                    return Ok(None);
+                }
+                let mut acc = DocBits::new(max_doc);
+                for w in words {
+                    acc.or_with(&self.word_set(ord, w)?);
+                }
+                Some(acc)
+            }
+            Node::Glob { pattern } => {
+                let mut acc = DocBits::new(max_doc);
+                for w in &self.expand_glob(pattern)? {
+                    acc.or_with(&self.word_set(ord, w)?);
+                }
+                Some(acc)
+            }
+            Node::Phrase { words } => {
+                for w in words {
+                    if self.doc_freq(w)? == 0 {
+                        return Ok(Some(DocBits::new(max_doc)));
+                    }
+                }
+                let mut cand: Option<DocBits> = None;
+                if let (Some(pf), true) = (self.pairs, words.len() > 1) {
+                    let seg = &self.searcher.segment_readers()[ord];
+                    let inv = seg.inverted_index(pf)?;
+                    for w in words.windows(2) {
+                        let term = Term::from_field_text(pf, &super::index::pair(&w[0], &w[1]));
+                        let mut set = DocBits::new(max_doc);
+                        if let Some(mut p) = inv.read_postings(&term, IndexRecordOption::Basic)? {
+                            let mut d = p.doc();
+                            while d != TERMINATED {
+                                if self.alive(ord, seg, d) {
+                                    set.insert(d);
+                                }
+                                d = p.advance();
+                            }
+                        }
+                        match cand.as_mut() {
+                            None => cand = Some(set),
+                            Some(c) => c.and_with(&set),
+                        }
+                    }
+                } else {
+                    for w in words {
+                        let set = self.word_set(ord, w)?;
+                        match cand.as_mut() {
+                            None => cand = Some(set),
+                            Some(c) => c.and_with(&set),
+                        }
+                    }
+                }
+                let cand = cand.unwrap_or_else(|| DocBits::new(max_doc));
+                if words.len() > 2 || (self.pairs.is_none() && words.len() > 1) {
+                    let list: Scores = cand.iter().map(|d| (d, 0)).collect();
+                    let mut out = DocBits::new(max_doc);
+                    for (d, _) in self.phrase_filter(ord, words, list)? {
+                        out.insert(d);
+                    }
+                    Some(out)
+                } else {
+                    Some(cand)
+                }
+            }
+            Node::And { items, nots } => {
+                let mut set: Option<DocBits> = None;
+                for n in items {
+                    if let Some(r) = self.eval_set(ord, n)? {
+                        match set.as_mut() {
+                            None => set = Some(r),
+                            Some(s) => s.and_with(&r),
+                        }
+                    }
+                }
+                let mut set = set.unwrap_or_else(|| DocBits::new(max_doc));
+                for n in nots {
+                    if let Some(r) = self.eval_set(ord, n)? {
+                        set.andnot_with(&r);
+                    }
+                }
+                Some(set)
+            }
+            Node::Or { items } => {
+                let mut acc = DocBits::new(max_doc);
+                for n in items {
+                    if let Some(r) = self.eval_set(ord, n)? {
+                        acc.or_with(&r);
+                    }
+                }
+                Some(acc)
+            }
+        })
+    }
+
+    /// Run `node` with no score: the hits of each segment as a set, or
+    /// `None` when the tree matches every document. A sort on another
+    /// index needs no score: `Catalog.search` sorts the keys of the result.
+    pub fn run_set(&mut self, node: &Node) -> tantivy::Result<Option<Vec<DocBits>>> {
+        let mut out = Vec::new();
+        for ord in 0..self.searcher.segment_readers().len() {
+            match self.eval_set(ord, node)? {
+                Some(s) => out.push(s),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Run `node`. Return the hits of each segment, sorted by document,
     /// with their scores, or `None` when the tree matches every document.
     pub fn run(&mut self, node: &Node) -> tantivy::Result<Option<Vec<Scores>>> {
@@ -611,4 +890,66 @@ pub fn rank(
     }
     all.sort_by(cmp);
     Ok((count, all))
+}
+
+/// Map the hits of each segment to (rid, score) through `map`, in the
+/// order of `IIBucket.byValue(0)`, and keep the first `limit`. Return the
+/// count of all.
+pub fn rank_map(map: &RidMap, hits: &[Scores], limit: usize) -> (usize, Vec<(u64, i64)>) {
+    let mut all = Vec::with_capacity(hits.iter().map(Vec::len).sum());
+    for (ord, seg_hits) in hits.iter().enumerate() {
+        let rids = &map.doc_to_rid[ord];
+        all.extend(seg_hits.iter().map(|&(doc, score)| (u64::from(rids[doc as usize]), score)));
+    }
+    let count = all.len();
+    let cmp = |a: &(u64, i64), b: &(u64, i64)| b.1.cmp(&a.1).then(b.0.cmp(&a.0));
+    if limit < all.len() {
+        all.select_nth_unstable_by(limit, cmp);
+        all.truncate(limit);
+    }
+    all.sort_by(cmp);
+    (count, all)
+}
+
+/// As `rank_map`, with a heap of `limit` hits: the rid of a hit is read only
+/// when its score can enter the heap.
+pub fn top_map(map: &RidMap, hits: &[Scores], limit: usize) -> (usize, Vec<(u64, i64)>) {
+    top_map_in(map, hits, limit, |_| true)
+}
+
+/// As `top_map`, for the hits whose rid `keep` holds.
+pub fn top_map_in(
+    map: &RidMap,
+    hits: &[Scores],
+    limit: usize,
+    keep: impl Fn(u32) -> bool,
+) -> (usize, Vec<(u64, i64)>) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    // The greater is the better: the higher score, then the higher rid.
+    let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::with_capacity(limit + 1);
+    let mut count = 0;
+    for (ord, seg_hits) in hits.iter().enumerate() {
+        let rids = &map.doc_to_rid[ord];
+        for &(doc, score) in seg_hits {
+            let rid = rids[doc as usize];
+            if !keep(rid) {
+                continue;
+            }
+            count += 1;
+            if heap.len() == limit && heap.peek().is_some_and(|m| score < m.0.0) {
+                continue;
+            }
+            let k = (score, rid);
+            if heap.len() < limit {
+                heap.push(Reverse(k));
+            } else if heap.peek().is_some_and(|m| k > m.0) {
+                heap.pop();
+                heap.push(Reverse(k));
+            }
+        }
+    }
+    let mut out: Vec<(u64, i64)> = heap.into_iter().map(|Reverse((s, r))| (u64::from(r), s)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+    (count, out)
 }
