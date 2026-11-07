@@ -322,6 +322,18 @@ _Avoid_: cache, replica
 A record that says how one index entry changed in a transaction, instead of a rewritten index bucket.
 _Avoid_: patch, diff
 
+**Text delta**:
+The text of one document in one text index of one catalog at one tid: a row of `text_deltas`, with a history per tid, written in the transaction that indexes the document (ADR 0060). One with an empty payload is an unindex: the document leaves the index.
+_Avoid_: text record (it has no oid), posting
+
+**Clear delta**:
+The row of `text_deltas` that empties one text index of one catalog at one tid; no read at a later snapshot sees a text delta of that index before it, and pack removes such deltas.
+_Avoid_: reset, truncate
+
+**Text overlay**:
+The texts that one query of the text index scores beside the tantivy index, in place of the documents that it takes out of the result: their texts at the snapshot of the query, and the texts that its transaction or a `DemoStorage` staged.
+_Avoid_: overlay (alone: the overlay of `zoe.kv` and the transaction overlay of the mirror are other things), segment
+
 **Projection**:
 The catalog kept only as delta records and snapshots, with no index buckets in the store.
 _Avoid_: materialised view

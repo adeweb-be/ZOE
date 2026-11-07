@@ -86,6 +86,7 @@
   - [0056. A write-ahead log with a background fold: ZOE format 3](adr/0056-the-write-ahead-log.md)
   - [0057. The reader of ZOE: a record decodes in Rust in place of ObjectReader](adr/0057-the-reader-of-zoe.md)
   - [0059. The catalog mirror](adr/0059-the-catalog-mirror.md)
+  - [0060. The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex](adr/0060-the-native-text-index.md)
   - [0061. The security index: the inherited inputs of `allowedRolesAndUsers`](adr/0061-the-security-index.md)
 
 # Reference
@@ -109,6 +110,7 @@
   - [A reader in Rust in place of `Connection._reader`](spikes/ghost-to-cache.md)
   - [Field-addressable objects, before the design of phase 6](spikes/field-addressable-objects.md)
   - [The catalog mirror, built from the index trees of a catalog of one million entries](spikes/catalog-mirror.md)
+  - [The native text index on tantivy, its delta record type, and the compatibility with ZCTextIndex](spikes/text-index.md)
   - [The incremental security index](spikes/security-index.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
