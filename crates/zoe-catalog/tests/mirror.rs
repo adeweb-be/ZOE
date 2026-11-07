@@ -1048,7 +1048,7 @@ fn an_option_that_the_mirror_does_not_serve_gives_a_refusal() {
         decode_plan(&wire(&json)).unwrap_err()
     };
     assert!(matches!(
-        unknown(r#"{"c": [{"k": "p", "i": "path"}]}"#),
+        unknown(r#"{"c": [{"k": "z", "i": "path"}]}"#),
         PlanError::Unknown(_)
     ));
     assert!(matches!(
