@@ -166,7 +166,13 @@ fn s(text: &str) -> Val {
 
 /// A catalog of the model with `n` entries.
 fn model(first_oid: u64, n: i32) -> CatalogModel {
-    let mut m = CatalogModel::new(
+    model_with(first_oid, n, None)
+}
+
+/// A catalog of the model with `n` entries, whose inner nodes split past
+/// `fanout` children.
+fn model_with(first_oid: u64, n: i32, fanout: Option<usize>) -> CatalogModel {
+    let mut m = CatalogModel::with_fanout(
         first_oid,
         &[
             ("portal_type", IndexKind::Field),
@@ -182,6 +188,7 @@ fn model(first_oid: u64, n: i32) -> CatalogModel {
             ),
         ],
         &["getId"],
+        fanout,
     );
     for i in 0..n {
         add(&mut m, i, 0);
@@ -389,12 +396,17 @@ fn testing_writes_the_records_that_zcatalog_writes() {
                             TreeRecord::Inline(items(heap, family.set, bucket))
                         }
                         TreeState::Split => {
-                            let parts = heap.tuple(heap.tuple(record.state).unwrap()[0]).unwrap();
+                            let whole = heap.tuple(record.state).unwrap();
+                            let parts = heap.tuple(whole[0]).unwrap();
                             TreeRecord::Split {
+                                first: reference(heap, whole[1]).0,
                                 children: parts
                                     .iter()
                                     .step_by(2)
-                                    .map(|c| reference(heap, *c).0)
+                                    .map(|c| {
+                                        let (oid, _, name) = reference(heap, *c);
+                                        (oid, name == family.tree)
+                                    })
                                     .collect(),
                                 keys: parts
                                     .iter()
@@ -1032,7 +1044,7 @@ fn an_option_that_the_mirror_does_not_serve_gives_a_refusal() {
         range: Some((Some(s("a str")), None)),
         not: Vec::new(),
     });
-    assert_eq!(refusal(&bad_bound), Reason::Plan);
+    assert_eq!(refusal(&bad_bound), Reason::Option);
     // A plan with a kind or a key that this version does not know.
     let unknown = |text: &str| {
         let json: Json = serde_json::from_str(text).unwrap();
@@ -1146,5 +1158,41 @@ fn past_catalog_memory_the_mirror_that_answered_least_recently_drops() {
     // builds again.
     let tid = commit(&store, Some(&mirrors), &[], &[], &[b.key()]);
     assert!(ready_at(&mirrors, a.oid(), tid));
+    mirrors.stop();
+}
+
+#[test]
+fn a_split_of_an_inner_node_or_of_a_root_keeps_the_rows_of_the_moved_buckets() {
+    let store = store();
+    let mut m = model_with(10, 100, Some(4));
+    let first = commit(&store, None, &m.records(), &[m.key()], &[]);
+    let at_base = m.splits();
+    let mirrors = mirrors(&store, Config::default());
+    assert!(ready_at(&mirrors, m.oid(), first));
+    let mut tids = vec![first];
+    for turn in 1..11 {
+        for i in 0..60 {
+            add(&mut m, 100 + turn * 60 + i, turn);
+        }
+        for i in (turn..100).step_by(13) {
+            add(&mut m, i, turn);
+        }
+        // A removal in a bucket that a split moved.
+        m.uncatalog(&format!("/site/item-{}", turn * 7));
+        m.uncatalog(&format!("/site/item-{}", 100 + turn * 30));
+        tids.push(commit(&store, Some(&mirrors), &m.records(), &[], &[]));
+    }
+    let (below, roots) = m.splits();
+    assert!(
+        below > at_base.0,
+        "no split of an inner node: {:?}",
+        m.splits()
+    );
+    assert!(roots > at_base.1, "no split of a root: {:?}", m.splits());
+    assert!(ready_at(&mirrors, m.oid(), *tids.last().unwrap()));
+    assert_eq!(mirrors.status(m.oid()).unwrap().stale_at, None);
+    for tid in &tids {
+        check_like_fresh(&store, &mirrors, m.oid(), *tid, &format!("at {tid:#x}"));
+    }
     mirrors.stop();
 }

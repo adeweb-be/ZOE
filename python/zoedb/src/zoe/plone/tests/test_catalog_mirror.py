@@ -200,8 +200,14 @@ class TestTheCatalogMirror(unittest.TestCase):
                 transaction.commit()
                 after = answer(site.portal_catalog.unrestrictedSearchResults(**query))
             self.assertEqual(len(after[0]), len(before[0]) + 1)
+            native = catalog._counts_now()["queries"].get("native", 0)
+            python = catalog._counts_now()["queries"].get("python", 0)
             again = answer(app.plone.portal_catalog.unrestrictedSearchResults(**query))
             self.assertEqual(again, before)
+            # The mirror answered the old snapshot.
+            counts = catalog._counts_now()["queries"]
+            self.assertEqual(counts.get("native", 0), native + 1)
+            self.assertEqual(counts.get("python", 0), python)
         finally:
             old.transaction_manager.abort()
             old.close()

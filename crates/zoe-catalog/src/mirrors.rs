@@ -839,7 +839,12 @@ fn start_build(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
             let shared = worker;
             let result = {
                 let _one = BUILDS.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(hook) = &shared.config.hooks.before_build {
+                // A build of another store can hold the lock for long: a
+                // stop during that wait starts no walk.
+                let cancelled = || shared.cancel.load(AtomicOrdering::Relaxed);
+                if !cancelled()
+                    && let Some(hook) = &shared.config.hooks.before_build
+                {
                     hook(catalog);
                 }
                 let room = |bytes: usize| {
@@ -848,10 +853,14 @@ fn start_build(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
                         && shared.room(&mut inner, Some(catalog), bytes)
                 };
                 let reads = Weakly(&shared.open);
-                let built = catch_unwind(AssertUnwindSafe(|| {
-                    build(&reads, catalog, tid, shared.config.threads, &room)
-                }))
-                .unwrap_or_else(|_| Err(BuildError::Refused("the build panicked".into())));
+                let built = if cancelled() {
+                    Err(BuildError::Dropped)
+                } else {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        build(&reads, catalog, tid, shared.config.threads, &room)
+                    }))
+                    .unwrap_or_else(|_| Err(BuildError::Refused("the build panicked".into())))
+                };
                 match built {
                     // A build that the close of the store stopped.
                     Err(BuildError::Refused(_)) if (shared.open)().is_none() => {

@@ -951,9 +951,15 @@ impl Storage {
                 zoe_catalog::Reason::NotRegistered,
                 "the store has no registration key",
             );
+            // The plan comes first, as on the path of the mirrors: a
+            // malformed plan raises, an unknown key gives `plan`.
             return match zoe_catalog::decode_plan(&plan) {
                 Err(zoe_catalog::PlanError::Malformed(why)) => Err(PyValueError::new_err(why)),
-                _ => catalog::reply(py, tid, &Err(fallback)),
+                Err(zoe_catalog::PlanError::Unknown(why)) => {
+                    let unknown = zoe_catalog::Fallback::new(zoe_catalog::Reason::Plan, why);
+                    catalog::reply(py, tid, &Err(unknown))
+                }
+                Ok(_) => catalog::reply(py, tid, &Err(fallback)),
             };
         };
         let (answer, events) = py.detach(|| {

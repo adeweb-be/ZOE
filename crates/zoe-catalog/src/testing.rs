@@ -12,9 +12,10 @@
 //! - `CatalogModel` keeps a catalog with its indexes and its trees, as
 //!   `Catalog.catalogObject` and `uncatalogObject` change them, and gives
 //!   the records that changed since the last call. Its trees split a
-//!   bucket as BTrees does: at half of its items, past the largest bucket
-//!   of the family. Its tree sets stay one inline bucket, and its trees
-//!   never split an inner node: the catalogs of the tests stay small.
+//!   bucket at half of its items, past the largest bucket of the family,
+//!   and an inner node at half of its children, past the largest inner
+//!   node of the family or the fan-out of `with_fanout`; the root splits as
+//!   `BTree_split_root` does. Its tree sets stay one inline bucket.
 //! - `commit` writes records and registration keys to a store.
 
 use std::cmp::Ordering;
@@ -324,6 +325,8 @@ pub struct Family {
     pub leaf: usize,
     /// True for a set.
     pub set: bool,
+    /// The most children of an inner node: past it, the node splits.
+    pub internal: usize,
 }
 
 /// `IOBTree`.
@@ -333,6 +336,7 @@ pub const IO: Family = Family {
     bucket: "IOBucket",
     leaf: 60,
     set: false,
+    internal: 500,
 };
 /// `OIBTree`.
 pub const OI: Family = Family {
@@ -341,6 +345,7 @@ pub const OI: Family = Family {
     bucket: "OIBucket",
     leaf: 60,
     set: false,
+    internal: 250,
 };
 /// `OOBTree`.
 pub const OO: Family = Family {
@@ -349,6 +354,7 @@ pub const OO: Family = Family {
     bucket: "OOBucket",
     leaf: 30,
     set: false,
+    internal: 250,
 };
 /// `IITreeSet`.
 pub const II_SET: Family = Family {
@@ -357,6 +363,7 @@ pub const II_SET: Family = Family {
     bucket: "IISet",
     leaf: 120,
     set: true,
+    internal: 500,
 };
 
 /// A value of a tree: a value of the model, or a persistent reference.
@@ -396,13 +403,16 @@ pub enum TreeRecord {
     Empty,
     /// One bucket, inline: its items.
     Inline(Vec<(Val, Item)>),
-    /// Buckets with their own oids, and the key before each bucket but the
-    /// first.
+    /// Children with their own oids, the key before each child but the
+    /// first, and the first bucket of the tree.
     Split {
-        /// The oids of the buckets.
-        children: Vec<u64>,
+        /// The oid of each child, and true for an inner node, false for a
+        /// bucket.
+        children: Vec<(u64, bool)>,
         /// The separating keys.
         keys: Vec<Val>,
+        /// The oid of the first bucket.
+        first: u64,
     },
 }
 
@@ -417,16 +427,21 @@ pub fn tree_record(family: Family, state: &TreeRecord) -> Vec<u8> {
             let inner = p.tuple(vec![bucket]);
             p.tuple(vec![inner])
         }
-        TreeRecord::Split { children, keys } => {
+        TreeRecord::Split {
+            children,
+            keys,
+            first,
+        } => {
             let mut data = Vec::new();
-            for (i, child) in children.iter().enumerate() {
+            for (i, (child, inner)) in children.iter().enumerate() {
                 if i > 0 {
                     data.push(p.val(&keys[i - 1]));
                 }
-                data.push(p.reference(*child, family.module, family.bucket));
+                let class = if *inner { family.tree } else { family.bucket };
+                data.push(p.reference(*child, family.module, class));
             }
             let data = p.tuple(data);
-            let first = p.reference(children[0], family.module, family.bucket);
+            let first = p.reference(*first, family.module, family.bucket);
             p.tuple(vec![data, first])
         }
     };
@@ -545,121 +560,251 @@ struct Bucket {
     items: Vec<(Val, Item)>,
 }
 
+/// A child of an inner node of the model.
+#[derive(Clone, Debug)]
+enum Child {
+    Bucket(Bucket),
+    Node(Inner),
+}
+
+/// An inner node of the model: the tree object itself at the root.
+#[derive(Clone, Debug)]
+struct Inner {
+    oid: u64,
+    /// The key before each child but the first.
+    keys: Vec<Val>,
+    children: Vec<Child>,
+}
+
+/// What a change of a tree of the model needs: oids, and the oids that
+/// changed.
+struct Work<'a, F> {
+    family: Family,
+    fanout: usize,
+    new_oid: &'a mut F,
+    changed: &'a mut BTreeSet<u64>,
+    /// The splits of an inner node below the root, and of the root.
+    splits: &'a mut (usize, usize),
+}
+
 /// A tree of the model, with the oids that changed.
+///
+/// An inner node splits at half of its children past `fanout` children, as
+/// a bucket splits past the largest bucket of its family. The root splits
+/// as `BTree_split_root` does: its children move to a new inner node, which
+/// splits.
 #[derive(Clone, Debug)]
 pub struct Tree {
     /// The oid of the tree.
     pub root: u64,
     family: Family,
-    buckets: Vec<Bucket>,
-    /// The key before each bucket but the first.
-    keys: Vec<Val>,
+    fanout: usize,
+    top: Inner,
     changed: BTreeSet<u64>,
+    /// The next bucket of each bucket, and the first bucket of each inner
+    /// node, as the last records gave them.
+    written: HashMap<u64, Option<u64>>,
+    splits: (usize, usize),
 }
 
 fn order(a: &Val, b: &Val) -> Ordering {
     py_cmp(a, b).expect("keys that the model orders")
 }
 
+/// The place of the child of `key` in `node`.
+fn child_of(node: &Inner, key: &Val) -> usize {
+    node.keys
+        .partition_point(|k| order(k, key) != Ordering::Greater)
+}
+
+/// Sets `key` in the subtree of `node`. Returns the key and the new sibling
+/// of `node` when `node` splits.
+fn set_in<F: FnMut() -> u64>(
+    node: &mut Inner,
+    key: Val,
+    value: Item,
+    work: &mut Work<'_, F>,
+) -> Option<(Val, Inner)> {
+    if node.children.is_empty() {
+        node.children.push(Child::Bucket(Bucket {
+            oid: None,
+            items: Vec::new(),
+        }));
+    }
+    let i = child_of(node, &key);
+    let oid = node.oid;
+    let mut grown: Option<(Val, Child)> = None;
+    match &mut node.children[i] {
+        Child::Bucket(b) => {
+            match b.items.binary_search_by(|(k, _)| order(k, &key)) {
+                Ok(at) if b.items[at].1 == value => return None,
+                Ok(at) => b.items[at].1 = value,
+                Err(at) => b.items.insert(at, (key, value)),
+            }
+            work.changed.insert(b.oid.unwrap_or(oid));
+            if b.items.len() > work.family.leaf {
+                let half = b.items.len() / 2;
+                let moved = b.items.split_off(half);
+                if b.oid.is_none() {
+                    b.oid = Some((work.new_oid)());
+                }
+                work.changed.insert(b.oid.unwrap_or(oid));
+                let new = (work.new_oid)();
+                work.changed.insert(new);
+                grown = Some((
+                    moved[0].0.clone(),
+                    Child::Bucket(Bucket {
+                        oid: Some(new),
+                        items: moved,
+                    }),
+                ));
+            }
+        }
+        Child::Node(n) => {
+            if let Some((sep, sibling)) = set_in(n, key, value, work) {
+                grown = Some((sep, Child::Node(sibling)));
+            }
+        }
+    }
+    if let Some((sep, child)) = grown {
+        node.keys.insert(i, sep);
+        node.children.insert(i + 1, child);
+        work.changed.insert(oid);
+    }
+    if node.children.len() <= work.fanout {
+        return None;
+    }
+    let half = node.children.len() / 2;
+    let children = node.children.split_off(half);
+    let mut keys = node.keys.split_off(half - 1);
+    let sep = keys.remove(0);
+    work.splits.0 += 1;
+    let sibling = Inner {
+        oid: (work.new_oid)(),
+        keys,
+        children,
+    };
+    work.changed.insert(sibling.oid);
+    Some((sep, sibling))
+}
+
+/// Removes `key` from the subtree of `node`. Returns its value, and true
+/// when `node` holds no child after it.
+fn remove_in(node: &mut Inner, key: &Val, changed: &mut BTreeSet<u64>) -> Option<(Item, bool)> {
+    let i = child_of(node, key);
+    let oid = node.oid;
+    let (value, empty) = match node.children.get_mut(i)? {
+        Child::Bucket(b) => {
+            let at = b.items.binary_search_by(|(k, _)| order(k, key)).ok()?;
+            let (_, value) = b.items.remove(at);
+            changed.insert(b.oid.unwrap_or(oid));
+            (value, b.items.is_empty())
+        }
+        Child::Node(n) => remove_in(n, key, changed)?,
+    };
+    if empty {
+        node.children.remove(i);
+        if !node.keys.is_empty() {
+            node.keys.remove(i.saturating_sub(1));
+        }
+        changed.insert(oid);
+    }
+    Some((value, node.children.is_empty()))
+}
+
+/// The buckets of the subtree of `node`, in key order.
+fn leaves<'a>(node: &'a Inner, out: &mut Vec<&'a Bucket>) {
+    for child in &node.children {
+        match child {
+            Child::Bucket(b) => out.push(b),
+            Child::Node(n) => leaves(n, out),
+        }
+    }
+}
+
+/// The inner nodes of the subtree of `node`, `node` included.
+fn nodes<'a>(node: &'a Inner, out: &mut Vec<&'a Inner>) {
+    out.push(node);
+    for child in &node.children {
+        if let Child::Node(n) = child {
+            nodes(n, out);
+        }
+    }
+}
+
 impl Tree {
-    fn new(root: u64, family: Family) -> Tree {
+    fn new(root: u64, family: Family, fanout: Option<usize>) -> Tree {
+        let fanout = fanout.unwrap_or(family.internal).max(2);
         Tree {
             root,
             family,
-            buckets: Vec::new(),
-            keys: Vec::new(),
+            fanout,
+            top: Inner {
+                oid: root,
+                keys: Vec::new(),
+                children: Vec::new(),
+            },
             changed: BTreeSet::from([root]),
+            written: HashMap::new(),
+            splits: (0, 0),
         }
-    }
-
-    /// The place of the bucket of `key`.
-    fn bucket_of(&self, key: &Val) -> usize {
-        self.keys
-            .partition_point(|k| order(k, key) != Ordering::Greater)
-    }
-
-    fn touch(&mut self, b: usize) {
-        match self.buckets[b].oid {
-            Some(oid) => self.changed.insert(oid),
-            None => self.changed.insert(self.root),
-        };
     }
 
     /// The value of `key`.
     pub fn get(&self, key: &Val) -> Option<&Item> {
-        let b = self.buckets.get(self.bucket_of(key))?;
-        let i = b.items.binary_search_by(|(k, _)| order(k, key)).ok()?;
-        Some(&b.items[i].1)
+        let mut node = &self.top;
+        loop {
+            match node.children.get(child_of(node, key))? {
+                Child::Bucket(b) => {
+                    let i = b.items.binary_search_by(|(k, _)| order(k, key)).ok()?;
+                    return Some(&b.items[i].1);
+                }
+                Child::Node(n) => node = n,
+            }
+        }
     }
 
-    /// Sets `key` to `value`. `new_oid` gives an oid to a bucket that a
-    /// split makes.
+    /// Sets `key` to `value`. `new_oid` gives an oid to a bucket or an
+    /// inner node that a split makes.
     pub fn set(&mut self, key: Val, value: Item, new_oid: &mut impl FnMut() -> u64) {
-        if self.buckets.is_empty() {
-            self.buckets.push(Bucket {
-                oid: None,
-                items: Vec::new(),
-            });
-        }
-        let b = self.bucket_of(&key);
-        let items = &mut self.buckets[b].items;
-        match items.binary_search_by(|(k, _)| order(k, &key)) {
-            Ok(i) => {
-                if items[i].1 == value {
-                    return;
-                }
-                items[i].1 = value;
-            }
-            Err(i) => items.insert(i, (key, value)),
-        }
-        self.touch(b);
-        if self.buckets[b].items.len() > self.family.leaf {
-            let half = self.buckets[b].items.len() / 2;
-            let moved = self.buckets[b].items.split_off(half);
-            if self.buckets[b].oid.is_none() {
-                self.buckets[b].oid = Some(new_oid());
-            }
-            let oid = new_oid();
-            self.keys.insert(b, moved[0].0.clone());
-            self.buckets.insert(
-                b + 1,
-                Bucket {
-                    oid: Some(oid),
-                    items: moved,
-                },
-            );
-            self.touch(b);
-            self.changed.insert(oid);
-            self.changed.insert(self.root);
+        let mut work = Work {
+            family: self.family,
+            fanout: self.fanout,
+            new_oid,
+            changed: &mut self.changed,
+            splits: &mut self.splits,
+        };
+        if let Some((sep, sibling)) = set_in(&mut self.top, key, value, &mut work) {
+            // The root splits: its first half moves to a new inner node.
+            let left = Inner {
+                oid: (work.new_oid)(),
+                keys: std::mem::take(&mut self.top.keys),
+                children: std::mem::take(&mut self.top.children),
+            };
+            work.changed.insert(left.oid);
+            work.changed.insert(self.root);
+            self.top.keys = vec![sep];
+            self.top.children = vec![Child::Node(left), Child::Node(sibling)];
+            work.splits.0 -= 1;
+            work.splits.1 += 1;
         }
     }
 
     /// Removes `key`, and gives its value.
     pub fn remove(&mut self, key: &Val) -> Option<Item> {
-        let b = self.bucket_of(key);
-        let bucket = self.buckets.get_mut(b)?;
-        let i = bucket.items.binary_search_by(|(k, _)| order(k, key)).ok()?;
-        let (_, value) = bucket.items.remove(i);
-        self.touch(b);
-        if self.buckets[b].items.is_empty() {
-            if self.buckets.len() == 1 {
-                self.buckets.clear();
-                self.keys.clear();
-            } else {
-                self.buckets.remove(b);
-                self.keys.remove(b.saturating_sub(1));
-                if b > 0 {
-                    self.touch(b - 1);
-                }
-            }
-            self.changed.insert(self.root);
-        }
-        Some(value)
+        remove_in(&mut self.top, key, &mut self.changed).map(|(value, _)| value)
+    }
+
+    /// The items of the tree, in key order.
+    fn items(&self) -> Vec<&(Val, Item)> {
+        let mut out = Vec::new();
+        leaves(&self.top, &mut out);
+        out.into_iter().flat_map(|b| b.items.iter()).collect()
     }
 
     /// The number of items.
     pub fn len(&self) -> usize {
-        self.buckets.iter().map(|b| b.items.len()).sum()
+        self.items().len()
     }
 
     /// Tells if the tree holds no item.
@@ -667,33 +812,72 @@ impl Tree {
         self.len() == 0
     }
 
-    /// The records of the tree and of its buckets that changed since the
-    /// last call.
+    /// The splits of an inner node below the root, and of the root.
+    pub fn splits(&self) -> (usize, usize) {
+        self.splits
+    }
+
+    /// The records of the tree, of its inner nodes and of its buckets that
+    /// changed since the last call.
     fn records(&mut self, out: &mut Vec<(u64, Vec<u8>)>) {
-        let changed = std::mem::take(&mut self.changed);
-        for oid in changed {
-            if oid == self.root {
-                out.push((oid, tree_record(self.family, &self.state())));
-                continue;
+        let mut changed = std::mem::take(&mut self.changed);
+        let mut buckets = Vec::new();
+        leaves(&self.top, &mut buckets);
+        // A bucket whose next bucket changed, and an inner node whose first
+        // bucket changed, change too.
+        for (i, b) in buckets.iter().enumerate() {
+            if let Some(oid) = b.oid {
+                let next = buckets.get(i + 1).and_then(|n| n.oid);
+                if self.written.insert(oid, next) != Some(next) {
+                    changed.insert(oid);
+                }
             }
-            if let Some(b) = self.buckets.iter().position(|b| b.oid == Some(oid)) {
-                let next = self.buckets.get(b + 1).and_then(|n| n.oid);
-                out.push((
-                    oid,
-                    bucket_record(self.family, &self.buckets[b].items, next),
-                ));
+        }
+        let mut inner = Vec::new();
+        nodes(&self.top, &mut inner);
+        for node in &inner {
+            let mut first = Vec::new();
+            leaves(node, &mut first);
+            let first = first.first().and_then(|b| b.oid);
+            if self.written.insert(node.oid, first) != Some(first) {
+                changed.insert(node.oid);
+            }
+        }
+        for node in &inner {
+            if changed.contains(&node.oid) {
+                out.push((node.oid, tree_record(self.family, &state(node))));
+            }
+        }
+        for (i, b) in buckets.iter().enumerate() {
+            if let Some(oid) = b.oid
+                && changed.contains(&oid)
+            {
+                let next = buckets.get(i + 1).and_then(|n| n.oid);
+                out.push((oid, bucket_record(self.family, &b.items, next)));
             }
         }
     }
+}
 
-    fn state(&self) -> TreeRecord {
-        match &self.buckets[..] {
-            [] => TreeRecord::Empty,
-            [only] if only.oid.is_none() => TreeRecord::Inline(only.items.clone()),
-            buckets => TreeRecord::Split {
-                children: buckets.iter().filter_map(|b| b.oid).collect(),
-                keys: self.keys.clone(),
-            },
+/// The state of an inner node.
+fn state(node: &Inner) -> TreeRecord {
+    match &node.children[..] {
+        [] => TreeRecord::Empty,
+        [Child::Bucket(only)] if only.oid.is_none() => TreeRecord::Inline(only.items.clone()),
+        children => {
+            let mut first = Vec::new();
+            leaves(node, &mut first);
+            TreeRecord::Split {
+                children: children
+                    .iter()
+                    .map(|c| match c {
+                        Child::Bucket(b) => (b.oid.expect("a bucket with an oid"), false),
+                        Child::Node(n) => (n.oid, true),
+                    })
+                    .collect(),
+                keys: node.keys.clone(),
+                first: first[0].oid.expect("a bucket with an oid"),
+            }
         }
     }
 }
@@ -753,11 +937,22 @@ impl CatalogModel {
     /// A new catalog whose objects take oids from `first_oid`, with the
     /// indexes `indexes` and the columns `columns`.
     pub fn new(first_oid: u64, indexes: &[(&str, IndexKind)], columns: &[&str]) -> CatalogModel {
+        Self::with_fanout(first_oid, indexes, columns, None)
+    }
+
+    /// A new catalog as `new` gives it, whose inner nodes split past
+    /// `fanout` children; `None` keeps the sizes of the families.
+    pub fn with_fanout(
+        first_oid: u64,
+        indexes: &[(&str, IndexKind)],
+        columns: &[&str],
+        fanout: Option<usize>,
+    ) -> CatalogModel {
         let mut next = first_oid;
         let oid = take(&mut next);
-        let data = Tree::new(take(&mut next), IO);
-        let uids = Tree::new(take(&mut next), OI);
-        let paths = Tree::new(take(&mut next), IO);
+        let data = Tree::new(take(&mut next), IO, fanout);
+        let uids = Tree::new(take(&mut next), OI, fanout);
+        let paths = Tree::new(take(&mut next), IO, fanout);
         let length = (take(&mut next), 0);
         let indexes = indexes
             .iter()
@@ -767,8 +962,8 @@ impl CatalogModel {
                 oid: take(&mut next),
                 length: (take(&mut next), 0),
                 counter: (take(&mut next), 0),
-                index: Tree::new(take(&mut next), OO),
-                unindex: Tree::new(take(&mut next), IO),
+                index: Tree::new(take(&mut next), OO, fanout),
+                unindex: Tree::new(take(&mut next), IO, fanout),
                 sets: Vec::new(),
                 dirty: true,
             })
@@ -796,6 +991,20 @@ impl CatalogModel {
         self.oid.to_be_bytes()
     }
 
+    /// The splits of an inner node below a root, and of a root, over the
+    /// trees of the catalog.
+    pub fn splits(&self) -> (usize, usize) {
+        let mut trees = vec![&self.data, &self.uids, &self.paths];
+        for index in &self.indexes {
+            trees.push(&index.index);
+            trees.push(&index.unindex);
+        }
+        trees.iter().fold((0, 0), |(a, b), t| {
+            let (x, y) = t.splits();
+            (a + x, b + y)
+        })
+    }
+
     /// The oid of the root of the `_unindex` of the index `id`.
     pub fn unindex_root(&self, id: &str) -> u64 {
         self.index(id).unindex.root
@@ -819,9 +1028,8 @@ impl CatalogModel {
     /// The paths of the catalog, with their rids, by rid.
     pub fn entries(&self) -> Vec<(i32, String)> {
         self.paths
-            .buckets
-            .iter()
-            .flat_map(|b| b.items.iter())
+            .items()
+            .into_iter()
             .filter_map(|(rid, path)| match (rid, path) {
                 (Val::Int(rid), Item::Val(Val::Str(path))) => Some((*rid as i32, path.to_string())),
                 _ => None,
@@ -929,8 +1137,9 @@ impl CatalogModel {
             .find(|i| i.id == id)
             .expect("an index of the model");
         index.length = (take(next), 0);
-        index.index = Tree::new(take(next), OO);
-        index.unindex = Tree::new(take(next), IO);
+        let fanout = Some(index.unindex.fanout);
+        index.index = Tree::new(take(next), OO, fanout);
+        index.unindex = Tree::new(take(next), IO, fanout);
         index.sets.clear();
         index.counter.1 += 1;
         index.dirty = true;
@@ -1005,7 +1214,7 @@ fn insert_forward(index: &mut IndexModel, key: &Val, rid: i32, new_oid: &mut imp
     match index.sets.iter().position(|(k, _)| k == key) {
         Some(i) => index.sets[i].1.set(row, Item::Val(Val::None), new_oid),
         None => {
-            let mut set = Tree::new(new_oid(), II_SET);
+            let mut set = Tree::new(new_oid(), II_SET, None);
             set.set(row, Item::Val(Val::None), new_oid);
             let reference = Item::Ref(set.root, II_SET.module, II_SET.tree);
             index.index.set(key.clone(), reference, new_oid);

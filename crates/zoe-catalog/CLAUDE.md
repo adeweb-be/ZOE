@@ -20,7 +20,7 @@ Built: FieldIndex, its clauses and its sorts; the registration, the build, the b
 ## Invariants
 
 - A query is answered as of the snapshot tid of the client, exclusive as the tid of `loadBefore`. A result never names an object that the Connection cannot load.
-- A query with an index or an option that the mirror does not serve takes the Python path, whole, with its reason. So does a snapshot outside the mirror window, and a catalog that is not registered, not ready, refused, dropped or stale. The names of the reasons are a contract (`Reason::name`).
+- A query with an index or an option that the mirror does not serve takes the Python path, whole, with its reason. So does a snapshot outside the mirror window, and a catalog that is not registered, not ready, refused, dropped or stale. The names of the reasons are a contract (`Reason::name`). The store also gives `sort`, a reason of the client in ADR 0059, section 7, for several sort indexes on the path of ZCatalog that iterates the first sort index: only the size of the result decides that path. A range bound that the keys of the index do not order gives `option`.
 - Rids, order, `len()` and `actual_result_count` equal those of ZCatalog, ties included: each of the four sort paths keeps its own rule of ties, and a batch past the middle takes the other end.
 - Security stays in Plone: `allowedRolesAndUsers` is an index like any other.
 - The mirror builds only registered catalogs: the keys of the durable namespace `zoe.catalog`, read at the start and after each commit that changes its generation. No scan of the store, no build on a first query.

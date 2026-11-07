@@ -359,7 +359,7 @@ impl<'a> View<'a> {
     ) -> Result<RoaringBitmap, Fallback> {
         let unordered = || {
             Fallback::new(
-                Reason::Plan,
+                Reason::Option,
                 "a bound of a range that the keys of the index do not order",
             )
         };

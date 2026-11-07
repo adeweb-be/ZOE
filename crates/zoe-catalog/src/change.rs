@@ -12,7 +12,7 @@
 //! bucket. A record of another object costs one lookup.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use crate::base::{Base, Index, rid_of};
@@ -304,6 +304,8 @@ pub fn read_records(
     let mut new_items: BTreeMap<Slot, BTreeMap<i32, Val>> = BTreeMap::new();
     // The old key ranges of the changed buckets, by tree.
     let mut old_ranges: BTreeMap<Slot, Vec<(i64, i64)>> = BTreeMap::new();
+    // The children that left a changed inner node.
+    let mut gone: Vec<(Slot, u64)> = Vec::new();
     let mut done = vec![false; records.len()];
     // A changed inner node names its new buckets, which can come before it
     // in the commit: read until no record is left to read.
@@ -376,15 +378,15 @@ pub fn read_records(
                                     edits.owners.insert(*child, Owner::Node(slot));
                                 }
                             }
-                            // A child that left the node takes its rows
-                            // with it, unless a bucket of this commit holds
-                            // them.
-                            for gone in old.iter().filter(|c| !children.contains(c)) {
-                                if let Some(range) = shapes.buckets.get(gone) {
-                                    old_ranges.entry(slot).or_default().push(*range);
-                                    edits.buckets.insert(*gone, None);
-                                }
-                            }
+                            // A child that left the node may have moved to
+                            // another inner node of the commit, as a split of
+                            // an inner node moves it: the end of the read
+                            // decides.
+                            gone.extend(
+                                old.iter()
+                                    .filter(|c| !children.contains(c))
+                                    .map(|c| (slot, *c)),
+                            );
                             if let Some(range) = old_range {
                                 // A bucket that became a tree of buckets.
                                 old_ranges.entry(slot).or_default().push(range);
@@ -418,6 +420,27 @@ pub fn read_records(
         }
         if !progress {
             break;
+        }
+    }
+    // A child that an inner node of the commit names moved, and keeps its
+    // range and its shape. A bucket that no inner node of the commit names
+    // left its tree with its rows, unless a bucket of the commit holds them.
+    // An inner node that left its tree takes rows that the mirror does not
+    // follow: the mirror is stale.
+    let named: HashSet<u64> = edits.inner.values().flatten().copied().collect();
+    for (slot, child) in gone {
+        if named.contains(&child) {
+            continue;
+        }
+        if shapes.inner.contains_key(&child) || edits.inner.contains_key(&child) {
+            out.stale = Some(format!("the inner node {child:#x} left its tree"));
+        } else if let Some(range) = shapes.buckets.get(&child) {
+            if edits.buckets.get(&child).is_some_and(Option::is_some) {
+                out.stale = Some(format!("the bucket {child:#x} left its tree and changed"));
+                continue;
+            }
+            old_ranges.entry(slot).or_default().push(*range);
+            edits.buckets.insert(child, None);
         }
     }
     // The changes of each tree: the rows of the old ranges that no new

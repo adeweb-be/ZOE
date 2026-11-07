@@ -395,6 +395,9 @@ def test_the_storage_takes_the_settings_of_the_catalog_mirrors(tmp_path):
         reply = storage.catalog_query(b"\0" * 7 + b"\1", b"\xff" * 8, {"c": []})
         assert reply["f"] == "not_registered"
         assert reply["tid"] == b"\xff" * 8
+        # The plan comes first: an unknown key gives `plan`.
+        reply = storage.catalog_query(b"\0" * 7 + b"\1", b"\xff" * 8, {"c": [], "o": 1})
+        assert reply["f"] == "plan"
         with pytest.raises(ValueError):
             storage.catalog_query(b"\0" * 7 + b"\1", b"\xff" * 8, {"s": []})
         with pytest.raises(ValueError):
