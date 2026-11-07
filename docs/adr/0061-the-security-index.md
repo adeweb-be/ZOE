@@ -72,7 +72,7 @@ With a `ZoeSecurityIndex`, the Indexer of ADR 0047 does not add the catalog subt
 
 `security` is an opt-in backend of `zoe.plone`, as `indexing` is: `ZOE_PLONE_BACKENDS=security` or `zoe.plone:security.zcml`, which call `install()`. It has `install()`, `uninstall()` and `installed()`, as the other backends of `zoe.plone`. A second call of `install()` or `uninstall()` does nothing. Every instance of the site needs the backend. An instance without it runs the stock walk: the result is correct, but it writes and waits as before.
 
-- `install()` replaces the methods of section 3 in the process. It also puts a `ZoeSecurityIndex` in place of the `KeywordIndex` `allowedRolesAndUsers` into each catalog that does not hold one yet. It finds the sites as queued indexing does (ADR 0047), in the databases that the process has open and at each open of a database (`IDatabaseOpenedWithRoot`). Each catalog gets the index in a transaction of its own, which indexes every catalog entry: 36 to 42 s for 50,064 entries in the prototype.
+- `install()` replaces the methods of section 3 in the process. It also puts a `ZoeSecurityIndex` in place of the `KeywordIndex` `allowedRolesAndUsers` into each catalog that does not hold one yet. It finds the sites as queued indexing does (ADR 0047), in the databases that the process has open and at each open of a database (`IDatabaseOpenedWithRoot`). Each catalog gets the index in a transaction of its own, which indexes every catalog entry: 36 to 42 s for 50,064 entries in the prototype. A thread does this work under the lease of the site (ADR 0047), so the open of a database does not wait and two instances do not do it together. A read-only storage gets no index. Until the catalog holds the index, each instance runs the stock methods, and the result stays correct.
 - A site created later gets the index in the transaction that creates it.
 - `uninstall()` gives the stock methods back in the process. For each catalog of the databases that the process has open, it puts the `KeywordIndex` back in a transaction of its own and indexes every catalog entry.
 - `installed()` tells if the backend is installed in the process.
@@ -89,6 +89,8 @@ The index holds persistent objects only, so it runs on a `DemoStorage`. ZOE-301 
 ### 6. The mirror
 
 The mirror decodes the buckets of the inputs. It keeps the inputs of each node: each catalog entry and each recorded container. It resolves the value of each catalog entry and keeps one bitmap for each distinct value. A query of the tokens of a user is an or of the bitmaps whose value holds one of them.
+
+ZOE-301 adds `ZoeSecurityIndex` to the classes that the mirror serves (ADR 0059, section 7). Its clause on the wire is the clause of a KeywordIndex of ADR 0059, section 8: `{"k": "v", "i": index, "q": [token...], "and": false}`. Until then, a query with the index takes the Python path (`index`).
 
 The mirror resolves at the version of a query, with the versions of ADR 0059:
 
@@ -116,7 +118,7 @@ F33 says: "incremental security index (the inherited inputs of allowedRolesAndUs
 - The corpus of the spike has no Owner local role, no sequence setting below the site root (no stock workflow of Plone 6.1 acquires "Access contents information"), no comment and no mount. Its only opaque entries come from two changes on `xlarge-mini`. A check on `xlarge` covers none of these cases. ZOE-301 adds a small synthetic fixture for each.
 - The acceptance test of ZOE-301 compares, before and after changes of security: the resolved value of every catalog entry with the Plone value; the bitmap of each token in the mirror with the postings of a stock `KeywordIndex`; and the rids of queries. It runs on these fixtures and on `xlarge` (G5).
 - The Python path is O(N) in its candidates: 0.18 to 0.42 s at 50,064 catalog entries, not run at one million. Every restricted search pays it while the mirror is `not_ready`, `lag`, `outside_window` or `dropped`. This record accepts the limit until the cache of ZOE-301.
-- ZOE-301 changes the specification: "Step 2" and the invariant of `zoe-catalog` (section 8); the table of the surface of `zoe.plone`, with the backend `security` (`install()`, `uninstall()`, `installed()`) and `ZoeSecurityIndex`; the list of the opt-in backends of `zoe.plone`, with `zoe.plone:security.zcml`; the line of the Indexer in "`zoe.plone` and queued indexing", which adds no security subtree with the index (section 4); and the row F33 (section 8).
+- ZOE-301 changes the specification: "Step 2" and the invariant of `zoe-catalog` (section 8); the table of the surface of `zoe.plone`, with the backend `security` (`install()`, `uninstall()`, `installed()`) and `ZoeSecurityIndex`; the list of the opt-in backends of `zoe.plone`, with `zoe.plone:security.zcml`; the line of the Indexer in "`zoe.plone` and queued indexing", which adds no security subtree with the index (section 4); the row F33 (section 8); and the classes that the mirror serves, with `ZoeSecurityIndex` (section 6).
 
 ## Alternatives
 
