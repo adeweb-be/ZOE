@@ -936,6 +936,13 @@ impl Pool {
         self.shared.listener()?.kv_generation(name).await
     }
 
+    /// Query the catalog mirror of the server, as `Client::catalog_query`
+    /// does, on any connection of the pool.
+    pub async fn catalog_query(&self, catalog: Oid, tid: Tid, plan: Value) -> Result<Value, Error> {
+        let connection = self.shared.any_connection()?;
+        connection.catalog_query(catalog, tid, plan).await
+    }
+
     /// Begin a transaction on a free connection, as `Client::begin_with`
     /// does. Open a connection when none is free and the pool has less than
     /// its bound. Else wait for a free one. After the close, or while the

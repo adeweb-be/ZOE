@@ -6,7 +6,7 @@
 //! is one row here and one arm in `Session::dispatch` or
 //! `Transaction::dispatch`. The server keeps no other list of method names.
 
-use zoe_wire::extension::{KV, LOCK_INTENT, SEQUENCES};
+use zoe_wire::extension::{CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES};
 
 /// Where the call of a method runs, once the connection is registered.
 /// Before `register`, each call runs alone on the read pool.
@@ -71,6 +71,7 @@ pub(crate) enum Op {
     KvGet,
     KvScan,
     KvGeneration,
+    CatalogQuery,
     LockIntent,
     UnlockIntent,
     TpcBegin,
@@ -172,6 +173,7 @@ pub(crate) const METHODS: &[Method] = &[
     Method::new("kv_get", Op::KvGet, Read).of(KV),
     Method::new("kv_scan", Op::KvScan, Read).of(KV),
     Method::new("kv_generation", Op::KvGeneration, Read).of(KV),
+    Method::new("catalog_query", Op::CatalogQuery, Read).of(CATALOG_QUERY),
     Method::new("lock_intent", Op::LockIntent, Transaction).of(LOCK_INTENT),
     Method::new("unlock_intent", Op::UnlockIntent, Transaction).of(LOCK_INTENT),
     Method::new("tpc_begin", Op::TpcBegin, Transaction).no_reply(),

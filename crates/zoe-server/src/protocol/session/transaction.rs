@@ -12,6 +12,7 @@ use super::args::{
     Args, ArgsMut, bin_of, flavour_of, serial_of, store_serial, str_of, text_bytes, ttl_of, u64_of,
 };
 use super::{Fault, Outcome, Session};
+use crate::protocol::catalog;
 use crate::protocol::compress::{Compressor, Job};
 use crate::protocol::extension;
 use crate::protocol::message::{self, Call};
@@ -578,8 +579,18 @@ impl Transaction {
     /// `kv_set(flavour, name, key, value, ttl)`. `ttl` is an int or a float
     /// of seconds for `"ephemeral"`, and nil for `"durable"`. The call has
     /// no reply: an error fails the vote, as an error of `storea` does.
+    ///
+    /// A write of the registration keys of `zoe.catalog` starts the catalog
+    /// mirrors of the store, which read the keys after the commit.
     fn kv_set(&mut self, args: Args<'_>) -> Result<Value, Fault> {
         let [flavour, name, key, value, ttl] = args.exactly::<5>()?;
+        if let (Ok(flavour), Some(name)) = (flavour_of(flavour), name.as_str())
+            && catalog::registers(flavour, name)
+            && self.open.is_some()
+        {
+            let storage = &self.session.storage;
+            storage.catalog.start(&storage.invalidations);
+        }
         self.opened(args.method)?.stage(|txn| {
             let flavour = flavour_of(flavour)?;
             let (name, key) = (str_of(name, "name of a namespace")?, bin_of(key, "key")?);

@@ -21,7 +21,7 @@ use std::time::Duration;
 use rmpv::Value;
 use tokio::sync::{broadcast, mpsc};
 use zoe_core::{Flavour, Oid, Tid};
-use zoe_wire::extension::{KV, LOCK_INTENT, SEQUENCES, TRACE_CONTEXT};
+use zoe_wire::extension::{CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, TRACE_CONTEXT};
 use zoe_wire::{PROTOCOL, p64, u64_of};
 
 use crate::endpoint::{Address, Endpoint};
@@ -628,6 +628,23 @@ impl Client {
         self.check_extension(KV)?;
         let reply = self.inner.call("kv_generation", vec![name.into()]).await?;
         self::tid(&reply, "kv_generation")
+    }
+
+    /// Query the catalog mirror of the server (ADR 0059): the catalog whose
+    /// `Catalog` object has the oid `catalog`, as of the snapshot that ends
+    /// before `tid`, with `plan` in the form of section 8. Return the reply
+    /// map as the server gives it. The overlay is nil. It needs the
+    /// extension `catalog_query`: without it, it fails with
+    /// `Error::Unsupported` and sends nothing. A plan of another form fails
+    /// with the `ValueError` of the server.
+    pub async fn catalog_query(&self, catalog: Oid, tid: Tid, plan: Value) -> Result<Value, Error> {
+        self.check_extension(CATALOG_QUERY)?;
+        let args = vec![p64(catalog.0), p64(tid.0), plan, Value::Nil];
+        let reply = self.inner.call("catalog_query", args).await?;
+        match reply {
+            Value::Map(_) => Ok(reply),
+            other => Err(bad("catalog_query", &other)),
+        }
     }
 
     /// Take the early write-intent lock of each oid of `oids`, in ascending

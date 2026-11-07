@@ -28,11 +28,11 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_POSTING_DICTS` | `zoe serve`, `<zoe>` | the mode of the rules of ADR 0042: `on`, `shadow` or `off` |
 | `ZOE_RESOLUTION_LOG` | `zoe serve`, `<zoe>` | the file of the resolution log |
 | `ZOE_NATIVE_READER` | `<zoe>` | a boolean: the connections of a database on the storage decode their records with the reader of ZOE (ADR 0057); `true` when not set |
-| `ZOE_CATALOG_MEMORY` | `<zoe>` | the bound of the memory of the catalog mirrors of the store, as a byte size such as `2GB` (ADR 0059); `2GB` when not set |
-| `ZOE_CATALOG_WINDOW_TIDS` | `<zoe>` | the newer change sets past which a change set leaves the mirror window; `10000` when not set |
-| `ZOE_CATALOG_WINDOW_SECONDS` | `<zoe>` | the age past which a change set leaves the mirror window, as a time such as `10m`; `10m` when not set |
-| `ZOE_CATALOG_REBASE_ROWS` | `<zoe>` | the rows of the overrides past which a mirror rebases; `20000` when not set |
-| `ZOE_CATALOG_WAIT` | `<zoe>` | the longest wait of a catalog query for the mirror, as a time such as `1s`; `1s` when not set |
+| `ZOE_CATALOG_MEMORY` | `zoe serve`, `<zoe>` | the bound of the memory of the catalog mirrors of each store, as a byte size such as `2GB` (ADR 0059); `2GB` when not set |
+| `ZOE_CATALOG_WINDOW_TIDS` | `zoe serve`, `<zoe>` | the newer change sets past which a change set leaves the mirror window; `10000` when not set |
+| `ZOE_CATALOG_WINDOW_SECONDS` | `zoe serve`, `<zoe>` | the age past which a change set leaves the mirror window, as a time such as `10m`; `10m` when not set |
+| `ZOE_CATALOG_REBASE_ROWS` | `zoe serve`, `<zoe>` | the rows of the overrides past which a mirror rebases; `20000` when not set |
+| `ZOE_CATALOG_WAIT` | `zoe serve`, `<zoe>` | the longest wait of a catalog query for the mirror, as a time such as `1s`; `1s` when not set |
 | `ZOE_FROM_DATA_FS` | `zoe convert` | the `Data.fs` to copy into the store |
 | `ZOE_TO_DATA_FS` | `zoe convert` | the `Data.fs` to copy the store into |
 | `ZOE_DATA_FS_BLOB_DIR` | `zoe convert` | the blob directory of the `Data.fs` |

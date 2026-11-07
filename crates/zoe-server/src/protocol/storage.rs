@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use zoe_core::Store;
 
+use super::catalog::Catalog;
 use super::compress::Compressor;
 use super::invalidation::Invalidations;
 use super::metrics::{Exported, Metrics};
@@ -78,6 +79,8 @@ pub(crate) struct NamedStorage {
     /// closes the connection, and the transaction aborts. `None` closes
     /// no connection for this reason.
     pub(crate) transaction_timeout: Option<Duration>,
+    /// The host of the catalog mirrors of the store (ADR 0059).
+    pub(super) catalog: Catalog,
     /// True when the store is on a `MemVfs` of the simulator, so it has no
     /// directory to measure.
     #[cfg(feature = "sim")]
@@ -95,6 +98,7 @@ impl NamedStorage {
             name: name.to_owned(),
             path: path.to_path_buf(),
             invalidations: Arc::new(Invalidations::new(store.last_transaction())),
+            catalog: Catalog::new(&store, zoe_catalog::Config::default()),
             store,
             stats: Arc::new(Stats::new(SystemTime::now())),
             metrics,
@@ -162,6 +166,18 @@ impl NamedStorage {
     pub(crate) fn transaction_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.transaction_timeout = timeout;
         self
+    }
+
+    /// Keep the catalog mirrors of the store with `config`.
+    pub(crate) fn catalog(mut self, config: zoe_catalog::Config) -> Self {
+        self.catalog = Catalog::new(&self.store, config);
+        self
+    }
+
+    /// Start the catalog mirrors of the store when its namespace
+    /// `zoe.catalog` holds a registration key.
+    pub(crate) fn start_catalog(&self) {
+        self.catalog.start_if_registered(&self.invalidations);
     }
 
     /// Write the lines of the resolution log to `log`.
@@ -265,6 +281,11 @@ impl Storages {
             .collect()
     }
 
+    /// Stop the catalog mirrors of each storage, and wait for them.
+    pub(crate) fn stop_catalogs(&self) {
+        stop_catalogs(&self.storages);
+    }
+
     /// Return the reply to `ruok`: the status of each storage. It reads the
     /// stores.
     pub(super) fn ruok(&self) -> String {
@@ -274,5 +295,18 @@ impl Storages {
             .map(|storage| (storage.name.as_str(), storage.status()))
             .collect();
         status::ruok(&statuses)
+    }
+}
+
+/// Stop the catalog mirrors of each of `storages`, and wait for them. All
+/// get the signal first: a build of one store waits for the build of
+/// another, which a single process runs one at a time, so a join before
+/// the next signal could wait for a whole build.
+pub(crate) fn stop_catalogs(storages: &[Arc<NamedStorage>]) {
+    for storage in storages {
+        Catalog::signal_stop(&storage.invalidations);
+    }
+    for storage in storages {
+        Catalog::stop(&storage.invalidations);
     }
 }

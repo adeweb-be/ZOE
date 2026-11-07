@@ -16,7 +16,7 @@ The stores add up. The server serves the store of `--path` under the storage nam
 ## Keys
 
 - The top-level keys are the long options of `zoe serve` without `--`, such as `listen` and `admin-listen` (see [The zoe command](cli.md#zoe-serve)). Three options are not keys: `config`, `storage` and `structural-merge-class`. The `[storages.NAME]` tables take the place of `--storage`, and the table `[structural-merge-classes]` the place of `--structural-merge-class`.
-- A key takes a string, an integer or a boolean, with the syntax of its option: `listen = "127.0.0.1:8100"`, `client-queue-size = 1000`, `read-only = true`, `shutdown-timeout = "30s"`.
+- A key takes a string, an integer or a boolean, with the syntax of its option: `listen = "127.0.0.1:8100"`, `client-queue-size = 1000`, `read-only = true`, `shutdown-timeout = "30s"`. The keys of the catalog mirrors are `catalog-memory`, `catalog-window-tids`, `catalog-window-seconds`, `catalog-rebase-rows` and `catalog-wait`: `catalog-memory = "2GB"`, `catalog-wait = "1s"`.
 - Each `[storages.NAME]` table adds a store under the storage name `NAME`.
 - The table `[structural-merge-classes]` gives the mode of classes of tier 1, as `CLASS = MODE`. When the command line or the twin gives `--structural-merge-class`, the server ignores this table.
 

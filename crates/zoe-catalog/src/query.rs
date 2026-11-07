@@ -22,6 +22,7 @@ use crate::base::{
 };
 use crate::cell;
 use crate::change::{Overrides, Slot, same, value};
+use crate::plan::ClauseKind;
 use crate::reason::{Fallback, Reason};
 use crate::table::Cell;
 use crate::value::{Val, py_cmp};
@@ -264,6 +265,32 @@ impl<'a> View<'a> {
             .get(&i)
             .copied()
             .unwrap_or(self.base.indexes[i].length)
+    }
+
+    /// Refuses a clause whose kind on the wire (`kinds`, in the order of
+    /// the clauses of `plan`) does not read the class of its index: the
+    /// reason `plan`. A clause on an index that the mirror does not serve
+    /// passes: the query gives its reason.
+    pub fn check_kinds(&self, plan: &Plan, kinds: &[ClauseKind]) -> Result<(), Fallback> {
+        for (clause, kind) in plan.clauses.iter().zip(kinds) {
+            let Some(&i) = self.base.by_name.get(&clause.index) else {
+                continue;
+            };
+            let Some(class) = self.base.indexes[i].kind else {
+                continue;
+            };
+            if !kind.reads(class) {
+                return fallback(
+                    Reason::Plan,
+                    format!(
+                        "a clause of the kind {:?} on the index {} of another class",
+                        kind.name(),
+                        clause.index
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Answers `plan`, with the rows of `columns`.

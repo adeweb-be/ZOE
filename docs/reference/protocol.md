@@ -35,7 +35,7 @@ The methods that the `ZEOStorage` of ZEO 6 exposes, and the ZOE extensions:
 | copy and backup | `restorea`, `iterator_start`, `iterator_next`, `iterator_record_start`, `iterator_record_next`, `iterator_gc` | as ZEO | For `zodbconvert`, backups and `zodbverify`. A connection keeps at most 1,000 open iterators. |
 | maintenance | `pack` | as ZEO | Online: the other calls go on while it runs. A read-only connection packs, as in ZEO, and a read-only store refuses. |
 | undo | `undo`, `undoa`, `undoInfo`, `undoLog` | as ZEO | An undo that no tier merges fails the vote with `MultipleUndoErrors`. |
-| extensions | `sequence_next`, `kv_get`, `kv_scan`, `kv_generation`, `kv_set`, `kv_delete`, `lock_intent`, `unlock_intent` | ZOE only | Only after the client declared the extension in `register`. Another connection gets `ValueError`, and stays open. |
+| extensions | `sequence_next`, `kv_get`, `kv_scan`, `kv_generation`, `kv_set`, `kv_delete`, `lock_intent`, `unlock_intent`, `catalog_query` | ZOE only | Only after the client declared the extension in `register`. Another connection gets `ValueError`, and stays open. |
 
 After each commit, every other client of the storage gets one `invalidateTransaction(tid, oids)`, also with an empty list, as ZEO 6.2 does. The client that committed gets `info {length, size}`, then the reply of its `tpc_finish`, and no invalidation.
 
@@ -50,5 +50,27 @@ A client declares the extensions that it wants as a third argument of `register`
 | `lock_intent` | `lock_intent(oids)`, `unlock_intent()` | The early write-intent locks (ADR 0044, part B). `lock_intent` takes the lock of each oid in ascending order, within the lock timeout, and returns the current serial of each one. The next `tpc_begin` of the session adopts the locks. A session that holds them 60 seconds without a `tpc_begin` loses them. |
 | `trace_context` | none | Each message can carry a fifth element, a map whose key `traceparent` holds a W3C traceparent. The span of the call joins the trace of the client. A fifth element on a connection without the extension closes the connection. |
 | `server_writes` | none | The client promises to give every Connection of its process the oids of its commit, also an oid that the vote wrote without a store. Only then can the split merge write in the vote the new bucket of the other side (ADR 0048). The native client of `zoe.zeo.ClientStorage` declares it. |
+| `catalog_query` | `catalog_query(catalog, tid, plan, overlay)` | A query of the catalog mirror of the store (ADR 0059), below. The native client of `zoe.zeo.ClientStorage` declares it. |
 
-`zoe.zeo.ClientStorage` declares `sequences`, `lock_intent` and `kv`, `trace_context` when the package `opentelemetry` is installed, and `server_writes` with the native client.
+`zoe.zeo.ClientStorage` declares `sequences`, `lock_intent` and `kv`, `trace_context` when the package `opentelemetry` is installed, and `server_writes` and `catalog_query` with the native client.
+
+### `catalog_query`
+
+Each store keeps the mirrors of the catalogs that its durable namespace `zoe.catalog` lists, under its own bound `--catalog-memory`, for every client. The mirrors start at the open of a store with a registration key, or at the first `kv_set` of the namespace, and build in the background.
+
+- `catalog` is the 8 bytes of the oid of the `Catalog` object. `tid` is 8 bytes, exclusive as the tid of `loadBefore`: the answer is the version of the last commit before it.
+- The call runs on the read pool, outside the transaction of the connection, also on a read-only connection or store. A snapshot that holds a commit that the mirror did not apply waits for it, at most `--catalog-wait`, then gives `lag`.
+- `plan` has the form of ADR 0059, section 8. A plan of another form fails the call with `ValueError`, and the connection stays open. An unknown key or kind of clause gives the reason `plan`, and so does a clause whose kind (`v`, `b`, `d`, `p`) does not read the class of its index.
+- `overlay` is nil. The server reads no transaction overlay yet: another value gives the reason `plan`.
+
+The reply is a map with the key `tid`, the tid of the call. A native answer has `r`, the rids as signed 32-bit big-endian ints in one bin, `n`, the length of the lazy result, `a`, `actual_result_count`, and, when the plan names `cols`, `rows` and `paths` for the first `rn` rids. A fallback has `f`, the reason, and `why`, a text. Each row is an array of msgpack cells, or nil:
+
+| Cell | msgpack |
+| --- | --- |
+| `None`, a bool, an int of 64 bits, a float, a str, bytes | nil, bool, int, float, str, bin |
+| a tuple, a dict | an array, a map |
+| `Missing.Value` | ext 1, no data |
+| `DateTime` | ext 2: 8 bytes of `_micros` as a big-endian int64, one byte for the naive flag (0 or 1), then the UTF-8 of `_tz` |
+| `Message` | ext 3: the msgpack array of the arguments of its `__reduce__` |
+
+A row with a value of another type is nil, and the client makes that brain from `data`.
