@@ -53,17 +53,15 @@ _zeo_logger = logging.getLogger("ZEO.ClientStorage")
 _MB = 1024**2
 
 # The extensions that the native client declares: those of the client of
-# ZEO, and `server_writes` (ADR 0049). With it, the vote of the server can
-# write a record that the transaction did not store, and the finish gives
-# every Connection of the process every oid of the commit. The asyncio
-# client does not keep that promise, so it does not declare it.
+# ZEO, `server_writes` (ADR 0049) and `catalog_query` (ADR 0059). With
+# `server_writes`, the vote of the server can write a record that the
+# transaction did not store, and the finish gives every Connection of the
+# process every oid of the commit. The asyncio client does not keep that
+# promise, so it does not declare it. Only the native client gives
+# `catalog_query`, so the asyncio client does not declare it either.
 _SERVER_WRITES = "server_writes"
-_NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES)
-
-# The extension of the catalog queries (ADR 0059). The native client
-# declares it after `_NATIVE_EXTENSIONS`: only the native client serves
-# `catalog_query`, so the asyncio client does not declare it.
 _CATALOG_QUERY = "catalog_query"
+_NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES, _CATALOG_QUERY)
 
 # The protocols of a server for which a `ClientStorage` without `native`
 # takes the asyncio client of ZEO inside: the pickle protocol of a stock
@@ -585,7 +583,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
                 storage,
                 read_only=self._read_only,
                 read_only_fallback=self._read_only_fallback,
-                extensions=[*_NATIVE_EXTENSIONS, _CATALOG_QUERY],
+                extensions=list(_NATIVE_EXTENSIONS),
                 wait_timeout=float(wait_timeout or 30),
                 pool_bound=_POOL_BOUND,
                 cache_size=cache_size,

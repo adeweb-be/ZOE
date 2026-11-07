@@ -97,6 +97,14 @@ impl Catalog {
         mirrors.committed(hub.published().0);
     }
 
+    /// Tell the thread of the mirrors and their builds to stop. Do not
+    /// wait for them.
+    pub(crate) fn signal_stop(hub: &Invalidations) {
+        if let Some(mirrors) = hub.follower() {
+            mirrors.signal_stop();
+        }
+    }
+
     /// Stop the thread of the mirrors and their builds, and wait for them.
     pub(crate) fn stop(hub: &Invalidations) {
         if let Some(mirrors) = hub.follower() {

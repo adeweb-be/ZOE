@@ -286,8 +286,8 @@ pub(crate) fn value_of_wire(wire: Wire) -> rmpv::Value {
 /// The reply `value` of `catalog_query` over the wire, as `reply` gives
 /// the reply of the mirrors of the process: the same keys and the same
 /// types. Each row keeps its msgpack bytes, and `CatalogRows` makes its
-/// Python values only when the row is read. A reply of another form
-/// raises `ValueError`.
+/// Python values only when the row is read. A key that this version does
+/// not know is left out. A known key of another form raises `ValueError`.
 pub(crate) fn reply_of_value<'py>(
     py: Python<'py>,
     value: rmpv::Value,
@@ -366,7 +366,11 @@ pub(crate) fn reply_of_value<'py>(
                     s.as_str().ok_or_else(|| bad("a text that is not UTF-8"))?,
                 )?;
             }
-            _ => return Err(bad(&format!("the key {key:?} of another form"))),
+            ("tid" | "r" | "n" | "a" | "rows" | "paths" | "f" | "why", _) => {
+                return Err(bad(&format!("the key {key:?} of another form")));
+            }
+            // A newer server can add a key: an older client reads past it.
+            _ => {}
         }
     }
     if answered {

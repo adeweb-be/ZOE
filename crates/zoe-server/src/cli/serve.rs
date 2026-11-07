@@ -186,12 +186,12 @@ pub(super) struct ServeArgs {
     catalog_window_seconds: Option<Duration>,
 
     /// The rows of the overrides of the last tid past which a catalog
-    /// mirror rebases in the background. The default is 20000.
+    /// mirror rebases in the background, 1 or more. The default is 20000.
     #[arg(
         long,
         env = "ZOE_CATALOG_REBASE_ROWS",
         value_name = "ROWS",
-        value_parser = clap::value_parser!(u64)
+        value_parser = rebase_rows
     )]
     catalog_rebase_rows: Option<u64>,
 
@@ -584,6 +584,18 @@ fn catalog_memory(value: &str) -> Result<usize, String> {
     match byte_size(value)? {
         0 => Err("the catalog memory is more than 0 bytes".to_owned()),
         bytes => Ok(bytes),
+    }
+}
+
+/// Read the rows past which a mirror rebases: a whole number, 1 or more. 0
+/// would rebase after each commit.
+fn rebase_rows(value: &str) -> Result<u64, String> {
+    match value.trim().parse::<u64>() {
+        Ok(0) => Err(
+            "the catalog rebase rows are 1 or more: 0 would rebase after each commit".to_owned(),
+        ),
+        Ok(rows) => Ok(rows),
+        Err(_) => Err(format!("{value} is not a whole number of rows")),
     }
 }
 
@@ -1176,6 +1188,7 @@ mod tests {
         for refused in [
             &["--catalog-memory", "0"][..],
             &["--catalog-window-tids", "0"],
+            &["--catalog-rebase-rows", "0"],
             &["--catalog-wait", "1x"],
         ] {
             let error = serve(refused).unwrap_err();

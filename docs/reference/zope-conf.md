@@ -111,7 +111,7 @@ An unknown key, a bad boolean, a storage without a path and a storage name that 
 | `catalog-memory` | `--catalog-memory` | The bound of the catalog mirrors of each store with a registered catalog, such as `2GB`. The default is 2 GiB. |
 | `catalog-window-tids` | `--catalog-window-tids` | The change sets of the mirror window. The default is 10000. |
 | `catalog-window-seconds` | `--catalog-window-seconds` | The age past which a change set leaves the mirror window, in whole seconds. The default is 600. |
-| `catalog-rebase-rows` | `--catalog-rebase-rows` | The rows of the overrides past which a mirror rebases. The default is 20000. |
+| `catalog-rebase-rows` | `--catalog-rebase-rows` | The rows of the overrides past which a mirror rebases, 1 or more. The default is 20000. |
 | `catalog-wait` | `--catalog-wait` | The longest wait of a catalog query for the mirror, in whole seconds. The default is 1. |
 | `compression` | `--compression` | `none`, `zstd` or `zstd:LEVEL`. The default is `none`. |
 | `lock-timeout` | `--lock-timeout` | The longest lock wait of a vote, in whole seconds. |

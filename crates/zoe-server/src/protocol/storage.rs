@@ -180,12 +180,6 @@ impl NamedStorage {
         self.catalog.start_if_registered(&self.invalidations);
     }
 
-    /// Stop the catalog mirrors of the store, and wait for their thread
-    /// and their builds.
-    pub(crate) fn stop_catalog(&self) {
-        Catalog::stop(&self.invalidations);
-    }
-
     /// Write the lines of the resolution log to `log`.
     pub(crate) fn resolution_log(mut self, log: Option<Arc<ResolutionLog>>) -> Self {
         self.resolution_log = log;
@@ -289,9 +283,7 @@ impl Storages {
 
     /// Stop the catalog mirrors of each storage, and wait for them.
     pub(crate) fn stop_catalogs(&self) {
-        for storage in &self.storages {
-            storage.stop_catalog();
-        }
+        stop_catalogs(&self.storages);
     }
 
     /// Return the reply to `ruok`: the status of each storage. It reads the
@@ -303,5 +295,18 @@ impl Storages {
             .map(|storage| (storage.name.as_str(), storage.status()))
             .collect();
         status::ruok(&statuses)
+    }
+}
+
+/// Stop the catalog mirrors of each of `storages`, and wait for them. All
+/// get the signal first: a build of one store waits for the build of
+/// another, which a single process runs one at a time, so a join before
+/// the next signal could wait for a whole build.
+pub(crate) fn stop_catalogs(storages: &[Arc<NamedStorage>]) {
+    for storage in storages {
+        Catalog::signal_stop(&storage.invalidations);
+    }
+    for storage in storages {
+        Catalog::stop(&storage.invalidations);
     }
 }

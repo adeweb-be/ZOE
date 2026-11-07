@@ -397,7 +397,16 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     plan, reason = plan_of(catalog, query, sort_index, reverse, limit, merge)
     if plan is None:
         return None, reason, None
-    reply = storage.catalog_query(oid, start, plan)
+    from ZODB.POSException import StorageError, Unsupported
+
+    try:
+        reply = storage.catalog_query(oid, start, plan)
+    except (Unsupported, StorageError):
+        # The server stopped serving the extension, as an older server
+        # after a failover, or the connection is lost. The stock search
+        # answers. A plan of another form raises `ValueError`, a fault of
+        # the hook, which goes on.
+        return None, "unsupported", plan
     if "f" in reply:
         return None, None, plan
     return _result(catalog, reply, jar, start), None, plan

@@ -89,7 +89,7 @@ Serve stores with the ZEO 6 msgpack protocol until SIGTERM or SIGINT, each store
 | `--catalog-memory BYTES` | `ZOE_CATALOG_MEMORY` | 2 GiB | The bound of the memory of the catalog mirrors of each store with a registered catalog, with the units of `--cache-size`, more than 0 (ADR 0059). A build, a rebase or a growth that would pass it drops the mirror that answered a query least recently, and its queries take the Python path (`dropped`). |
 | `--catalog-window-tids TIDS` | `ZOE_CATALOG_WINDOW_TIDS` | `10000`, at least 1 | The change set of a commit leaves the mirror window when this many newer change sets exist. A query at an older tid takes the Python path (`outside_window`). |
 | `--catalog-window-seconds SECONDS` | `ZOE_CATALOG_WINDOW_SECONDS` | `600`, 10 minutes | The age past which a change set leaves the mirror window. |
-| `--catalog-rebase-rows ROWS` | `ZOE_CATALOG_REBASE_ROWS` | `20000` | The rows of the overrides of the last tid past which a catalog mirror rebases in the background. |
+| `--catalog-rebase-rows ROWS` | `ZOE_CATALOG_REBASE_ROWS` | `20000`, at least 1 | The rows of the overrides of the last tid past which a catalog mirror rebases in the background. |
 | `--catalog-wait SECONDS` | `ZOE_CATALOG_WAIT` | `1` | The longest wait of a `catalog_query` for the mirror to apply the commits of its snapshot. The wait holds a thread of the read pool. Past it, the reply is `lag`. |
 | `--lock-timeout SECONDS` | `ZOE_LOCK_TIMEOUT` | the default of the store, 10 seconds | The longest time that a vote waits for the lock of an object. A longer wait fails the vote with `ConflictError`. |
 | `--lock-warn SECONDS` | `ZOE_LOCK_WARN` | none: no line | Log each lock held longer than this, when the lock is released. 0 logs no lock. |

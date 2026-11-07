@@ -7,7 +7,8 @@ The site of `zoe.plone.testing.ZOE_SERVE_SITE` lives in a database whose
 storage is the native client of a `zoe serve`, with no `DemoStorage` on
 it, so the server holds the mirror. The registration writes the key of the
 site through `zoe.kv` on the native client. A stock `ZEO.ClientStorage` of
-the same server takes the Python path, with the reason `unsupported`.
+the same server takes the Python path, with the reason `unsupported`, and
+so does a call that fails with `Unsupported` or a lost connection.
 `just plone zoe backends` runs these tests; the server is the `zoe` binary
 that `ZOE_BINARY` names.
 """
@@ -106,6 +107,24 @@ class TestTheCatalogMirrorOverZoeServe(unittest.TestCase):
             site.manage_delObjects(["later"])
             transaction.commit()
         self.assertEqual(catalog._counts_now()["queries"].get("native"), 2)
+
+    def test_an_error_of_the_call_takes_the_python_path_unsupported(self):
+        from unittest import mock
+
+        from ZEO.Exceptions import ClientDisconnected
+        from ZODB.POSException import Unsupported
+
+        for error in (Unsupported("an older server"), ClientDisconnected("gone")):
+            with (
+                mock.patch.object(self.storage, "catalog_query", side_effect=error),
+                opened(self.db) as site,
+            ):
+                query = QUERIES[0]
+                got = answer(site.portal_catalog.unrestrictedSearchResults(**query))
+                self.assertEqual(got, stock(site, query))
+        counts = catalog._counts_now()
+        self.assertEqual(counts["fallbacks"][("unsupported", "client")], 2)
+        self.assertNotIn("native", counts["queries"])
 
     def test_a_stock_zeo_client_takes_the_python_path_unsupported(self):
         from ZEO.ClientStorage import ClientStorage

@@ -617,7 +617,7 @@ In a buildout, `plone.recipe.zope2instance` knows only filestorage, ZEO client a
 | `--catalog-memory SIZE` | `ZOE_CATALOG_MEMORY` | 2 GiB | the bound of the catalog mirrors of each store with a registered catalog, with the units of `--cache-size` (ADR 0059, section 6) |
 | `--catalog-window-tids N` | `ZOE_CATALOG_WINDOW_TIDS` | 10,000 | the change sets of the mirror window, at least 1 |
 | `--catalog-window-seconds SECONDS` | `ZOE_CATALOG_WINDOW_SECONDS` | 600 s | the age past which a change set leaves the mirror window |
-| `--catalog-rebase-rows N` | `ZOE_CATALOG_REBASE_ROWS` | 20,000 | the rows of the overrides of the last tid past which a mirror rebases |
+| `--catalog-rebase-rows N` | `ZOE_CATALOG_REBASE_ROWS` | 20,000, at least 1 | the rows of the overrides of the last tid past which a mirror rebases |
 | `--catalog-wait SECONDS` | `ZOE_CATALOG_WAIT` | 1 s | the longest wait of a `catalog_query` for the mirror to apply the commits of its snapshot; past it, the reply is `lag` |
 | `--blocking-threads N` | `ZOE_BLOCKING_THREADS` | the number of cores | the threads of the read pool (see "Connection handling") |
 | `--shared-blob-dir[=BOOL]` | `ZOE_SHARED_BLOB_DIR` | off | accepts `storeBlobShared` (see the row blobs of the protocol matrix) |

@@ -480,6 +480,12 @@ impl Mirrors {
         std::mem::take(&mut self.shared.lock().events)
     }
 
+    /// Tells the thread and the builds to stop, and does not wait for them.
+    /// `stop` waits.
+    pub fn signal_stop(&self) {
+        self.shared.signal_stop();
+    }
+
     /// Stops the thread and the builds, and waits for them.
     pub fn stop(&self) {
         self.shared.signal_stop();

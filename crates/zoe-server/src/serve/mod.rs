@@ -248,50 +248,62 @@ impl Server {
         // own lock manager, and each storage its own invalidations.
         let mut storages = Vec::with_capacity(options.storages.len());
         let mut stores = Vec::with_capacity(options.storages.len());
-        for storage in &options.storages {
-            let read_only = options.is_read_only(storage);
-            let store = if read_only {
-                open_read_only(&storage.name, &storage.path, options.store_options(storage))?
-            } else {
-                open(&storage.name, &storage.path, options.store_options(storage))?
-            };
-            // The open cut the damaged last entry of the write-ahead log: a
-            // crash stopped its finish, or a damage of the disk destroyed
-            // it after its sync. Its commits are lost (ADR 0056).
-            if let Some((previous, last)) = store.cut_at_open() {
-                tracing::error!(
-                    storage = storage.name.as_str(),
-                    previous_tid = format_args!("{:016x}", previous.0),
-                    last_tid = format_args!("{:016x}", last.0),
-                    "the open cut the damaged last entry of the write-ahead log: \
-                     the commits after previous_tid up to last_tid are lost"
-                );
+        // A store that does not open stops the catalog mirrors of the
+        // stores that opened before it, so no build keeps their stores.
+        let opened = (|| -> Result<(), Error> {
+            for storage in &options.storages {
+                let read_only = options.is_read_only(storage);
+                let store = if read_only {
+                    open_read_only(&storage.name, &storage.path, options.store_options(storage))?
+                } else {
+                    open(&storage.name, &storage.path, options.store_options(storage))?
+                };
+                // The open cut the damaged last entry of the write-ahead log: a
+                // crash stopped its finish, or a damage of the disk destroyed
+                // it after its sync. Its commits are lost (ADR 0056).
+                if let Some((previous, last)) = store.cut_at_open() {
+                    tracing::error!(
+                        storage = storage.name.as_str(),
+                        previous_tid = format_args!("{:016x}", previous.0),
+                        last_tid = format_args!("{:016x}", last.0),
+                        "the open cut the damaged last entry of the write-ahead log: \
+                         the commits after previous_tid up to last_tid are lost"
+                    );
+                }
+                // The blob directory gets its layout file before a client of
+                // the shared directory creates the directory of an oid there.
+                if options.shared_blob_dir && !read_only {
+                    store
+                        .blob_temp_dir()
+                        .map_err(|error| Error::Store(storage.path.clone(), error))?;
+                }
+                stores.push(StoreHealth {
+                    name: storage.name.clone(),
+                    no_stale_locks: store.lock_table_is_empty(),
+                });
+                let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
+                let named = named
+                    .read_only(read_only)
+                    .resolution_log(resolution_log.clone())
+                    .shared_blob_dir(options.shared_blob_dir)
+                    .timeout(
+                        !options.idle_timeout.is_zero() || !options.transaction_timeout.is_zero(),
+                    )
+                    .transaction_timeout(
+                        (!options.transaction_timeout.is_zero())
+                            .then_some(options.transaction_timeout),
+                    )
+                    .catalog(options.catalog_config());
+                // The catalog mirrors of a registered catalog build in the
+                // background, so the start does not wait for them.
+                named.start_catalog();
+                storages.push(Arc::new(named));
             }
-            // The blob directory gets its layout file before a client of
-            // the shared directory creates the directory of an oid there.
-            if options.shared_blob_dir && !read_only {
-                store
-                    .blob_temp_dir()
-                    .map_err(|error| Error::Store(storage.path.clone(), error))?;
-            }
-            stores.push(StoreHealth {
-                name: storage.name.clone(),
-                no_stale_locks: store.lock_table_is_empty(),
-            });
-            let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
-            let named = named
-                .read_only(read_only)
-                .resolution_log(resolution_log.clone())
-                .shared_blob_dir(options.shared_blob_dir)
-                .timeout(!options.idle_timeout.is_zero() || !options.transaction_timeout.is_zero())
-                .transaction_timeout(
-                    (!options.transaction_timeout.is_zero()).then_some(options.transaction_timeout),
-                )
-                .catalog(options.catalog_config());
-            // The catalog mirrors of a registered catalog build in the
-            // background, so the start does not wait for them.
-            named.start_catalog();
-            storages.push(Arc::new(named));
+            Ok(())
+        })();
+        if let Err(error) = opened {
+            protocol::stop_catalogs(&storages);
+            return Err(error);
         }
         health.measured(storages.iter().map(|storage| storage.exported()).collect());
         let storages = Storages::new(storages, options.queues.client)
