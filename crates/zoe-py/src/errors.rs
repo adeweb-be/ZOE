@@ -140,7 +140,12 @@ impl Failure {
                 message(storage_transaction_error(py), &self.error)
             }
             ZoeError::Io(error) => error.into(),
-            ZoeError::InvalidKv(_) => PyValueError::new_err(self.error.to_string()),
+            ZoeError::TextConflict { catalog } => {
+                conflict(py, conflict_error(py), catalog, None, None)
+            }
+            ZoeError::InvalidKv(_) | ZoeError::InvalidText(_) => {
+                PyValueError::new_err(self.error.to_string())
+            }
             ZoeError::Locked
             | ZoeError::Closed
             | ZoeError::Format(_)
@@ -149,6 +154,7 @@ impl Failure {
             | ZoeError::RepairFailed(_)
             | ZoeError::TooLarge { .. }
             | ZoeError::KvTooLarge { .. }
+            | ZoeError::TextTooLarge { .. }
             | ZoeError::MissingBlobDir { .. }
             | ZoeError::NotBlobDir { .. } => message(storage_error(py), &self.error),
             ZoeError::Halted
@@ -157,6 +163,7 @@ impl Failure {
             | ZoeError::CorruptTxn { .. }
             | ZoeError::CorruptSequence { .. }
             | ZoeError::CorruptKv { .. }
+            | ZoeError::CorruptText { .. }
             | ZoeError::Backend(_) => message(storage_system_error(py), &self.error),
         }
     }
