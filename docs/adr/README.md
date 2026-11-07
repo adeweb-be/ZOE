@@ -61,4 +61,4 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0055](0055-zoe-wire.md) | zoe-wire: the ZEO frame codec and the TLS certificate reader, written once in a sans-IO crate | accepted | |
 | [0056](0056-the-write-ahead-log.md) | A write-ahead log with a background fold: ZOE format 3 | accepted | |
 | [0057](0057-the-reader-of-zoe.md) | The reader of ZOE: a record decodes in Rust in place of ObjectReader | accepted | |
-| [0060](0060-the-native-text-index.md) | The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex | proposed | |
+| [0060](0060-the-native-text-index.md) | The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex | accepted | |
