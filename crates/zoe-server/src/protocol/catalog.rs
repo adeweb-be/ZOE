@@ -90,11 +90,7 @@ impl Catalog {
         }
         let weak = self.store.clone();
         let open: Opener = Arc::new(move || weak.upgrade().map(|s| s as Arc<dyn Reads>));
-        let mirrors = Arc::new(Mirrors::start(
-            open,
-            hub.published().0,
-            self.config.clone(),
-        ));
+        let mirrors = Arc::new(Mirrors::start(open, hub.published().0, self.config.clone()));
         hub.follow(Arc::clone(&mirrors));
         // A commit that the hub published between the start and the follow
         // reaches the mirrors here.

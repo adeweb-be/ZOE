@@ -73,7 +73,9 @@ SEEDS = {
     "date-range": plan([{"k": "d", "i": "effectiveRange", "t": 29000000}]),
     "date-range-nil": plan([{"k": "d", "i": "effectiveRange", "t": None}]),
     "path": plan([path("path", [["/site/folder", None], ["/site/other", 1]], depth=1)]),
-    "navtree": plan([path("path", [["/site/folder/doc", None]], navtree=True, start=1)]),
+    "navtree": plan(
+        [path("path", [["/site/folder/doc", None]], navtree=True, start=1)]
+    ),
     "batch-rows": plan(
         [keys("portal_type", ["Document"])],
         sort=[["getId", True], ["created", None]],

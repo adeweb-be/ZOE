@@ -72,7 +72,7 @@ impl Catalog {
             &format!("/site/item-{i}"),
             &[
                 ("portal_type", Val::Str(kind.into())),
-                ("is_folderish", Val::Bool(i % 2 == 0)),
+                ("is_folderish", Val::Bool(i.is_multiple_of(2))),
                 ("getId", Val::Str(format!("item-{i}").into())),
             ],
         );
@@ -183,8 +183,10 @@ fn answer(reply: &Value) -> Result<Vec<i32>, String> {
         panic!("a reply without r: {reply:?}");
     };
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_be_bytes(*c))
         .collect())
 }
 
@@ -210,7 +212,11 @@ fn settled(conn: &mut Conn, catalog: u64, tid: u64, plan: &Value) -> Result<Vec<
 fn until_reason(conn: &mut Conn, catalog: u64, tid: u64, plan: &Value, reason: &str) -> bool {
     let deadline = Instant::now() + WAIT;
     while Instant::now() < deadline {
-        if answer(&query(conn, catalog, tid, plan).unwrap()).err().as_deref() == Some(reason) {
+        if answer(&query(conn, catalog, tid, plan).unwrap())
+            .err()
+            .as_deref()
+            == Some(reason)
+        {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -234,10 +240,16 @@ fn commit(
         let serial = serials.get(oid).copied().unwrap_or(0);
         conn.send_async(
             "storea",
-            vec![p64(*oid), p64(serial), Value::Binary(data.clone()), id.clone()],
+            vec![
+                p64(*oid),
+                p64(serial),
+                Value::Binary(data.clone()),
+                id.clone(),
+            ],
         );
     }
-    let namespace = |key: &[u8; 8]| vec![s("durable"), s("zoe.catalog"), Value::Binary(key.to_vec())];
+    let namespace =
+        |key: &[u8; 8]| vec![s("durable"), s("zoe.catalog"), Value::Binary(key.to_vec())];
     for key in register {
         let mut args = namespace(key);
         args.extend([Value::Binary(Vec::new()), Value::Nil]);
@@ -326,7 +338,13 @@ fn a_commit_that_adds_a_key_builds_the_catalog_and_one_that_removes_it_drops_the
         answer(&query(&mut writer, other.oid(), tid + 1, &of_type("Folder")).unwrap()),
         Err("not_registered".to_owned())
     );
-    let tid = commit(&mut writer, &mut serials, &records, &[other.model.key()], &[]);
+    let tid = commit(
+        &mut writer,
+        &mut serials,
+        &records,
+        &[other.model.key()],
+        &[],
+    );
     let plan = of_type("Folder");
     assert_eq!(
         settled(&mut writer, other.oid(), tid + 1, &plan),
@@ -363,13 +381,19 @@ fn a_query_at_a_tid_gives_the_rids_of_that_tid_after_later_commits() {
     let mut writer = client(server.addr(), "1", false, DECLARED);
     let plan = of_type("Document");
     let before = catalog.rids("Document");
-    assert_eq!(settled(&mut reader, catalog.oid(), first + 1, &plan), Ok(before.clone()));
+    assert_eq!(
+        settled(&mut reader, catalog.oid(), first + 1, &plan),
+        Ok(before.clone())
+    );
     let mut serials = serials_of(&records, first);
     let mut tids = Vec::new();
     for i in 20..26 {
         catalog.add(i);
         let records = catalog.model.records();
-        tids.push((commit(&mut writer, &mut serials, &records, &[], &[]), catalog.rids("Document")));
+        tids.push((
+            commit(&mut writer, &mut serials, &records, &[], &[]),
+            catalog.rids("Document"),
+        ));
     }
     assert_ne!(tids.last().unwrap().1, before);
     // The snapshot of the first tid keeps its rids.
@@ -482,7 +506,11 @@ fn with_the_apply_held_a_newer_tid_gets_lag_and_the_commits_are_not_delayed() {
     let found = answer(&query(&mut reader, catalog.oid(), first + 1, &plan).unwrap());
     assert!(found.is_ok(), "{found:?}");
     let admin = server.admin_addr().unwrap();
-    let lag = sample(admin, "zoe_catalog_mirror_lag_tids", &mirror("1", catalog.oid()));
+    let lag = sample(
+        admin,
+        "zoe_catalog_mirror_lag_tids",
+        &mirror("1", catalog.oid()),
+    );
     assert!(lag.is_some_and(|lag| lag >= 1.0), "{lag:?}");
     hold.set(false);
     let deadline = Instant::now() + WAIT;
@@ -506,7 +534,10 @@ fn a_connection_that_did_not_declare_the_extension_gets_value_error_and_stays_op
     let mut stock = Conn::open(server.addr());
     stock.register("1", false).unwrap();
     let info = stock.call("get_info", vec![]).unwrap();
-    assert!(get(&info, "extensions").is_none(), "a stock client sees extensions");
+    assert!(
+        get(&info, "extensions").is_none(),
+        "a stock client sees extensions"
+    );
     let fault = query(&mut stock, catalog.oid(), tid + 1, &of_type("Document")).unwrap_err();
     assert_eq!(fault.class, "builtins.ValueError");
     assert_eq!(stock.call("ping", vec![]).unwrap(), Value::Nil);
@@ -532,9 +563,7 @@ fn a_tid_outside_the_mirror_window_gets_outside_window() {
     let mut catalog = Catalog::new(10, 10, 0);
     let records = catalog.model.records();
     let first = prepare_records(&path, &records, catalog.model.key());
-    let options = options(&path)
-        .catalog_window_tids(2)
-        .catalog_rebase_rows(0);
+    let options = options(&path).catalog_window_tids(2).catalog_rebase_rows(0);
     let server = Server::start(options).unwrap();
     let mut conn = client(server.addr(), "1", false, DECLARED);
     let plan = of_type("Document");
@@ -657,7 +686,12 @@ fn bytes_of_mirror(path: &Path, catalog: &Catalog, tid: u64) -> f64 {
     let mut conn = client(server.addr(), "1", false, DECLARED);
     settled(&mut conn, catalog.oid(), tid + 1, &of_type("Document")).unwrap();
     let admin = server.admin_addr().unwrap();
-    let bytes = sample(admin, "zoe_catalog_mirror_bytes", &mirror("1", catalog.oid())).unwrap();
+    let bytes = sample(
+        admin,
+        "zoe_catalog_mirror_bytes",
+        &mirror("1", catalog.oid()),
+    )
+    .unwrap();
     drop(conn);
     server.stop();
     bytes
@@ -683,8 +717,14 @@ fn two_named_storages_keep_their_mirrors_apart_each_under_its_own_bound() {
     let mut ca = client(server.addr(), "one", false, DECLARED);
     let mut cb = client(server.addr(), "two", false, DECLARED);
     let plan = of_type("Document");
-    assert_eq!(settled(&mut ca, a.oid(), tid_a + 1, &plan), Ok(a.rids("Document")));
-    assert_eq!(settled(&mut cb, b.oid(), tid_b + 1, &plan), Ok(b.rids("Document")));
+    assert_eq!(
+        settled(&mut ca, a.oid(), tid_a + 1, &plan),
+        Ok(a.rids("Document"))
+    );
+    assert_eq!(
+        settled(&mut cb, b.oid(), tid_b + 1, &plan),
+        Ok(b.rids("Document"))
+    );
     assert_ne!(a.rids("Document"), b.rids("Document"));
     let admin = server.admin_addr().unwrap();
     for name in ["one", "two"] {
@@ -694,7 +734,10 @@ fn two_named_storages_keep_their_mirrors_apart_each_under_its_own_bound() {
             Some(0.0)
         );
         let labels = mirror(name, a.oid());
-        assert_eq!(sample(admin, "zoe_catalog_mirror_ready", &labels), Some(1.0));
+        assert_eq!(
+            sample(admin, "zoe_catalog_mirror_ready", &labels),
+            Some(1.0)
+        );
     }
     server.stop();
 }
@@ -710,13 +753,19 @@ fn past_the_bound_the_mirror_that_answered_least_recently_drops() {
     let server = Server::start(options).unwrap();
     let mut conn = client(server.addr(), "1", false, DECLARED);
     let plan = of_type("Document");
-    assert_eq!(settled(&mut conn, a.oid(), tid + 1, &plan), Ok(a.rids("Document")));
+    assert_eq!(
+        settled(&mut conn, a.oid(), tid + 1, &plan),
+        Ok(a.rids("Document"))
+    );
     // A second catalog of the same size passes the bound.
     let mut b = Catalog::new(100_000, 40, 1);
     let records = b.model.records();
     let mut serials = HashMap::new();
     let tid = commit(&mut conn, &mut serials, &records, &[b.model.key()], &[]);
-    assert_eq!(settled(&mut conn, b.oid(), tid + 1, &plan), Ok(b.rids("Document")));
+    assert_eq!(
+        settled(&mut conn, b.oid(), tid + 1, &plan),
+        Ok(b.rids("Document"))
+    );
     let found = answer(&query(&mut conn, a.oid(), tid + 1, &plan).unwrap());
     assert_eq!(found, Err("dropped".to_owned()));
     let admin = server.admin_addr().unwrap();
@@ -756,15 +805,34 @@ fn the_metrics_of_the_catalog_have_the_label_storage() {
         "zoe_catalog_mirror_bytes",
         "zoe_catalog_mirror_drops_total",
     ] {
-        assert!(text.contains(&format!("# TYPE {name} ")), "no {name}:\n{text}");
+        assert!(
+            text.contains(&format!("# TYPE {name} ")),
+            "no {name}:\n{text}"
+        );
     }
     let one = "storage=\"1\"";
-    assert!(sample(admin, "zoe_catalog_queries_total", &format!("{one},path=\"native\"")) >= Some(1.0));
+    assert!(
+        sample(
+            admin,
+            "zoe_catalog_queries_total",
+            &format!("{one},path=\"native\"")
+        ) >= Some(1.0)
+    );
     assert!(sample(admin, "zoe_catalog_query_latency_seconds_count", one) >= Some(1.0));
     assert_eq!(
-        sample(admin, "zoe_catalog_mirror_lag_tids", &mirror("1", catalog.oid())),
+        sample(
+            admin,
+            "zoe_catalog_mirror_lag_tids",
+            &mirror("1", catalog.oid())
+        ),
         Some(0.0)
     );
-    assert!(sample(admin, "zoe_catalog_mirror_bytes", &mirror("1", catalog.oid())) > Some(0.0));
+    assert!(
+        sample(
+            admin,
+            "zoe_catalog_mirror_bytes",
+            &mirror("1", catalog.oid())
+        ) > Some(0.0)
+    );
     server.stop();
 }

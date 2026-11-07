@@ -312,8 +312,10 @@ pub(crate) fn reply_of_value<'py>(
                     return Err(bad("rids that are not 4 bytes each"));
                 }
                 let rids: Vec<i32> = rids
-                    .chunks_exact(4)
-                    .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_be_bytes(*c))
                     .collect();
                 out.set_item("r", PyList::new(py, rids)?)?;
                 answered = true;
@@ -349,9 +351,9 @@ pub(crate) fn reply_of_value<'py>(
                 for item in items {
                     match item {
                         Value::Nil => list.append(py.None())?,
-                        Value::String(s) => list.append(
-                            s.as_str().ok_or_else(|| bad("a path that is not UTF-8"))?,
-                        )?,
+                        Value::String(s) => {
+                            list.append(s.as_str().ok_or_else(|| bad("a path that is not UTF-8"))?)?
+                        }
                         _ => return Err(bad("a path that is not a str or nil")),
                     }
                 }
@@ -359,7 +361,10 @@ pub(crate) fn reply_of_value<'py>(
             }
             ("rows" | "paths", Value::Nil) => {}
             ("f" | "why", Value::String(s)) => {
-                out.set_item(key, s.as_str().ok_or_else(|| bad("a text that is not UTF-8"))?)?;
+                out.set_item(
+                    key,
+                    s.as_str().ok_or_else(|| bad("a text that is not UTF-8"))?,
+                )?;
             }
             _ => return Err(bad(&format!("the key {key:?} of another form"))),
         }

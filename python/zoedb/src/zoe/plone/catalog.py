@@ -3,7 +3,13 @@ by the catalog mirror of the store.
 
 `install()` hooks `Products.ZCatalog.Catalog.Catalog.search`, as
 collective.solr does. The hook reads `catalog_supported()` of the storage
-of the catalog with `getattr`, as `zoe.kv` reads `kv_supported()`. It
+of the catalog with `getattr`, as `zoe.kv` reads `kv_supported()`. A
+`zoe.Storage` answers from the mirror of the process; a
+`zoe.zeo.ClientStorage` with the native client inside answers from the
+mirror of `zoe serve`, when its server accepted `catalog_query`. A stock
+`ZEO.ClientStorage`, the asyncio mode of `zoe.zeo.ClientStorage` and a
+test storage have no `catalog_supported`, so their searches take the
+Python path (`unsupported`). It
 builds the plan of the query with ZCatalog's own `IndexQuery` and the
 conversion of each index, sends it with the start of the snapshot of the
 Connection to `catalog_query` of the storage, and gives a `LazyMap` of
