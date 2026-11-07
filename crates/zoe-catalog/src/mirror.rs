@@ -226,7 +226,7 @@ pub fn rebase(
         .collect();
     let widths = head.trees.get(&Slot::Width);
     let table = if columns.iter().any(Option::is_some) || widths.is_some() {
-        let table = table::rebuilt(&base.table, &columns, widths, &rows);
+        let table = table::rebuilt(&base.table, &columns, widths, &rows)?;
         // The columns that the rebase built, and the lengths of the records.
         held += table.widths.capacity() * 4
             + columns

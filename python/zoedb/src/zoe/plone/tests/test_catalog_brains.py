@@ -203,19 +203,106 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
         self.assertTrue(brains, query)
         names = list(aq_base(site.portal_catalog)._catalog.schema)
         for got, want in zip(brains, expected, strict=True):
-            self.assertIs(type(aq_base(got)), type(aq_base(want)))
-            self.assertEqual(got.getRID(), want.getRID())
-            self.assertEqual(got.data_record_id_, want.data_record_id_)
-            self.assertEqual(got.data_record_score_, want.data_record_score_)
-            self.assertEqual(
-                got.data_record_normalized_score_, want.data_record_normalized_score_
-            )
-            self.assertEqual(got.getPath(), want.getPath())
-            self.assertEqual(got.getURL(), want.getURL())
-            self.assertIs(aq_base(aq_parent(got)), aq_base(aq_parent(want)))
-            for name in names:
-                a, b = getattr(got, name), getattr(want, name)
-                self.assertTrue(same(a, b), f"{name} of {got.getPath()}: {a!r} {b!r}")
+            self.same_brain(got, want, names)
+
+    def same_brain(self, got, want, names):
+        """`got` is the brain `want`, column by column."""
+        self.assertIs(type(aq_base(got)), type(aq_base(want)))
+        self.assertEqual(got.getRID(), want.getRID())
+        self.assertEqual(got.data_record_id_, want.data_record_id_)
+        self.assertEqual(got.data_record_score_, want.data_record_score_)
+        self.assertEqual(
+            got.data_record_normalized_score_, want.data_record_normalized_score_
+        )
+        self.assertEqual(got.getPath(), want.getPath())
+        self.assertEqual(got.getURL(), want.getURL())
+        self.assertIs(aq_base(aq_parent(got)), aq_base(aq_parent(want)))
+        for name in names:
+            a, b = getattr(got, name), getattr(want, name)
+            self.assertTrue(same(a, b), f"{name} of {got.getPath()}: {a!r} {b!r}")
+
+    def late(self, site, found):
+        """Read each brain of the native result `found`, made before a
+        change, and the brain that `Catalog.__getitem__` makes now for the
+        same rid: each pair gives the same brain, or both raise `KeyError`
+        for a rid that is gone. Return the rids that the native result made
+        with `Catalog.__getitem__`, and its brains."""
+        cat = site.portal_catalog._catalog
+        names = list(aq_base(cat).schema)
+        wanted = []
+        for rid in found._seq:
+            try:
+                wanted.append(cat[rid])
+            except KeyError:
+                wanted.append(None)
+        brains = []
+        with getitems() as rids:
+            for k, want in enumerate(wanted):
+                if want is None:
+                    with self.assertRaises(KeyError):
+                        found[k]  # noqa: B018
+                    continue
+                got = found[k]
+                self.same_brain(got, want, names)
+                self.assertIs(
+                    aq_base(got._unrestrictedGetObject()),
+                    aq_base(want._unrestrictedGetObject()),
+                )
+                brains.append(got)
+        return rids, brains
+
+    def test_a_brain_made_after_a_write_of_the_transaction_is_the_stock_brain(self):
+        from Products.CMFCore.indexing import processQueue
+
+        with opened(self.db) as site:
+            before = catalog._counts_now()["queries"].get("native", 0)
+            found = site.portal_catalog.unrestrictedSearchResults(**LISTING)
+            self.assertEqual(catalog._counts_now()["queries"]["native"], before + 1)
+            folder = site[FOLDER]
+            folder["doc-005"].setTitle("Late title")
+            folder["doc-005"].reindexObject()
+            folder.manage_renameObject("doc-006", "doc-006-moved")
+            processQueue()
+            rids, brains = self.late(site, found)
+            self.assertEqual(len(rids), ITEMS)
+            self.assertIn("Late title", [b.Title for b in brains])
+
+    def test_a_brain_made_after_a_commit_and_a_new_transaction_is_the_stock_brain(
+        self,
+    ):
+        with opened(self.db) as site:
+            doc = site[FOLDER]["doc-008"]
+            old = doc.Title()
+            found = site.portal_catalog.unrestrictedSearchResults(**LISTING)
+            doc.setTitle("Committed title")
+            doc.reindexObject()
+            transaction.commit()
+            try:
+                rids, brains = self.late(site, found)
+                self.assertEqual(len(rids), ITEMS)
+                self.assertIn("Committed title", [b.Title for b in brains])
+            finally:
+                doc.setTitle(old)
+                doc.reindexObject()
+                transaction.commit()
+
+    def test_len_and_the_first_brain_decode_one_row(self):
+        replies = []
+        original = catalog._brains
+
+        def spy(cat, reply, jar, start):
+            replies.append(reply)
+            return original(cat, reply, jar, start)
+
+        with opened(self.db) as site, mock.patch.object(catalog, "_brains", spy):
+            found = site.portal_catalog.unrestrictedSearchResults(**LISTING)
+            [reply] = replies
+            self.assertEqual(len(reply["rows"]), ITEMS)
+            self.assertEqual(len(found), ITEMS)
+            self.assertEqual(found.actual_result_count, ITEMS)
+            self.assertEqual(reply["rows"]._decoded, 0)
+            found[0].Title  # noqa: B018
+            self.assertEqual(reply["rows"]._decoded, 1)
 
     def test_a_folder_listing_makes_its_brains_with_no_load_of_data_or_paths(self):
         with opened(self.db) as site:

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use zoe_pickle::python::Value;
@@ -240,9 +240,12 @@ pub fn build(
         ));
     }
     // The records of `data`, cell by cell. A record of a rid that `paths`
-    // does not hold is in no result: the table does not keep it.
+    // does not hold is in no result: the table does not keep it. The cells
+    // count against the bound as the walk collects them.
     let width = schema.len();
-    let (data_shape, parts, stats) = walk_tree_with(
+    let walked = AtomicUsize::new(0);
+    let over = AtomicBool::new(false);
+    let walk = walk_tree_with(
         reads,
         before,
         trees.data,
@@ -250,20 +253,30 @@ pub fn build(
         RECORDS,
         || TablePart::new(width),
         |part: &mut TablePart, items| {
+            let start = part.heap_bytes();
             for (rid, value) in items {
                 if let Some(row) = rows_ref.row(rid_of(&rid)?) {
-                    part.push(row, &value);
+                    part.push(row, &value)?;
                 }
+            }
+            let grown = part.heap_bytes().saturating_sub(start);
+            let now = walked.fetch_add(grown, AtomicOrdering::Relaxed) + grown;
+            if !room(held.load(AtomicOrdering::Relaxed) + now) {
+                over.store(true, AtomicOrdering::Relaxed);
+                return Err("the memory bound has no room for data".into());
             }
             Ok(())
         },
-    )
-    .map_err(|e| refused("data", e))?;
+    );
+    if over.load(AtomicOrdering::Relaxed) {
+        return Err(BuildError::Dropped);
+    }
+    let (data_shape, parts, stats) = walk.map_err(|e| refused("data", e))?;
     read_records += stats.records;
     read_bytes += stats.bytes;
     let mut table_part = TablePart::new(width);
     for part in parts {
-        table_part.append(part);
+        table_part.append(part).map_err(|e| refused("data", e))?;
     }
     if !room(held.load(AtomicOrdering::Relaxed) + table_part.heap_bytes() + data_shape.heap_bytes())
     {
@@ -285,7 +298,8 @@ pub fn build(
         let count = rows_ref.len();
         let held_ref = &held;
         let table_build = scope.spawn(move || {
-            let table = table_part.build(schema, count);
+            // A table that does not build serves no row.
+            let table = table_part.build(schema, count).unwrap_or_default();
             held_ref.fetch_add(table.heap_bytes(), AtomicOrdering::Relaxed);
             table
         });

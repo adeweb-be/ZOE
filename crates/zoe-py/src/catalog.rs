@@ -9,7 +9,9 @@
 //! each commit to them after its publication.
 
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::PyValueError;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use zoe_catalog::cell::{self, EXT_DATE_TIME, EXT_MESSAGE, EXT_MISSING};
@@ -177,11 +179,54 @@ fn row<'py>(py: Python<'py>, classes: &mut Classes<'py>, bytes: &[u8]) -> Bound<
     }
 }
 
+/// The rows of a reply: a sequence of the tuple of the cells of each of the
+/// first rids, or `None`. It makes the Python values of a row only when the
+/// row is read, so a caller that reads few brains pays for few rows.
+#[pyclass(frozen, sequence, module = "zoe._zoe", name = "CatalogRows")]
+pub(crate) struct Rows {
+    rows: Vec<Option<Vec<u8>>>,
+    /// The rows that a read decoded.
+    decoded: AtomicUsize,
+}
+
+#[pymethods]
+impl Rows {
+    fn __len__(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The tuple of the cells of the row at `index`, or `None` when the
+    /// brain of its rid comes from `data`.
+    fn __getitem__<'py>(&self, py: Python<'py>, index: isize) -> PyResult<Bound<'py, PyAny>> {
+        let at = if index < 0 {
+            index + self.rows.len() as isize
+        } else {
+            index
+        };
+        let Some(found) = usize::try_from(at).ok().and_then(|at| self.rows.get(at)) else {
+            return Err(PyIndexError::new_err("the index of a row is out of range"));
+        };
+        Ok(match found {
+            Some(bytes) => {
+                self.decoded.fetch_add(1, Ordering::Relaxed);
+                row(py, &mut Classes::default(), bytes)
+            }
+            None => py.None().into_bound(py),
+        })
+    }
+
+    /// The number of rows that a read decoded, for the tests.
+    #[getter]
+    fn _decoded(&self) -> usize {
+        self.decoded.load(Ordering::Relaxed)
+    }
+}
+
 /// The reply of a query at `tid`, as a dict: `r` as a list of ints, `n`,
-/// `a`, `rows` and `paths`, or `f` and `why`. `rows` holds a tuple of the
-/// cells of each of the first rids, or `None` for a rid whose brain comes
-/// from `data`; `paths` holds the path of each. Both are `None` when the
-/// plan names no columns.
+/// `a`, `rows` and `paths`, or `f` and `why`. `rows` is a sequence of the
+/// tuple of the cells of each of the first rids, or `None` for a rid whose
+/// brain comes from `data`, made when it is read; `paths` holds the path of
+/// each. Both are `None` when the plan names no columns.
 pub(crate) fn reply<'py>(
     py: Python<'py>,
     tid: &[u8],
@@ -196,15 +241,11 @@ pub(crate) fn reply<'py>(
             out.set_item("a", reply.actual)?;
             match (&reply.rows, &reply.paths) {
                 (Some(rows), Some(paths)) => {
-                    let mut classes = Classes::default();
-                    let made = PyList::empty(py);
-                    for each in rows {
-                        made.append(match each {
-                            Some(bytes) => row(py, &mut classes, bytes),
-                            None => py.None().into_bound(py),
-                        })?;
-                    }
-                    out.set_item("rows", made)?;
+                    let made = Rows {
+                        rows: rows.clone(),
+                        decoded: AtomicUsize::new(0),
+                    };
+                    out.set_item("rows", Bound::new(py, made)?)?;
                     out.set_item("paths", PyList::new(py, paths)?)?;
                 }
                 _ => {

@@ -499,5 +499,14 @@ fn a_record_of_data_that_the_decoder_refuses_makes_the_catalog_refused() {
         .query_wire(catalog, tid + 1, &wire(&data["plans"]["batch"]))
         .unwrap();
     assert_eq!(reply.unwrap_err().reason.name(), "refused");
+    // The log names the oid of the record that the decoder refused.
+    let oid = format!("{:#x}", children[1]);
+    let events = mirrors.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("data") && e.contains(&oid)),
+        "{events:?}"
+    );
     mirrors.stop();
 }

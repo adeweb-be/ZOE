@@ -28,7 +28,11 @@ pub const NO_RECORD: i32 = i32::MIN;
 /// The length of the record of a row whose record is not a tuple.
 pub const NOT_A_TUPLE: i32 = -1;
 
-/// An arena of byte strings, each found by its place.
+/// Why an arena takes no more bytes: its offsets are 32 bits.
+const FULL: &str = "the cells of data pass the 4 GiB of an arena";
+
+/// An arena of byte strings, each found by its place. It holds at most
+/// 4 GiB: past it, `push` and `extend` refuse.
 #[derive(Clone, Debug, Default)]
 pub struct ByteArena {
     bytes: Vec<u8>,
@@ -37,10 +41,12 @@ pub struct ByteArena {
 
 impl ByteArena {
     /// Appends `data` and returns its place.
-    pub fn push(&mut self, data: &[u8]) -> u32 {
+    pub fn push(&mut self, data: &[u8]) -> Result<u32, String> {
+        let end = u32::try_from(self.bytes.len() + data.len()).map_err(|_| FULL)?;
+        let place = u32::try_from(self.ends.len()).map_err(|_| FULL)?;
         self.bytes.extend_from_slice(data);
-        self.ends.push(self.bytes.len() as u32);
-        (self.ends.len() - 1) as u32
+        self.ends.push(end);
+        Ok(place)
     }
 
     /// The bytes at `place`.
@@ -66,12 +72,14 @@ impl ByteArena {
 
     /// Appends each byte string of `other` and returns the place of its
     /// first.
-    pub fn extend(&mut self, other: &ByteArena) -> u32 {
+    pub fn extend(&mut self, other: &ByteArena) -> Result<u32, String> {
+        u32::try_from(self.bytes.len() + other.bytes.len()).map_err(|_| FULL)?;
+        u32::try_from(self.ends.len() + other.ends.len()).map_err(|_| FULL)?;
         let first = self.ends.len() as u32;
         let offset = self.bytes.len() as u32;
         self.bytes.extend_from_slice(&other.bytes);
         self.ends.extend(other.ends.iter().map(|end| end + offset));
-        first
+        Ok(first)
     }
 
     /// The bytes that the arena takes.
@@ -181,7 +189,11 @@ impl Column {
 
     /// Builds the column from the cell of each row of `items`, for `rows`
     /// rows: a place in `arena`, or `None` for a value of another type.
-    pub fn build(arena: &ByteArena, items: &[(u32, Option<u32>)], rows: usize) -> Column {
+    pub fn build(
+        arena: &ByteArena,
+        items: &[(u32, Option<u32>)],
+        rows: usize,
+    ) -> Result<Column, String> {
         let mut codes = vec![ABSENT; rows];
         let mut cells = ByteArena::default();
         let mut found: HashMap<&[u8], u32> = HashMap::new();
@@ -190,22 +202,31 @@ impl Column {
                 None => OTHER,
                 Some(place) => {
                     let bytes = arena.get(*place);
-                    *found
-                        .entry(bytes)
-                        .or_insert_with(|| FIRST + cells.push(bytes))
+                    match found.get(bytes) {
+                        Some(code) => *code,
+                        None => {
+                            let code = FIRST + cells.push(bytes)?;
+                            found.insert(bytes, code);
+                            code
+                        }
+                    }
                 }
             };
         }
         cells.shrink();
-        Column {
+        Ok(Column {
             codes: Codes::of(codes, cells.len()),
             cells,
-        }
+        })
     }
 
     /// Builds the column of a new base: the cells of this column, with the
     /// cells of `changed` over them, for `rows`.
-    pub fn rebuilt(&self, changed: &BTreeMap<i32, Option<Val>>, rows: &Rows) -> Column {
+    pub fn rebuilt(
+        &self,
+        changed: &BTreeMap<i32, Option<Val>>,
+        rows: &Rows,
+    ) -> Result<Column, String> {
         let mut arena = ByteArena::default();
         let mut items: Vec<(u32, Option<u32>)> = Vec::new();
         let mut touched = vec![false; rows.len()];
@@ -217,11 +238,11 @@ impl Column {
             match Cell::of_val(value.as_ref()) {
                 Cell::Absent => {}
                 Cell::Other => items.push((row, None)),
-                Cell::Encoded(bytes) => items.push((row, Some(arena.push(bytes)))),
+                Cell::Encoded(bytes) => items.push((row, Some(arena.push(bytes)?))),
             }
         }
         // The places of the cells of this column in `arena`.
-        let first = arena.extend(&self.cells);
+        let first = arena.extend(&self.cells)?;
         for row in 0..rows.len() as u32 {
             if touched[row as usize] {
                 continue;
@@ -296,7 +317,7 @@ impl TablePart {
     }
 
     /// Adds the record `value` of `row`, as `record_of` reads it.
-    pub fn push(&mut self, row: u32, value: &Val) {
+    pub fn push(&mut self, row: u32, value: &Val) -> Result<(), String> {
         let cells: &[Val] = match value {
             Val::Tuple(cells) => cells,
             _ => &[],
@@ -308,15 +329,16 @@ impl TablePart {
         self.widths.push((row, width));
         for (column, cell) in self.columns.iter_mut().zip(cells) {
             match cell {
-                Val::Cell(Some(bytes)) => column.push((row, Some(self.arena.push(bytes)))),
+                Val::Cell(Some(bytes)) => column.push((row, Some(self.arena.push(bytes)?))),
                 _ => column.push((row, None)),
             }
         }
+        Ok(())
     }
 
     /// Adds the cells of `other`.
-    pub fn append(&mut self, other: TablePart) {
-        let first = self.arena.extend(&other.arena);
+    pub fn append(&mut self, other: TablePart) -> Result<(), String> {
+        let first = self.arena.extend(&other.arena)?;
         for (mine, theirs) in self.columns.iter_mut().zip(other.columns) {
             mine.extend(
                 theirs
@@ -325,6 +347,7 @@ impl TablePart {
             );
         }
         self.widths.extend(other.widths);
+        Ok(())
     }
 
     /// The bytes that the part takes.
@@ -339,21 +362,21 @@ impl TablePart {
     }
 
     /// Builds the table of `rows` rows with the positions `schema`.
-    pub fn build(self, schema: HashMap<String, usize>, rows: usize) -> Table {
+    pub fn build(self, schema: HashMap<String, usize>, rows: usize) -> Result<Table, String> {
         let columns = self
             .columns
             .iter()
-            .map(|items| Arc::new(Column::build(&self.arena, items, rows)))
-            .collect();
+            .map(|items| Column::build(&self.arena, items, rows).map(Arc::new))
+            .collect::<Result<_, _>>()?;
         let mut widths = vec![NO_RECORD; rows];
         for (row, width) in self.widths {
             widths[row as usize] = width;
         }
-        Table {
+        Ok(Table {
             schema,
             columns,
             widths: Arc::new(widths),
-        }
+        })
     }
 }
 
@@ -388,11 +411,11 @@ pub fn rebuilt(
     columns: &[Option<&BTreeMap<i32, Option<Val>>>],
     widths: Option<&BTreeMap<i32, Option<Val>>>,
     rows: &Rows,
-) -> Table {
+) -> Result<Table, String> {
     let mut out = table.clone();
     for (i, changed) in columns.iter().enumerate() {
         if let (Some(changed), Some(column)) = (changed, out.columns.get_mut(i)) {
-            *column = Arc::new(column.rebuilt(changed, rows));
+            *column = Arc::new(column.rebuilt(changed, rows)?);
         }
     }
     let grown = rows.len() > table.widths.len();
@@ -409,5 +432,5 @@ pub fn rebuilt(
         }
         out.widths = Arc::new(new);
     }
-    out
+    Ok(out)
 }
