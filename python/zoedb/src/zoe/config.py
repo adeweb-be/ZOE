@@ -104,6 +104,40 @@ def class_modes(value):
     return modes
 
 
+def catalog_memory(value):
+    """Return the bound of the catalog mirrors of the store, in bytes, as
+    ZConfig's byte-size gives it, such as 2GB. Refuse 0 and less."""
+    size = stock_datatypes["byte-size"](value)
+    if size <= 0:
+        raise ValueError("the catalog memory is more than 0 bytes")
+    return size
+
+
+def count(value):
+    """Return a count: an int, 0 or more."""
+    number = stock_datatypes["integer"](value)
+    if number < 0:
+        raise ValueError(f"{value!r} is not a count, 0 or more")
+    return number
+
+
+def window_tids(value):
+    """Return the change sets of the mirror window: an int, 1 or more."""
+    number = count(value)
+    if number < 1:
+        raise ValueError("the mirror window holds 1 change set or more")
+    return number
+
+
+def seconds(value):
+    """Return seconds, as ZConfig's time-interval gives them, such as 10m
+    or 1s. Refuse a negative time."""
+    number = stock_datatypes["time-interval"](value)
+    if number < 0:
+        raise ValueError(f"{value!r} is not a time of 0 or more seconds")
+    return number
+
+
 # The keys and the converters of their values.
 KEYS = {
     "path": stock_datatypes["string"],
@@ -120,6 +154,11 @@ KEYS = {
     "posting-dicts": merge_mode,
     "resolution-log": stock_datatypes["string"],
     "native-reader": stock_datatypes["boolean"],
+    "catalog-memory": catalog_memory,
+    "catalog-window-tids": window_tids,
+    "catalog-window-seconds": seconds,
+    "catalog-rebase-rows": count,
+    "catalog-wait": seconds,
 }
 
 # The keys that a section and a URI can give more than once. Their values
@@ -191,6 +230,11 @@ def open_storage(settings):
         posting_dicts=settings.get("posting-dicts"),
         resolution_log=os.path.expanduser(resolution_log) if resolution_log else None,
         native_reader=settings.get("native-reader", True),
+        catalog_memory=settings.get("catalog-memory"),
+        catalog_window_tids=settings.get("catalog-window-tids"),
+        catalog_window_seconds=settings.get("catalog-window-seconds"),
+        catalog_rebase_rows=settings.get("catalog-rebase-rows"),
+        catalog_wait=settings.get("catalog-wait"),
     )
 
 

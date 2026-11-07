@@ -315,8 +315,44 @@ _Avoid_: GUI, admin app
 ## Catalog and retrieval
 
 **Mirror**:
-An in-memory copy of the catalog indexes, versioned per tid, that answers catalog queries as of the client's snapshot.
+An in-memory copy of the catalog indexes, versioned per tid, that answers catalog queries as of the client's snapshot (ADR 0059).
 _Avoid_: cache, replica
+
+**Registration key**:
+The key of one catalog in the durable namespace `zoe.catalog` of the store that holds it: the 8 bytes of the oid of its `Catalog` object. The store builds a mirror for each such key only. It is not the `register` of a ZEO connection.
+_Avoid_: subscription
+
+**Row**:
+One entry of the catalog in the mirror, one rid of `paths`; the row number is the rank of the rid, and every bitmap of the mirror holds row numbers. A row is not a record.
+_Avoid_: document, record
+
+**Base**:
+The structures of a mirror as of one tid. A base never changes. It is not the base store of a fork.
+_Avoid_: snapshot
+
+**Change set**:
+What one commit changed in the mirrored trees: the old and the new value of each changed row of each tree. It is not a delta record.
+_Avoid_: delta, diff
+
+**Overrides**:
+The value at the tid of a version of each row that a change set after the base changed; a version is the base and its overrides.
+_Avoid_: patch
+
+**Rebase**:
+The build of a new base from the base and the change sets, one structure at a time, the other structures shared. It is not the fold of the log.
+_Avoid_: compaction
+
+**Mirror window**:
+How far back the change sets let a query reach: `catalog-window-tids` newer change sets, or `catalog-window-seconds`. It is not the window of queued indexing.
+_Avoid_: retention
+
+**Transaction overlay**:
+The records that a transaction changed and did not commit, sent with a catalog query. It is not the overlay of `zoe.kv`.
+_Avoid_: dirty set
+
+**Test storage**:
+A `DemoStorage` over a ZOE storage, at any depth of a stack, as in the test layers of plone.app.testing. Its namespace writes go to the overlay of `zoe.kv`, and it has no mirror.
+_Avoid_: demo store
 
 **Delta record**:
 A record that says how one index entry changed in a transaction, instead of a rewritten index bucket.

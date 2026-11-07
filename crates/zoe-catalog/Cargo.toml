@@ -9,6 +9,21 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+roaring.workspace = true
+zoe-core.workspace = true
+zoe-pickle.workspace = true
+
+[features]
+# The module `testing`, which writes the records of a catalog for the tests
+# of this crate and of the crates that serve the mirror. Only
+# dev-dependencies turn it on.
+testing = ["zoe-pickle/testing"]
+
+[dev-dependencies]
+serde_json.workspace = true
+# This crate with the module `testing`. Cargo builds dev-dependencies only
+# for tests, examples and benchmarks.
+zoe-catalog = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

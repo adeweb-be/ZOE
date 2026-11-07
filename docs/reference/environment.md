@@ -28,6 +28,11 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_POSTING_DICTS` | `zoe serve`, `<zoe>` | the mode of the rules of ADR 0042: `on`, `shadow` or `off` |
 | `ZOE_RESOLUTION_LOG` | `zoe serve`, `<zoe>` | the file of the resolution log |
 | `ZOE_NATIVE_READER` | `<zoe>` | a boolean: the connections of a database on the storage decode their records with the reader of ZOE (ADR 0057); `true` when not set |
+| `ZOE_CATALOG_MEMORY` | `<zoe>` | the bound of the memory of the catalog mirrors of the store, as a byte size such as `2GB` (ADR 0059); `2GB` when not set |
+| `ZOE_CATALOG_WINDOW_TIDS` | `<zoe>` | the newer change sets past which a change set leaves the mirror window; `10000` when not set |
+| `ZOE_CATALOG_WINDOW_SECONDS` | `<zoe>` | the age past which a change set leaves the mirror window, as a time such as `10m`; `10m` when not set |
+| `ZOE_CATALOG_REBASE_ROWS` | `<zoe>` | the rows of the overrides past which a mirror rebases; `20000` when not set |
+| `ZOE_CATALOG_WAIT` | `<zoe>` | the longest wait of a catalog query for the mirror, as a time such as `1s`; `1s` when not set |
 | `ZOE_FROM_DATA_FS` | `zoe convert` | the `Data.fs` to copy into the store |
 | `ZOE_TO_DATA_FS` | `zoe convert` | the `Data.fs` to copy the store into |
 | `ZOE_DATA_FS_BLOB_DIR` | `zoe convert` | the blob directory of the `Data.fs` |
@@ -70,7 +75,8 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `zoe serve` | The OTLP protocol, with `ZOE_OTLP_ENDPOINT`: `grpc`, `http/protobuf`, the default, or `http/json`. Another value fails the start with 1. |
 | `OTEL_SERVICE_NAME` | `zoe serve` | The service name of the traces. The default is `zoe`. |
 | `ZOE_BINARY` | `python -m zoe.serve`, `zoe.testing` | The `zoe` binary to run. `python -m zoe.serve` takes the key `binary` first, then this variable, then the `zoe` binary on the PATH. `zoe.testing` takes this variable, else the debug build of the repository. |
-| `ZOE_PLONE_BACKENDS` | `zoe.plone`, `zoe.plone.testing` | The backends of `zoe.plone` to install, separated by commas: `locking`, `indexing` and `registry`. An instance sets it with `<environment>` in `zope.conf`; the ZCML of `zoe.plone` reads it when it loads. An unknown name raises `ValueError`. |
+| `ZOE_PLONE_BACKENDS` | `zoe.plone`, `zoe.plone.testing` | The backends of `zoe.plone` to install, separated by commas: `locking`, `indexing`, `registry` and `catalog`. An instance sets it with `<environment>` in `zope.conf`; the ZCML of `zoe.plone` reads it when it loads. An unknown name raises `ValueError`. |
+| `ZOE_PLONE_CATALOG_MODE` | `zoe.plone.catalog` | The mode of the catalog backend: `on`, the default, answers a search from the catalog mirror; `compare` also runs the stock search, logs each difference at ERROR with the indexes and the options of the query and no value, and returns the stock result. Another mode raises `ValueError` at `install()`. |
 
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` change nothing in `zoe serve`. The exporter still reads the headers, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` else `OTEL_EXPORTER_OTLP_HEADERS`, and the timeout, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` else `OTEL_EXPORTER_OTLP_TIMEOUT`. So a header that the host sets for another collector, such as a token, also goes to `ZOE_OTLP_ENDPOINT`.
 

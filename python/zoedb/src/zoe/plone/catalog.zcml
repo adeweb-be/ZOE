@@ -1,0 +1,16 @@
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:zcml="http://namespaces.zope.org/zcml"
+    >
+
+  <!-- Opt in: Catalog.search asks the catalog mirror of the store, and
+       each catalog of a site has a registration key in the store
+       (ADR 0059). Include this file in the ZCML of the site. The backend
+       installs when the ZCML loads. -->
+  <include
+      package="z3c.zcmlhook"
+      file="meta.zcml"
+      />
+  <zcml:customAction handler=".catalog.install" />
+
+</configure>

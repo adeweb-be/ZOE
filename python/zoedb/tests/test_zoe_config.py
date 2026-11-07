@@ -350,6 +350,79 @@ def test_native_reader_takes_its_key_its_twin_and_the_uri(tmp_path, monkeypatch)
         storage.close()
 
 
+def test_the_catalog_mirrors_take_their_keys_their_twins_and_the_uri(
+    tmp_path, monkeypatch
+):
+    captured(monkeypatch)
+    options = open_stanza(
+        f"path {tmp_path}",
+        "catalog-memory 512MB",
+        "catalog-window-tids 500",
+        "catalog-window-seconds 2m",
+        "catalog-rebase-rows 1000",
+        "catalog-wait 3s",
+    )
+    assert options["catalog_memory"] == 512 * 1024 * 1024
+    assert options["catalog_window_tids"] == 500
+    assert options["catalog_window_seconds"] == 120
+    assert options["catalog_rebase_rows"] == 1000
+    assert options["catalog_wait"] == 3
+    monkeypatch.setenv("ZOE_CATALOG_MEMORY", "1GB")
+    monkeypatch.setenv("ZOE_CATALOG_WAIT", "2s")
+    options = open_stanza(f"path {tmp_path}", "catalog-wait 5s")
+    assert options["catalog_memory"] == 1024 * 1024 * 1024
+    # A key of the section wins over its twin.
+    assert options["catalog_wait"] == 5
+    # Without the keys and the twins, the defaults of the storage stay.
+    monkeypatch.delenv("ZOE_CATALOG_MEMORY")
+    monkeypatch.delenv("ZOE_CATALOG_WAIT")
+    options = open_stanza(f"path {tmp_path}")
+    for name in ("memory", "window_tids", "window_seconds", "rebase_rows", "wait"):
+        assert options[f"catalog_{name}"] is None
+    factory, _ = zodburi.resolve_uri(
+        f"zoe://{tmp_path}?catalog-rebase-rows=7&catalog-window-tids=3"
+    )
+    options = factory()
+    assert options["catalog_rebase_rows"] == 7
+    assert options["catalog_window_tids"] == 3
+
+
+def test_the_storage_takes_the_settings_of_the_catalog_mirrors(tmp_path):
+    storage = open_stanza(f"path {tmp_path}", "catalog-memory 64MB", "catalog-wait 2s")
+    try:
+        assert storage.catalog_supported() is True
+        # A store without a registration key has no mirror.
+        reply = storage.catalog_query(b"\0" * 7 + b"\1", b"\xff" * 8, {"c": []})
+        assert reply["f"] == "not_registered"
+        assert reply["tid"] == b"\xff" * 8
+        # The plan comes first: an unknown key gives `plan`.
+        reply = storage.catalog_query(b"\0" * 7 + b"\1", b"\xff" * 8, {"c": [], "o": 1})
+        assert reply["f"] == "plan"
+        with pytest.raises(ValueError):
+            storage.catalog_query(b"\0" * 7 + b"\1", b"\xff" * 8, {"s": []})
+        with pytest.raises(ValueError):
+            storage.catalog_query(b"\1", b"\xff" * 8, {"c": []})
+        assert storage._catalog_status(b"\0" * 7 + b"\1") is None
+        counts = storage._catalog_counts()
+        assert counts["zoe_catalog_queries_total"] == {"native": 0, "python": 0}
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "catalog-memory 0",
+        "catalog-window-tids 0",
+        "catalog-rebase-rows -1",
+        "catalog-wait -2",
+    ],
+)
+def test_a_bad_value_of_a_catalog_key_raises(tmp_path, line):
+    with pytest.raises(ValueError):
+        open_stanza(f"path {tmp_path}", line)
+
+
 @pytest.mark.parametrize(
     "line",
     [

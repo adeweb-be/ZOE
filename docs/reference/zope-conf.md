@@ -40,6 +40,11 @@ Each key has an environment twin: `ZOE_` and the key in upper case, with `_` for
 | `posting-dicts` | `ZOE_POSTING_DICTS` | `off` | The mode of the posting-dict rule and the first-key rule of ADR 0042: `on`, `shadow` or `off`. A shadow mode needs `resolution-log`. |
 | `resolution-log` | `ZOE_RESOLUTION_LOG` | none: no line | A file of JSON lines, one for each result of tier 1. The storage opens it in append mode and never syncs it. A leading `~` is the home directory. |
 | `native-reader` | `ZOE_NATIVE_READER` | `true` | A boolean: `true`, `false`, `yes`, `no`, `on` or `off`. If true, the connections of a database on the storage decode their records with the reader of ZOE, in Rust, in place of ZODB's `ObjectReader` (ADR 0057): `zoe.plone` gives the reader at the start of Zope, and `zoe.reader.install` outside Zope. If false, they keep ZODB's `ObjectReader`. |
+| `catalog-memory` | `ZOE_CATALOG_MEMORY` | `2GB` | The bound of the memory of the catalog mirrors of the store, as a byte size such as `2GB` or `512MB`, more than 0 (ADR 0059, section 6). A build, a rebase or a growth that would pass it drops the mirror that answered a query least recently. |
+| `catalog-window-tids` | `ZOE_CATALOG_WINDOW_TIDS` | `10000` | The newer change sets past which a change set leaves the mirror window, 1 or more. |
+| `catalog-window-seconds` | `ZOE_CATALOG_WINDOW_SECONDS` | `10m` | The age past which a change set leaves the mirror window, as a time such as `10m`. |
+| `catalog-rebase-rows` | `ZOE_CATALOG_REBASE_ROWS` | `20000` | The rows of the overrides of the last tid past which a mirror rebases in the background, 0 or more. |
+| `catalog-wait` | `ZOE_CATALOG_WAIT` | `1s` | The longest wait of a catalog query for the mirror to apply the commits of its snapshot, as a time such as `1s`; past it, the query takes the Python path. |
 
 The keys `staging-memory`, `max-record-size`, `max-transaction-size` and `max-blob-size` are options of the core only. No key of `<zoe>` sets them.
 

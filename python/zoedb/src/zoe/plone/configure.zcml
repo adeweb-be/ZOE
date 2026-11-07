@@ -23,7 +23,7 @@
       />
 
   <!-- The backends that ZOE_PLONE_BACKENDS names: locking, indexing,
-       registry. They are opt-in. They install when the ZCML loads, so an
+       registry, catalog. They are opt-in. They install when the ZCML loads, so an
        instance, its scripts and bin/instance run see the same backends. -->
   <include
       package="z3c.zcmlhook"
@@ -59,6 +59,24 @@
       for="Products.CMFCore.interfaces.ISiteRoot"
       class=".indexing.StatusView"
       permission="cmf.ManagePortal"
+      />
+
+  <!-- The catalog mirror, when its backend is installed: the registration
+       keys of the catalogs of the sites at the open of a database, at the
+       creation of a site and at its removal (ADR 0059). -->
+  <subscriber
+      for="zope.processlifetime.IDatabaseOpenedWithRoot"
+      handler=".catalog.database_opened"
+      />
+  <subscriber
+      for="Products.CMFCore.interfaces.ISiteRoot
+           zope.lifecycleevent.interfaces.IObjectAddedEvent"
+      handler=".catalog.site_added"
+      />
+  <subscriber
+      for="Products.CMFCore.interfaces.ISiteRoot
+           zope.lifecycleevent.interfaces.IObjectRemovedEvent"
+      handler=".catalog.site_removed"
       />
 
   <!-- The writes-on-GET report: each transaction of a GET or a HEAD request

@@ -44,6 +44,11 @@ KEYS = {
     "posting-dicts",
     "resolution-log",
     "native-reader",
+    "catalog-memory",
+    "catalog-window-tids",
+    "catalog-window-seconds",
+    "catalog-rebase-rows",
+    "catalog-wait",
 }
 # The ways to give a value to a key.
 SOURCES = ["stanza", "environment", "uri"]
