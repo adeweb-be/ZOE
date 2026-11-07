@@ -67,13 +67,15 @@ use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::{PyBytes, PyDict, PyString};
+use zoe_catalog::{Config as CatalogConfig, Mirrors, Opener, Reads};
 use zoe_client::lock;
 use zoe_core::{
     Compression, Flavour, IntentLocks, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT, Store, Tid,
     Txn, ZoeError,
 };
 
+use crate::catalog;
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::kv;
 use crate::publish::{Publication, Published};
@@ -114,6 +116,33 @@ impl Deref for StoreRef {
 
     fn deref(&self) -> &Store {
         &self.0.store
+    }
+}
+
+impl Reads for Owned {
+    fn last_tid(&self) -> u64 {
+        self.store.last_tid()
+    }
+
+    fn load_before(&self, oid: u64, tid: u64) -> Result<Option<Vec<u8>>, String> {
+        Reads::load_before(&self.store, oid, tid)
+    }
+
+    fn commits(
+        &self,
+        from: u64,
+        to: u64,
+        each: &mut dyn FnMut(zoe_catalog::read::Commit) -> bool,
+    ) -> Result<(), String> {
+        self.store.commits(from, to, each)
+    }
+
+    fn registrations(&self) -> Result<Vec<Vec<u8>>, String> {
+        self.store.registrations()
+    }
+
+    fn registration_generation(&self) -> Result<u64, String> {
+        self.store.registration_generation()
     }
 }
 
@@ -242,6 +271,12 @@ pub(crate) struct Storage {
     /// True when the database of the storage gives each Connection the
     /// oids of a commit that the vote wrote without a store (ADR 0049).
     server_writes: AtomicBool,
+    /// The catalog mirrors of the store (ADR 0059), from the open of a
+    /// store with a registration key or from the first write of the
+    /// namespace `zoe.catalog`.
+    catalog: Mutex<Option<Arc<Mirrors>>>,
+    /// The settings of the catalog mirrors.
+    catalog_config: CatalogConfig,
 }
 
 impl Storage {
@@ -351,6 +386,38 @@ impl Storage {
         staged.map_err(|failure| failure.into_py(py))
     }
 
+    /// Start the catalog mirrors of the store, once. Their thread reads the
+    /// registration keys of the namespace `zoe.catalog`.
+    fn start_catalog(&self, py: Python<'_>) {
+        let mut catalog = lock(&self.catalog);
+        if catalog.is_some() {
+            return;
+        }
+        let store = self
+            .shared
+            .store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(store) = &store {
+            let weak = Arc::downgrade(&store.0);
+            let open: Opener = Arc::new(move || weak.upgrade().map(|o| o as Arc<dyn Reads>));
+            let published = self.published.wait_for(Tid::ZERO).0;
+            *catalog = Some(Arc::new(Mirrors::start(
+                open,
+                published,
+                self.catalog_config.clone(),
+            )));
+        }
+        drop(catalog);
+        py.detach(move || drop(store));
+    }
+
+    /// The catalog mirrors of the store, if they started.
+    fn mirrors(&self) -> Option<Arc<Mirrors>> {
+        lock(&self.catalog).clone()
+    }
+
     /// Return the next value of the sequence `name`. A read-only storage
     /// refuses the call.
     pub(crate) fn next_value(&self, py: Python<'_>, name: &str) -> PyResult<u64> {
@@ -380,7 +447,9 @@ impl Storage {
     #[pyo3(signature = (
         path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true,
         compression = None, structural_merges = None, structural_merge_classes = None,
-        posting_dicts = None, resolution_log = None
+        posting_dicts = None, resolution_log = None, catalog_memory = None,
+        catalog_window_tids = None, catalog_window_seconds = None, catalog_rebase_rows = None,
+        catalog_wait = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -395,7 +464,19 @@ impl Storage {
         structural_merge_classes: Option<HashMap<String, String>>,
         posting_dicts: Option<&str>,
         resolution_log: Option<PathBuf>,
+        catalog_memory: Option<u64>,
+        catalog_window_tids: Option<u64>,
+        catalog_window_seconds: Option<f64>,
+        catalog_rebase_rows: Option<u64>,
+        catalog_wait: Option<f64>,
     ) -> PyResult<Self> {
+        let catalog_config = catalog_config(
+            catalog_memory,
+            catalog_window_tids,
+            catalog_window_seconds,
+            catalog_rebase_rows,
+            catalog_wait,
+        )?;
         let mut options = Options::default();
         if let Some(text) = structural_merges {
             options.structural_merges.mode = text
@@ -486,11 +567,22 @@ impl Storage {
             sweeper: Mutex::new(None),
             resolution_log,
             server_writes: AtomicBool::new(false),
+            catalog: Mutex::new(None),
+            catalog_config,
         };
         let store = storage.opened(py)?;
-        let ephemeral = py.detach(move || store.has_ephemeral_namespaces().unwrap_or(false));
+        let (ephemeral, registered) = py.detach(move || {
+            let ephemeral = store.has_ephemeral_namespaces().unwrap_or(false);
+            let registered = store
+                .kv_scan(Flavour::Durable, zoe_catalog::NAMESPACE, None, None, 1)
+                .is_ok_and(|keys| !keys.is_empty());
+            (ephemeral, registered)
+        });
         if ephemeral {
             storage.start_sweeper(py);
+        }
+        if registered {
+            storage.start_catalog(py);
         }
         Ok(storage)
     }
@@ -810,6 +902,9 @@ impl Storage {
         if flavour == Flavour::Ephemeral {
             self.start_sweeper(py);
         }
+        if flavour == Flavour::Durable && name == zoe_catalog::NAMESPACE {
+            self.start_catalog(py);
+        }
         Ok(())
     }
 
@@ -830,6 +925,80 @@ impl Storage {
             transaction,
             |txn| Ok(txn.kv_delete(flavour, name, key)?),
         )
+    }
+
+    /// Answer the catalog query `plan` on the catalog whose `Catalog`
+    /// object has the oid `catalog`, as of the snapshot that ends before
+    /// `tid`, as the tid of `loadBefore` (ADR 0059, section 9). `catalog`
+    /// and `tid` are 8 bytes, and `plan` is a dict in the form of section
+    /// 8. The reply is a dict: `r`, the rids as a list of ints, `n` and
+    /// `a`; or `f`, the reason of a fallback, and `why`. A plan of another
+    /// form raises `ValueError`. A key or a kind of clause that the mirror
+    /// does not know gives the reason `plan`. The call releases the GIL.
+    fn catalog_query<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+        tid: &[u8],
+        plan: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let oid = catalog::p64("catalog", catalog)?;
+        let before = catalog::p64("tid", tid)?;
+        let plan = catalog::wire(plan)?;
+        self.check_open(py)?;
+        let Some(mirrors) = self.mirrors() else {
+            let fallback = zoe_catalog::Fallback::new(
+                zoe_catalog::Reason::NotRegistered,
+                "the store has no registration key",
+            );
+            return match zoe_catalog::decode_plan(&plan) {
+                Err(zoe_catalog::PlanError::Malformed(why)) => Err(PyValueError::new_err(why)),
+                _ => catalog::reply(py, tid, &Err(fallback)),
+            };
+        };
+        let (answer, events) = py.detach(|| {
+            let answer = mirrors.query_wire(oid, before, &plan);
+            (answer, mirrors.take_events())
+        });
+        catalog::log(py, events);
+        match answer {
+            Ok(answer) => catalog::reply(py, tid, &answer),
+            Err(why) => Err(PyValueError::new_err(why)),
+        }
+    }
+
+    /// Tell if the storage serves `catalog_query`: a `zoe.Storage` always
+    /// does.
+    fn catalog_supported(&self) -> bool {
+        true
+    }
+
+    /// Return the state of the mirror of the catalog `catalog`, 8 bytes, as
+    /// a dict, or `None` when the store does not list it. This is a private
+    /// hook for the tests.
+    #[pyo3(name = "_catalog_status")]
+    fn catalog_status<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let oid = catalog::p64("catalog", catalog)?;
+        let status = self.mirrors().and_then(|m| py.detach(|| m.status(oid)));
+        catalog::status(py, status)
+    }
+
+    /// Return the counts of the catalog mirrors of the store (ADR 0059,
+    /// section 11) as a dict, and log the events of the mirrors.
+    #[pyo3(name = "_catalog_counts")]
+    fn catalog_counts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let found = self
+            .mirrors()
+            .map(|m| py.detach(|| (m.counts(), m.take_events())));
+        let counts = found.map(|(counts, events)| {
+            catalog::log(py, events);
+            counts
+        });
+        catalog::counts(py, counts)
     }
 
     /// Return a new owner of early write-intent locks (ADR 0045). It holds
@@ -1474,11 +1643,19 @@ impl Storage {
                 ))
             })
             .map_err(|e| core(py, e))?;
-        let tid = p64(py, publication.tid().0);
-        if let Some(func) = func {
-            publication.run(|| func.call1((&tid,)))?;
-        }
+        let committed = publication.tid();
+        let tid = p64(py, committed.0);
+        let called = match func {
+            Some(func) => publication.run(|| func.call1((&tid,))).map(drop),
+            None => Ok(()),
+        };
         drop(publication);
+        // The mirrors apply the commit after its publication, in their own
+        // thread.
+        if let Some(mirrors) = self.mirrors() {
+            mirrors.committed(committed.0);
+        }
+        called?;
         Ok(tid)
     }
 
@@ -1503,6 +1680,7 @@ impl Storage {
     /// The storage refuses every later call. A call that runs when `close`
     /// starts keeps the store open until it returns.
     fn close(&self, py: Python<'_>) {
+        let mirrors = lock(&self.catalog).take();
         let sweeper = self.take_sweeper();
         let entries: Vec<Arc<Entry>> = {
             let mut table = self.table();
@@ -1511,8 +1689,12 @@ impl Storage {
         };
         let store = self.shared.take_store();
         let entries = py.detach(move || {
-            // A sweep step that runs holds the store: it ends first, so the
-            // store closes before `close` returns.
+            // The thread of the mirrors and a sweep step that runs hold the
+            // store: they end first, so the store closes before `close`
+            // returns.
+            if let Some(mirrors) = mirrors {
+                mirrors.stop();
+            }
             if let Some(sweeper) = sweeper {
                 sweeper.stop();
             }
@@ -1531,11 +1713,15 @@ impl Drop for Storage {
     /// was not closed. This also holds during the shutdown of the
     /// interpreter, on the thread that finalizes it.
     fn drop(&mut self) {
+        let mirrors = lock(&self.catalog).take();
         let sweeper = self.take_sweeper();
         let store = self.shared.take_store();
         let entries: Vec<Arc<Entry>> = self.shared.table().drain();
         let txns: Vec<SharedTxn> = entries.iter().filter_map(|entry| entry.take()).collect();
         let close = move || {
+            if let Some(mirrors) = mirrors {
+                mirrors.stop();
+            }
             if let Some(sweeper) = sweeper {
                 sweeper.stop();
             }
@@ -1760,6 +1946,42 @@ fn text(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         Ok(string) => Ok(string.to_str()?.as_bytes().to_vec()),
         Err(_) => Ok(value.cast::<PyBytes>()?.as_bytes().to_vec()),
     }
+}
+
+/// The settings of the catalog mirrors from the arguments of the storage:
+/// a bound in bytes, a count of change sets, seconds, a count of rows and
+/// seconds. `None` keeps a default.
+fn catalog_config(
+    memory: Option<u64>,
+    window_tids: Option<u64>,
+    window_seconds: Option<f64>,
+    rebase_rows: Option<u64>,
+    wait: Option<f64>,
+) -> PyResult<CatalogConfig> {
+    let seconds = |name: &str, value: f64| {
+        Duration::try_from_secs_f64(value)
+            .map_err(|_| PyValueError::new_err(format!("{name} is a number of seconds, 0 or more")))
+    };
+    let mut config = CatalogConfig::default();
+    if let Some(memory) = memory {
+        config.memory = usize::try_from(memory)
+            .map_err(|_| PyValueError::new_err("catalog_memory is too large"))?;
+    }
+    if let Some(tids) = window_tids {
+        config.window_tids = usize::try_from(tids)
+            .map_err(|_| PyValueError::new_err("catalog_window_tids is too large"))?;
+    }
+    if let Some(value) = window_seconds {
+        config.window = seconds("catalog_window_seconds", value)?;
+    }
+    if let Some(rows) = rebase_rows {
+        config.rebase_rows = usize::try_from(rows)
+            .map_err(|_| PyValueError::new_err("catalog_rebase_rows is too large"))?;
+    }
+    if let Some(value) = wait {
+        config.wait = seconds("catalog_wait", value)?;
+    }
+    Ok(config)
 }
 
 /// Return the total size of the files in the directory `dir`, in bytes.

@@ -23,8 +23,8 @@
 //! answered a query least recently.
 //!
 //! The thread holds a share of the store only while it works, so the store
-//! can close between two passes. `stop` stops the thread and the builds,
-//! and waits for them.
+//! can close between two passes, and a build takes a share for each read.
+//! `stop` stops the thread and the builds, and waits for them.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -38,6 +38,7 @@ use crate::build::{BuildError, Built, build};
 use crate::change::{ChangeSet, Shapes, read_records};
 use crate::counts::{Counters, Counts, MirrorCounts};
 use crate::mirror::{Versions, rebase};
+use crate::plan::{PlanError, Wire, decode_plan};
 use crate::query::{Plan, Reply, View};
 use crate::read::{Commit, Reads};
 use crate::reason::{Fallback, Reason};
@@ -272,6 +273,25 @@ impl Mirrors {
             Err(f) => self.shared.counters.python(f.reason, started.elapsed()),
         }
         answer
+    }
+
+    /// Answers the plan `plan` in the form of section 8, as `query` does.
+    /// A plan of another form is an error: its text. A key or a kind of
+    /// clause that this version does not know gives the reason `plan`.
+    pub fn query_wire(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Wire,
+    ) -> Result<Result<Reply, Fallback>, String> {
+        match decode_plan(plan) {
+            Ok(plan) => Ok(self.query(catalog, tid, &plan)),
+            Err(PlanError::Malformed(why)) => Err(why),
+            Err(PlanError::Unknown(why)) => {
+                self.shared.counters.python(Reason::Plan, Duration::ZERO);
+                Ok(Err(Fallback::new(Reason::Plan, why)))
+            }
+        }
     }
 
     fn answer(&self, catalog: u64, tid: u64, plan: &Plan) -> Result<Reply, Fallback> {
@@ -515,6 +535,47 @@ impl Shared {
             );
             self.event(inner, text);
         }
+    }
+}
+
+/// The reads of a build: each read takes a share of the store and gives it
+/// back, so a build never keeps the store open. After the close, each read
+/// fails.
+struct Weakly<'a>(&'a Opener);
+
+impl Weakly<'_> {
+    fn with<T>(&self, f: impl FnOnce(&dyn Reads) -> Result<T, String>) -> Result<T, String> {
+        match (self.0)() {
+            Some(store) => f(&*store),
+            None => Err("the store is closed".into()),
+        }
+    }
+}
+
+impl Reads for Weakly<'_> {
+    fn last_tid(&self) -> u64 {
+        (self.0)().map_or(0, |store| store.last_tid())
+    }
+
+    fn load_before(&self, oid: u64, tid: u64) -> Result<Option<Vec<u8>>, String> {
+        self.with(|store| store.load_before(oid, tid))
+    }
+
+    fn commits(
+        &self,
+        from: u64,
+        to: u64,
+        each: &mut dyn FnMut(Commit) -> bool,
+    ) -> Result<(), String> {
+        self.with(|store| store.commits(from, to, each))
+    }
+
+    fn registrations(&self) -> Result<Vec<Vec<u8>>, String> {
+        self.with(|store| store.registrations())
+    }
+
+    fn registration_generation(&self) -> Result<u64, String> {
+        self.with(|store| store.registration_generation())
     }
 }
 
@@ -781,19 +842,22 @@ fn start_build(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
                 if let Some(hook) = &shared.config.hooks.before_build {
                     hook(catalog);
                 }
-                match (shared.open)() {
-                    None => Err(BuildError::Dropped),
-                    Some(store) => {
-                        let room = |bytes: usize| {
-                            let mut inner = shared.lock();
-                            !shared.cancel.load(AtomicOrdering::Relaxed)
-                                && shared.room(&mut inner, Some(catalog), bytes)
-                        };
-                        catch_unwind(AssertUnwindSafe(|| {
-                            build(&*store, catalog, tid, shared.config.threads, &room)
-                        }))
-                        .unwrap_or_else(|_| Err(BuildError::Refused("the build panicked".into())))
+                let room = |bytes: usize| {
+                    let mut inner = shared.lock();
+                    !shared.cancel.load(AtomicOrdering::Relaxed)
+                        && shared.room(&mut inner, Some(catalog), bytes)
+                };
+                let reads = Weakly(&shared.open);
+                let built = catch_unwind(AssertUnwindSafe(|| {
+                    build(&reads, catalog, tid, shared.config.threads, &room)
+                }))
+                .unwrap_or_else(|_| Err(BuildError::Refused("the build panicked".into())));
+                match built {
+                    // A build that the close of the store stopped.
+                    Err(BuildError::Refused(_)) if (shared.open)().is_none() => {
+                        Err(BuildError::Dropped)
                     }
+                    other => other,
                 }
             };
             let mut inner = shared.lock();

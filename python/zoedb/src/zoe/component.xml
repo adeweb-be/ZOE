@@ -131,6 +131,42 @@
         false, they keep the ObjectReader of ZODB. The default is true.
       </description>
     </key>
+    <key name="catalog-memory" datatype="string">
+      <description>
+        The bound of the memory of the catalog mirrors of the store, as a
+        byte size such as 2GB (ADR 0059). A build, a rebase or a growth
+        that would pass it drops the mirror that answered a query least
+        recently, and its queries take the Python path. The default is
+        2GB.
+      </description>
+    </key>
+    <key name="catalog-window-tids" datatype="string">
+      <description>
+        The change sets of the mirror window: a change set leaves the
+        window when this many newer change sets exist. A query at a tid
+        whose later commits have no change set in the mirror takes the
+        Python path. The default is 10000.
+      </description>
+    </key>
+    <key name="catalog-window-seconds" datatype="string">
+      <description>
+        The age past which a change set leaves the mirror window, as a time
+        such as 10m. The default is 10 minutes.
+      </description>
+    </key>
+    <key name="catalog-rebase-rows" datatype="string">
+      <description>
+        The rows of the overrides of the last tid past which a mirror
+        rebases in the background. The default is 20000.
+      </description>
+    </key>
+    <key name="catalog-wait" datatype="string">
+      <description>
+        The longest wait of a catalog query for the mirror to apply the
+        commits of its snapshot, as a time such as 1s. Past it, the query
+        takes the Python path. The default is 1 second.
+      </description>
+    </key>
   </sectiontype>
 
   <sectiontype name="ssl">

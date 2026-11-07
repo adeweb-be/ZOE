@@ -24,11 +24,19 @@ the `initialization` of the test script. It makes the layer a base of
 `STARTUP`. zope.testrunner then sets up the layer before `STARTUP` and
 tears it down after `STARTUP`. Only the `plone` extra and plone.testing
 make this module importable.
+
+`ZOE_SITE` is a layer over the fixture of plone.app.testing whose database
+is a `zoe.Storage` itself, with no `DemoStorage` on it: a Plone site
+`plone` with plone.app.contenttypes, in a store of its own. The tests that
+need the catalog mirror of the store use it. Its resources are `zoeDB`,
+the database, and `zoeStorage`, its storage. The module makes the layer at
+its first use, so it imports plone.app.testing only then.
 """
 
 import shutil
 import tempfile
 
+import transaction
 from plone.testing import Layer, zodb
 from plone.testing import zope as zope_layers
 from ZODB.DB import DB
@@ -133,3 +141,74 @@ def install(zeo=None):
     if layer not in startup.__bases__:
         startup.__bases__ = (layer, *startup.__bases__)
     return layer
+
+
+class ZoeSite(Layer):
+    """A Plone site in a database whose storage is a `zoe.Storage`, with no
+    `DemoStorage` on it.
+
+    `setUp` opens the storage in a new directory, adds a Zope application
+    with the site owner of plone.app.testing, and a Plone site `plone` with
+    the profile of plone.app.contenttypes. `tearDown` closes the database
+    and removes the directory.
+    """
+
+    def setUp(self):
+        from OFS.Application import Application
+        from plone.app.testing import SITE_OWNER_NAME, SITE_OWNER_PASSWORD
+        from plone.testing import zope as zope_testing
+        from Products.CMFPlone.factory import addPloneSite
+        from Testing.makerequest import makerequest
+        from zope.component.hooks import getSite, setSite
+
+        import zoe
+
+        self._directory = tempfile.mkdtemp(prefix="zoe-plone-site-")
+        storage = zoe.Storage(f"{self._directory}/zoe")
+        db = DB(storage)
+        site = getSite()
+        connection = db.open()
+        try:
+            app = Application()
+            connection.root()["Application"] = app
+            app.acl_users._doAddUser(
+                SITE_OWNER_NAME, SITE_OWNER_PASSWORD, ["Manager"], []
+            )
+            transaction.commit()
+            app = makerequest(connection.root()["Application"])
+            zope_testing.login(app["acl_users"], SITE_OWNER_NAME)
+            setSite(None)
+            addPloneSite(
+                app,
+                "plone",
+                setup_content=False,
+                extension_ids=("plone.app.contenttypes:default",),
+            )
+            transaction.commit()
+        finally:
+            transaction.abort()
+            zope_testing.logout()
+            setSite(site)
+            connection.close()
+        self["zoeDB"] = db
+        self["zoeStorage"] = storage
+
+    def tearDown(self):
+        self["zoeDB"].close()
+        del self["zoeDB"], self["zoeStorage"]
+        shutil.rmtree(self._directory, ignore_errors=True)
+
+
+_layers = {}
+
+
+def __getattr__(name):
+    # The layer depends on plone.app.testing, which the module imports only
+    # when a test asks for it.
+    if name == "ZOE_SITE":
+        if name not in _layers:
+            from plone.app.testing import PLONE_FIXTURE
+
+            _layers[name] = ZoeSite(bases=(PLONE_FIXTURE,), name="ZoeSite")
+        return _layers[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

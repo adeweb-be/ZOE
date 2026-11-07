@@ -2549,6 +2549,7 @@ dependencies = [
  "rmpv",
  "signal-hook",
  "tokio",
+ "zoe-catalog",
  "zoe-client",
  "zoe-core",
  "zoe-pickle",
