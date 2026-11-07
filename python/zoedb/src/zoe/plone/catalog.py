@@ -7,9 +7,20 @@ of the catalog with `getattr`, as `zoe.kv` reads `kv_supported()`. It
 builds the plan of the query with ZCatalog's own `IndexQuery` and the
 conversion of each index, sends it with the start of the snapshot of the
 Connection to `catalog_query` of the storage, and gives a `LazyMap` of
-brains in the order of the reply. The brains read their metadata from
-`data` through the Connection. For a refusal, or for a query that it
+brains in the order of the reply. For a refusal, or for a query that it
 cannot type, the hook runs the stock search, whole.
+
+The brains. The plan names the columns of the `schema` of the catalog, in
+the order of their positions (`cols`), and the number of rids that get
+their rows (`rn`): `b_size`, or a page of `_CELLS` cells when the query
+has no `b_size`. The reply gives the row and the path of each of these
+rids. The hook makes the brain of such a rid as `Catalog.instantiate`
+makes it from `data`, with the cells of the row, and its `getPath()`
+gives the path of the reply: the Connection loads no bucket of `data` and
+no bucket of `paths` for it. A rid whose row is `None` (a cell of a type
+that the mirror does not model), and a rid past `rn`, gets the brain of
+the stock `Catalog.__getitem__`, which loads the bucket of `data`. A
+schema that does not give each position from 0 once sends no columns.
 
 This version types the clauses of FieldIndex, KeywordIndex, DateIndex and
 UUIDIndex (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
@@ -99,6 +110,9 @@ _plant = None
 
 # The largest int of a plan: msgpack carries 64 bits.
 _INT = 2**63
+
+# The cells of the rows that a reply gives for a query without `b_size`.
+_CELLS = 50_000
 
 
 def installed():
@@ -398,11 +412,58 @@ def _result(catalog, reply):
     if not reply["r"] and not reply["a"]:
         return LazyCat([])
     return LazyMap(
-        catalog.__getitem__,
+        _brains(catalog, reply),
         list(reply["r"]),
         reply["n"],
         actual_result_count=reply["a"],
     )
+
+
+def _brains(catalog, reply):
+    """The function that makes the brain of a rid of `reply`: from its row
+    and its path, as `Catalog.instantiate` makes it from `data`, or with the
+    stock `Catalog.__getitem__` for a rid without a row."""
+    from Acquisition import aq_parent
+
+    rows = reply.get("rows")
+    paths = reply.get("paths")
+    if not rows or not paths:
+        return catalog.__getitem__
+    klass = catalog._v_result_class
+    width = len(klass.__record_schema__)
+    found = {}
+    for rid, row, path in zip(reply["r"], rows, paths, strict=False):
+        # The fast path of `instantiate`: one value for each column, then
+        # the rid and the two scores.
+        if row is not None and path is not None and len(row) + 3 == width:
+            found[rid] = (row, path)
+    parent = aq_parent(catalog)
+
+    def brain(rid):
+        made = found.get(rid)
+        if made is None:
+            return catalog.__getitem__(rid)
+        row, path = made
+        catalog._maintain_zodb_cache()
+        record = klass(row + (rid, 1, 1))
+        # A brain takes no attribute outside its schema, but keeps a dict:
+        # the path of the reply shadows `getPath`, which reads `paths`.
+        record.__dict__["getPath"] = lambda: path
+        return record.__of__(parent)
+
+    return brain
+
+
+def _columns(catalog):
+    """The columns of the schema of `catalog` in the order of their
+    positions, or None when the schema does not give each position from 0
+    once."""
+    schema = getattr(catalog, "schema", None)
+    if not isinstance(schema, dict):
+        return None
+    if sorted(schema.values()) != list(range(len(schema))):
+        return None
+    return sorted(schema, key=schema.__getitem__)
 
 
 def _wire(value):
@@ -506,14 +567,21 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
         b_size = int(b_size) if b_size is not None else None
     except (TypeError, ValueError):
         return None, "option"
+    cols = _columns(catalog)
+    if cols is None:
+        rn = 0
+    elif b_size is not None:
+        rn = max(0, b_size)
+    else:
+        rn = max(1, _CELLS // max(1, len(cols)))
     return {
         "c": clauses,
         "s": sort,
         "l": limit,
         "bs": b_start,
         "bz": b_size,
-        "cols": None,
-        "rn": 0,
+        "cols": cols,
+        "rn": rn,
     }, None
 
 

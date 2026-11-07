@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! plan   = {"c": [clause...], "s": [[index, reverse]...], "l": sort_limit | nil,
-//!           "bs": b_start, "bz": b_size | nil, "cols": nil, "rn": count}
+//!           "bs": b_start, "bz": b_size | nil, "cols": [column...] | nil,
+//!           "rn": count}
 //! clause = {"k": "v", "i": index, "q": [value...], "and": bool,
 //!           "r": [min | nil, max | nil] | nil, "not": [value...]}
 //!        | {"k": "b", "i": index, "q": bool | nil}
@@ -17,15 +18,23 @@
 //!           "and": bool, "d": depth, "nt": bool, "ns": navtree_start,
 //!           "ip": [component...]}
 //! value  = nil | bool | int | float | str | [value...] (a tuple)
-//! reply  = {"tid": tid, "r": rids, "n": len, "a": actual_result_count}
+//! reply  = {"tid": tid, "r": rids, "n": len, "a": actual_result_count,
+//!           "rows": [[cell...] | nil...] | nil, "paths": [path | nil...] | nil}
 //!        | {"tid": tid, "f": reason, "why": text}
 //! ```
+//!
+//! `rows` and `paths` come when the plan names `cols`: one item for each of
+//! the first `rn` rids of `r`. A cell is a msgpack value of `cell`. A row
+//! is nil when a cell of the row has another type, when the record of the
+//! rid does not have one value for each column of the schema, or when the
+//! schema of the catalog has no column of `cols`.
 //!
 //! A plan that does not have this form is `Malformed`: the caller raises
 //! `ValueError`. A key or a kind of clause that this version does not know
 //! is `Unknown`: the reply is the reason `plan`.
 
-use crate::query::{Clause, Plan, Reply};
+use crate::cell;
+use crate::query::{Clause, Columns, Plan, Reply};
 use crate::reason::{Fallback, Reason};
 use crate::value::Val;
 
@@ -48,6 +57,8 @@ pub enum Wire {
     Array(Vec<Wire>),
     /// A map, in the order of its items.
     Map(Vec<(Wire, Wire)>),
+    /// An ext: its type and its data.
+    Ext(i8, Vec<u8>),
 }
 
 /// Why a plan does not read.
@@ -132,7 +143,9 @@ fn value_at(wire: &Wire, depth: &mut usize) -> Result<Val, PlanError> {
                 .map(|item| value_at(item, depth))
                 .collect::<Result<_, _>>()?,
         ),
-        Wire::Bin(_) | Wire::Map(_) => return malformed("a value that is a bin or a map"),
+        Wire::Bin(_) | Wire::Map(_) | Wire::Ext(..) => {
+            return malformed("a value that is a bin, a map or an ext");
+        }
     };
     *depth -= 1;
     Ok(out)
@@ -342,9 +355,16 @@ fn path_clause(items: &[(&str, &Wire)]) -> Result<Clause, PlanError> {
     Ok(clause)
 }
 
-/// Reads a plan.
+/// Reads a plan, without its rows.
 pub fn decode_plan(wire: &Wire) -> Result<Plan, PlanError> {
+    decode_request(wire).map(|(plan, _)| plan)
+}
+
+/// Reads a plan and the rows that its reply gives: `cols` and `rn`. A
+/// negative `rn` gives no row.
+pub fn decode_request(wire: &Wire) -> Result<(Plan, Columns), PlanError> {
     let mut plan = Plan::default();
+    let mut columns = Columns::default();
     let mut clauses = None;
     let mut unknown = None;
     for (key, v) in items(wire, "the plan")? {
@@ -380,12 +400,19 @@ pub fn decode_plan(wire: &Wire) -> Result<Plan, PlanError> {
             "l" => plan.limit = opt_int(v, "l")?,
             "bs" => plan.b_start = int(v, "bs")?,
             "bz" => plan.b_size = opt_int(v, "bz")?,
-            "rn" => {
-                int(v, "rn")?;
-            }
+            "rn" => columns.rn = usize::try_from(int(v, "rn")?).unwrap_or(0),
             "cols" => {
-                if *v != Wire::Nil {
-                    unknown.get_or_insert_with(|| "the columns of the metadata table".into());
+                columns.cols = match v {
+                    Wire::Nil => None,
+                    other => Some(
+                        array(other, "cols")?
+                            .iter()
+                            .map(|c| match c {
+                                Wire::Str(name) => Ok(name.clone()),
+                                _ => malformed("a column of cols is not a str"),
+                            })
+                            .collect::<Result<_, _>>()?,
+                    ),
                 }
             }
             other => {
@@ -400,7 +427,7 @@ pub fn decode_plan(wire: &Wire) -> Result<Plan, PlanError> {
         return Err(PlanError::Unknown(why));
     }
     plan.clauses = clauses;
-    Ok(plan)
+    Ok((plan, columns))
 }
 
 /// The reply to a query at `tid`, as section 8 gives it on the wire.
@@ -410,15 +437,30 @@ pub fn encode_reply(tid: u64, answer: &Result<Reply, Fallback>) -> Wire {
         Wire::Bin(tid.to_be_bytes().to_vec()),
     );
     match answer {
-        Ok(reply) => Wire::Map(vec![
-            tid,
-            (
-                Wire::Str("r".into()),
-                Wire::Bin(reply.rids.iter().flat_map(|r| r.to_be_bytes()).collect()),
-            ),
-            (Wire::Str("n".into()), Wire::Int(reply.len)),
-            (Wire::Str("a".into()), Wire::Int(reply.actual)),
-        ]),
+        Ok(reply) => {
+            let mut items = vec![
+                tid,
+                (
+                    Wire::Str("r".into()),
+                    Wire::Bin(reply.rids.iter().flat_map(|r| r.to_be_bytes()).collect()),
+                ),
+                (Wire::Str("n".into()), Wire::Int(reply.len)),
+                (Wire::Str("a".into()), Wire::Int(reply.actual)),
+            ];
+            if let (Some(rows), Some(paths)) = (&reply.rows, &reply.paths) {
+                let rows = rows
+                    .iter()
+                    .map(|row| row.as_deref().and_then(cell::decode).unwrap_or(Wire::Nil))
+                    .collect();
+                let paths = paths
+                    .iter()
+                    .map(|p| p.clone().map_or(Wire::Nil, Wire::Str))
+                    .collect();
+                items.push((Wire::Str("rows".into()), Wire::Array(rows)));
+                items.push((Wire::Str("paths".into()), Wire::Array(paths)));
+            }
+            Wire::Map(items)
+        }
         Err(fallback) => Wire::Map(vec![
             tid,
             (

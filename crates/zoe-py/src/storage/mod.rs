@@ -931,8 +931,10 @@ impl Storage {
     /// object has the oid `catalog`, as of the snapshot that ends before
     /// `tid`, as the tid of `loadBefore` (ADR 0059, section 9). `catalog`
     /// and `tid` are 8 bytes, and `plan` is a dict in the form of section
-    /// 8. The reply is a dict: `r`, the rids as a list of ints, `n` and
-    /// `a`; or `f`, the reason of a fallback, and `why`. A plan of another
+    /// 8. The reply is a dict: `r`, the rids as a list of ints, `n`, `a`,
+    /// `rows` and `paths`; or `f`, the reason of a fallback, and `why`.
+    /// `rows` holds the cells of the columns `cols` of the plan for each of
+    /// the first `rn` rids, as Python values, or `None`. A plan of another
     /// form raises `ValueError`. A key or a kind of clause that the mirror
     /// does not know gives the reason `plan`. The call releases the GIL.
     fn catalog_query<'py>(
