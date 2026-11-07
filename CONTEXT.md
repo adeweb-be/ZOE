@@ -327,7 +327,7 @@ The text of one document in one text index of one catalog at one tid: a row of `
 _Avoid_: text record (it has no oid), posting
 
 **Clear delta**:
-The row of `text_deltas` that empties one text index of one catalog at one tid; no read sees a text delta of that index before it, and pack removes such deltas.
+The row of `text_deltas` that empties one text index of one catalog at one tid; no read at a later snapshot sees a text delta of that index before it, and pack removes such deltas.
 _Avoid_: reset, truncate
 
 **Text overlay**:

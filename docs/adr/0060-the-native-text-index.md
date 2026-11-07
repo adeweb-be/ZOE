@@ -22,7 +22,7 @@ This record uses the terms of ADR 0059: mirror window, transaction overlay, test
 - **Text delta**: the text of one document in one text index of one catalog, at one tid. It is a row of `text_deltas`, not a record: it has no oid.
 - **Unindex**: a text delta with an empty payload. The document leaves the index.
 - **Clear delta**: a row of `text_deltas` that empties one text index of one catalog at one tid. "The deltas" names the text deltas and the clear deltas together.
-- **Dead delta**: a text delta before the newest clear delta of its index. No read sees it.
+- **Dead delta**: at a snapshot, a text delta before the newest clear delta of its index before that snapshot. No read at that snapshot or at a later snapshot sees it.
 - **Live text**: the text of a document at a snapshot: the newest text delta of its key before the snapshot, when that delta is not dead and not an unindex.
 - **Replaced document**: a document of the tantivy index that one query takes out of the result of the index.
 - **Text overlay**: the texts that one query scores beside the tantivy index, in place of the replaced documents. It is not the overlay of `zoe.kv`, and not the transaction overlay.
@@ -31,24 +31,25 @@ This record uses the terms of ADR 0059: mirror window, transaction overlay, test
 
 ### Decisions of the human
 
-The human delegated the decisions of this record to the orchestrator. The seven points of section 17 stay as the human decided them (#601). The orchestrator decided:
+The human delegated the decisions of this record, and its acceptance, to the orchestrator. The seven points of section 17 stay as the human decided them (#601). The orchestrator decided:
 
 1. A clear of an index is a clear delta in `text_deltas`, not a generation in the key (section 1). `ZoeTextIndex.clear()` and `Catalog.delIndex` stage it (section 14).
 2. Pack keeps the transaction row of each delta that it keeps. Verify accepts a missing previous delta at or before `pack_watermark` (sections 4 and 7).
-3. The vote and the finish check each text delta against the deltas committed after the snapshot of its transaction. An equal text is dropped, another text is a conflict. The undo checks under the commit sequencer too (sections 5 and 8).
+3. The vote reserves the keys of the text deltas of its transaction, and checks each text delta against the deltas committed after the snapshot of its transaction. An equal text is dropped, another text is a conflict. The finish never fails for a text delta (sections 5 and 8).
 4. The call `text_query` of the extension `text` answers a text clause without the mirror, with the `resultset` of the other indexes as its filter (section 12). `ZoeTextIndex` needs the backend `catalog` (section 14).
 5. The text clause refuses a snapshot at or before `pack_watermark`. Pack caps its tid at the tid of each live text index (sections 4 and 13).
-6. In the compatibility mode, the statistics are those at the snapshot. The enhanced mode keeps the statistics of the current index, as Q9 decided (section 13).
+6. A change of Q9: in the compatibility mode, the statistics are those at the snapshot, so the scores are those of ZCTextIndex at every snapshot that the text clause serves. Q9 let the scores use the statistics of the current corpus. The reason: the mechanism of a snapshot runs at nearly every query under writes, so with those statistics the scores of the compatibility mode would differ from ZCTextIndex inside the mirror window too. The enhanced mode keeps the statistics of the current index, as Q9 decided (section 13).
 7. `k1` and `b` are fixed at 1.2 and 0.75, the constants of tantivy 0.27 (section 11).
 8. ZOE-297 adds a replay of the text queries of the Plone suites on a ZOE store (section 11).
+9. A change of N1: the base of a test storage answers its queries, with the deltas of the test storage as staged texts (section 9). N1 said that a text index in the process, built from the deltas of the overlay and of the base, answers. The reason: one mechanism, the text overlay of section 13, then serves the transaction and the test storage, and a base behind a server gives its statistics with its reply. The test storage holds no text index of its own.
 
 ### 1. The text deltas
 
-Two key spaces hold the deltas. Numbers are big-endian.
+Two key spaces hold the deltas. The numbers of the keys are big-endian. The frame header is little-endian, as for every frame.
 
 | Key space | Key | Value |
 | --- | --- | --- |
-| `text_deltas`, a text delta | the oid of the catalog (8 bytes); the length of the index id (1 byte, 1 to 255); the index id (UTF-8); the rid (4 bytes, the sign bit flipped, so the byte order is the order of the rids); the tid (8 bytes) | a frame with checksum tag 9. Its previous serial is the tid of the previous text delta of the same key without its tid, or 0. Its payload is the length of the language (1 byte), the language (0 to 35 bytes of ASCII: a BCP 47 tag, or empty), then the text (UTF-8). An unindex has an empty payload. The codec follows the setting `compression`, as for a record. |
+| `text_deltas`, a text delta | the oid of the catalog (8 bytes); the length of the index id (1 byte, 1 to 255); the index id (UTF-8); the rid (4 bytes, the sign bit flipped, so the byte order is the order of the rids); the tid (8 bytes) | a frame with checksum tag 9. Its previous serial is the tid of the previous text delta of the same key without its tid, or 0. Its payload is the length of the language (1 byte), the language (0 to 35 bytes of ASCII: a BCP 47 tag, or empty), then the text (UTF-8). An unindex has an empty payload and codec 0. The codec of another text delta follows the setting `compression`, as for a record. |
 | `text_deltas`, a clear delta | the oid of the catalog (8 bytes); the byte 0; the length of the index id (1 byte); the index id; the tid (8 bytes) | a frame with checksum tag 9 and an empty payload, codec 0. Its previous serial is the tid of the previous clear delta of the same index, or 0. |
 | `text_txn` | the tid (8 bytes), then the key of the delta without its tid | empty, not a frame, so no checksum tag |
 
@@ -57,7 +58,7 @@ Two key spaces hold the deltas. Numbers are big-endian.
 - A read of a live text at a snapshot takes the newest clear delta of the index before the snapshot. Then it makes one reverse range scan of the key from the snapshot, as `loadBefore` does. The store keeps the clear deltas of each index in memory: they are few. A text delta before that clear is dead. A text delta at the tid of the clear is live: its transaction staged it after the clear (section 8).
 - A scan of `text_txn` over a tid range gives the documents and the clears of the range.
 - The tag 9 is the next free tag (`format::KeySpace`). The tag 6 stays reserved for `vectors`.
-- A delta takes no lock. The vote and the finish check a text delta against the deltas committed after the snapshot of its transaction (section 8).
+- A delta takes no per-OID lock. The vote reserves the key of each text delta and checks the text delta against the deltas committed after the snapshot of its transaction (section 8).
 - A delta counts in `max-record-size`, `staging-memory` and `max-transaction-size` as a pickle does. A delta over a limit fails with `TextTooLarge`, as `KvTooLarge` fails for a namespace write, and stages nothing.
 - An empty index id or one longer than 255 bytes, a language longer than 35 bytes or not ASCII, and a rid outside the signed 32-bit range fail with `InvalidText`. The call stages nothing.
 - A transaction with only deltas commits as a transaction with only namespace writes: a tid, and a transaction row with an oid count of 0.
@@ -82,12 +83,12 @@ The finding gives the bytes: 3,105 bytes for the three deltas of one save of `ca
 Pack at T applies these rules to the deltas:
 
 1. Pack keeps every delta after T.
-2. A text delta at or before T that is dead at T goes: it is before the newest clear delta of its index at or before T. That clear delta goes too, with every clear delta of the index before it.
+2. A text delta at or before T that is dead at T goes: it is before the newest clear delta of its index at or before T. That clear delta goes too, with every clear delta of the index before it, after the dead text deltas.
 3. Of the other text deltas at or before T of one key, pack keeps the newest and removes the others.
 4. When that newest text delta is an unindex, pack removes it too.
 5. With `pack-gc` true, the deltas at or before T of a catalog that the mark does not reach go too. The mark is unchanged, since a delta refers to nothing.
 
-With `pack-gc` false, pack has no mark, and rules 1 to 4 apply. Pack removes the key of each removed delta in `text_txn`. It removes the deltas in batches of its own, in key order, before the batches of the records. Before each batch, it marks what the noted records of the finishes refer to, as for a batch of records. It notes, in a set in memory, the tids of the deltas that it keeps. A transaction row before T stays while it keeps a record or a delta. So a transaction of deltas only, and an edit whose records pack removed, keep their rows while a delta of theirs stays. A delta whose frame fails its checksum stops the pack, as a record does. A dry run counts the deltas that pack would remove.
+With `pack-gc` false, pack has no mark, and rules 1 to 4 apply. Pack removes the key of each removed delta in `text_txn`. It removes the deltas in batches of its own, before the batches of the records. The batches remove the text deltas in key order, and the clear deltas in the last batch of the deltas. So a clear delta goes only after every dead text delta that it hides. A stop or a crash between two batches always leaves the clear delta, and no dead text delta comes back. Before each batch, it marks what the noted records of the finishes refer to, as for a batch of records. It notes, in a set in memory, the tids of the deltas that it keeps. A transaction row before T stays while it keeps a record or a delta. So a transaction of deltas only, and an edit whose records pack removed, keep their rows while a delta of theirs stays. A delta whose frame fails its checksum stops the pack, as a record does. A dry run counts the deltas that pack would remove.
 
 Pack caps T at the tid of each text index that the process holds open: the tid up to which a live index holds the deltas, or the tid from which a rebuild reads them. So pack never removes an unindex that a live index has not applied yet. A text index in `text/` of a closed store needs no cap: its open rebuilds it when its tid is before the pack watermark (section 10).
 
@@ -96,11 +97,12 @@ Pack never changes the live text of a document at T or later. The text clause re
 ### 5. Undo
 
 - The undo of T reads, for each text delta of T, the text of its key as its own transaction sees it: a text that the transaction staged, else the newest committed one.
-- When that text is the text of the delta of T, the undo stages the live text of the key before T, or an unindex when there is none.
+- When that text is the text of the delta of T, the undo stages the live text of the key before T, or an unindex when there is none. In this comparison, no live text equals an unindex.
 - Otherwise the undo fails with `Undo` (`UndoError` in Python): text has no merge.
+- When a clear delta of the index committed after T, the undo of a text delta of T fails with `Undo`, also for an unindex. So an undo never puts a document back into a cleared index.
 - So several undos in one transaction undo one over the other, as for records: the undo of a later transaction first, then the undo of an earlier one.
 - An undo of a transaction that holds a clear delta fails with `Undo`.
-- The undo checks its keys, the vote checks them again, and the finish checks them once more under the commit sequencer, as for the pack watermark. A commit that wrote a key of the undo after the check fails that commit alone with `Undo`.
+- The `before` of each text delta that an undo stages is the tid before which the undo read the key. So check 3 of section 8 applies to it: a commit of the key after that read fails the vote with `TextConflict`. The reservation of section 8 covers the keys of the undo, and the finish checks no key of it.
 - The catalog records of the same undo go through the tiers of the vote.
 
 ### 6. The iterator, `zoe convert` and the dumps
@@ -139,16 +141,24 @@ The core (ZOE-293):
 - A restore transaction refuses them. It takes `Txn::restore_text(catalog, index, rid, language, text: Option<&str>)` and `Txn::restore_clear(catalog, index)`, which restore a delta at the tid of the transaction and check nothing.
 - `Store::text_before(catalog, index, rid, tid)` gives the language and the live text before `tid`, or none. `tid` is exclusive, as the tid of `loadBefore`. `Store::text_changed(after, last)` scans `text_txn`: it gives the key of each delta of the tids after `after` and at or before `last`, in tid order, then in key order.
 
+The vote reserves the keys of the text deltas of its transaction:
+
+- The store keeps a set of the reserved keys under a mutex. The mutex is held with no other lock taken under it.
+- The vote reserves every key of its staged text deltas before it runs the checks below. A key that another transaction reserved fails the vote at once with `TextConflict` (`ConflictError` in Python, so Zope retries the request).
+- The finish releases the reservation after the commit is visible to reads, or when the commit fails. An abort releases it.
+- So no commit of a reserved key is in flight. The check of the vote sees every commit of the key that can come before its own, and no two members of one commit batch write one key.
+- A reservation is not a per-OID lock, and the lock hand-off of ADR 0044 does not pass it. A vote that takes a hand-off from a commit in flight and stages a key of that commit fails at once with `TextConflict`. It does not wait for the commit of the holder.
+- A vote refuses a transaction whose `before` is at or before `pack_watermark` with `TextConflict`, when the transaction stages a text delta. Pack removed the history that the checks read, and a retry gets a new snapshot. Pack needs no other cap for it.
+
 The checks of a text delta, with the snapshot `before` of its transaction:
 
 1. When the transaction also stages a clear delta of the index, the delta is written. No check runs.
 2. When the language and the text equal the live text at the snapshot, the delta is dropped. An unindex of a document with no live text is dropped too. ZCTextIndex writes nothing in both cases.
-3. When a text delta of the key, or a clear delta of its index, committed at or after `before`: a text delta with the same language and text drops the staged delta. Anything else fails the transaction with `TextConflict` (`ConflictError` in Python, with the oid of the catalog). This is the conflict that "Step 3" of the specification names: the same rid and index in two concurrent transactions.
+3. When a text delta of the key, or a clear delta of its index, committed at or after `before`: the newest committed text delta of the key, with the same language and text, drops the staged delta. Anything else fails the transaction with `TextConflict` (`ConflictError` in Python, with the oid of the catalog). This is the conflict that "Step 3" of the specification names: the same rid and index in two concurrent transactions.
 4. Otherwise the delta is written.
 
-- The vote runs checks 2 and 3, with reads outside the commit sequencer.
-- The finish runs check 3 again under the commit sequencer, for the commits between the vote and the finish. A conflict there fails that commit alone with `TextConflict`, as a pack fails an undo there. The `transaction` package logs a failure of `tpc_finish` at CRITICAL, and Zope retries the request.
-- The same lookup gives the previous serial: the newest text delta of the key, from the unfolded table, then the tables, with the members of the batch before it. So one batch chains two deltas of one key.
+- The vote runs checks 2 and 3, with reads outside the commit sequencer. The finish runs no check, and it never fails for a text delta: `tpc_finish` must not fail.
+- The finish reads the previous serial under the commit sequencer: the newest text delta of the key, from the unfolded table, then the tables.
 - A clear delta takes no check. It replaces the whole index, as `ZCTextIndex.clear()` replaces the trees of its index. A text delta committed between the snapshot of the clearing transaction and its clear is dead. An entry written to the old trees of a ZCTextIndex is lost in the same way.
 
 The wire (ZOE-295): the protocol extension `text`, with the calls `text_set(catalog, index, rid, language, text, before)`, `text_unindex(catalog, index, rid, before)` and `text_clear(catalog, index)`. They have no reply, and they stage into the open transaction in its lane. An error fails the vote, as for `kv_set`. The calls `text_query` and `text_info` of section 12 run on the read pool.
@@ -169,7 +179,8 @@ A storage without the write path: a stock ZEO client, the asyncio mode of `zoe.z
 - On a test storage, the deltas of a commit go to memory that belongs to the `DemoStorage`, as the namespace writes of `zoe.kv` do (ADR 0047, section 9). They never reach the base, and they go with the `DemoStorage`.
 - The `DemoStorage` keeps the newest text delta of each key and the clear deltas of each index. It checks nothing: a test runs one transaction at a time. A stacked `DemoStorage` keeps its own deltas over those of the one below, and a delta above replaces the same key below.
 - A query on a test storage goes to its base, a ZOE storage with the extension `text`, in the process or behind a server, at the last tid of the base. The client sends the texts of each `DemoStorage` of the stack, then the staged texts of the transaction, as the staged texts of the clause (section 12).
-- When the base holds no record of the catalog, or a `DemoStorage` holds a clear delta of the index, the clause lists the index in `cl`. The base then answers from the staged texts alone. A site that a test layer creates is such a catalog.
+- On a test storage, the clause carries the settings of the index (`mode`, `language` and the boosts): the base cannot read the namespace `zoe.text` of the overlay of `zoe.kv`.
+- The clause lists the index in `cl` when the base holds no record of the catalog, when the base has no text index for the catalog, and when a `DemoStorage` holds a clear delta of the index. The base has no text index for the catalog when its registration key or its settings are only in the overlay of `zoe.kv`. The base then answers from the staged texts alone, with the settings of the clause. A site that a test layer creates is such a catalog.
 - So the base gives the statistics and the scores, in the process or in the reply of the server. The test storage holds no text index. With a base in the process, the text index of the base is in the process, as N1 decided.
 - The Plone suites run on an empty `zoe.Storage` base. There each query runs on the text overlay alone, not on tantivy. So the replay of section 11 runs on a ZOE store.
 - A test storage whose texts pass the cap of a call (section 12) fails its searches with `Unavailable`.
@@ -212,7 +223,8 @@ The text clause is a clause of a plan of `catalog_query` (ADR 0059, section 8). 
 
 ```text
 clause  = ... | {"k": "t", "i": index, "q": node, "lg": [language...] | nil,
-                 "cl": [index...], "st": [staged...]}
+                 "cl": [index...], "st": [staged...], "set": settings | nil}
+settings = {"mode": "enhanced" | "compat", "language": [language...], "boosts": {index: float}}
 node    = {"n": "and", "items": [node...], "nots": [node...]}
         | {"n": "or", "items": [node...]}
         | {"n": "atom", "w": [word...]}
@@ -224,15 +236,16 @@ reply   = {"tid": tid, "r": rids, "sc": scores | nil, "n": len, "a": actual_resu
         | {"tid": tid, "f": reason, "why": text}
         | {"tid": tid, "e": error, "why": text}
 scores  = bin: the score of each rid of "r", as a signed 32-bit big-endian int
-error   = "unavailable" | "packed" | "cleared" | "corrupt"
+error   = "unavailable" | "packed" | "cleared" | "corrupt" | "too_large"
 ```
 
 - `w` holds the words after the lexicon: each element of the pipeline of the lexicon of the index, with `process_post_glob` when it has one. The compatibility mode uses them as they are. The enhanced mode analyses each word again with its analyzer.
 - `p` holds the pattern before the lexicon, as the user wrote it. The server folds it with the analysis of the mode.
 - `st` holds the staged texts of the indexes that the query reads: the index of the clause, and with the boosts `Title` and `Description`. It has one entry for each key. A `nil` text is an unindex.
 - `cl` lists the indexes that the transaction cleared, and on a test storage the indexes of section 9. The server answers for them from the staged texts alone.
+- `set` holds the settings of the index on a test storage (section 9), and `nil` elsewhere: the server then reads `zoe.text`.
 - `lg` lists the languages whose fields the query reads, from the `Language` clause of the catalog query. `nil` reads every field of the index.
-- `sc` comes when the plan has a text clause and no sort. An error comes from the text clause (sections 10 and 13). `unavailable` raises `zoe.storage.Unavailable`, `packed` and `cleared` raise `ReadConflictError`, and `corrupt` raises `StorageSystemError`.
+- `sc` comes when the plan has a text clause and no sort. An error comes from the text clause (sections 10 and 13). `unavailable` and `too_large` raise `zoe.storage.Unavailable`, `packed` and `cleared` raise `ReadConflictError`, and `corrupt` raises `StorageSystemError`.
 
 The mirror runs the other clauses of the plan first and gives the bitmap of their rids with the text clause. The result follows `Catalog.search`:
 
@@ -256,6 +269,7 @@ reply   = {"tid": tid, "docs": count, "words": count, "lang": language | nil, "t
 - `rids` and `tid` have the forms of ADR 0059, section 8. `tid` is exclusive.
 - `text_info` gives the documents of the index at the snapshot, the distinct words of the index at its tid, and the live text of `rid` at the snapshot when `rid` is not `nil`.
 - A call holds at most 50,000 msgpack values and 16 MiB (ADR 0059, section 8). A filter that passes the cap is not sent: the client intersects the reply with the `resultset` itself. Staged texts that pass the cap fail the search with `Unavailable`. With the boosts, a transaction reaches the cap at about 3,000 saved documents.
+- A reply holds at most 16 MiB too. A hit of `text_query` takes 8 bytes, its rid and its score, so the cap holds about 2,000,000 hits. A larger result fails the search with the error `too_large`, which raises `Unavailable`.
 - A clause that does not have the form of this section raises `ValueError`.
 
 The text index keeps the maps of section 10 in memory. It builds them at the open and changes them with each reload of its reader. The filter applies inside the search, and the smaller side drives it:
@@ -339,11 +353,12 @@ The other names of this record: the calls `text_clear`, `text_query` and `text_i
   - The table of the Python surface and `docs/reference/python-api.md`: the text methods of the storages and `zoe.storage.Unavailable`.
   - The text of the backends of `zoe.plone`: `ZoeTextIndex` needs the backend `catalog`, and the profile steps.
   - "Testing of the catalog": the replay of section 11 for G1, and the query set of `just bench catalog text` for G4.
-  - `crates/zoe-core/CLAUDE.md`: the format name, the tag 9, the deltas in a commit batch and in a direct batch, the checks of section 8, and the invariant of pack on the rows of the transactions.
+  - `crates/zoe-core/CLAUDE.md`: the format name, the tag 9, the deltas in a commit batch and in a direct batch, the reservations and the checks of section 8, the mutex of the reservations in the lock order, and the invariant of pack on the rows of the transactions.
+  - ADR 0059, section 8 (an amendment): the text clause in a plan of `catalog_query`, and the field `sc` and the error form `e` in its reply.
   - `crates/zoe-catalog/CLAUDE.md`: the invariants "a query ... takes the Python path, whole" and "a snapshot older than the mirror window takes the Python path" get: on that path, a `ZoeTextIndex` asks the text index with `text_query`.
   - `CONTEXT.md` gets the terms text delta, clear delta and text overlay with this record.
 - A save of a document writes three deltas in place of the buckets of three ZCTextIndex indexes. The text indexes leave the conflicts of saves. Two concurrent transactions that write one document with different texts conflict on its delta, also when they share no record.
-- A conflict or an undo check can fail a finish, for the commits between the vote and the finish. The `transaction` package logs it at CRITICAL, and Zope retries the request.
+- A text delta never fails a finish. A vote that stages a key of a transaction in flight fails at once with `TextConflict`, also after a lock hand-off, and Zope retries the request.
 - A store of format 3 needs the migration tool. The fixtures move with `prepare`. A backup directory of version 2 needs a new full dump.
 - The tantivy directory is a cache. Losing it costs a rebuild: about 4 minutes for `catalog-1m` with `zoe catalog rebuild-text`. A rebuild inside a store uses one thread, and its time was not measured. During a rebuild, text searches wait `catalog-wait`, then fail with `Unavailable`. A clear starts such a rebuild: `clearFindAndRebuild`, `manage_catalogClear`, `manage_clearIndex`, `delIndex` and the uninstall step.
 - A site on FileStorage or on a stock ZEO client cannot use `ZoeTextIndex`. Each instance of a site with `ZoeTextIndex` needs the backend `catalog`.
@@ -351,7 +366,7 @@ The other names of this record: the calls `text_clear`, `text_query` and `text_i
 - Snippets, the `@search` extension of plone.restapi and the labelled query set stay out of phase 6.
 - On the 12 terms of the plan, G4 holds in every variant, with a sort or with `b_size`. Over the 111 queries of the finding, the compatibility mode misses it: 27.6 ms at p99 alone and 23.1 ms with the filter, from the phrases of two frequent words (up to 30 ms). Fuzzy matching takes 20.7 ms at p99 alone over the 111 queries. It is off by default.
 - A text query with no `sort_on` and no `b_size` gets every hit in the order of the score. For a word in 77 % of the entries with the filter of a listing, about 380,000 hits, that takes about 25 ms in the compatibility mode and 35 ms in the enhanced mode (finding, section 8). The search view of Plone sends `b_size`.
-- `just bench catalog text` (ZOE-299) runs the 12 text terms of the plan of `catalog-1m` in the five variants of the finding, in both modes, through the wire. It proves G4. The finding did not measure an index of many segments with deletes, the change of the maps at each reload of the reader, the wire, the parse in Python, concurrent queries, the text overlay with the filter, the correction of the statistics, or the check of the files at the open.
+- `just bench catalog text` (ZOE-299) runs the 12 text terms of the plan of `catalog-1m` in the five variants of the finding, in both modes, through the wire. It proves G4. The finding did not measure an index of many segments with deletes, the change of the maps at each reload of the reader, the wire, the parse in Python, concurrent queries, the text overlay with the filter, the correction of the statistics, the check of the files at the open, or the path of `text_query`, which scores every hit with no pruning.
 - A filter that becomes a bitset costs 1.2 ms for 495,943 rids. A query whose hits have no bound pays it even when its hits are few: a glob of the search form of Plone in the enhanced mode loses up to 1.9 ms at p50.
 - The order of the documents of the index does not follow the rids, and does not need to. That order would save 0.3 ms of the 1.2 ms of a broad filter, and updates and merges would break it.
 - tantivy does not check its files on read. A file damaged after the open gives wrong results until a rebuild.
@@ -362,7 +377,8 @@ The other names of this record: the calls `text_clear`, `text_query` and `text_i
 - The text index answers outside the mirror window from ZCTextIndex: `ZoeTextIndex` replaces ZCTextIndex, so no Python index is left to answer. Q9 chose the delta history, and `text_query` answers when `catalog_query` refuses.
 - A generation in the key of each text delta, raised by a clear: each key grows. A read at a snapshot still needs the generation at that snapshot, so a history per tid of the generation, which is what a clear delta is.
 - An unindex for each rid at a clear: one row for each document of the index, in place of one row.
-- A lock on each key of a text delta in the vote: the lock manager locks oids, and a key of a delta has none. The checks of section 8 need no lock.
+- A repeat of check 3 at the finish, under the commit sequencer, in place of the reservations: `tpc_finish` must not fail, and the lock hand-off of ADR 0044 makes the race between the vote and the finish common.
+- A per-OID lock on each key of a text delta: the lock manager locks oids, and a key of a delta has none. The reservations are a set of their own.
 - The scorer of tantivy for the compatibility mode: its `idf`, its rounded norms and its `f32` scores give other scores and other ties.
 - `k1` and `b` as settings: a weight of their own, with bounds of their own for block-max WAND, for no need that F18 names.
 - A Rust port of the parser of ZCTextIndex: the parser in Python is the reference, and the plan keeps it.
