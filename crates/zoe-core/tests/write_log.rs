@@ -13,7 +13,8 @@
 //! a prefix of the commits, also while the fold runs. A batch of large
 //! records, a batch larger than half of the backlog and a batch of deferred
 //! restores go into the tables directly. An idle store folds by age. The
-//! format of such a store is `ZOE format 3`.
+//! format of such a store is `ZOE format 4` (ADR 0060), the log of `ZOE
+//! format 3` with the op of a delta.
 //!
 //! The crash images are in `write_log_crash.rs`, the bytes of a commit in
 //! `write_log_bytes.rs`, and the read-only opens in
@@ -119,12 +120,12 @@ impl Observer for Seen {
 }
 
 #[test]
-fn a_store_of_format_3_opens_and_a_store_of_format_2_is_refused() {
+fn a_store_of_format_4_opens_and_a_store_of_format_2_is_refused() {
     let vfs = MemVfs::new();
     let store = open(&vfs, WriteLog::default());
     let oid = new_oid(&store);
     let tid = commit(&store, oid, Tid::ZERO, b"pickle");
-    testing::write_meta(&store, "format", b"ZOE format 3").unwrap();
+    testing::write_meta(&store, "format", b"ZOE format 4").unwrap();
     drop(store);
 
     let store = open(&vfs, WriteLog::default());

@@ -412,6 +412,57 @@ pub trait Backend: Send + Sync {
     /// Tell if the store has the table of the namespaces of `flavour`. The
     /// first commit that writes a key of the flavour creates it.
     fn has_kv(&self, flavour: Flavour) -> Result<bool>;
+
+    /// Return the newest delta of `prefix`, a key of `text_deltas` without
+    /// its tid, whose tid is before `before`: its key and its frame, as
+    /// stored. The caller checks the frame. A key that the scan gives
+    /// outside the prefix is `CorruptText`. The default has no delta.
+    fn text_newest(&self, _prefix: &[u8], _before: Tid) -> Result<Option<(Bytes, Bytes)>> {
+        Ok(None)
+    }
+
+    /// Return the rows of `text_deltas` from `from` to `to`, in key order,
+    /// at most `limit` of them: the key and the frame of each, as stored.
+    /// One snapshot gives the list. A key outside the bounds, or a key that
+    /// does not come after the key before it, is `CorruptText`. The
+    /// default has no delta.
+    fn text_rows(
+        &self,
+        _from: Bound<&[u8]>,
+        _to: Bound<&[u8]>,
+        _limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        Ok(Vec::new())
+    }
+
+    /// Return the keys of `text_txn` from `from` to `to`, in key order, at
+    /// most `limit` of them. One snapshot gives the list. A key outside the
+    /// bounds, or out of order, is `CorruptTxn` with the tid of the key.
+    /// The default has no key.
+    fn text_txn_keys(
+        &self,
+        _from: Bound<&[u8]>,
+        _to: Bound<&[u8]>,
+        _limit: usize,
+    ) -> Result<Vec<Bytes>> {
+        Ok(Vec::new())
+    }
+
+    /// Store `bytes` under `key` in `text_deltas`, or in `text_txn` when
+    /// `index` is true, or remove the row for `None`, as they are. The
+    /// test hook damages a store with it. The default fails.
+    #[cfg(feature = "testing")]
+    fn write_text_stored(&self, _index: bool, _key: &[u8], _bytes: Option<&[u8]>) -> Result<()> {
+        Err(ZoeError::Backend("no text deltas in this backend".into()))
+    }
+
+    /// Remove the tables of the deltas and write `format` in `meta`, as a
+    /// store of the format before this one has them. The test hook makes
+    /// such a store with it. The default fails.
+    #[cfg(feature = "testing")]
+    fn write_previous_format_for_test(&self) -> Result<()> {
+        Err(ZoeError::Backend("no text deltas in this backend".into()))
+    }
 }
 
 /// A version that a commit writes: the oid, the serial of the previous
@@ -444,6 +495,8 @@ pub enum Framed<'a> {
     Blob(Oid, Tid, &'a [u8]),
     /// A row of the namespaces of a flavour, under the key of the row.
     Kv(Flavour, &'a [u8], &'a [u8]),
+    /// A delta, under its key in `text_deltas`.
+    Text(&'a [u8], &'a [u8]),
 }
 
 /// One backend write transaction. It holds the records, their keys in
@@ -542,6 +595,11 @@ pub trait WriteTxn {
                     .map_err(|_| crate::kv::corrupt(flavour, row))?;
                 self.put_kv(flavour, row, &frame.data)
             }
+            Framed::Text(key, bytes) => {
+                let frame = format::decode_frame(KeySpace::TextDeltas, key, bytes)
+                    .map_err(|_| crate::text::corrupt_key(key))?;
+                self.put_text(key, frame.prev, &frame.data)
+            }
         }
     }
 
@@ -594,6 +652,21 @@ pub trait WriteTxn {
     /// checksum and its own expiry is at or before `now`. Every other row
     /// stays.
     fn sweep_kv(&mut self, now: u64, limit: usize) -> Result<Swept>;
+
+    /// Stage the delta `key`, a key of `text_deltas` that ends in the tid
+    /// of its commit, with `payload` and the previous serial `prev`, and
+    /// its key in `text_txn`. The backend encodes the payload with its own
+    /// compression. The default fails: the backend keeps no delta.
+    fn put_text(&mut self, _key: &[u8], _prev: Tid, _payload: &[u8]) -> Result<()> {
+        Err(ZoeError::Backend("no text deltas in this backend".into()))
+    }
+
+    /// Stage the move of a store of the format before this one to this
+    /// format: the row `format` of `meta`, and the tables of the deltas,
+    /// empty. Only `zoe migrate` calls it. The default fails.
+    fn migrate_format(&mut self) -> Result<()> {
+        Err(ZoeError::Backend("no migration in this backend".into()))
+    }
 
     /// Commit the staged writes. The writes are durable when this returns.
     fn commit(self: Box<Self>) -> Result<()>;

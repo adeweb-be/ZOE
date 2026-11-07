@@ -42,10 +42,13 @@
 //! | 6 | removal of an ephemeral row | key length `u16`, key |
 //! | 7 | removal of a durable row | key length `u16`, key |
 //! | 8 | expiry key | key length `u16`, the key of `kv_expiry` |
+//! | 9 | delta | key length `u16`, the key of `text_deltas`, length `u32`, the frame |
 //!
 //! Each commit of the batch starts with its transaction row. Each op after
 //! it belongs to that commit: a record and a blob record have the tid of
-//! the row. The transaction rows come in tid order: the first tid is after
+//! the row, and the key of a delta ends in that tid. The deltas of a
+//! commit come after its namespace ops. The fold derives the key of
+//! `text_txn` of each delta from its key. The transaction rows come in tid order: the first tid is after
 //! the previous tid, and the last one is the last tid of the header. A
 //! frame is the value that the tables store under its key, byte for byte.
 
@@ -271,6 +274,8 @@ pub(crate) enum OpKind {
     RemoveDurable,
     /// A key of the index of the expiries.
     Expiry,
+    /// A text delta or a clear delta.
+    Text,
 }
 
 impl OpKind {
@@ -284,6 +289,7 @@ impl OpKind {
             OpKind::RemoveEphemeral => 6,
             OpKind::RemoveDurable => 7,
             OpKind::Expiry => 8,
+            OpKind::Text => 9,
         }
     }
 
@@ -297,6 +303,7 @@ impl OpKind {
             6 => OpKind::RemoveEphemeral,
             7 => OpKind::RemoveDurable,
             8 => OpKind::Expiry,
+            9 => OpKind::Text,
             _ => return None,
         })
     }
@@ -320,7 +327,7 @@ pub(crate) struct Op {
     pub(crate) tid: Tid,
     /// The oid of a record or of a blob record. 0 for the other ops.
     pub(crate) oid: Oid,
-    /// The key of a namespace op. Empty for the other ops.
+    /// The key of a namespace op or of a delta. Empty for the other ops.
     pub(crate) key: Range<usize>,
     /// The frame. Empty for a removal and an expiry key.
     pub(crate) frame: Range<usize>,
@@ -505,6 +512,30 @@ impl EntryBuilder {
         self.key_only(OpKind::Expiry, key)
     }
 
+    /// Add the delta `key`, a key of `text_deltas`, whose frame `frame`
+    /// appends to the bytes, to the current commit. The key must end in
+    /// the tid of the commit.
+    pub(crate) fn text(
+        &mut self,
+        key: &[u8],
+        frame: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Refused> {
+        let tid = self.tid()?;
+        if super::text::key_tid(key) != Some(tid) {
+            return Err(Refused("a delta of another tid than its commit"));
+        }
+        let key = self.keyed(OpKind::Text, key)?;
+        let frame = self.framed(frame);
+        self.push(Op {
+            kind: OpKind::Text,
+            tid,
+            oid: Oid(0),
+            key,
+            frame,
+        });
+        Ok(())
+    }
+
     fn key_only(&mut self, kind: OpKind, key: &[u8]) -> Result<(), Refused> {
         let tid = self.tid()?;
         let key = self.keyed(kind, key)?;
@@ -542,8 +573,17 @@ impl EntryBuilder {
         start..self.bytes.len()
     }
 
-    /// Add `op` to the current commit.
+    /// Add `op` to the current commit. A namespace op after a delta of the
+    /// commit breaks the order of the format.
     fn push(&mut self, op: Op) {
+        let commit = self.commits.last().expect("an op follows a commit");
+        debug_assert!(
+            op.kind == OpKind::Text
+                || self.ops[commit.ops.clone()]
+                    .last()
+                    .is_none_or(|last| last.kind != OpKind::Text),
+            "the deltas of a commit come after its other ops"
+        );
         self.ops.push(op);
         let commit = self.commits.last_mut().expect("an op follows a commit");
         commit.ops.end = self.ops.len();
@@ -608,7 +648,7 @@ pub(crate) fn parse(bytes: &[u8], header: &EntryHeader) -> Result<(Vec<Op>, Vec<
             _ => {
                 let len = u16_at(bytes, take(&mut at, 2)?.start) as usize;
                 op.key = take(&mut at, len)?;
-                if matches!(kind, OpKind::Ephemeral | OpKind::Durable) {
+                if matches!(kind, OpKind::Ephemeral | OpKind::Durable | OpKind::Text) {
                     let len = u32_at(bytes, take(&mut at, 4)?.start) as usize;
                     op.frame = take(&mut at, len)?;
                 }
@@ -628,6 +668,10 @@ pub(crate) fn parse(bytes: &[u8], header: &EntryHeader) -> Result<(Vec<Op>, Vec<
         let commit = commits
             .last_mut()
             .ok_or("an op before the transaction row of its commit")?;
+        if kind == OpKind::Text && super::text::key_tid(&bytes[op.key.clone()]) != Some(commit.tid)
+        {
+            return Err("a delta whose key has another tid than its commit".to_owned());
+        }
         op.tid = commit.tid;
         ops.push(op);
         commit.ops.end = ops.len();
@@ -833,7 +877,7 @@ mod tests {
         assert!(parse(&bytes, &header).is_err());
         // An unknown kind.
         let mut damaged = entry.bytes.clone();
-        damaged[ENTRY_HEADER_LEN] = 9;
+        damaged[ENTRY_HEADER_LEN] = 10;
         let damaged = Entry {
             bytes: damaged,
             ops: Vec::new(),
@@ -841,6 +885,49 @@ mod tests {
         };
         let (bytes, header) = resealed(&damaged, 9, Tid(4), Tid(6));
         assert!(parse(&bytes, &header).is_err());
+    }
+
+    /// Return an entry of one commit at `tid` with one delta whose key
+    /// ends in `key_tid`, written without the check of the builder.
+    fn a_delta(tid: Tid, key_tid: Tid) -> Entry {
+        let prefix = crate::format::text::text_prefix(Oid(3), "Title", 7);
+        let mut builder = EntryBuilder::new(0);
+        builder.txn(tid, |b| b.extend_from_slice(b"row")).unwrap();
+        builder
+            .text(&crate::format::text::delta_key(&prefix, tid), |b| {
+                b.extend_from_slice(b"delta")
+            })
+            .unwrap();
+        let mut entry = builder.finish();
+        if key_tid != tid {
+            let op = &entry.ops[1];
+            let end = op.key.end;
+            entry.bytes[end - 8..end].copy_from_slice(&key_tid.0.to_be_bytes());
+        }
+        entry.seal(1, Tid(4));
+        entry
+    }
+
+    #[test]
+    fn a_delta_reads_back_and_one_of_another_tid_is_refused() {
+        let entry = a_delta(Tid(5), Tid(5));
+        let header = EntryHeader::decode(&entry.bytes).unwrap();
+        let (ops, commits) = parse(&entry.bytes, &header).unwrap();
+        assert_eq!(ops, entry.ops);
+        assert_eq!(commits, entry.commits);
+        assert_eq!(ops[1].kind, OpKind::Text);
+        assert_eq!(&entry.bytes[ops[1].frame.clone()], b"delta");
+        assert_eq!(entry.bytes[ops[1].key.start - 3], 9);
+
+        let entry = a_delta(Tid(5), Tid(6));
+        let header = EntryHeader::decode(&entry.bytes).unwrap();
+        assert!(parse(&entry.bytes, &header).is_err());
+
+        let mut builder = EntryBuilder::new(0);
+        builder.txn(Tid(5), |_| {}).unwrap();
+        let prefix = crate::format::text::clear_prefix(Oid(3), "Title");
+        let key = crate::format::text::delta_key(&prefix, Tid(6));
+        assert!(builder.text(&key, |_| {}).is_err());
     }
 
     #[test]

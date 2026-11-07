@@ -83,6 +83,7 @@ def prepare(
 ) -> Path:
     target = fixture_dir(name)
     if (target / "equivalence.json").exists() and not force:
+        migrate(target / "store" / "zoe")
         print(f"plonebench: the fixture {name} exists; --force builds it again")
         return target
     if target.exists():
@@ -209,6 +210,21 @@ def _build(zeo: stack.Stack, target: Path, credentials: Path) -> None:
     if code != 0:
         tail = "\n".join(err.read_text().splitlines()[-30:])
         raise RuntimeError(f"build_site.py failed with {code}:\n{tail}")
+
+
+def migrate(store: Path) -> None:
+    """Move the ZOE store `store` of a fixture to the format of the `zoe`
+    binary with `zoe migrate`, so that a fixture of an older format serves
+    without a new build. A store of the current format stays as it is."""
+    result = subprocess.run(
+        [str(stack.zoe_binary()), "migrate", str(store)],
+        capture_output=True,
+        text=True,
+        env=stack.clean_environment(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"zoe migrate failed:\n{result.stdout}{result.stderr}")
+    print(f"plonebench: {result.stdout.strip()}", flush=True)
 
 
 def _remove_old(store: Path) -> None:

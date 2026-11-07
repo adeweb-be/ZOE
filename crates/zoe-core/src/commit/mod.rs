@@ -65,6 +65,17 @@
 //! buffer. It takes no lock, and the vote checks nothing for it. The leader
 //! of the commit batch writes it with the records of the transaction.
 //!
+//! `text_set`, `text_unindex` and `text_clear` stage a text delta, an
+//! unindex and a clear delta in the same buffer (ADR 0060, section 8). A
+//! delta takes no lock. The vote that takes the locks reserves the key of
+//! each text delta in a set of the store, then checks each one against
+//! the deltas committed since the snapshot of the transaction: an equal
+//! text is dropped, another text fails the vote with `TextConflict`. The
+//! finish runs no check: it reads the previous serial of each delta under
+//! the commit sequencer and writes the deltas after the namespace writes.
+//! It releases the reservations after the commit is visible, before it
+//! releases the locks.
+//!
 //! `store` and `store_blob` check the size limits of the store before
 //! they stage anything. A transaction logs its slow locks when it releases
 //! them, and logs itself when it ends, if it was slow.
@@ -215,6 +226,9 @@ pub struct Txn<S: Deref<Target = Store>> {
     dropping: Vec<Oid>,
     /// The oids that the vote staged and that the client did not store.
     unstored: BTreeSet<Oid>,
+    /// The keys of the text deltas that the vote that took the locks
+    /// reserved. The finish, an abort and a failed vote release them.
+    reserved: Vec<Vec<u8>>,
 }
 
 /// A merge of shadow mode, kept for its check against the resolution of
@@ -267,6 +281,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             server_writes: false,
             dropping: Vec::new(),
             unstored: BTreeSet::new(),
+            reserved: Vec::new(),
         }
     }
 

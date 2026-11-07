@@ -33,7 +33,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from plonebench import environment, stack
+from plonebench import environment, fixture, stack
 from plonebench.catalog import plan
 
 WORK = stack.REPO / "target" / "bench" / "catalog"
@@ -118,6 +118,7 @@ def prepare(
     """Build the fixture of `spec` in the directory `target`. Return
     `target`. An existing fixture stays, unless `force`."""
     if (target / "manifest.json").exists() and not force:
+        fixture.migrate(target / "store" / "zoe")
         print(f"plonebench: the fixture {target.name} exists; --force builds it again")
         return target
     missing = [

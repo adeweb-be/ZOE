@@ -9,7 +9,7 @@ use redb::ReadableTable;
 use super::{
     BLOBS, META, META_LAST_TID, META_NEXT_OID, META_OBJECT_COUNT, META_PACK_WATERMARK, RECORDS,
     RedbBackend, SEQUENCES, TXN_OIDS, TXNS, backend, decode_object_count, has_records,
-    has_records_from, kv, refused,
+    has_records_from, kv, refused, text,
 };
 use crate::backend::{
     BlobRecord, Framed, NewPayload, NewRecord, Payload, TxnMeta, TxnStatus, WriteTxn,
@@ -315,6 +315,7 @@ impl WriteTxn for RedbWrite<'_> {
                 Ok(())
             }
             Framed::Kv(flavour, row, frame) => kv::put_frame(&self.txn, flavour, row, frame),
+            Framed::Text(key, frame) => text::put_frame(&self.txn, key, frame),
         }
     }
 
@@ -421,6 +422,18 @@ impl WriteTxn for RedbWrite<'_> {
 
     fn sweep_kv(&mut self, now: u64, limit: usize) -> Result<Swept> {
         kv::sweep(&self.txn, now, limit)
+    }
+
+    fn put_text(&mut self, key: &[u8], prev: Tid, payload: &[u8]) -> Result<()> {
+        text::put(&self.txn, key, prev, payload, self.compression)
+    }
+
+    fn migrate_format(&mut self) -> Result<()> {
+        text::create(&self.txn)?;
+        let mut meta = self.txn.open_table(META).map_err(backend)?;
+        meta.insert(super::META_FORMAT, format::FORMAT_NAME)
+            .map_err(backend)?;
+        Ok(())
     }
 
     fn commit(self: Box<Self>) -> Result<()> {

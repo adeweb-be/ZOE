@@ -38,6 +38,14 @@
 //! write plus its TTL. Each durable namespace that a member writes gets the
 //! tid of the member as its generation.
 //!
+//! The leader writes the deltas of each member after its namespace writes,
+//! in key order. The previous serial of each is the tid of the newest
+//! delta of its key: of a member before it in the batch, else from the
+//! unfolded table, then the tables. The leader reads it under the commit
+//! sequencer and checks no frame, so a delta never fails a finish. The
+//! clear deltas of the batch go into the clear deltas in memory before the
+//! backend write (`text::Clears`).
+//!
 //! The write of a batch and its sync run in a `tracing` span `fsync`, with
 //! the field `commits`, the number of members that have a tid. The span
 //! is a child of the span of the leader's finish. A batch of deferred
@@ -281,7 +289,15 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
             tracing::info_span!("fsync", commits)
         };
-        match span.in_scope(|| write(store, &mut members, deferred, now_ms, start)) {
+        let clears = clears_of(&members);
+        if !clears.is_empty() {
+            store.text_clears.begin(&clears);
+        }
+        let written = span.in_scope(|| write(store, &mut members, deferred, now_ms, start));
+        if !clears.is_empty() {
+            store.text_clears.end();
+        }
+        match written {
             Ok(intents) => {
                 if deferred {
                     // A crash before the next durable commit loses this
@@ -383,6 +399,10 @@ fn plan(
                 estimate += OP_FIXED + format::blob::BLOB_RECORD_LEN as u64;
             }
         }
+        for (key, staged) in member.staged.texts() {
+            // The key of the delta ends in the tid.
+            estimate += KV_OP_FIXED + (key.len() + 8 + staged.payload_len()) as u64;
+        }
         for (flavour, key, value, delete) in member.staged.kv_lens() {
             let (key, value) = (key as u64, value as u64);
             estimate += if delete {
@@ -425,6 +445,9 @@ fn write(
     let plan = plan(store, members, deferred, previous);
     let mut write = store.backend.begin_batch(&plan)?;
     let mut intents = Vec::new();
+    // The tid of the newest delta of each key that a member of the batch
+    // wrote.
+    let mut written: HashMap<Vec<u8>, Tid> = HashMap::new();
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
         if let Some(oid) = member.staged.last_oid() {
@@ -468,6 +491,7 @@ fn write(
             }
         }
         write_kv(&mut *write, &member.staged, tid, now_ms)?;
+        write_texts(&mut *write, store, &member.staged, tid, &mut written)?;
     }
     if deferred {
         write.commit_deferred()?;
@@ -509,6 +533,45 @@ fn write_kv(write: &mut dyn WriteTxn, staged: &Staging, tid: Tid, now_ms: u64) -
         write.put_kv(Flavour::Durable, &format::kv_key(name, b""), &generation)?;
     }
     Ok(())
+}
+
+/// Write the deltas of `staged`, the staging of the member with the tid
+/// `tid`, in key order. `written` holds the tid of the newest delta of each
+/// key that a member before it in the batch wrote, and gets the deltas of
+/// this member.
+fn write_texts(
+    write: &mut dyn WriteTxn,
+    store: &Store,
+    staged: &Staging,
+    tid: Tid,
+    written: &mut HashMap<Vec<u8>, Tid>,
+) -> Result<()> {
+    for (prefix, delta) in staged.texts() {
+        let prev = match written.get(prefix) {
+            Some(&prev) => prev,
+            None => store.text_previous(prefix)?,
+        };
+        let payload = staged.text_payload(delta)?;
+        let key = format::text::delta_key(prefix, tid);
+        write.put_text(&key, prev, payload.as_deref().unwrap_or(&[]))?;
+        written.insert(prefix.to_vec(), tid);
+    }
+    Ok(())
+}
+
+/// Return the clear deltas of the members of a batch that have a tid: the
+/// key of each without its tid, with the tid of its member.
+fn clears_of(members: &[(Member, Result<Finished>)]) -> Vec<(Vec<u8>, Tid)> {
+    let mut clears = Vec::new();
+    for (member, finished) in members {
+        let Ok(finished) = finished else { continue };
+        for (key, _) in member.staged.texts() {
+            if key.get(8) == Some(&0) {
+                clears.push((key.to_vec(), finished.tid));
+            }
+        }
+    }
+    clears
 }
 
 /// Fail each member that has a tid with `error`. The last such member gets

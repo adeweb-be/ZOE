@@ -32,6 +32,12 @@
 //! It also flips bits in a zstd payload and seals the frame again, so that
 //! the decoder gets the damage past the checksum.
 //!
+//! The cases of the text deltas flip every bit of each frame of
+//! `text_deltas`, one at a time: each read of the delta through the core,
+//! `text_before` and the vote, gives `CorruptText` with the catalog, the
+//! index, the rid and the tid of the delta, never another text or an absent
+//! one, and `verify_text` reports it.
+//!
 //! Every flip comes from a seeded generator, and the counts and a failure
 //! give the seed and the build profile. `ZOE_FLIP_SEED` sets another seed,
 //! and `ZOE_FLIPS` sets the number of flips of each run, for a longer
@@ -1352,4 +1358,148 @@ fn a_damaged_zstd_payload_under_a_valid_checksum_raises_corrupt_record_or_decode
 
     testing::write_frame(&store, Key::Record(oid, tid), &frame).unwrap();
     assert_eq!(store.load(oid).unwrap(), (data, tid));
+}
+
+/// The catalog of the cases of the text deltas.
+const CATALOG: Oid = Oid(7);
+
+/// One frame of `text_deltas` of the cases of the text deltas: its key,
+/// its stored bytes, the rid of a text delta, and the tid of its commit.
+struct DeltaFrame {
+    key: Vec<u8>,
+    bytes: Vec<u8>,
+    rid: Option<i32>,
+    tid: Tid,
+}
+
+/// Commit the deltas of the cases into a new store in `vfs`: a text delta
+/// with codec 0, a text delta that zstd shrinks, an unindex, a clear delta
+/// and a text delta after it. Return the frames of the first four.
+fn delta_frames(vfs: &MemVfs) -> Vec<DeltaFrame> {
+    let options = Options {
+        compression: Compression::default(),
+        ..Options::default()
+    };
+    let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+    let mut tids = Vec::new();
+    let long = "a long text of many words that zstd shrinks ".repeat(8);
+    for (rid, text) in [(1, Some("short")), (2, Some(long.as_str())), (3, None)] {
+        let before = Tid(store.last_transaction().0 + 1);
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        match text {
+            Some(text) => txn.text_set(CATALOG, "Title", rid, "en", text, before),
+            None => {
+                txn.text_set(CATALOG, "Title", rid, "en", "gone", before)
+                    .unwrap();
+                txn.vote().unwrap();
+                txn.finish().unwrap();
+                let before = Tid(store.last_transaction().0 + 1);
+                txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.text_unindex(CATALOG, "Title", rid, before)
+            }
+        }
+        .unwrap();
+        txn.vote().unwrap();
+        tids.push((Some(rid), txn.finish().unwrap()));
+    }
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.text_clear(CATALOG, "Body").unwrap();
+    txn.vote().unwrap();
+    tids.push((None, txn.finish().unwrap()));
+    let before = Tid(store.last_transaction().0 + 1);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.text_set(CATALOG, "Body", 9, "", "after the clear", before)
+        .unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    let frames = tids
+        .into_iter()
+        .map(|(rid, tid)| {
+            let index = if rid.is_some() { "Title" } else { "Body" };
+            let key = testing::text_delta_key(CATALOG, index, rid, tid);
+            let bytes = testing::read_text_frame(&store, &key).unwrap();
+            DeltaFrame {
+                key,
+                bytes,
+                rid,
+                tid,
+            }
+        })
+        .collect::<Vec<_>>();
+    // The zstd frame has codec 1.
+    assert_eq!(frames[1].bytes[2], 1);
+    frames
+}
+
+/// Tell if `error` is the `CorruptText` of `frame`.
+fn names(error: &ZoeError, frame: &DeltaFrame, index: &str) -> bool {
+    matches!(
+        error,
+        ZoeError::CorruptText { catalog, index: named, rid, tid }
+            if *catalog == CATALOG && named == index && *rid == frame.rid && *tid == frame.tid
+    )
+}
+
+#[test]
+fn flips_in_the_frames_of_text_deltas_give_corrupt_text_and_hide_nothing() {
+    let vfs = MemVfs::new();
+    let frames = delta_frames(&vfs);
+    let mut flips = 0;
+    for frame in &frames {
+        let clear = frame.rid.is_none();
+        let index = if clear { "Body" } else { "Title" };
+        for byte in 0..frame.bytes.len() {
+            for bit in 0..8 {
+                let what = format!("byte {byte} bit {bit} of the delta at {:?}", frame.tid);
+                // A clear delta is read once and then kept in memory, so
+                // each flip of one reads it in a store that opens again.
+                let store = open_vfs(vfs.clone()).unwrap();
+                testing::write_text_frame(&store, &frame.key, Some(&flip(&frame.bytes, byte, bit)))
+                    .unwrap();
+                flips += 1;
+                let (rid, after) = match frame.rid {
+                    Some(rid) => (rid, Tid(frame.tid.0 + 1)),
+                    None => (9, Tid::MAX),
+                };
+                match store.text_before(CATALOG, index, rid, after) {
+                    Err(error) => assert!(names(&error, frame, index), "{what}: {error}"),
+                    Ok(read) => panic!("{what} went unseen: {read:?}"),
+                }
+                // The vote reads the same delta for a new text of its key.
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.text_set(CATALOG, index, rid, "en", "new", after)
+                    .unwrap();
+                match txn.vote() {
+                    Err(error) => assert!(names(&error, frame, index), "{what}: {error}"),
+                    Ok(()) => panic!("{what}: the vote passed"),
+                }
+                drop(txn);
+                let checked = store.verify_text().unwrap();
+                assert!(
+                    checked
+                        .findings
+                        .iter()
+                        .any(|finding| finding.tid == Some(frame.tid)
+                            && finding.rid == frame.rid
+                            && finding.index.as_deref() == Some(index)),
+                    "{what}: {checked:?}"
+                );
+                testing::write_text_frame(&store, &frame.key, Some(&frame.bytes)).unwrap();
+            }
+        }
+    }
+    eprintln!(
+        "bit flips in the frames of text deltas, {} build: {flips} flips, every one CorruptText",
+        profile()
+    );
+    // The store reads again once the frames are back.
+    let store = open_vfs(vfs).unwrap();
+    assert!(store.verify_text().unwrap().findings.is_empty());
+    assert_eq!(
+        store
+            .text_before(CATALOG, "Title", 1, Tid::MAX)
+            .unwrap()
+            .map(|live| live.text),
+        Some("short".to_owned())
+    );
 }

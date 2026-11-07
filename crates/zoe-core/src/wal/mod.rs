@@ -652,6 +652,22 @@ impl WriteTxn for LogWrite<'_> {
         Err(not_on_the_log("a sweep step"))
     }
 
+    fn put_text(&mut self, key: &[u8], prev: Tid, payload: &[u8]) -> Result<()> {
+        let compression = self.compression;
+        self.builder
+            .text(key, |out| {
+                format::append_frame_with(
+                    out,
+                    KeySpace::TextDeltas,
+                    key,
+                    prev,
+                    payload,
+                    compression,
+                );
+            })
+            .map_err(refused)
+    }
+
     /// Append the entry to the log with one write and one sync, then
     /// publish the batch (ADR 0056, section 5). An error leaves the table
     /// without any member of the batch.

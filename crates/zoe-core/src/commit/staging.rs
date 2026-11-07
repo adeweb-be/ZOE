@@ -21,6 +21,10 @@
 //! not fit goes to the spill file; the key stays in memory. A later write
 //! of the same key replaces the earlier one.
 //!
+//! The text deltas stage in the same buffer, as the namespace writes: the
+//! key of the delta and its payload count in `staging-memory`, and a
+//! payload that does not fit goes to the spill file.
+//!
 //! A spill file is never part of the durable store. Nothing syncs it or
 //! `staging/`: the transaction reads the file in the same process, and a
 //! crash ends the transaction. A transaction removes its spill file when it
@@ -205,6 +209,30 @@ impl StagedKv {
 /// row, the value or `None` for a delete, and the TTL in milliseconds.
 pub(crate) type KvWrite<'a> = (Flavour, &'a [u8], Option<Cow<'a, [u8]>>, u64);
 
+/// A text delta or a clear delta waiting for the commit.
+pub(crate) struct StagedText {
+    /// The payload of a text delta: the language, then the text. An
+    /// unindex and a clear delta have none.
+    payload: Option<Pickle>,
+    /// The snapshot of the transaction that staged a text delta: the tid
+    /// that its Connection loads before. A clear delta and a restored
+    /// delta have `Tid::ZERO`.
+    pub(crate) before: Tid,
+    /// True when a restore staged the delta: the vote checks nothing.
+    pub(crate) restored: bool,
+}
+
+impl StagedText {
+    /// Return the length of the payload. This reads no payload.
+    pub(crate) fn payload_len(&self) -> usize {
+        match &self.payload {
+            Some(Pickle::Memory(bytes)) => bytes.len(),
+            Some(Pickle::Spilled { len, .. }) => *len,
+            None => 0,
+        }
+    }
+}
+
 /// The staged records of one transaction.
 ///
 /// The buffer does not hold its staging area: each call that needs it
@@ -214,6 +242,9 @@ pub(crate) struct Staging {
     records: BTreeMap<Oid, Staged>,
     /// The namespace writes, by flavour and key of the row.
     kv: BTreeMap<(Flavour, Vec<u8>), StagedKv>,
+    /// The deltas, by key of `text_deltas` without the tid. The order of
+    /// the keys is the order of `text_deltas`.
+    texts: BTreeMap<Vec<u8>, StagedText>,
     /// The bytes of the pickles in memory.
     in_memory: usize,
     /// The spill file. It exists after the first pickle that does not fit
@@ -324,6 +355,121 @@ impl Staging {
                 staged.value.is_none(),
             )
         })
+    }
+
+    /// Stage the delta `key`, a key of `text_deltas` without its tid, with
+    /// `payload`, or none for an unindex and a clear delta. It replaces an
+    /// earlier delta of the key. The key counts in memory, and the payload
+    /// as a namespace value does. If the call fails, the earlier delta
+    /// stays.
+    pub(crate) fn put_text(
+        &mut self,
+        area: &StagingArea,
+        key: Vec<u8>,
+        payload: Option<&[u8]>,
+        before: Tid,
+        restored: bool,
+    ) -> Result<()> {
+        let replaced = match self.texts.get(&key) {
+            Some(StagedText {
+                payload: Some(Pickle::Memory(bytes)),
+                ..
+            }) => key.len() + bytes.len(),
+            Some(_) => key.len(),
+            None => 0,
+        };
+        let others = self.in_memory - replaced + key.len();
+        let payload = match payload {
+            None => {
+                self.in_memory = others;
+                None
+            }
+            Some(data) if others.saturating_add(data.len()) <= area.memory => {
+                self.in_memory = others + data.len();
+                Some(Pickle::Memory(data.to_vec()))
+            }
+            Some(data) => {
+                let pickle = self.spill(area, data)?;
+                self.in_memory = others;
+                Some(pickle)
+            }
+        };
+        let staged = StagedText {
+            payload,
+            before,
+            restored,
+        };
+        self.texts.insert(key, staged);
+        Ok(())
+    }
+
+    /// Return the staged delta of `key`. This reads no payload.
+    pub(crate) fn text(&self, key: &[u8]) -> Option<&StagedText> {
+        self.texts.get(key)
+    }
+
+    /// Take the deltas whose keys start with `prefix` out of the staging.
+    /// Return the bytes that their keys and payloads counted toward the
+    /// transaction size.
+    pub(crate) fn remove_texts(&mut self, prefix: &[u8]) -> u64 {
+        let keys: Vec<Vec<u8>> = self
+            .texts
+            .range::<[u8], _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(key, _)| key)
+            .take_while(|key| key.starts_with(prefix))
+            .cloned()
+            .collect();
+        let mut counted = 0;
+        for key in keys {
+            counted += self.remove_text(&key);
+        }
+        counted
+    }
+
+    /// Take the delta `key` out of the staging. Return the bytes that its
+    /// key and payload counted toward the transaction size, or 0 when the
+    /// key is not staged.
+    pub(crate) fn remove_text(&mut self, key: &[u8]) -> u64 {
+        let Some(staged) = self.texts.remove(key) else {
+            return 0;
+        };
+        let len = staged.payload_len();
+        let in_memory = match staged.payload {
+            Some(Pickle::Memory(_)) => key.len() + len,
+            _ => key.len(),
+        };
+        self.in_memory -= in_memory;
+        (key.len() + len) as u64
+    }
+
+    /// Return each staged delta, in the order of `text_deltas`. This reads
+    /// no payload.
+    pub(crate) fn texts(&self) -> impl Iterator<Item = (&[u8], &StagedText)> + '_ {
+        self.texts
+            .iter()
+            .map(|(key, staged)| (key.as_slice(), staged))
+    }
+
+    /// Tell if the transaction stages a delta.
+    pub(crate) fn has_texts(&self) -> bool {
+        !self.texts.is_empty()
+    }
+
+    /// Return the payload of `staged`, a staged delta: `None` for an
+    /// unindex and a clear delta. A spilled payload is read from the spill
+    /// file.
+    pub(crate) fn text_payload<'a>(
+        &'a self,
+        staged: &'a StagedText,
+    ) -> io::Result<Option<Cow<'a, [u8]>>> {
+        staged
+            .payload
+            .as_ref()
+            .map(|pickle| self.read(pickle))
+            .transpose()
     }
 
     /// Return the number of staged namespace writes.

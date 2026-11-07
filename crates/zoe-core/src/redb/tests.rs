@@ -280,7 +280,7 @@ fn the_last_transaction_row_raises_a_damaged_last_tid() {
         .unwrap();
     txn.commit().unwrap();
 
-    let reopened = RedbBackend::open_db(backend.db).unwrap();
+    let reopened = RedbBackend::open_db(backend.db, false).unwrap().0;
     assert_eq!(reopened.last_tid(), Tid(500));
 }
 
@@ -306,7 +306,7 @@ fn a_last_row_under_a_damaged_key_does_not_raise_the_last_tid() {
     }
     txn.commit().unwrap();
 
-    let reopened = RedbBackend::open_db(backend.db).unwrap();
+    let reopened = RedbBackend::open_db(backend.db, false).unwrap().0;
     assert_eq!(reopened.last_tid(), Tid(500));
 }
 
@@ -1278,7 +1278,7 @@ fn a_sequence_row_round_trips_and_changes_no_meta_row() {
     assert_eq!(backend.last_tid(), Tid::ZERO);
     assert_eq!(backend.next_oid().unwrap(), Oid(1));
 
-    let reopened = RedbBackend::open_db(backend.db).unwrap();
+    let reopened = RedbBackend::open_db(backend.db, false).unwrap().0;
     assert_eq!(reopened.last_tid(), Tid::ZERO);
     assert_eq!(reopened.sequence_end("intids").unwrap(), Some(101));
 }

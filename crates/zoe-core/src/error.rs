@@ -99,6 +99,53 @@ pub enum ZoeError {
         max: u64,
     },
 
+    /// The frame of a text delta or of a clear delta does not pass its
+    /// checksum, or its payload does not decode, or a scan of the deltas
+    /// gave a key outside the scan or out of order. The error names the
+    /// catalog, the index, the rid of a text delta and the tid, never the
+    /// text.
+    #[error("corrupt text delta: catalog {catalog:?}, index {index:?}, {}, tid {tid:?}", rid_text(*.rid))]
+    CorruptText {
+        /// The oid of the catalog.
+        catalog: Oid,
+        /// The index id.
+        index: String,
+        /// The rid of a text delta. A clear delta has none.
+        rid: Option<i32>,
+        /// The tid of the delta, when the key gives it, else 0.
+        tid: Tid,
+    },
+
+    /// A call that stages a delta has a bad argument: an empty index id or
+    /// one longer than 255 bytes, a language longer than 35 bytes or not
+    /// ASCII, or a rid outside the signed 32-bit range. The call stages
+    /// nothing.
+    #[error("invalid text delta: {0}")]
+    InvalidText(&'static str),
+
+    /// A text delta is over `max-record-size`, or takes the transaction
+    /// past `max-transaction-size`. The transaction refuses the call and
+    /// stages nothing. The message holds no text.
+    #[error("text delta refused: {} of {size} bytes, over {} ({max} bytes)", .limit.subject(), .limit.key())]
+    TextTooLarge {
+        /// The limit that refused the call.
+        limit: SizeLimit,
+        /// The size that the call gives, in bytes.
+        size: u64,
+        /// The limit, in bytes.
+        max: u64,
+    },
+
+    /// Another transaction committed another text for a key of a text
+    /// delta of this transaction since its snapshot, or reserves the key
+    /// in its own commit, or a pack ran at or after the snapshot. This is
+    /// a `ConflictError` of ZODB on the catalog.
+    #[error("text conflict: catalog {catalog:?}")]
+    TextConflict {
+        /// The oid of the catalog.
+        catalog: Oid,
+    },
+
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout, or a
     /// `LockCancel` ended the wait for its lock.
@@ -253,4 +300,12 @@ pub enum ZoeError {
     /// An I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Return the words of a rid in the message of `CorruptText`.
+fn rid_text(rid: Option<i32>) -> String {
+    match rid {
+        Some(rid) => format!("rid {rid}"),
+        None => "a clear delta".to_owned(),
+    }
 }

@@ -653,6 +653,76 @@ impl Backend for Logged {
         Ok(out)
     }
 
+    fn text_newest(&self, prefix: &[u8], before: Tid) -> Result<Option<(Bytes, Bytes)>> {
+        let core = &self.core;
+        if let Some((p, table)) = core.view()
+            && let Some((key, frame)) = table.text_newest(prefix, before, p)
+        {
+            return Ok(Some((key.to_vec(), frame.to_vec())));
+        }
+        core.redb.text_newest(prefix, before)
+    }
+
+    fn text_rows(
+        &self,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let core = &self.core;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // The table first: a commit leaves it only after the tables hold
+        // it, so the read of the tables after it misses no commit.
+        let backlog = match core.view() {
+            Some((p, table)) => table.text_rows(from, to, p, limit),
+            None => Vec::new(),
+        };
+        let tables = core.redb.text_rows(from, to, limit)?;
+        if backlog.is_empty() {
+            return Ok(tables);
+        }
+        let mut merged: BTreeMap<Bytes, Bytes> = tables.into_iter().collect();
+        merged.extend(backlog);
+        Ok(merged.into_iter().take(limit).collect())
+    }
+
+    fn text_txn_keys(
+        &self,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<Bytes>> {
+        let core = &self.core;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let backlog = match core.view() {
+            Some((p, table)) => table.text_txn_keys(from, to, p, limit),
+            None => Vec::new(),
+        };
+        let mut keys = core.redb.text_txn_keys(from, to, limit)?;
+        if backlog.is_empty() {
+            return Ok(keys);
+        }
+        keys.extend(backlog);
+        keys.sort_unstable();
+        keys.dedup();
+        keys.truncate(limit);
+        Ok(keys)
+    }
+
+    #[cfg(feature = "testing")]
+    fn write_text_stored(&self, index: bool, key: &[u8], bytes: Option<&[u8]>) -> Result<()> {
+        self.core.redb.write_text_stored(index, key, bytes)
+    }
+
+    #[cfg(feature = "testing")]
+    fn write_previous_format_for_test(&self) -> Result<()> {
+        self.core.redb.write_previous_format_for_test()
+    }
+
     fn kv_expiry_has(&self, key: &[u8]) -> Result<bool> {
         let core = &self.core;
         if let Some((p, table)) = core.view()

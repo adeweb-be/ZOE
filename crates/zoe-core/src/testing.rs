@@ -124,6 +124,74 @@ pub fn write_kv_expiry_key(store: &Store, key: &[u8], present: bool) -> Result<(
         .write_kv_stored(None, key, present.then_some(&[][..]))
 }
 
+/// Return the key of `text_deltas` of a delta at `tid`: a text delta of
+/// `rid` in `index` of `catalog`, or a clear delta of the index for `None`.
+pub fn text_delta_key(catalog: Oid, index: &str, rid: Option<i32>, tid: Tid) -> Vec<u8> {
+    let prefix = match rid {
+        Some(rid) => crate::format::text::text_prefix(catalog, index, rid),
+        None => crate::format::text::clear_prefix(catalog, index),
+    };
+    crate::format::text::delta_key(&prefix, tid)
+}
+
+/// Return the frame of the delta `key` with the previous serial `prev` and
+/// `payload` as it is, codec 0, as the store writes it.
+pub fn text_frame(key: &[u8], prev: Tid, payload: &[u8]) -> Vec<u8> {
+    use crate::format::{KeySpace, MAIN_BRANCH, encode_frame};
+    encode_frame(KeySpace::TextDeltas, key, MAIN_BRANCH, prev, payload)
+}
+
+/// Return the payload of a text delta in `language` with `text`.
+pub fn text_payload(language: &str, text: &str) -> Vec<u8> {
+    crate::format::text::encode_payload(language, text)
+}
+
+/// Return the key of `text_txn` of the delta `key`, a key of
+/// `text_deltas`.
+pub fn text_txn_key(key: &[u8]) -> Vec<u8> {
+    crate::format::text::txn_key_of(key).expect("a key of a delta ends in its tid")
+}
+
+/// Return the bytes that `store` holds for the delta `key` in
+/// `text_deltas`, as stored. A row that does not exist is a `Backend`
+/// error.
+pub fn read_text_frame(store: &Store, key: &[u8]) -> Result<Vec<u8>> {
+    store.fold()?;
+    let at = std::ops::Bound::Included(key);
+    store
+        .backend
+        .text_rows(at, at, 1)?
+        .pop()
+        .map(|(_, frame)| frame)
+        .ok_or_else(|| ZoeError::Backend("no delta under the key".into()))
+}
+
+/// Store `bytes` for the delta `key` in `text_deltas` of `store`, in place
+/// of the row, or remove the row for `None`. The hook checks nothing and
+/// changes no other row: the key in `text_txn` stays.
+pub fn write_text_frame(store: &Store, key: &[u8], bytes: Option<&[u8]>) -> Result<()> {
+    store.fold()?;
+    store.backend.write_text_stored(false, key, bytes)
+}
+
+/// Put `key` in `text_txn` of `store`, or remove it for `false`. The hook
+/// checks nothing and changes no other row.
+pub fn write_text_txn_key(store: &Store, key: &[u8], present: bool) -> Result<()> {
+    store.fold()?;
+    store
+        .backend
+        .write_text_stored(true, key, present.then_some(&[][..]))
+}
+
+/// Make the store a store of the format before this one: remove the
+/// tables of the deltas and write the name of that format in `meta`. The
+/// open store keeps the state that it read at its open, so the change
+/// counts from the next open.
+pub fn write_previous_format(store: &Store) -> Result<()> {
+    store.fold()?;
+    store.backend.write_previous_format_for_test()
+}
+
 /// A record that zstd shrinks, so that a store with compression keeps it
 /// with codec 1.
 pub fn compressible() -> Vec<u8> {

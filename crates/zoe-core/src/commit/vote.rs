@@ -15,6 +15,7 @@ use super::tier::Tier;
 use super::{READ_CHUNK, Shadowed, Txn, order, split, staging};
 use crate::backend::Record;
 use crate::error::{Result, ZoeError};
+use crate::format;
 use crate::guard::SizeLimit;
 use crate::lock::{Handoff, Held, InFlight, Mode, Refused, Waited};
 use crate::merge::policy::{Policy, Rules};
@@ -281,6 +282,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let checked = self
             .check_undone()
+            .and_then(|()| if native { self.check_texts() } else { Ok(()) })
             .and_then(|()| VoteCheck::new(resolve, native, self.stored_bytes).run(self));
         let error = match checked {
             Ok(Check::Passed(conflicts)) => return Ok(conflicts),
@@ -298,6 +300,97 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.release();
         self.resolving.clear();
         Err(error)
+    }
+
+    /// Reserve the key of each staged text delta, then check each one
+    /// (ADR 0060, section 8). The vote that takes the locks calls it before
+    /// it checks the serials, so it never waits for a commit in flight of
+    /// a key that another transaction reserved.
+    ///
+    /// A key that another transaction reserved fails the vote at once with
+    /// `TextConflict`, also after a lock hand-off. Then, for each text
+    /// delta with the snapshot `before` of its transaction:
+    ///
+    /// 1. When the transaction also stages a clear delta of the index, the
+    ///    delta stays, and no check runs.
+    /// 2. When the delta equals the live text at the snapshot, the vote
+    ///    drops it. An unindex of a document with no live text is dropped
+    ///    too.
+    /// 3. When a delta of the key, or a clear delta of its index, committed
+    ///    at or after `before`, a delta equal to the live text now is
+    ///    dropped, and any other fails the vote with `TextConflict`.
+    /// 4. Otherwise the delta stays.
+    ///
+    /// The reads run outside the commit sequencer. After them, a vote
+    /// whose `before` is at or before `pack_watermark` fails with
+    /// `TextConflict`: pack writes the watermark before it removes
+    /// anything, so a pack that removed the history that the reads used
+    /// shows here. A clear delta and a restored delta take no check and no
+    /// reservation.
+    fn check_texts(&mut self) -> Result<()> {
+        if !self.staged.has_texts() {
+            return Ok(());
+        }
+        let keys: Vec<Vec<u8>> = self
+            .staged
+            .texts()
+            .filter(|(key, staged)| !staged.restored && !is_clear(key))
+            .map(|(key, _)| key.to_vec())
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let store: &Store = &self.store;
+        store
+            .text_reservations
+            .reserve(&keys)
+            .map_err(|catalog| ZoeError::TextConflict { catalog })?;
+        self.reserved = keys;
+        let mut dropped = Vec::new();
+        let mut lowest: Option<(Tid, Oid)> = None;
+        for (key, staged) in self.staged.texts() {
+            if staged.restored || is_clear(key) {
+                continue;
+            }
+            let parts =
+                format::text::split_prefix(key).expect("a staged key of a text delta reads");
+            let catalog = parts.catalog;
+            let rid = parts.rid.expect("a text delta has a rid");
+            let before = staged.before;
+            if lowest.is_none_or(|(low, _)| before < low) {
+                lowest = Some((before, catalog));
+            }
+            let clear = format::text::clear_prefix(catalog, parts.index);
+            if self.staged.text(&clear).is_some() {
+                continue;
+            }
+            let payload = self.staged.text_payload(staged)?;
+            let snapshot = store.text_snapshot(before);
+            let then = store.live_payload(catalog, parts.index, rid, snapshot)?;
+            if payload.as_deref() == then.as_deref() {
+                dropped.push(key.to_vec());
+                continue;
+            }
+            if store.text_committed_since(key, before)? {
+                let now = store.current_payload(key)?;
+                if payload.as_deref() == now.as_deref() {
+                    dropped.push(key.to_vec());
+                    continue;
+                }
+                return Err(ZoeError::TextConflict { catalog });
+            }
+        }
+        if let Some((before, catalog)) = lowest {
+            let watermark = store.pack_watermark()?;
+            if watermark > Tid::ZERO && before <= watermark {
+                return Err(ZoeError::TextConflict { catalog });
+            }
+        }
+        for key in dropped {
+            let counted = self.staged.remove_text(&key);
+            self.stored_bytes = self.stored_bytes.saturating_sub(counted);
+        }
+        Ok(())
     }
 
     /// Fail with `Undo` when the transaction undoes a transaction at or
@@ -1063,4 +1156,10 @@ impl VoteCheck {
             Waited::TimedOut | Waited::Cancelled => Ok(Handed::Late { waited }),
         }
     }
+}
+
+/// Tell if `key`, a key of `text_deltas` without its tid, is the key of a
+/// clear delta: the byte after the catalog is 0.
+fn is_clear(key: &[u8]) -> bool {
+    key.get(8) == Some(&0)
 }
