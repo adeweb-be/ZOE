@@ -2,7 +2,7 @@
 
 The catalog mirror: the ZCatalog indexes of each registered catalog of a store in memory, answering queries as of a tid (ADR 0059). Specification: "Catalog acceleration and search", "Step 2: the mirror".
 
-Built: FieldIndex, its clauses and its sorts; the registration, the build, the base and its change sets, the rebase, the mirror window, the memory bound and the counts; the plan and the reply of section 8 as a tree of msgpack values (`Wire`). The other index types, the metadata table, the wire of `zoe serve` and the transaction overlay come later.
+Built: FieldIndex, KeywordIndex, DateIndex, DateRangeIndex, BooleanIndex and UUIDIndex with their clauses, and the sorts on FieldIndex, DateIndex and UUIDIndex; the registration, the build, the base and its change sets, the rebase, the mirror window, the memory bound and the counts; the plan and the reply of section 8 as a tree of msgpack values (`Wire`). ExtendedPathIndex, the metadata table, the wire of `zoe serve` and the transaction overlay come later.
 
 ## Layout
 
@@ -10,19 +10,23 @@ Built: FieldIndex, its clauses and its sorts; the registration, the build, the b
 - `base.rs`, `build.rs`: the rows and the structures of a base, and their build.
 - `change.rs`: the change sets and the read of the records of a commit.
 - `mirror.rs`: the versions of one mirror, the window and the rebase.
-- `query.rs`: the clauses and the four sort paths of ZCatalog.
+- `query.rs`: the clauses of each index type and the four sort paths of ZCatalog.
 - `plan.rs`: the codec of a plan and of a reply.
 - `mirrors.rs`: the mirrors of a store, their thread, their builds and the bound.
 - `reason.rs`, `counts.rs`: the reasons of a fallback and the counts.
 - `testing.rs`, with the feature `testing`: the records of a catalog as Products.ZCatalog writes them, and `commit`.
-- `tests/data/zcatalog.py` writes `tests/data/zcatalog.json`: records and answers of Products.ZCatalog, for `tests/mirror.rs`.
+- `tests/data/zcatalog.py` writes `tests/data/zcatalog.json`: records and answers of Products.ZCatalog on FieldIndexes, for `tests/mirror.rs`. `tests/data/indexes.py` writes `tests/data/indexes.json` for the other index types, for `tests/indexes.rs`. Run each with `PYTHONHASHSEED=0`.
 
 ## Invariants
 
 - A query is answered as of the snapshot tid of the client, exclusive as the tid of `loadBefore`. A result never names an object that the Connection cannot load.
 - A query with an index or an option that the mirror does not serve takes the Python path, whole, with its reason. So does a snapshot outside the mirror window, and a catalog that is not registered, not ready, refused, dropped or stale. The names of the reasons are a contract (`Reason::name`). The store also gives `sort`, a reason of the client in ADR 0059, section 7, for several sort indexes on the path of ZCatalog that iterates the first sort index: only the size of the result decides that path. A range bound that the keys of the index do not order gives `option`.
 - Rids, order, `len()` and `actual_result_count` equal those of ZCatalog, ties included: each of the four sort paths keeps its own rule of ties, and a batch past the middle takes the other end.
-- Security stays in Plone: `allowedRolesAndUsers` is an index like any other.
+- Security stays in Plone: `allowedRolesAndUsers` is a KeywordIndex like any other.
+- Each index reads the record of the index object, its `_unindex` tree and its `_length`, and no other tree: no `_index`, no `_index_value` of a BooleanIndex, no `_since` or `_always` of a DateRangeIndex. FieldIndex, DateIndex, UUIDIndex and BooleanIndex keep the structure of a FieldIndex; a KeywordIndex keeps the keys of each row; a DateRangeIndex keeps `since` and `until` of each row and the rows sorted by each. A change set keeps the value of a row of a KeywordIndex as its distinct keys in ascending order, and a row without a key as a row without a value.
+- A UUIDIndex whose `_length` in the version differs from its rows with a UUID gives `index_unavailable` to each clause and sort on it. `_length` counts the keys of `_index`, which the mirror does not read. A UUID at two rows, or a UUID that left `_index` while a row keeps it (`removeForwardIndexEntry` deletes the key whichever row holds it), makes ZCatalog find other rows than `_unindex` gives. The count follows the `_length` and the rows of each change set.
+- A key of `not` that the keys of the index do not order gives `option`: ZCatalog raises.
+- A clause on a DateRangeIndex applies after the other clauses. A row of the result without an entry in a DateRangeIndex of the query gives `date_range_order`, as does a date outside the range of the index with another clause: the answer of ZCatalog then depends on the order of its plan. The only clause of a query comes first in that plan.
 - The mirror builds only registered catalogs: the keys of the durable namespace `zoe.catalog`, read at the start and after each commit that changes its generation. No scan of the store, no build on a first query.
 - A base never changes. A change set holds only the changed values. A rebase keeps the number of each row, so the structures that it does not build again stay shared.
 - The mirrors of a store stay within `catalog-memory`, the memory of a build and of a rebase included. Past it, the mirror that answered a query least recently drops, and the drop is counted.

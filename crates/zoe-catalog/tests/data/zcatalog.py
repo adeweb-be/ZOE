@@ -2,14 +2,17 @@
 Products.ZCatalog writes, the records of three commits, and the answers of
 ZCatalog to a set of queries on FieldIndexes.
 
-    python zcatalog.py OUT.json
+    PYTHONHASHSEED=0 python zcatalog.py OUT.json
 
 Run it with an interpreter that has Products.ZCatalog 7.2, ZODB 6 and
 BTrees 6, such as the interpreter of the zoe scenario of `just plone`.
+`PYTHONHASHSEED` fixes the order of the keywords of the KeywordIndex,
+which `_unindex` keeps in the order of a set.
 
 The catalog is a `Products.ZCatalog.Catalog.Catalog` at `root["catalog"]`
 of a `MappingStorage`, with six FieldIndexes, one KeywordIndex and one
-column. A seeded random gives each entry its rid and its values. Each
+column, and an `OOBTree` at `root["deep"]` whose root has inner nodes as
+children. A seeded random gives each entry its rid and its values. Each
 query comes with its plan in the form of ADR 0059, section 8, and with the
 answer of `searchResults` after the base and after each commit: the rids
 in order, `len()` and `actual_result_count`.
@@ -28,6 +31,7 @@ import sys
 import Products.ZCatalog.Catalog as catalog_module
 import transaction
 from Acquisition import aq_base
+from BTrees.OOBTree import OOBTree
 from Products.PluginIndexes.FieldIndex.FieldIndex import FieldIndex
 from Products.PluginIndexes.KeywordIndex.KeywordIndex import KeywordIndex
 from Products.ZCatalog.Catalog import Catalog
@@ -99,11 +103,18 @@ for i in range(400):
     add(i)
 transaction.commit()
 
+# A tree whose root splits, so its children are inner nodes. The root of an
+# OOBTree splits at 500 children of 15 items.
+deep = OOBTree()
+for k in range(7600):
+    deep[k] = k
+root["deep"] = deep
+transaction.commit()
+assert isinstance(deep.__getstate__()[0][0], OOBTree), "no inner child"
+
 
 def records():
-    return {
-        struct.unpack(">Q", oid)[0]: storage.load(oid) for oid in storage._data
-    }
+    return {struct.unpack(">Q", oid)[0]: storage.load(oid) for oid in storage._data}
 
 
 def as_hex(found):
@@ -198,7 +209,10 @@ QUERIES = {
         "Creator": "editor-2",
     },
     "not-only": {"review_state": {"not": "published"}},
-    "not-only-list": {"Creator": {"not": ["editor-1", "editor-2"]}, "portal_type": "File"},
+    "not-only-list": {
+        "Creator": {"not": ["editor-1", "editor-2"]},
+        "portal_type": "File",
+    },
     "not-only-absent": {"num": {"not": [-5]}},
     "iterate-index": {"portal_type": "Document", "sort_on": "review_state"},
     "iterate-index-desc": {
@@ -212,8 +226,17 @@ QUERIES = {
         "sort_on": "sortable_title",
         "sort_order": "descending",
     },
-    "resultset-limit": {"portal_type": "Document", "sort_on": "Creator", "sort_limit": 30},
-    "nbest": {**ALL, "sort_on": "review_state", "sort_order": "descending", "sort_limit": 10},
+    "resultset-limit": {
+        "portal_type": "Document",
+        "sort_on": "Creator",
+        "sort_limit": 30,
+    },
+    "nbest": {
+        **ALL,
+        "sort_on": "review_state",
+        "sort_order": "descending",
+        "sort_limit": 10,
+    },
     "nbest-reverse": {**ALL, "sort_on": "review_state", "sort_limit": 10},
     "nbest-missing": {
         **ALL,
@@ -276,9 +299,7 @@ def commit(name, change):
     change()
     transaction.commit()
     after = records()
-    changed = {
-        oid: found for oid, found in after.items() if before.get(oid) != found
-    }
+    changed = {oid: found for oid, found in after.items() if before.get(oid) != found}
     commits.append({"name": name, "records": as_hex(changed)})
     for q, query in QUERIES.items():
         answers[q].append(answer(query))

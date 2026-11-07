@@ -2,13 +2,16 @@
 //!
 //! The form is a tree of msgpack values: `Wire`. The extension module
 //! makes it from a Python dict; the server makes it from msgpack. This
-//! version reads the clauses of FieldIndex (`"k": "v"`).
+//! version reads the clauses of keys (`"k": "v"`), of a BooleanIndex
+//! (`"k": "b"`) and of a DateRangeIndex (`"k": "d"`).
 //!
 //! ```text
 //! plan   = {"c": [clause...], "s": [[index, reverse]...], "l": sort_limit | nil,
 //!           "bs": b_start, "bz": b_size | nil, "cols": nil, "rn": count}
 //! clause = {"k": "v", "i": index, "q": [value...], "and": bool,
 //!           "r": [min | nil, max | nil] | nil, "not": [value...]}
+//!        | {"k": "b", "i": index, "q": bool | nil}
+//!        | {"k": "d", "i": index, "t": minutes | nil}
 //! value  = nil | bool | int | float | str | [value...] (a tuple)
 //! reply  = {"tid": tid, "r": rids, "n": len, "a": actual_result_count}
 //!        | {"tid": tid, "f": reason, "why": text}
@@ -138,12 +141,15 @@ fn values(wire: &Wire, what: &str) -> Result<Vec<Val>, PlanError> {
 fn clause(wire: &Wire) -> Result<Clause, PlanError> {
     let items = items(wire, "a clause")?;
     let kind = items.iter().find(|(k, _)| *k == "k").map(|(_, v)| *v);
-    match kind {
-        Some(Wire::Str(k)) if k == "v" => {}
+    let kind = match kind {
+        Some(Wire::Str(k)) if matches!(k.as_str(), "v" | "b" | "d") => k.as_str(),
         Some(Wire::Str(k)) => {
             return Err(PlanError::Unknown(format!("a clause of the kind {k:?}")));
         }
         _ => return malformed("a clause without a kind"),
+    };
+    if kind != "v" {
+        return one_key_clause(kind, &items);
     }
     let mut clause = Clause {
         index: String::new(),
@@ -189,6 +195,52 @@ fn clause(wire: &Wire) -> Result<Clause, PlanError> {
     }
     if !named {
         return malformed("a clause without an index");
+    }
+    Ok(clause)
+}
+
+/// Reads a clause on a BooleanIndex (`"b"`, the truth `q`) or on a
+/// DateRangeIndex (`"d"`, the term `t`) as a clause of one key: `q` and
+/// `t` give it; a nil `q` gives no key, and a nil `t` the key `None`.
+fn one_key_clause(kind: &str, items: &[(&str, &Wire)]) -> Result<Clause, PlanError> {
+    let mut clause = Clause {
+        index: String::new(),
+        keys: Vec::new(),
+        and: false,
+        range: None,
+        not: Vec::new(),
+    };
+    let (mut named, mut keyed) = (false, false);
+    let what = if kind == "b" { "q" } else { "t" };
+    for (key, v) in items {
+        match *key {
+            "k" => {}
+            "i" => match v {
+                Wire::Str(name) => {
+                    clause.index = name.clone();
+                    named = true;
+                }
+                _ => return malformed("the index of a clause is not a str"),
+            },
+            k if k == what => {
+                keyed = true;
+                clause.keys = match (kind, v) {
+                    ("b", Wire::Bool(b)) => vec![Val::Bool(*b)],
+                    ("b", Wire::Nil) => Vec::new(),
+                    ("d", Wire::Int(t)) => vec![Val::Int(*t)],
+                    ("d", Wire::Nil) => vec![Val::None],
+                    ("b", _) => return malformed("q of a clause b is not a bool or nil"),
+                    _ => return malformed("t of a clause d is not an int or nil"),
+                };
+            }
+            other => return Err(PlanError::Unknown(format!("a clause key {other:?}"))),
+        }
+    }
+    if !named {
+        return malformed("a clause without an index");
+    }
+    if !keyed {
+        return malformed(format!("a clause {kind} without {what}"));
     }
     Ok(clause)
 }

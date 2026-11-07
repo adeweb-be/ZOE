@@ -181,10 +181,7 @@ fn model_with(first_oid: u64, n: i32, fanout: Option<usize>) -> CatalogModel {
             ("sortable_title", IndexKind::Field),
             (
                 "Subject",
-                IndexKind::Other(
-                    "Products.PluginIndexes.KeywordIndex.KeywordIndex",
-                    "KeywordIndex",
-                ),
+                IndexKind::Other("Products.ZCTextIndex.ZCTextIndex", "ZCTextIndex"),
             ),
         ],
         &["getId"],
