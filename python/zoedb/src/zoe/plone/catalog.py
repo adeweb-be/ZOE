@@ -225,11 +225,13 @@ def _catalogs(db):
                 continue
             tool = getattr(base, "portal_catalog", None)
             catalog = (
-                getattr(aq_base(tool), "_catalog", None) if tool is not None else None
+                aq_base(getattr(aq_base(tool), "_catalog", None))
+                if tool is not None
+                else None
             )
-            if catalog is None or catalog._p_oid is None or id(catalog) in seen:
+            if catalog is None or catalog._p_oid is None or catalog._p_oid in seen:
                 continue
-            seen.add(id(catalog))
+            seen.add(catalog._p_oid)
             yield catalog
     finally:
         manager.abort()
@@ -250,7 +252,9 @@ def _register_new_site(site, parent):
     tool = getattr(aq_base(site), "portal_catalog", None)
     if tool is None:
         return
-    catalog = getattr(aq_base(tool), "_catalog", None)
+    # An attribute of an acquirer comes in a wrapper: the store takes the
+    # object itself.
+    catalog = aq_base(getattr(aq_base(tool), "_catalog", None))
     if catalog is None:
         return
     jar = (
@@ -272,7 +276,9 @@ def site_removed(site, event):
     from Acquisition import aq_base
 
     tool = getattr(aq_base(site), "portal_catalog", None)
-    catalog = getattr(aq_base(tool), "_catalog", None) if tool is not None else None
+    catalog = (
+        aq_base(getattr(aq_base(tool), "_catalog", None)) if tool is not None else None
+    )
     if catalog is None or catalog._p_oid is None or catalog._p_jar is None:
         return
     jar = catalog._p_jar

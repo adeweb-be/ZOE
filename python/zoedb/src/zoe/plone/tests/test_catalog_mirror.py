@@ -65,6 +65,9 @@ QUERIES = [
         "portal_type": ["Document", "Folder"],
         "sort_on": ["portal_type", "sortable_title"],
         "sort_order": ["ascending", "descending"],
+        # Without a limit, ZCatalog iterates the first sort index here, which
+        # the mirror refuses for several sort indexes (`sort`).
+        "sort_limit": 20,
     },
     {"portal_type": "Document", "sort_on": "getId", "b_start": 2, "b_size": 3},
 ]
