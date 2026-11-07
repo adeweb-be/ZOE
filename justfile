@@ -927,6 +927,22 @@ docs:
     docs-linkcheck docs
     mdbook build docs
 
+# Move each named package to its newest release in the lock file of each uv
+# project that locks it. The other packages and projects stay as they are.
+# The lock of ci/ reads ci/sdk, which `dagger develop --mod ci` writes.
+lock +packages:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for lock in $(git ls-files '*uv.lock'); do
+        dir="$(dirname "$lock")"
+        for pkg in {{ packages }}; do
+            if grep -qx "name = \"$pkg\"" "$lock"; then
+                echo "== $dir: $pkg"
+                uv lock --directory "$dir" --upgrade-package "$pkg"
+            fi
+        done
+    done
+
 # Run CI functions locally through Dagger. The default is check, test and docs.
 ci *functions="check test docs":
     for f in {{ functions }}; do dagger call --mod ci "$f"; done
