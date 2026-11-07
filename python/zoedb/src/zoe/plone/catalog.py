@@ -462,7 +462,12 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
                 return None, "option"
             clauses.append({"k": "d", "i": name, "t": term})
             continue
-        clause, reason = _value_clause(index, name, rec)
+        try:
+            clause, reason = _value_clause(index, name, rec)
+        except Exception:
+            # A key that the conversion of the index refuses: the stock
+            # search raises as it does.
+            return None, "option"
         if clause is None:
             return None, reason
         clauses.append(clause)
