@@ -911,8 +911,8 @@ impl NativeClient {
     ) -> PyResult<Bound<'py, PyDict>> {
         let oid = crate::catalog::p64("catalog", catalog)?;
         let before = crate::catalog::p64("tid", tid)?;
-        let clause = crate::catalog::value_of_wire(crate::catalog::wire(clause)?);
-        let filter = crate::catalog::value_of_wire(crate::text::filter(filter)?);
+        let clause = crate::catalog::wire(clause)?.into_value();
+        let filter = crate::text::filter(filter)?.into_value();
         let reply = self.run(py, async move |pool| {
             pool.text_query(Oid(oid), Tid(before), clause, filter).await
         })?;
