@@ -167,31 +167,10 @@ _installed = {}
 # runs while `uninstall()` runs.
 _originals = {}
 
-
-class _Turn:
-    """The turn of `install()` and `uninstall()` of a backend: one call runs
-    at a time, its transactions included. A call waits for the end of the
-    call that has the turn. No lock stays held while a call runs."""
-
-    def __init__(self):
-        self._condition = threading.Condition()
-        self._taken = False
-
-    def __enter__(self):
-        with self._condition:
-            while self._taken:
-                self._condition.wait()
-            self._taken = True
-        return self
-
-    def __exit__(self, *exc_info):
-        with self._condition:
-            self._taken = False
-            self._condition.notify()
-
-
-# The turn of `install()` and `uninstall()`.
-_turn = _Turn()
+# The lock of `install()` and `uninstall()`. A call holds it to its end,
+# its transactions included. Only these two functions take it: no search
+# and no request waits for it. A call of one inside the other deadlocks.
+_install_lock = threading.Lock()
 
 # The root database of the process, from `IDatabaseOpenedWithRoot`.
 _root = {}
@@ -264,7 +243,7 @@ def install():
     or an `uninstall()` in progress."""
     from Products.ZCatalog.Catalog import Catalog
 
-    with _turn:
+    with _install_lock:
         if _installed:
             return
         current = mode()
@@ -333,7 +312,7 @@ def uninstall():
     stock search."""
     from Products.ZCatalog.Catalog import Catalog
 
-    with _turn:
+    with _install_lock:
         if not _installed:
             return
         Catalog.search = _installed["stock"]

@@ -49,7 +49,6 @@ from Products.ZCatalog.Catalog import Catalog
 from ZODB.POSException import ConflictError
 
 import zoe.kv
-from zoe.plone.catalog import _Turn
 
 __all__ = ["ZoeSecurityIndex", "install", "installed", "uninstall"]
 
@@ -722,8 +721,10 @@ _stock = {}
 # The stock methods of CMFCore, kept after `uninstall()`: a request that
 # runs a replaced method while `uninstall()` runs calls them.
 _originals = {}
-# The turn of `install()` and `uninstall()`.
-_turn = _Turn()
+# The lock of `install()` and `uninstall()`. A call holds it to its end,
+# its transactions and `_join()` included. Only these two functions take
+# it: no request waits for it. A call of one inside the other deadlocks.
+_install_lock = threading.Lock()
 
 
 def _uses_index(obj, catalog):
@@ -849,7 +850,7 @@ def install():
     from Products.CMFCore.MembershipTool import MembershipTool
     from zope.component import getGlobalSiteManager
 
-    with _turn:
+    with _install_lock:
         if _stock:
             return
         stock = {
@@ -881,7 +882,7 @@ def uninstall():
     from Products.CMFCore.MembershipTool import MembershipTool
     from zope.component import getGlobalSiteManager
 
-    with _turn:
+    with _install_lock:
         if not _stock:
             return
         registry = getGlobalSiteManager()
@@ -926,9 +927,10 @@ def _start(db):
         name="zoe.plone.security install",
         daemon=True,
     )
+    # `_join()` sees only a thread that started.
     with _threads_lock:
+        thread.start()
         _threads.append(thread)
-    thread.start()
 
 
 def _join(timeout=None):

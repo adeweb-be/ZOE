@@ -22,9 +22,11 @@ the first one, so the first one goes on after `WAIT`.
 
 A test of an install and an uninstall holds the first call after its
 change of the installed state, before its transactions, in the same way.
-Without the turn of the backend, the second call runs to its end, then
-the first call writes for the state that the second call replaced. Then
-the test runs the two calls at the same time, many times, with no hold.
+Without a lock across the whole call, the second call runs to its end,
+then the first call writes for the state that the second call replaced.
+With it, the second call runs after the first one, so its state wins.
+Then the test runs the two calls at the same time, many times, with no
+hold.
 
 They need the interpreter of a Plone instance: `just plone zoe backends`
 runs them. Only the tests of an install and an uninstall need a layer:
@@ -430,8 +432,11 @@ class InstallAndUninstall:
         db = acceptance.new_db(self)
         with acceptance.opened(db, ()) as app:
             acceptance.add_site(app)
-            # The commit reads no utility of the new site, as the layer
-            # `ZOE_SITE` does.
+            # At `tpc_finish`, the indexing queue of CMFCore reads the
+            # utilities of the site manager of the current site. That site
+            # manager is new in this transaction, and the savepoints of
+            # `addPloneSite` make it a ghost. The ghost does not load at the
+            # old snapshot. So the commit runs with no current site.
             setSite(None)
             transaction.commit()
         return db
@@ -457,6 +462,8 @@ class InstallAndUninstall:
                 with mock.patch.object(module, self.held, held):
                     race(first, held, second)
                 self.assertFalse(held._first)
+                # The second call runs after the first one.
+                self.assertEqual(module.installed(), second is module.install)
                 self.check()
         for turn in range(ROUNDS):
             with self.subTest(turn=turn):
