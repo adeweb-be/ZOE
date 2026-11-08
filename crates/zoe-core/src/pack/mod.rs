@@ -35,6 +35,11 @@
 //!    an oid count of 0 and keys in the transaction index is `CorruptTxn`,
 //!    and the pack stops before it removes it.
 //!
+//! A pack holds in memory the reachable oids of the mark, one batch of
+//! selected records or text deltas, the clear deltas that it removes, and
+//! `kept_tids`: one tid for each transaction at or before T that keeps a
+//! delta. For a large catalog that set can hold millions of tids.
+//!
 //! A finish during the pack writes records after T only, so the records
 //! that the mark reads do not change. Before each batch, under the commit
 //! sequencer, the pack reads the records that the finishes noted and marks
@@ -108,7 +113,8 @@ use crate::types::{Oid, Tid};
 /// The oid of the root object.
 const ROOT: Oid = Oid(0);
 
-/// The number of records that `Store::pack` removes in one batch.
+/// The number of records, or of text deltas, that `Store::pack` removes
+/// in one batch.
 const BATCH: usize = 1000;
 
 /// The number of record keys that one read of the key scan asks for.
@@ -192,8 +198,14 @@ struct Caps {
 /// A text index holds one (ADR 0060, section 4): a live index at the tid
 /// up to which it holds the deltas, a rebuild at the tid from which it
 /// reads them. So a pack never removes an unindex that the index has not
-/// applied. A pack reads the caps when it starts, so a cap holds only the
-/// packs that start after it.
+/// applied.
+///
+/// A pack reads the caps when it starts, so a cap holds only the packs
+/// that start after it. A cap taken while a pack runs does not hold that
+/// pack: the pack can remove an unindex after the tid of the cap. The
+/// pack writes `pack_watermark` with or before its first removal. So the
+/// holder reads `Store::pack_watermark` again after it catches up, and
+/// rebuilds its index when the watermark is above the tid of its cap.
 #[derive(Debug)]
 pub struct PackCap {
     caps: Arc<Mutex<Caps>>,
@@ -278,7 +290,8 @@ impl Store {
     /// Cap the packs of the store at `tid`: while the returned cap lives, a
     /// pack that starts packs at the tid of the cap at most. The holder
     /// moves the cap forward with `PackCap::advance` and releases it with
-    /// a drop.
+    /// a drop. The cap does not hold a pack that runs already: `PackCap`
+    /// gives the duty of the holder.
     pub fn pack_cap(&self, tid: Tid) -> PackCap {
         let caps = Arc::clone(&self.packing.caps);
         let id = {
@@ -299,14 +312,16 @@ impl Store {
     /// reader can reach. It removes only the old revisions, and the
     /// objects whose newest record at or before `at` is a deletion.
     ///
-    /// This is `pack_in_batches` with batches of 1,000 records and
-    /// nothing between them.
+    /// This is `pack_in_batches` with batches of 1,000 records or text
+    /// deltas and nothing between them.
     pub fn pack(&self, at: Tid) -> Result<PackReport> {
         self.pack_in_batches(at, BATCH, || {})
     }
 
     /// Pack the store at `at`, as `pack` does, in batches of at most
-    /// `batch` records. `between` runs after each batch. It runs without
+    /// `batch` records or text deltas, and one last batch of the deltas
+    /// with every clear delta that it removes. `between` runs after each
+    /// batch. It runs without
     /// the commit sequencer and without a backend transaction, so reads
     /// and commits can run then. Only a second pack or a dry run waits.
     /// Readers and commits continue during the whole pack.
@@ -346,8 +361,9 @@ impl Store {
         self.pack_or_stop(at, BATCH, stop)
     }
 
-    /// Pack the store at `at` in batches of at most `batch` records. After
-    /// each batch, stop with `Closed` when `stop` returns true.
+    /// Pack the store at `at` in batches of at most `batch` records or text
+    /// deltas, as `pack_in_batches` does. After each batch, stop with
+    /// `Closed` when `stop` returns true.
     fn pack_or_stop(
         &self,
         at: Tid,
@@ -386,6 +402,9 @@ impl Store {
                 return Err(ZoeError::Closed);
             }
         }
+        // The clear deltas need no bound: a clear empties a whole index,
+        // so a store has few of them, and the store keeps them in memory.
+        // One batch removes every clear only after every dead text.
         let clears = std::mem::take(&mut pack.deltas.clears);
         if !clears.is_empty() {
             batch_span(0, clears.len()).in_scope(|| pack.remove_deltas(clears))?;
@@ -430,8 +449,9 @@ impl Store {
     /// lock, so one waits for the other.
     ///
     /// The dry run holds the reachable oids of the mark, as a pack does,
-    /// one batch of selected records and the report. The report has one
-    /// entry for each class.
+    /// one batch of selected records or text deltas, the tids of the kept
+    /// deltas, the clear deltas that it selects, and the report. The
+    /// report has one entry for each class.
     ///
     /// A record that the mark reads and that does not decode fails the dry
     /// run with `Format`. A record that fails its checksum fails it with

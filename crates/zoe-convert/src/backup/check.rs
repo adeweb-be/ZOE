@@ -2,6 +2,7 @@
 //! store, through a copy that the dumps restore.
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -59,9 +60,11 @@ pub struct BackupCheck {
 /// store lacks it and its tid is at or before the pack watermark: a pack
 /// removed it. The store must have no other delta up to the last tid of
 /// the dumps. The live text of each key of the dumps at their last tid
-/// must be the same in both, unless the store lacks it and the newest
-/// delta of the key is at or before the watermark. A difference names the catalog, the index,
-/// the rid and the tid of a delta, never its text.
+/// must be the same in both, unless the store lacks it, the newest delta
+/// of the key is at or before the watermark, and the store has no current
+/// record of the catalog: a pack with garbage collection removed the
+/// catalog. A difference names the catalog, the index, the rid and the
+/// tid of a delta, never its text.
 ///
 /// A dump that does not restore fails the call with its error, and an
 /// open that fails fails the call with the error of `open`. The call
@@ -356,9 +359,12 @@ const KEY_CHUNK: usize = 1024;
 /// Compare the live text at `last` of each key of a text delta of `copy`
 /// in `store` and in `copy`. A pack never changes a live text after its
 /// tid, so a packed store gives the same live texts. A live text that
-/// `store` lacks is no difference when the newest delta of its key up to
-/// `last` is at or before `watermark`: a pack removed the deltas of a
-/// catalog that no reader reaches.
+/// `store` lacks is no difference only when the newest delta of its key up
+/// to `last` is at or before `watermark` and `store` has no current record
+/// of the catalog at `last`: a pack with garbage collection removed the
+/// catalog with its deltas. A catalog that no reader reaches but that has
+/// a record after the pack tid keeps that record, so its lost texts are
+/// differences.
 fn compare_live_texts(
     store: &Store,
     copy: &Store,
@@ -366,6 +372,14 @@ fn compare_live_texts(
     watermark: Tid,
     problems: &mut Problems,
 ) -> Result<(), Error> {
+    let mut check = LiveCheck {
+        store,
+        copy,
+        before: Tid(last.0.saturating_add(1)),
+        last,
+        watermark,
+        gone: HashMap::new(),
+    };
     let mut after: Option<TextChange> = None;
     // The key that the scan reads, and the tid of its newest delta up to
     // `last`.
@@ -386,7 +400,7 @@ fn compare_live_texts(
                 }
                 _ => {
                     if let Some((read, newest)) = key.take() {
-                        compare_live_text(store, copy, &read, newest, last, watermark, problems)?;
+                        check.compare(&read, newest, problems)?;
                     }
                     key = Some((change.clone(), change.tid));
                 }
@@ -398,39 +412,59 @@ fn compare_live_texts(
         }
     }
     if let Some((read, newest)) = key {
-        compare_live_text(store, copy, &read, newest, last, watermark, problems)?;
+        check.compare(&read, newest, problems)?;
     }
     Ok(())
 }
 
-/// Compare the live text at `last` of the key of `change` in `store` and
-/// in `copy`, for `compare_live_texts`. `newest` is the tid of the newest
-/// delta of the key in `copy` up to `last`.
-fn compare_live_text(
-    store: &Store,
-    copy: &Store,
-    change: &TextChange,
-    newest: Tid,
+/// The comparison of the live texts of `compare_live_texts`.
+struct LiveCheck<'a> {
+    store: &'a Store,
+    copy: &'a Store,
+    /// The tid after the last tid of the dumps.
+    before: Tid,
     last: Tid,
     watermark: Tid,
-    problems: &mut Problems,
-) -> Result<(), Error> {
-    let before = Tid(last.0.saturating_add(1));
-    let (catalog, index) = (change.catalog, change.index.as_str());
-    let rid = change.rid.expect("a text delta has a rid");
-    let theirs = copy.text_before(catalog, index, rid, before)?;
-    let name = format!(
-        "the live text of catalog {}, index {index:?}, rid {rid} at {}",
-        catalog.hex(),
-        last.hex()
-    );
-    match store.text_before(catalog, index, rid, before) {
-        Ok(ours) if ours == theirs => {}
-        Ok(None) if newest <= watermark => {}
-        Ok(_) => problems.push(format!("{name} differs")),
-        Err(error) => problems.push(format!("{name}: {error}")),
+    /// True for each catalog that has no current record in `store` at
+    /// `last`.
+    gone: HashMap<Oid, bool>,
+}
+
+impl LiveCheck<'_> {
+    /// Compare the live text of the key of `change`. `newest` is the tid of
+    /// the newest delta of the key in `copy` up to `last`.
+    fn compare(
+        &mut self,
+        change: &TextChange,
+        newest: Tid,
+        problems: &mut Problems,
+    ) -> Result<(), Error> {
+        let (catalog, index) = (change.catalog, change.index.as_str());
+        let rid = change.rid.expect("a text delta has a rid");
+        let theirs = self.copy.text_before(catalog, index, rid, self.before)?;
+        let name = format!(
+            "the live text of catalog {}, index {index:?}, rid {rid} at {}",
+            catalog.hex(),
+            self.last.hex()
+        );
+        match self.store.text_before(catalog, index, rid, self.before) {
+            Ok(ours) if ours == theirs => {}
+            Ok(None) if newest <= self.watermark && self.gone(catalog)? => {}
+            Ok(_) => problems.push(format!("{name} differs")),
+            Err(error) => problems.push(format!("{name}: {error}")),
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Tell if `store` has no current record of `catalog` at `last`.
+    fn gone(&mut self, catalog: Oid) -> Result<bool, Error> {
+        if let Some(&gone) = self.gone.get(&catalog) {
+            return Ok(gone);
+        }
+        let gone = current(self.store, catalog, self.before)?.is_none();
+        self.gone.insert(catalog, gone);
+        Ok(gone)
+    }
 }
 
 fn not_in_dumps(tid: Tid) -> String {

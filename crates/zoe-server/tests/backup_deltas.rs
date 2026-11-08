@@ -345,3 +345,75 @@ fn a_damaged_dump_fails_before_anything_is_restored() {
     assert!(!target.exists());
     assert!(!dir.join("target.restore").exists());
 }
+
+/// A catalog that the root does not reach.
+const ORPHAN: Oid = Oid(2);
+
+/// Commit an edit of the catalog record. Return the tid.
+fn edit(store: &Store) -> Tid {
+    let serial = store.load(CATALOG).unwrap().1;
+    let mut txn = store.tpc_begin(b"", b"edit", b"").unwrap();
+    txn.store(CATALOG, serial, &record(&[])).unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap()
+}
+
+#[test]
+fn the_texts_of_a_catalog_that_a_pack_removed_are_no_difference() {
+    let dir = fresh_dir("orphan");
+    let (source, dumps) = (dir.join("source"), dir.join("dumps"));
+    let last = {
+        let store = open_store(&source);
+        create(&store);
+        let before = snapshot(&store);
+        let mut txn = store.tpc_begin(b"", b"orphan", b"").unwrap();
+        txn.store(ORPHAN, Tid::ZERO, &record(&[])).unwrap();
+        txn.text_set(ORPHAN, INDEX, 1, "en", &format!("{SECRET} orphan"), before)
+            .unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        edit(&store)
+    };
+    backup(&source, &dumps, "full");
+    {
+        // The garbage collection removes the orphan catalog and its texts.
+        let store = open_store(&source);
+        store.pack(last).unwrap();
+        assert!(store.load(ORPHAN).is_err());
+        assert_eq!(store.text_before(ORPHAN, INDEX, 1, Tid::MAX).unwrap(), None);
+    }
+    let output = verify(&source, &dumps);
+    assert_exit(&output, 0, "verify after the pack of an orphan catalog");
+    assert!(!text(&output).contains(SECRET), "{}", text(&output));
+}
+
+#[test]
+fn a_lost_live_text_of_a_catalog_that_is_still_there_is_a_difference() {
+    let dir = fresh_dir("lost");
+    let (source, dumps) = (dir.join("source"), dir.join("dumps"));
+    let (first, last) = {
+        let store = open_store(&source);
+        let first = create(&store);
+        (first, edit(&store))
+    };
+    backup(&source, &dumps, "full");
+    {
+        // The pack keeps the text of rid 1: the test then removes it, with
+        // its key in text_txn, as a pack that lost it would.
+        let store = open_store(&source);
+        store.pack(last).unwrap();
+        let key = testing::text_delta_key(CATALOG, INDEX, Some(1), first);
+        testing::read_text_frame(&store, &key).unwrap();
+        testing::write_text_frame(&store, &key, None).unwrap();
+        testing::write_text_txn_key(&store, &testing::text_txn_key(&key), false).unwrap();
+        assert!(store.load(CATALOG).is_ok());
+    }
+    let output = verify(&source, &dumps);
+    assert_exit(&output, 1, "a lost live text");
+    let all = text(&output);
+    assert!(
+        all.contains("the live text") && all.contains("rid 1"),
+        "{all}"
+    );
+    assert!(!all.contains(SECRET), "the output holds a text:\n{all}");
+}

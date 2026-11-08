@@ -3,9 +3,9 @@
 //!
 //! A pack at T keeps every delta after T, so `text_before` at each tid
 //! after T gives the live text of before the pack, for each catalog that a
-//! reader can reach. A text delta at or
-//! before T that a clear delta at or before T hides goes, with that clear
-//! delta and every clear delta of the index before it. Of the other text
+//! reader can reach. A text delta at or before T that a clear delta at or
+//! before T hides goes, with that clear delta and every clear delta of the
+//! index before it. Of the other text
 //! deltas at or before T of one key, the newest stays and the others go,
 //! and that newest one goes too when it is an unindex. With `pack-gc` true,
 //! the deltas at or before T of a catalog that the mark does not reach go
@@ -345,6 +345,26 @@ fn a_crash_at_each_batch_brings_no_dead_text_back_and_changes_no_live_text() {
                 expected,
                 "gc {gc}: {image:?} changed a live text"
             );
+            // The watermark comes with or before the first removal: when a
+            // delta at or before T is gone, the watermark is at T.
+            let removed = [
+                (CATALOG, TEXT, Some(1), tids.t1),
+                (CATALOG, TEXT, Some(2), tids.t1),
+                (CATALOG, TEXT, Some(2), tids.t3),
+                (CATALOG, TITLE, Some(1), tids.t1),
+                (CATALOG, TITLE, None, tids.t4),
+                (ORPHAN, TEXT, Some(1), tids.t1),
+                (ORPHAN, TEXT, Some(2), tids.t6),
+            ];
+            let gone = removed
+                .iter()
+                .any(|&(catalog, index, rid, tid)| !has(&store, catalog, index, rid, tid));
+            if gone {
+                assert!(
+                    store.pack_watermark().unwrap() >= tids.t7,
+                    "gc {gc}: {image:?} removed a delta before its watermark"
+                );
+            }
             // The clear delta goes only after the dead text that it hides.
             if !has(&store, CATALOG, TITLE, None, tids.t4) {
                 assert!(

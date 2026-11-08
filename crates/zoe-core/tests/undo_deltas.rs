@@ -217,3 +217,28 @@ fn the_catalog_records_of_the_same_undo_go_through_the_tiers() {
     assert_eq!(store.load(counter).unwrap().0, length(15));
     assert_eq!(text(&store, 1), live("one"));
 }
+
+#[test]
+fn a_clear_staged_by_the_undoing_transaction_or_committed_before_its_vote_stops_the_undo() {
+    let store = store();
+    set(&store, 1, "one");
+    let second = set(&store, 1, "two");
+
+    // The undoing transaction clears the index first: the undo never puts
+    // the document back into the cleared index.
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.text_clear(CATALOG, INDEX).unwrap();
+    assert!(matches!(txn.undo(second), Err(ZoeError::Undo { .. })));
+    txn.abort();
+
+    // A clear that commits between the undo and its vote fails the vote.
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.undo(second).unwrap();
+    clear(&store);
+    assert!(matches!(
+        txn.vote(),
+        Err(ZoeError::TextConflict { catalog }) if catalog == CATALOG
+    ));
+    txn.abort();
+    assert_eq!(text(&store, 1), None);
+}
