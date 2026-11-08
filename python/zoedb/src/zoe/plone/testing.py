@@ -11,13 +11,21 @@ stack does not change, so the suites run unchanged.
   at that address.
 
 `ZOE_PLONE_BACKENDS` names the backends of `zoe.plone` that the suites run
-on, separated by commas: `locking`, `indexing` or `registry`. `install`
+on, separated by commas: `locking`, `indexing`, `registry` or `security`. `install`
 installs them, the guard of a stock registry (ADR 0050) and the patch of
 the mutable property sheet of PlonePAS (ADR 0046, section 9), which an
 instance installs through `configure.zcml`.
 The suites of Plone run without `indexing`: they search the catalog right
 after a change, in the same transaction. The tests of queued indexing
 install it themselves.
+With `security`, the site of the fixture of plone.app.testing gets the
+`ZoeSecurityIndex` in the transaction that creates it (ADR 0061); without
+it, the suites keep the stock index and run the stock methods of CMFCore.
+`just plone zoe backends` keeps `locking`, so only the tests of
+`zoe.plone.tests.test_security_index` and `test_security_backend` run with
+the index: they install the backend and put the index into their own
+sites. `ZOE_PLONE_BACKENDS=security just plone zoe suites -s zoe.plone -t
+TestTheFixtureOfTheSuites` checks that the site of the fixture holds it.
 
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of
@@ -44,7 +52,7 @@ import shutil
 import tempfile
 
 import transaction
-from plone.testing import Layer, zodb
+from plone.testing import Layer, zca, zodb
 from plone.testing import zope as zope_layers
 from ZODB.DB import DB
 from ZODB.DemoStorage import DemoStorage
@@ -58,19 +66,39 @@ class BaseStorage(Layer):
     `plone.testing.zodb.stackDemoStorage` without a database stacks a
     `DemoStorage` on this storage. With a database, it does not change.
     `tearDown` closes the storage and removes the directory.
+
+    The layer comes after `LAYER_CLEANUP` of plone.testing, which clears
+    the global registry. So `setUp` registers the handlers of the security
+    backend again when `install` installed it, and `tearDown` removes them.
     """
+
+    defaultBases = (zca.LAYER_CLEANUP,)
 
     def open(self, directory):
         """Open the base storage in `directory`."""
         raise NotImplementedError
 
     def setUp(self):
+        from zope.component import getGlobalSiteManager
+
+        from zoe.plone import security
+
+        self._handlers = security._handlers() if security.installed() else []
+        registry = getGlobalSiteManager()
+        for handler, required in self._handlers:
+            registry.registerHandler(handler, required)
         self._directory = tempfile.mkdtemp(prefix="zoe-plone-")
         self._storage = self.open(self._directory)
         self._stack = zodb.stackDemoStorage
         zodb.stackDemoStorage = self.stackDemoStorage
 
     def tearDown(self):
+        from zope.component import getGlobalSiteManager
+
+        registry = getGlobalSiteManager()
+        for handler, required in self._handlers:
+            registry.unregisterHandler(handler, required)
+        del self._handlers
         zodb.stackDemoStorage = self._stack
         self._storage.close()
         shutil.rmtree(self._directory, ignore_errors=True)

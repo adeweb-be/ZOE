@@ -14,6 +14,10 @@
 //! last tid: a new structure for each index and each column of the
 //! metadata table that the change sets touched, one at a time; the other
 //! structures stay shared with the old base.
+//!
+//! The rows of the overrides that the rebase counts include, for a
+//! `ZoeSecurityIndex`, the rows of the base below each changed row: a
+//! version resolves them again at each query.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -22,6 +26,7 @@ use std::time::Duration;
 use crate::base::{Base, Index};
 use crate::change::{ChangeSet, Overrides, Slot};
 use crate::table;
+use crate::value::Val;
 
 /// The versions of a mirror that queries read.
 #[derive(Debug)]
@@ -134,7 +139,7 @@ impl Versions {
     /// Tells if a rebase is due: the overrides hold more than `rows` rows,
     /// or a change set out of the window is not in the base yet.
     pub fn rebase_due(&self, rows: usize, window_tids: usize, window: Duration) -> bool {
-        if self.head.rows() > rows {
+        if self.head.rows() + security_rows(&self.base, &self.head, rows) > rows {
             return true;
         }
         let tid = self.base.tid;
@@ -176,6 +181,33 @@ impl Versions {
     }
 }
 
+/// The rows of the base below the rows whose inputs or path `head` changed,
+/// for each `ZoeSecurityIndex`. The count stops past `limit`.
+fn security_rows(base: &Base, head: &Overrides, limit: usize) -> usize {
+    let mut count = 0;
+    for (i, entry) in base.indexes.iter().enumerate() {
+        let Index::Security(s) = &entry.index else {
+            continue;
+        };
+        let changed = [Slot::Index(i), Slot::Paths]
+            .into_iter()
+            .filter_map(|slot| head.trees.get(&slot))
+            .flat_map(|rows| rows.iter());
+        for (rid, value) in changed {
+            if let Some(row) = base.rows.row(*rid) {
+                count += s.below_count(&base.rows, base.rows.paths.get(row));
+            }
+            if let Some(path) = value.as_ref().and_then(Val::text) {
+                count += s.below_count(&base.rows, path);
+            }
+            if count > limit {
+                return count;
+            }
+        }
+    }
+    count
+}
+
 /// Builds the base of the version of `base` with `head` at `tid`. Each
 /// index that `head` touches gets a new structure, one at a time; the
 /// others stay shared. `room` tells if the bound has room for the new
@@ -203,11 +235,21 @@ pub fn rebase(
         if let Some(length) = head.lengths.get(&i) {
             entry.length = *length;
         }
-        let rebuilt = match head.trees.get(&Slot::Index(i)) {
-            Some(changed) => entry.index.rebuilt(changed, &rows),
+        let rebuilt = match (&entry.index, head.trees.get(&Slot::Index(i))) {
+            (Index::Security(s), changed)
+                if changed.is_some() || !Arc::ptr_eq(&rows, &base.rows) =>
+            {
+                // The value of a row follows from the rows of its
+                // containers, which a change of the paths can change.
+                Some(
+                    s.rebuilt(changed, &rows)
+                        .map(|i| Index::Security(Arc::new(i))),
+                )
+            }
+            (_, Some(changed)) => entry.index.rebuilt(changed, &rows),
             // Every row keeps its number, so a structure that no change
             // touched stays valid.
-            None => continue,
+            (_, None) => continue,
         };
         match rebuilt {
             None => {}

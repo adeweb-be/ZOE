@@ -130,7 +130,8 @@ impl Wire {
 /// reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClauseKind {
-    /// `"v"`: a FieldIndex, a KeywordIndex, a DateIndex or a UUIDIndex.
+    /// `"v"`: a FieldIndex, a KeywordIndex, a DateIndex, a UUIDIndex or a
+    /// `ZoeSecurityIndex`.
     Value,
     /// `"b"`: a BooleanIndex.
     Boolean,
@@ -155,7 +156,10 @@ impl ClauseKind {
     pub fn reads(self, class: Kind) -> bool {
         match self {
             ClauseKind::Value => {
-                matches!(class, Kind::Field | Kind::Keyword | Kind::Date | Kind::Uuid)
+                matches!(
+                    class,
+                    Kind::Field | Kind::Keyword | Kind::Date | Kind::Uuid | Kind::Security
+                )
             }
             ClauseKind::Boolean => class == Kind::Boolean,
             ClauseKind::DateRange => class == Kind::DateRange,
