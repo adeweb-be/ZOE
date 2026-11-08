@@ -846,15 +846,17 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
                 time.sleep(min(left, 0.01))
 
     def _with_server(self, call, timeout=None, again=False):
-        """Return `call()`. Without a server, wait for one as ZEO does and
-        call again, once.
+        """Return `call()`.
 
-        `ClientDisconnected` tells that the call lost its connection. When
-        the client is connected after that, it has a new listener. Give
-        `again` only to a call that writes nothing on the server: such a
-        call runs once more on the new listener. Any other call raises when
-        the client has a new listener, because it can have written on the
-        server.
+        When `call()` raises `ClientDisconnected` and the client has no
+        server, wait for one as ZEO does, then call again, once. After
+        `close`, raise at once.
+
+        When the client is connected after the failure, `again` decides.
+        The lost connection can be a listener that a new one replaced, or
+        another connection of the pool. With `again`, call again, once.
+        Without `again`, raise. Give `again` only to a call that can run
+        twice with no harm: a read, or `new_oids`.
         """
         try:
             return call()
