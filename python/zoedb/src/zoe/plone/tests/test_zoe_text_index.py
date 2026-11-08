@@ -847,3 +847,26 @@ class TestAStepThatFailsHalfway(TextTests):
         self.import_again("profile-zoe.plone:text")
         wait_text(self.storage, self.key)
         self.check(textindex.ZoeTextIndex)
+
+    def test_a_failed_step_back_then_the_step_ends_on_the_text_index(self):
+        self.import_failing("profile-zoe.plone:text-uninstall", after=5)
+        self.check(textindex.ZoeTextIndex, pending=True)
+        self.import_again("profile-zoe.plone:text")
+        wait_text(self.storage, self.key)
+        self.check(textindex.ZoeTextIndex)
+
+    def test_a_failed_step_then_the_step_back_ends_on_zctextindex(self):
+        self.import_again("profile-zoe.plone:text-uninstall")
+        self.check(ZCTextIndex)
+        try:
+            self.import_failing("profile-zoe.plone:text", after=5)
+            self.check(ZCTextIndex, pending=True)
+            self.import_again("profile-zoe.plone:text-uninstall")
+            self.check(ZCTextIndex)
+            self.assertIsNone(
+                self.storage.kv_get("durable", textindex.NAMESPACE, self.key)
+            )
+        finally:
+            self.import_again("profile-zoe.plone:text")
+            wait_text(self.storage, self.key)
+        self.check(textindex.ZoeTextIndex)

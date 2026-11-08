@@ -1204,6 +1204,28 @@ def _reindex(tool, keys):
             transaction.commit()
 
 
+def _drop_pending(catalog, keep):
+    """Remove from `catalog` each pending index that is not an instance of
+    `keep`: the pending indexes of the other profile step. The removal
+    changes the mapping of the indexes directly, so the hook of `delIndex`
+    stages no clear delta for the id that the pending index shares with a
+    serving index. Return the ids of the dropped pending `ZoeTextIndex`
+    indexes."""
+    indexes = dict(catalog.indexes)
+    dropped = []
+    for key in [k for k in indexes if k.startswith(PENDING)]:
+        index = aq_base(indexes[key])
+        if isinstance(index, keep):
+            continue
+        del indexes[key]
+        if isinstance(index, ZoeTextIndex):
+            dropped.append(index.id)
+    if len(indexes) != len(catalog.indexes):
+        catalog.indexes = indexes
+        settings_changed(catalog)
+    return dropped
+
+
 def _swap(catalog, names):
     """Put the pending index of each id of `names` in the place of the old
     index of the id, in the current transaction. The hook of `delIndex`
@@ -1231,7 +1253,8 @@ def install_text(setup, mode="enhanced"):
     the step stages its texts in the pending index too. The last batch
     puts each pending index in the place of its ZCTextIndex, in the commit
     of the caller. An import after a failure finds the pending indexes and
-    indexes the catalog again into them."""
+    indexes the catalog again into them. The pending ZCTextIndex indexes of
+    a step back that failed go first."""
     site = _site_of(setup)
     tool = site.portal_catalog
     if mode != "enhanced":
@@ -1242,6 +1265,9 @@ def install_text(setup, mode="enhanced"):
     register_text_index()
     catalog = tool._catalog
     languages = _site_languages(site)
+    # The pending ZCTextIndex indexes of a step back that failed go: the
+    # `ZoeTextIndex` indexes still serve.
+    _drop_pending(catalog, ZoeTextIndex)
     names = []
     for name in TEXT_INDEXES:
         if PENDING + name in catalog.indexes:
@@ -1278,13 +1304,25 @@ def uninstall_text(setup):
     `ZoeTextIndex` serves. The last batch stages a clear delta of each
     `ZoeTextIndex` and puts each ZCTextIndex in its place, in the commit of
     the caller. An import after a failure indexes the catalog again into
-    the pending indexes. The ZCTextIndex indexes are of the type `Okapi
+    the pending indexes. The pending `ZoeTextIndex` indexes of a
+    `zoe.plone:text` that failed go first, with a clear delta of their
+    texts. The ZCTextIndex indexes are of the type `Okapi
     BM25 Rank`, the type of Plone."""
     from Products.ZCTextIndex.ZCTextIndex import ZCTextIndex
 
     site = _site_of(setup)
     tool = site.portal_catalog
     catalog = tool._catalog
+    # The pending `ZoeTextIndex` indexes of a `zoe.plone:text` that failed
+    # go, with a clear delta of their texts: the ZCTextIndex indexes of
+    # their ids still serve.
+    dropped = _drop_pending(catalog, ZCTextIndex)
+    if dropped:
+        _check_site(tool)
+        deltas = _deltas(aq_base(catalog)._p_jar, create=True)
+        for name in dropped:
+            if not isinstance(aq_base(catalog.indexes.get(name)), ZoeTextIndex):
+                deltas.clear(aq_base(catalog)._p_oid, name)
     serving = _text_indexes(aq_base(catalog), pending=False)
     names = sorted(
         set(serving)
