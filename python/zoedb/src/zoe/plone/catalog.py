@@ -766,7 +766,11 @@ def _start_of(jar):
     """The start of the snapshot of the Connection `jar`, or None. After a
     savepoint, `_storage` is the savepoint storage, so the start comes from
     the storage under it."""
-    storage = getattr(jar, "_normal_storage", None) or getattr(jar, "_storage", None)
+    # The MVCC adapter takes the `__len__` of its storage, so an empty
+    # storage gives a false adapter: the test is on None.
+    storage = getattr(jar, "_normal_storage", None)
+    if storage is None:
+        storage = getattr(jar, "_storage", None)
     return getattr(storage, "_start", None)
 
 
@@ -1017,6 +1021,11 @@ def _value_clause(index, name, rec):
             return None, "option"
         clause["q"] = keys
     nots = list(rec.get("not", None) or [])
+    # Keys that are all None: ZCatalog looks none up and gives no row,
+    # whatever `not` holds. With `not`, the plan would read as a query of
+    # `not` alone, which gives rows.
+    if rec.keys and not clause["q"] and not range_ and nots:
+        return None, "option"
     # `UnIndex.query_index` converts the keys of `not` for a query of `not`
     # alone. With keys or a range, it looks them up as they are.
     if not rec.keys:

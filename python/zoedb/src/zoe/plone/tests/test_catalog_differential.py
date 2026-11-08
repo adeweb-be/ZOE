@@ -247,6 +247,12 @@ def queries(site):
     }
 
 
+# The searches of the fixed set that take the Python path, with their
+# reason. Keys that are all None with `not`: ZCatalog gives no row, and the
+# plan would read as a query of `not` alone.
+EXPECTED = {"kw-none-not": ("option", "client")}
+
+
 @contextlib.contextmanager
 def test_storage(storage, depth=1):
     """Yield a database on `depth` `DemoStorage`s over `storage`. The base
@@ -290,6 +296,11 @@ def setup_site(test, mode):
     test.addCleanup(catalog._logged.clear)
 
 
+def empty_cache(site):
+    """Drop the cache of ZCatalog in the request of `site`."""
+    site.REQUEST.other.pop("__catalog_cache__", None)
+
+
 def run(test, site, named):
     """Run each search of `named` through the hook. Return, by name, None
     for a search that the mode `compare` compared, or the reason of its
@@ -297,7 +308,11 @@ def run(test, site, named):
     out = {}
     for name, query in named.items():
         before = counts()
+        # Each search starts with an empty cache of the request: a hit of
+        # that cache can give another stock answer than a miss.
+        empty_cache(site)
         expected = stock(site, query)
+        empty_cache(site)
         got = answer(site.portal_catalog.unrestrictedSearchResults(**query))
         test.assertEqual(got, expected, name)
         after = counts()
@@ -339,12 +354,14 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
         # Each search that the mirror does not serve takes a reason of the
         # table of ADR 0059, section 7.
         refused = {name: reason for name, reason in got.items() if reason}
-        self.assertEqual(refused, {}, refused)
+        self.assertEqual(refused, EXPECTED, refused)
         now = counts()
-        self.assertEqual(now["compared"], len(compared))
-        self.assertEqual(now["throwaways"], len(named))
-        self.assertEqual(now["queries"], {"native": len(named)})
-        self.assertEqual(now["mismatches"], 0)
+        served = len(named) - len(EXPECTED)
+        self.assertEqual(len(compared), served)
+        self.assertEqual(now["compared"], served)
+        self.assertEqual(now["throwaways"], served)
+        self.assertEqual(now["queries"], {"native": served, "python": len(EXPECTED)})
+        self.assertEqual(now["mismatches"], 0, catalog._mismatched)
         no_mirror(self, self.storage, self.key)
 
     def test_each_search_in_a_transaction_that_changed_the_catalog_is_compared(self):
@@ -376,13 +393,14 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
             site["dif-0"].manage_delObjects(["item-00"])
             got = run(self, site, named)
         refused = {name: reason for name, reason in got.items() if reason}
-        self.assertEqual(refused, {}, refused)
+        self.assertEqual(refused, EXPECTED, refused)
         now = counts()
-        self.assertEqual(now["compared"], len(named))
-        self.assertEqual(now["throwaways"], len(named))
-        self.assertEqual(now["mismatches"], 0)
-        # Each search sent the records of the transaction.
-        self.assertEqual(len(sent), len(named))
+        served = len(named) - len(EXPECTED)
+        self.assertEqual(now["compared"], served)
+        self.assertEqual(now["throwaways"], served)
+        self.assertEqual(now["mismatches"], 0, catalog._mismatched)
+        # Each search with a plan sent the records of the transaction.
+        self.assertEqual(len(sent), served)
         self.assertTrue(all(sent), sent)
         no_mirror(self, self.storage, self.key)
 
@@ -429,7 +447,7 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
             self.assertNotEqual(first, second)
         now = counts()
         self.assertEqual(now["compared"], 2)
-        self.assertEqual(now["mismatches"], 0)
+        self.assertEqual(now["mismatches"], 0, catalog._mismatched)
         self.assertEqual(now["cache_differences"], 1)
         text = "\n".join(logs.output)
         self.assertIn("cache of the request", text)
@@ -462,13 +480,15 @@ class TestTheModeCompareOnAZoeStore(unittest.TestCase):
             named = prepared(site)
             before = self.storage._catalog_counts()["zoe_catalog_queries_total"]
             got = run(self, site, named)
-        self.assertTrue(all(reason is None for reason in got.values()), got)
+        refused = {name: reason for name, reason in got.items() if reason}
+        self.assertEqual(refused, EXPECTED, refused)
+        served = len(named) - len(EXPECTED)
         now = counts()
-        self.assertEqual(now["compared"], len(named))
+        self.assertEqual(now["compared"], served)
         self.assertEqual(now["throwaways"], 0)
-        self.assertEqual(now["mismatches"], 0)
+        self.assertEqual(now["mismatches"], 0, catalog._mismatched)
         after = self.storage._catalog_counts()["zoe_catalog_queries_total"]
-        self.assertEqual(after["native"], before["native"] + len(named))
+        self.assertEqual(after["native"], before["native"] + served)
 
 
 class TestThePathsOfTheOverlay(unittest.TestCase):
