@@ -36,6 +36,7 @@ Only `install`, the sheets of a site and the import step import Plone.
 """
 
 import copy
+import threading
 
 import transaction
 
@@ -208,19 +209,16 @@ def import_properties(context):
 
 # The stock methods of the sheet while the patch is installed.
 _stock = {}
+# The lock of `install()`.
+_install_lock = threading.Lock()
 
 
 def install():
     """Patch the mutable property sheet of PlonePAS: a read copies the
     stored properties, and a write on a marked sheet stores a
     `PrincipalProperties`. A second call does nothing."""
-    if _stock:
-        return
     from Products.PlonePAS.plugins.property import ZODBMutablePropertyProvider
     from Products.PlonePAS.sheet import MutablePropertySheet
-
-    _stock["getPropertiesForUser"] = ZODBMutablePropertyProvider.getPropertiesForUser
-    _stock["setPropertiesForUser"] = ZODBMutablePropertyProvider.setPropertiesForUser
 
     def getPropertiesForUser(self, user, request=None):
         stored = self._storage.get(user.getId())
@@ -240,9 +238,15 @@ def install():
         if marked(self):
             move(self._storage, user.getId())
 
-    for name, method in (
-        ("getPropertiesForUser", getPropertiesForUser),
-        ("setPropertiesForUser", setPropertiesForUser),
-    ):
-        method.__doc__ = _stock[name].__doc__
-        setattr(ZODBMutablePropertyProvider, name, method)
+    with _install_lock:
+        if _stock:
+            return
+        provider = ZODBMutablePropertyProvider
+        _stock["getPropertiesForUser"] = provider.getPropertiesForUser
+        _stock["setPropertiesForUser"] = provider.setPropertiesForUser
+        for name, method in (
+            ("getPropertiesForUser", getPropertiesForUser),
+            ("setPropertiesForUser", setPropertiesForUser),
+        ):
+            method.__doc__ = _stock[name].__doc__
+            setattr(provider, name, method)

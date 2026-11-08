@@ -8,6 +8,7 @@ object does not. `configure.zcml` installs the guard whenever `zoe.plone`
 loads. `zoe.plone.registry` gives these names.
 """
 
+import threading
 import weakref
 
 import transaction.interfaces
@@ -19,6 +20,8 @@ __all__ = ["install_guard", "uninstall_guard"]
 
 # The stock property `records` while the guard is installed.
 _guard = {}
+# The lock of `install_guard()` and `uninstall_guard()`.
+_install_lock = threading.Lock()
 
 # Whether the storage of each database has namespaces.
 _namespaces = weakref.WeakKeyDictionary()
@@ -41,27 +44,30 @@ def _has_namespaces(jar):
 def install_guard():
     """Make each stock registry in a store with namespaces call
     `readCurrent` on the roots of its trees when code reads its records. A
-    second call does nothing."""
-    if _guard:
-        return
+    second call does nothing. The replacement keeps the stock property,
+    so a read that runs while `uninstall_guard()` runs ends with it."""
     from zoe.plone.registry_ops import MovedRecords
 
-    stock = Registry.__dict__["records"]
+    with _install_lock:
+        if _guard:
+            return
+        stock = Registry.__dict__["records"]
 
-    def records(self):
-        found = stock.fget(self)
-        if not isinstance(found, MovedRecords):
-            _read_current(self, found)
-        return found
+        def records(self):
+            found = stock.fget(self)
+            if not isinstance(found, MovedRecords):
+                _read_current(self, found)
+            return found
 
-    _guard["records"] = stock
-    Registry.records = property(records, doc=stock.__doc__)
+        _guard["records"] = stock
+        Registry.records = property(records, doc=stock.__doc__)
 
 
 def uninstall_guard():
     """Put the stock property `records` back."""
-    if _guard:
-        Registry.records = _guard.pop("records")
+    with _install_lock:
+        if _guard:
+            Registry.records = _guard.pop("records")
 
 
 def _holds_its_bucket(tree):

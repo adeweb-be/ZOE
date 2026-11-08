@@ -162,6 +162,12 @@ _SORTS = {
 
 # The stock `Catalog.search` and the mode, while the backend is installed.
 _installed = {}
+# The stock `Catalog.search` and the methods of `_SEARCH_METHODS` at the
+# last `install()`, kept after `uninstall()`: a search that runs while
+# `uninstall()` runs reads them.
+_originals = {}
+# The lock of `install()` and `uninstall()`.
+_install_lock = threading.Lock()
 
 # The root database of the process, from `IDatabaseOpenedWithRoot`.
 _root = {}
@@ -231,17 +237,20 @@ def install():
     """Hook `Catalog.search`, in the mode of `ZOE_PLONE_CATALOG_MODE`, and
     write the registration keys of the databases that the process has open.
     A second call does nothing."""
-    if _installed:
-        return
     from Products.ZCatalog.Catalog import Catalog
 
-    current = mode()
-    _installed.update(stock=Catalog.search, mode=current, code=_code(Catalog))
-    Catalog.search = _search
-    path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
-    if path and not _counts_file:
-        _counts_file["path"] = path
-        atexit.register(_write_counts, path)
+    with _install_lock:
+        if _installed:
+            return
+        current = mode()
+        stock = {"stock": Catalog.search, "code": _code(Catalog)}
+        _originals.update(stock)
+        _installed.update(stock, mode=current)
+        Catalog.search = _search
+        path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
+        if path and not _counts_file:
+            _counts_file["path"] = path
+            atexit.register(_write_counts, path)
     db = _root.get("db")
     if db is not None:
         register(db)
@@ -283,7 +292,7 @@ def _unchecked(catalog):
     from Acquisition import aq_base
     from Products.ZCatalog.Catalog import Catalog
 
-    if _code(Catalog) != _installed["code"]:
+    if _code(Catalog) != _originals["code"]:
         return "patched"
     mro = type(aq_base(catalog)).__mro__
     below = mro[: mro.index(Catalog)] if Catalog in mro else mro
@@ -295,13 +304,16 @@ def _unchecked(catalog):
 def uninstall():
     """Give the stock search back, then remove, in a transaction of its own,
     the registration keys of each database that the process has open. A
-    second call does nothing."""
-    if not _installed:
-        return
+    second call does nothing. A search that runs meanwhile ends with the
+    stock search."""
     from Products.ZCatalog.Catalog import Catalog
 
-    Catalog.search = _installed["stock"]
-    _installed.clear()
+    with _install_lock:
+        if not _installed:
+            return
+        Catalog.search = _installed["stock"]
+        # `_originals` keeps the stock search for the searches in flight.
+        _installed.clear()
     db = _root.get("db")
     if db is None:
         return
