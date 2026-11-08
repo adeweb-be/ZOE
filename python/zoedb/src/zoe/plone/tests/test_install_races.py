@@ -6,7 +6,11 @@
   guard of a stock registry, and the catalog backend;
 - two threads that run `install()` at the same time leave one
   installation: indexing, the guard of a stock registry, the catalog
-  backend, locking and the patch of the mutable property sheet.
+  backend, locking and the patch of the mutable property sheet;
+- an `install()` and an `uninstall()` at the same time of the catalog
+  backend or the security backend end in one of two states: installed,
+  with the registration keys or the `ZoeSecurityIndex`, or not
+  installed, with no keys or the stock index.
 
 A test of two installs holds the first `install()` after its check. The
 second thread meets the first one there at a barrier, then calls
@@ -16,8 +20,15 @@ then the first installs again over it, and keeps the replacement of the
 second as the stock method. With a lock, the second `install()` waits for
 the first one, so the first one goes on after `WAIT`.
 
+A test of an install and an uninstall holds the first call after its
+change of the installed state, before its transactions, in the same way.
+Without the turn of the backend, the second call runs to its end, then
+the first call writes for the state that the second call replaced. Then
+the test runs the two calls at the same time, many times, with no hold.
+
 They need the interpreter of a Plone instance: `just plone zoe backends`
-runs them. They need no layer.
+runs them. Only the tests of an install and an uninstall need a layer:
+they add a Plone site to a database of their own.
 """
 
 import os
@@ -27,6 +38,8 @@ from unittest import mock
 
 import transaction
 import ZODB
+from Acquisition import aq_base
+from zope.component.hooks import setSite
 
 import zoe
 from zoe.plone import (
@@ -36,7 +49,10 @@ from zoe.plone import (
     properties,
     registry_guard,
     registry_ops,
+    security,
 )
+from zoe.plone import testing as zoe_testing
+from zoe.plone.tests import test_security_index as acceptance
 from zoe.plone.tests.helpers import new_directory
 
 # The longest wait of the first `install()` for the end of the second one,
@@ -44,6 +60,10 @@ from zoe.plone.tests.helpers import new_directory
 WAIT = 2.0
 # The longest wait at the barrier, in seconds.
 START = 30.0
+# The rounds with no hold of each test of an install and an uninstall.
+ROUNDS = 20
+# The longest wait for the threads of the security backend, in seconds.
+JOIN = 60.0
 
 
 class Late(dict):
@@ -66,10 +86,30 @@ class Late(dict):
         return length
 
 
-def race(install, late):
-    """Run `install` in two threads. The second thread calls it after the
-    first one made its check of `late`, and the first one goes on when the
-    second one ends. Raise the first error of a thread."""
+class Held:
+    """A function whose first call meets the second thread at `start`,
+    then waits until `done` is set or `WAIT` runs out, then calls
+    `function`."""
+
+    def __init__(self, function):
+        self.function = function
+        self.start = threading.Barrier(2, timeout=START)
+        self.done = threading.Event()
+        self._first = True
+
+    def __call__(self, *args, **kwargs):
+        if self._first:
+            self._first = False
+            self.start.wait()
+            self.done.wait(WAIT)
+        return self.function(*args, **kwargs)
+
+
+def race(install, late, other=None):
+    """Run `install` in a first thread, and `other`, or `install` again, in
+    a second thread. The second thread calls it after the first one
+    reached `late`, and the first one goes on when the second one ends.
+    Raise the first error of a thread."""
     errors = []
 
     def first():
@@ -81,7 +121,7 @@ def race(install, late):
     def second():
         try:
             late.start.wait()
-            install()
+            (other or install)()
         except BaseException as error:
             errors.append(error)
         finally:
@@ -349,3 +389,135 @@ class TestProperties(PatchRace, unittest.TestCase):
             (provider, "getPropertiesForUser"),
             (provider, "setPropertiesForUser"),
         ]
+
+
+def at_once(*calls):
+    """Run each call in a thread of its own, all at the same time. Raise
+    the first error of a thread."""
+    start = threading.Barrier(len(calls), timeout=START)
+    errors = []
+
+    def run(call):
+        try:
+            start.wait()
+            call()
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=run, args=(call,)) for call in calls]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+
+
+class InstallAndUninstall:
+    """An `install()` and an `uninstall()` at the same time of a backend
+    that writes in the databases of the process. `module` is the backend,
+    and `held` the name of the function of the module that `install()` and
+    `uninstall()` call after their change of the installed state and
+    before their transactions. `check()` fails when the state of the
+    databases does not agree with `installed()`."""
+
+    layer = zoe_testing.ZOE_SITE
+    module = None
+    held = None
+
+    def make_site(self):
+        """Make a database of its own with a Plone site, and return it."""
+        db = acceptance.new_db(self)
+        with acceptance.opened(db, ()) as app:
+            acceptance.add_site(app)
+            # The commit reads no utility of the new site, as the layer
+            # `ZOE_SITE` does.
+            setSite(None)
+            transaction.commit()
+        return db
+
+    def check(self):
+        raise NotImplementedError
+
+    def start_in(self, installed):
+        """Install or uninstall the backend, then check its state."""
+        (self.module.install if installed else self.module.uninstall)()
+        self.assertEqual(self.module.installed(), installed)
+        self.check()
+
+    def test_an_install_and_an_uninstall_at_the_same_time_end_in_one_state(self):
+        module = self.module
+        for first, second in (
+            (module.install, module.uninstall),
+            (module.uninstall, module.install),
+        ):
+            with self.subTest(first=first.__name__):
+                self.start_in(first is module.uninstall)
+                held = Held(getattr(module, self.held))
+                with mock.patch.object(module, self.held, held):
+                    race(first, held, second)
+                self.assertFalse(held._first)
+                self.check()
+        for turn in range(ROUNDS):
+            with self.subTest(turn=turn):
+                self.start_in(bool(turn % 2))
+                calls = [module.install, module.uninstall]
+                at_once(*(calls if turn % 4 < 2 else calls[::-1]))
+                self.check()
+
+
+class TestCatalogInstallAndUninstall(InstallAndUninstall, unittest.TestCase):
+    module = catalog
+    held = "_databases"
+
+    def setUp(self):
+        from Products.ZCatalog.Catalog import Catalog
+
+        if catalog.installed():
+            self.skipTest("the catalog backend is installed")
+        self.db = self.make_site()
+        self.storage = self.db.storage
+        with acceptance.opened(self.db) as site:
+            self.key = aq_base(site.portal_catalog)._catalog._p_oid
+        self.addCleanup(setattr, Catalog, "search", Catalog.__dict__["search"])
+        for each, values in (
+            (catalog._root, {"db": self.db}),
+            (catalog._originals, {}),
+            (catalog._counts, {}),
+            (catalog._counts_file, {}),
+        ):
+            patch = mock.patch.dict(each, values, clear=each is catalog._root)
+            patch.start()
+            self.addCleanup(patch.stop)
+        environ = mock.patch.dict(os.environ, {"ZOE_PLONE_CATALOG_MODE": "on"})
+        environ.start()
+        self.addCleanup(environ.stop)
+        os.environ.pop("ZOE_PLONE_CATALOG_COUNTS", None)
+        self.addCleanup(catalog.uninstall)
+
+    def check(self):
+        found = {
+            bytes(k) for k, _ in self.storage.kv_scan("durable", catalog.NAMESPACE)
+        }
+        self.assertEqual(found, {self.key} if catalog.installed() else set())
+
+
+class TestSecurityInstallAndUninstall(InstallAndUninstall, unittest.TestCase):
+    module = security
+    held = "_root_db"
+
+    def setUp(self):
+        if security.installed():
+            self.skipTest("the security backend is installed")
+        self.db = self.make_site()
+        patch = mock.patch.dict(security._root, {"db": self.db}, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(security.uninstall)
+
+    def check(self):
+        security._join(JOIN)
+        self.assertFalse(any(t.is_alive() for t in security._threads))
+        with acceptance.opened(self.db) as site:
+            index = security.security_index(site.portal_catalog)
+            self.assertEqual(index is not None, security.installed())
