@@ -112,7 +112,7 @@ fn prepare(path: &Path, n: i32, cell: usize, register: bool) -> (CatalogModel, u
     for i in 0..n {
         let rid = 1000 + i;
         let kind = if i % 2 == 0 { "Document" } else { "Folder" };
-        let id = format!("{i:0>width$}", width = cell.max(4));
+        let id = format!("{i:04}{}", "x".repeat(cell.saturating_sub(4)));
         model.catalog(
             rid,
             &format!("/site/item-{i}"),

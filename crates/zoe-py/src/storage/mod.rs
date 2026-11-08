@@ -144,6 +144,10 @@ impl Reads for Owned {
     fn registration_generation(&self) -> Result<u64, String> {
         self.store.registration_generation()
     }
+
+    fn store(&self) -> Option<&Store> {
+        Some(&self.store)
+    }
 }
 
 impl StoreRef {

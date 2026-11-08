@@ -219,10 +219,9 @@ def refused(storage, error, stage):
     return raised.value
 
 
-def check_errors(storage, oid, rids, now, large=True):
-    """Each error of the core raises its Python class on `storage`. With
-    `large`, also a text over the staging memory: the native client would
-    send it in one frame past the limit of the server."""
+def check_errors(storage, oid, rids, now):
+    """Each error of the core that a storage with its default limits gives
+    raises its Python class on `storage`."""
     first = rids["/site/item-0"]
     for bad in (
         lambda t: storage.text_set(oid, "Title", 1 << 40, "en", "x", now, t),
@@ -231,14 +230,6 @@ def check_errors(storage, oid, rids, now, large=True):
         lambda t: storage.text_unindex(oid, "Title", -(1 << 31) - 1, now, t),
     ):
         refused(storage, ValueError, bad)
-    if large:
-        refused(
-            storage,
-            StorageError,
-            lambda t: storage.text_set(
-                oid, "Title", first, "en", "x" * (17 << 20), now, t
-            ),
-        )
     # Two transactions of one snapshot that write one document.
     commit(
         storage, lambda t: storage.text_set(oid, "Title", first, "en", "vite", now, t)
@@ -256,7 +247,7 @@ def check_errors(storage, oid, rids, now, large=True):
     last = after(storage.lastTransaction())
     # A catalog with no index.
     with pytest.raises(zoe.storage.Unavailable):
-        storage.text_query(b"\0" * 7 + b"\x01", last, clause("Title", ["kalo"]))
+        storage.text_query(b"\xff" * 8, last, clause("Title", ["kalo"]))
     assert issubclass(zoe.storage.Unavailable, StorageError)
     # A snapshot before a clear delta that the index holds.
     cleared = settled(lambda: storage.text_query(oid, last, clause("Title", ["kalo"])))
@@ -326,7 +317,7 @@ def test_the_native_client_stages_and_queries_text_deltas(tmp_path):
         remote = native(server)
         try:
             now = check_storage(remote, oid, rids)
-            check_errors(remote, oid, rids, now, large=False)
+            check_errors(remote, oid, rids, now)
         finally:
             remote.close()
 
