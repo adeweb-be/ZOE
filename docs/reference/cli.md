@@ -1,6 +1,6 @@
 # The `zoe` command
 
-`zoe` is one binary with eight subcommands. This page gives each subcommand, each of its options, the environment twin of each option, its default and the exit codes. ADR 0028 records the decisions of the command.
+`zoe` is one binary with nine subcommands. This page gives each subcommand, each of its options, the environment twin of each option, its default and the exit codes. ADR 0028 records the decisions of the command.
 
 ## Entry points
 
@@ -21,7 +21,7 @@ The extension module of the wheel has no server and no MCP server. So `zoe serve
 - `zoe serve` also reads a [configuration file](config-file.md). The command line wins over the twin, and the twin wins over the file.
 - The command parses all its arguments before it opens a file. So a usage error changes nothing on disk.
 - The report of a subcommand goes to stdout. A failure goes to stderr, as `zoe <subcommand>: <message>`. A usage error goes to stderr, as `error: <message>` and the usage.
-- A subcommand that only reads a store opens it read-only. On a store that was closed cleanly, it changes no byte. On a store that a writer left open, it repairs the store first, and writes one line to stderr that says `repaired the store` (ADR 0028).
+- A subcommand that only reads a store opens it read-only. On a store that was closed cleanly, it changes no byte. `zoe catalog rebuild-text` uses this open too: it changes no byte of the tables, and writes only in `text/`. On a store that a writer left open, it repairs the store first, and writes one line to stderr that says `repaired the store` (ADR 0028).
 
 ## Exit codes
 
@@ -150,6 +150,30 @@ An open of a store of `ZOE format 3` by this build fails, and the message names 
 | Argument | Twin | Default | Value |
 | --- | --- | --- | --- |
 | `STORE` | `ZOE_PATH` | necessary | The directory of the store. |
+
+## `zoe catalog`
+
+The tools of the catalogs of a store. `zoe catalog` takes one command.
+
+### `zoe catalog rebuild-text`
+
+Rebuild the text index of each registered catalog of a store from the live texts of the deltas at the last tid, with no Plone and no server (ADR 0060, section 15). The index in `text/<oid>/` of the store directory is a cache, and the deltas are the source of truth: run the command when a file of the index is damaged or when you want a fresh index.
+
+The command runs on a store folder that no process holds: it opens the store read-only, which takes the lock of the store, so a store that `zoe serve` or another process holds fails with 1 and nothing changes. It writes nothing in the tables: on a store that was closed cleanly, it changes no byte outside `text/`. On a store that a writer left open, it repairs the store first, as each tool that reads a store does.
+
+A catalog gets a new index when it is registered and its settings in `zoe.text` name a text index in the enhanced mode. For each such catalog, the command writes the new index in `text/<oid>.new` with 4 indexing threads, which share one memory budget of 256 MB, and syncs it; it runs no final merge, so the index keeps the segments that the merge policy of tantivy leaves. Then it renames `text/<oid>` to `text/<oid>.old`, renames `text/<oid>.new` to `text/<oid>`, syncs `text/` and the store directory, and removes `text/<oid>.old`. A failure of the second rename puts the old index back. So the old index stays until the new one is complete. A crash leaves the old index or the new one: the next open of the store removes a `.new` or `.old` directory, and rebuilds an index whose directory is missing. A store opens a new index as it is, and does not rebuild it.
+
+The report gives the tid, then one line for each catalog: its oid, the documents of the new index and the time of its rebuild. It never holds a text. A store with no such catalog exits with 0 and changes nothing. A registered catalog with no delta gets an empty index. Settings of `zoe.text` that do not read fail the command with 1 before it writes anything.
+
+```text
+The text indexes of the store var/zoe at tid 0x03f6db4f22222222:
+  catalog 0x0000000000000010  rebuilt  25 documents  0.04 s
+```
+
+| Argument or option | Twin | Default | Value |
+| --- | --- | --- | --- |
+| `STORE` | `ZOE_PATH` | necessary | The directory of the store. No process may hold it. |
+| `--catalog OID` | `ZOE_CATALOG` | every catalog with a text index | Rebuild the text index of this catalog only: the oid of its `Catalog` object, as `0x` and 1 to 16 hexadecimal digits. The other directories of `text/` stay as they are. A catalog that is not registered, or has no text index in the enhanced mode, fails the command with 1. An oid of another form is a usage error. |
 
 ## `zoe backup`
 

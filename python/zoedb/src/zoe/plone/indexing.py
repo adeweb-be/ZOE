@@ -236,6 +236,8 @@ def highest(paths):
 # utility, whether the registry held the stock utility itself, and the
 # processor.
 _installed = {}
+# The lock of `install()` and `uninstall()`.
+_install_lock = threading.Lock()
 
 # The state of the processing of the queue in each thread: the random part
 # of the keys, the number of the next operation, and the transaction that
@@ -261,43 +263,47 @@ def install():
     """Put the processor of this module in the place of the utility
     `portal-catalog` of the global registry. Start no thread. A second
     call does nothing."""
-    if _installed:
-        return
     from Products.CMFCore.indexing import PortalCatalogProcessor
     from Products.CMFCore.interfaces import IPortalCatalogQueueProcessor
     from zope.component import getGlobalSiteManager
     from zope.interface import classImplements
 
-    classImplements(QueueProcessor, IPortalCatalogQueueProcessor)
-    registry = getGlobalSiteManager()
-    stock = registry.queryUtility(IPortalCatalogQueueProcessor, name=UTILITY)
-    if stock is None:
-        stock = PortalCatalogProcessor()
-    own = any(
-        registration.provided is IPortalCatalogQueueProcessor
-        and registration.name == UTILITY
-        for registration in registry.registeredUtilities()
-    )
-    processor = QueueProcessor(stock)
-    registry.registerUtility(processor, IPortalCatalogQueueProcessor, UTILITY)
-    _installed.update(registry=registry, stock=stock, own=own, processor=processor)
+    with _install_lock:
+        if _installed:
+            return
+        classImplements(QueueProcessor, IPortalCatalogQueueProcessor)
+        registry = getGlobalSiteManager()
+        stock = registry.queryUtility(IPortalCatalogQueueProcessor, name=UTILITY)
+        if stock is None:
+            stock = PortalCatalogProcessor()
+        own = any(
+            registration.provided is IPortalCatalogQueueProcessor
+            and registration.name == UTILITY
+            for registration in registry.registeredUtilities()
+        )
+        processor = QueueProcessor(stock)
+        registry.registerUtility(processor, IPortalCatalogQueueProcessor, UTILITY)
+        _installed.update(registry=registry, stock=stock, own=own, processor=processor)
 
 
 def uninstall():
-    """Put the stock utility back. A second call does nothing."""
-    if not _installed:
-        return
+    """Put the stock utility back. A second call does nothing. The
+    processor keeps the stock utility, so a call into it that runs
+    meanwhile ends with the stock utility."""
     from Products.CMFCore.interfaces import IPortalCatalogQueueProcessor
 
-    registry = _installed["registry"]
-    registry.unregisterUtility(
-        _installed["processor"], IPortalCatalogQueueProcessor, UTILITY
-    )
-    if _installed["own"]:
-        registry.registerUtility(
-            _installed["stock"], IPortalCatalogQueueProcessor, UTILITY
+    with _install_lock:
+        if not _installed:
+            return
+        registry = _installed["registry"]
+        registry.unregisterUtility(
+            _installed["processor"], IPortalCatalogQueueProcessor, UTILITY
         )
-    _installed.clear()
+        if _installed["own"]:
+            registry.registerUtility(
+                _installed["stock"], IPortalCatalogQueueProcessor, UTILITY
+            )
+        _installed.clear()
 
 
 def _warn(jar):

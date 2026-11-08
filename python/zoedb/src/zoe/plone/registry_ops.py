@@ -9,6 +9,7 @@ of `zoe.plone.registry` tells how a moved registry reads and writes.
 """
 
 import bisect
+import threading
 import weakref
 
 from Acquisition import aq_base
@@ -45,6 +46,8 @@ __all__ = [
 
 # The flag of the option.
 _installed = {}
+# The lock of `install()` and `uninstall()`.
+_install_lock = threading.Lock()
 
 # The rows of the namespaces of moved registries, for each storage.
 _cache = registry_rows.Cache()
@@ -56,14 +59,17 @@ _transactions = weakref.WeakKeyDictionary()
 def install():
     """Let `move`, `copy_rows` and `reset` run in this process. A second
     call does nothing."""
-    _installed["on"] = True
+    with _install_lock:
+        _installed["on"] = True
 
 
 def uninstall():
     """Stop `move`, `copy_rows` and `reset`, and drop the cache of rows. A
-    second call does nothing."""
-    _installed.clear()
-    _cache.clear()
+    second call does nothing. A `move`, `copy_rows` or `reset` that
+    runs meanwhile ends."""
+    with _install_lock:
+        _installed.clear()
+        _cache.clear()
 
 
 def _need_install(what):
