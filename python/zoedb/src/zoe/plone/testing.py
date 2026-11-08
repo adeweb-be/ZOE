@@ -11,13 +11,19 @@ stack does not change, so the suites run unchanged.
   at that address.
 
 `ZOE_PLONE_BACKENDS` names the backends of `zoe.plone` that the suites run
-on, separated by commas: `locking`, `indexing` or `registry`. `install`
+on, separated by commas: `locking`, `indexing`, `registry` or `security`. `install`
 installs them, the guard of a stock registry (ADR 0050) and the patch of
 the mutable property sheet of PlonePAS (ADR 0046, section 9), which an
 instance installs through `configure.zcml`.
 The suites of Plone run without `indexing`: they search the catalog right
 after a change, in the same transaction. The tests of queued indexing
 install it themselves.
+With `security`, the site of the fixture of plone.app.testing gets the
+`ZoeSecurityIndex` in the transaction that creates it (ADR 0061); without
+it, the suites keep the stock index and run the stock methods of CMFCore.
+`just plone zoe backends` keeps `locking`, so only the tests of
+`zoe.plone.tests.test_security_index` run with the index: they install the
+backend and put the index into their own sites.
 
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of
