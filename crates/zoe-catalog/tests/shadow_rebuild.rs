@@ -1,16 +1,21 @@
 //! Acceptance test of the shadow rebuild of a mirror (ADR 0059, sections 5
 //! and 6): the way back from `stale`.
 //!
-//! A commit of each case of section 5 (`clearIndex`, `manage_catalogClear`,
-//! `addIndex`, `delIndex`, `addColumn`) makes the mirror stale and starts a
-//! shadow rebuild. A hook holds the shadow rebuild while later commits
-//! apply. Each query at each tid then gets the answer of a mirror built
+//! A commit of each case of section 5 (`clearIndex`, `addIndex`,
+//! `delIndex`, `addColumn`) makes the mirror stale and starts a shadow
+//! rebuild. A hook holds the shadow rebuild while later commits apply. Each query at each tid then gets the answer of a mirror built
 //! from scratch at that tid, or `stale` at the stale commit and later when
 //! it reads a changed structure. After the swap, each query at the stale
 //! commit and later gets the answer of a mirror built from scratch; a query
 //! before it that reads a changed structure gets `outside_window`, as the
 //! new base holds that structure from the stale commit on.
+//!
+//! `manage_catalogClear` changes the rows: a second whole base does not fit
+//! the bound of ADR 0059, section 6, so the mirror drops its base and
+//! builds again from nothing. So does a shadow rebuild that fails, or whose
+//! copy does not fit under the bound.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -24,6 +29,17 @@ use zoe_core::Store;
 use zoe_core::vfs::MemVfs;
 
 const WAIT: Duration = Duration::from_secs(20);
+
+/// One test at a time: a hook that holds a build or a shadow rebuild holds
+/// the one-build lock of the process, so it holds the builds of the other
+/// tests too.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const KINDS: [(&str, IndexKind); 4] = [
     ("portal_type", IndexKind::Field),
@@ -376,6 +392,7 @@ fn run(case: &Case) {
 
 #[test]
 fn clear_index_rebuilds_the_index_in_the_shadow_and_swaps() {
+    let _serial = serial();
     run(&Case {
         name: "clearIndex",
         stale: |m| {
@@ -389,32 +406,8 @@ fn clear_index_rebuilds_the_index_in_the_shadow_and_swaps() {
 }
 
 #[test]
-fn manage_catalog_clear_rebuilds_the_mirror_in_the_shadow_and_swaps() {
-    run(&Case {
-        name: "manage_catalogClear",
-        stale: |m| {
-            let entries = m.entries();
-            m.clear();
-            for (_, path) in entries.iter().step_by(2) {
-                let i: usize = path.trim_start_matches("/site/item-").parse().unwrap();
-                add(m, i, 7);
-            }
-        },
-        changed: &[
-            "type",
-            "state",
-            "type-by-state",
-            "subject",
-            "type-by-created",
-            "added",
-            "type-rows",
-            "type-description",
-        ],
-    });
-}
-
-#[test]
 fn add_index_builds_the_new_index_in_the_shadow_and_swaps() {
+    let _serial = serial();
     run(&Case {
         name: "addIndex",
         stale: |m| {
@@ -429,6 +422,7 @@ fn add_index_builds_the_new_index_in_the_shadow_and_swaps() {
 
 #[test]
 fn del_index_drops_the_index_in_the_shadow_and_swaps() {
+    let _serial = serial();
     run(&Case {
         name: "delIndex",
         stale: |m| m.del_index("Subject"),
@@ -438,6 +432,7 @@ fn del_index_drops_the_index_in_the_shadow_and_swaps() {
 
 #[test]
 fn add_column_rebuilds_the_table_in_the_shadow_and_swaps() {
+    let _serial = serial();
     run(&Case {
         name: "addColumn",
         stale: |m| m.add_column("Description"),
@@ -447,6 +442,7 @@ fn add_column_rebuilds_the_table_in_the_shadow_and_swaps() {
 
 #[test]
 fn a_new_record_of_a_refused_index_rebuilds_it_in_the_shadow() {
+    let _serial = serial();
     let store = store();
     let mut m = CatalogModel::new(10, &KINDS, &COLUMNS);
     for i in 0..ENTRIES {
@@ -478,57 +474,6 @@ fn a_new_record_of_a_refused_index_rebuilds_it_in_the_shadow() {
     mirrors.stop();
 }
 
-#[test]
-fn a_failed_shadow_rebuild_leaves_the_old_base_serving() {
-    let fail = Arc::new(Mutex::new(false));
-    let armed = Arc::clone(&fail);
-    let config = Config {
-        hooks: Hooks {
-            before_build: Some(Arc::new(move |_| {
-                if *armed.lock().unwrap() {
-                    panic!("the test fails the shadow rebuild");
-                }
-            })),
-            ..Hooks::default()
-        },
-        ..Config::default()
-    };
-    let (store, mirrors, mut m, first) = prepared(config);
-    let catalog = m.oid();
-    *fail.lock().unwrap() = true;
-    m.clear_index("review_state");
-    let stale = commit(&store, Some(&mirrors), &m.records(), &[]);
-    assert!(mirrors.wait_for(catalog, WAIT, |s| s.is_some_and(|s| {
-        s.state == "ready" && s.stale_at == Some(stale) && s.applied >= Some(stale)
-    })));
-    edit(&mut m, 1);
-    let later = commit(&store, Some(&mirrors), &m.records(), &[]);
-    assert!(applied(&mirrors, catalog, later));
-    let case = Case {
-        name: "failed",
-        stale: |_| {},
-        changed: &["state", "type-by-state"],
-    };
-    check(
-        &store,
-        &mirrors,
-        &m,
-        &[first, stale, later],
-        stale,
-        &case,
-        true,
-    );
-    let status = mirrors.status(catalog).unwrap();
-    assert_eq!((status.swaps, status.stale_at), (0, Some(stale)));
-    let failed: Vec<String> = mirrors
-        .take_events()
-        .into_iter()
-        .filter(|e| e.contains("failed"))
-        .collect();
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    mirrors.stop();
-}
-
 /// The bytes of the structures of the index `name` of a mirror built from
 /// scratch at `tid`.
 fn index_bytes(store: &Store, catalog: u64, tid: u64, name: &str) -> usize {
@@ -539,6 +484,7 @@ fn index_bytes(store: &Store, catalog: u64, tid: u64, name: &str) -> usize {
 
 #[test]
 fn the_second_copy_stays_within_the_bound_and_drops_the_mirror_that_answered_least_recently() {
+    let _serial = serial();
     let store = store();
     let distinct = |m: &mut CatalogModel, turn: usize| {
         for i in 0..ENTRIES * 2 {
@@ -612,5 +558,481 @@ fn the_second_copy_stays_within_the_bound_and_drops_the_mirror_that_answered_lea
             "{name}"
         );
     }
+    mirrors.stop();
+}
+
+/// Each query at each tid of `tids`: the reason that `expect` gives for the
+/// plan and the tid, or else the answer of a mirror built from scratch.
+fn check_with(
+    store: &Store,
+    mirrors: &Mirrors,
+    m: &CatalogModel,
+    tids: &[u64],
+    what: &str,
+    expect: impl Fn(&str, u64) -> Option<Reason>,
+) {
+    for tid in tids {
+        for (name, plan, columns) in plans() {
+            let got = answer(mirrors, m.oid(), *tid, &plan, &columns);
+            let label = format!("{what}: {name} at {tid:#x}");
+            match expect(name, *tid) {
+                Some(reason) => assert_eq!(got.err(), Some(reason), "{label}"),
+                None => assert_eq!(got, fresh(store, m.oid(), *tid, &plan, &columns), "{label}"),
+            }
+        }
+    }
+}
+
+/// Waits until the mirror is ready again, with no stale commit, and
+/// applied `tid`.
+fn ready_again(mirrors: &Mirrors, catalog: u64, tid: u64) -> bool {
+    mirrors.wait_for(catalog, WAIT, |s| {
+        s.is_some_and(|s| s.state == "ready" && s.stale_at.is_none() && s.applied >= Some(tid))
+    })
+}
+
+/// The bytes of the mirror of a catalog of `store`, from a first start.
+fn mirror_bytes(store: &Arc<Store>, catalog: u64, tid: u64) -> usize {
+    let measure = mirrors(
+        store,
+        Config {
+            threads: 1,
+            ..Config::default()
+        },
+    );
+    assert!(applied(&measure, catalog, tid));
+    let bytes = measure.status(catalog).unwrap().bytes;
+    measure.stop();
+    bytes
+}
+
+/// A catalog whose `review_state` holds a distinct value for each entry, in
+/// a new store.
+fn distinct_catalog() -> (Arc<Store>, CatalogModel, u64) {
+    let store = store();
+    let mut m = CatalogModel::new(10, &KINDS, &COLUMNS);
+    refill_distinct(&mut m);
+    let first = commit(&store, None, &m.records(), &[m.key()]);
+    (store, m, first)
+}
+
+fn refill_distinct(m: &mut CatalogModel) {
+    for i in 0..ENTRIES * 2 {
+        m.catalog(
+            1000 + i as i32,
+            &format!("/site/item-{i}"),
+            &[
+                ("portal_type", Val::Str(TYPES[i % 3].into())),
+                ("review_state", Val::Str(format!("state-{i}").into())),
+                ("getId", Val::Str(format!("item-{i}").into())),
+            ],
+        );
+    }
+}
+
+#[test]
+fn manage_catalog_clear_under_a_tight_bound_drops_the_base_and_builds_again() {
+    let _serial = serial();
+    let store = store();
+    let mut m = CatalogModel::new(10, &KINDS, &COLUMNS);
+    // A catalog large enough that one commit grows its mirror by little.
+    for i in 0..ENTRIES * 10 {
+        add(&mut m, i, 0);
+    }
+    let first = commit(&store, None, &m.records(), &[m.key()]);
+    let catalog = m.oid();
+    // Room for one base and the growth of its maps, not for a second
+    // whole base.
+    let memory = mirror_bytes(&store, catalog, first) * 7 / 4;
+    let (gate, reached) = Gate::new();
+    let config = Config {
+        memory,
+        threads: 1,
+        hooks: Hooks {
+            before_build: Some(gate.hook()),
+            ..Hooks::default()
+        },
+        ..Config::default()
+    };
+    let mirrors = mirrors(&store, config);
+    assert!(ready_again(&mirrors, catalog, first));
+    let mut tids = vec![first];
+    edit(&mut m, 1);
+    tids.push(commit(&store, Some(&mirrors), &m.records(), &[]));
+    assert!(
+        applied(&mirrors, catalog, tids[1]),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    gate.set(true);
+    let entries = m.entries();
+    m.clear();
+    for (_, path) in entries.iter().step_by(2) {
+        let i: usize = path.trim_start_matches("/site/item-").parse().unwrap();
+        add(&mut m, i, 7);
+    }
+    let stale = commit(&store, Some(&mirrors), &m.records(), &[]);
+    tids.push(stale);
+    // The build from nothing waits on the hook.
+    assert_eq!(
+        reached.recv_timeout(WAIT),
+        Ok(catalog),
+        "{:?} {:?}",
+        mirrors.status(catalog),
+        mirrors.take_events()
+    );
+    edit(&mut m, 2);
+    tids.push(commit(&store, Some(&mirrors), &m.records(), &[]));
+    let status = mirrors.status(catalog).unwrap();
+    assert_eq!(
+        (status.state, status.stale_at, status.base_tid),
+        ("building", Some(stale), None)
+    );
+    check_with(&store, &mirrors, &m, &tids, "during the build", |_, tid| {
+        Some(if tid < stale {
+            Reason::NotReady
+        } else {
+            Reason::Stale
+        })
+    });
+    gate.set(false);
+    let last = *tids.last().unwrap();
+    assert!(
+        ready_again(&mirrors, catalog, last),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    let base = mirrors.status(catalog).unwrap().base_tid.unwrap();
+    edit(&mut m, 3);
+    tids.push(commit(&store, Some(&mirrors), &m.records(), &[]));
+    assert!(
+        applied(&mirrors, catalog, *tids.last().unwrap()),
+        "{:?} {:?}",
+        mirrors.status(catalog),
+        mirrors.take_events()
+    );
+    check_with(&store, &mirrors, &m, &tids, "after the build", |_, tid| {
+        (tid < base).then_some(Reason::OutsideWindow)
+    });
+    let status = mirrors.status(catalog).unwrap();
+    assert!(status.bytes <= memory, "{} > {memory}", status.bytes);
+    assert_eq!(status.swaps, 0);
+    assert_eq!(mirrors.counts().drops, 0);
+    let events = mirrors.take_events();
+    assert!(
+        events.iter().any(|e| e.contains("builds again")),
+        "{events:?}"
+    );
+    mirrors.stop();
+}
+
+#[test]
+fn a_failed_shadow_rebuild_drops_the_base_and_builds_again() {
+    let _serial = serial();
+    let (gate, reached) = Gate::new();
+    let fail = Arc::new(AtomicBool::new(false));
+    let hold = gate.hook();
+    let armed = Arc::clone(&fail);
+    let config = Config {
+        hooks: Hooks {
+            before_build: Some(Arc::new(move |n| {
+                hold(n);
+                if armed.swap(false, Ordering::SeqCst) {
+                    panic!("the test fails the shadow rebuild");
+                }
+            })),
+            ..Hooks::default()
+        },
+        ..Config::default()
+    };
+    let (store, mirrors, mut m, first) = prepared(config);
+    let catalog = m.oid();
+    fail.store(true, Ordering::SeqCst);
+    gate.set(true);
+    m.clear_index("review_state");
+    let stale = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert_eq!(reached.recv_timeout(WAIT), Ok(catalog));
+    edit(&mut m, 1);
+    let later = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(applied(&mirrors, catalog, later));
+    // The old base serves while the shadow rebuild runs.
+    let changed = ["state", "type-by-state"];
+    check_with(
+        &store,
+        &mirrors,
+        &m,
+        &[first, stale, later],
+        "during the shadow rebuild",
+        |name, tid| (changed.contains(&name) && tid >= stale).then_some(Reason::Stale),
+    );
+    gate.set(false);
+    assert!(
+        ready_again(&mirrors, catalog, later),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    let status = mirrors.status(catalog).unwrap();
+    assert_eq!(status.swaps, 0);
+    let base = status.base_tid.unwrap();
+    edit(&mut m, 2);
+    let after = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(applied(&mirrors, catalog, after));
+    check_with(
+        &store,
+        &mirrors,
+        &m,
+        &[first, stale, later, after],
+        "after the build",
+        |_, tid| (tid < base).then_some(Reason::OutsideWindow),
+    );
+    let failed: Vec<String> = mirrors
+        .take_events()
+        .into_iter()
+        .filter(|e| e.contains("failed"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    mirrors.stop();
+}
+
+#[test]
+fn a_shadow_copy_that_does_not_fit_drops_the_base_and_builds_again() {
+    let _serial = serial();
+    let (store, mut m, first) = distinct_catalog();
+    let catalog = m.oid();
+    let bytes = mirror_bytes(&store, catalog, first);
+    let index = index_bytes(&store, catalog, first, "review_state");
+    // Room for the base, and not for the copy of the index beside it.
+    let config = Config {
+        memory: bytes + index / 2,
+        threads: 1,
+        ..Config::default()
+    };
+    let mirrors = mirrors(&store, config);
+    assert!(ready_again(&mirrors, catalog, first));
+    m.clear_index("review_state");
+    refill_distinct(&mut m);
+    let stale = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(
+        ready_again(&mirrors, catalog, stale),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    assert_eq!(mirrors.status(catalog).unwrap().swaps, 0);
+    check_with(&store, &mirrors, &m, &[stale], "after the build", |_, _| {
+        None
+    });
+    let events = mirrors.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("failed") && e.contains("no room")),
+        "{events:?}"
+    );
+    mirrors.stop();
+}
+
+#[test]
+fn a_second_stale_commit_during_a_shadow_rebuild_starts_it_again_for_both() {
+    let _serial = serial();
+    let (gate, reached) = Gate::new();
+    let config = Config {
+        hooks: Hooks {
+            before_build: Some(gate.hook()),
+            ..Hooks::default()
+        },
+        ..Config::default()
+    };
+    let (store, mirrors, mut m, first) = prepared(config);
+    let catalog = m.oid();
+    gate.set(true);
+    m.clear_index("review_state");
+    for i in 0..ENTRIES / 2 {
+        add(&mut m, i, 7);
+    }
+    let one = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert_eq!(reached.recv_timeout(WAIT), Ok(catalog));
+    m.add_column("Description");
+    let two = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(applied(&mirrors, catalog, two));
+    let state = ["state", "type-by-state"];
+    let rows = ["type-rows", "type-description"];
+    let tids = [first, one, two];
+    check_with(&store, &mirrors, &m, &tids, "during", |name, tid| {
+        let stale = (state.contains(&name) && tid >= one) || (rows.contains(&name) && tid >= two);
+        stale.then_some(Reason::Stale)
+    });
+    // The first shadow rebuild goes; the next one builds both.
+    gate.set(false);
+    assert!(
+        swapped(&mirrors, catalog, 1),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    edit(&mut m, 2);
+    let after = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(applied(&mirrors, catalog, after));
+    assert_eq!(mirrors.status(catalog).unwrap().swaps, 1);
+    check_with(
+        &store,
+        &mirrors,
+        &m,
+        &[first, one, two, after],
+        "after the swap",
+        |name, tid| {
+            ((state.contains(&name) || rows.contains(&name)) && tid < two)
+                .then_some(Reason::OutsideWindow)
+        },
+    );
+    mirrors.stop();
+}
+
+#[test]
+fn a_later_commit_that_the_shadow_cannot_follow_starts_it_again_there() {
+    let _serial = serial();
+    let (gate, reached) = Gate::new();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let hold = gate.hook();
+    let count = Arc::clone(&builds);
+    let config = Config {
+        hooks: Hooks {
+            before_build: Some(Arc::new(move |n| {
+                count.fetch_add(1, Ordering::SeqCst);
+                hold(n);
+            })),
+            ..Hooks::default()
+        },
+        ..Config::default()
+    };
+    let (store, mirrors, mut m, first) = prepared(config);
+    let catalog = m.oid();
+    gate.set(true);
+    m.add_index("added", IndexKind::Field);
+    for i in 0..ENTRIES / 2 {
+        add(&mut m, i, 0);
+    }
+    let one = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert_eq!(reached.recv_timeout(WAIT), Ok(catalog));
+    // A new root of the new index: the shadow cannot follow it.
+    m.clear_index("added");
+    for i in ENTRIES / 2..ENTRIES {
+        add(&mut m, i, 0);
+    }
+    let two = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(applied(&mirrors, catalog, two));
+    gate.set(false);
+    assert!(
+        swapped(&mirrors, catalog, 1),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    // The first build, the shadow rebuild, and the shadow rebuild again.
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    check_with(
+        &store,
+        &mirrors,
+        &m,
+        &[first, one, two],
+        "after the swap",
+        |name, tid| (name == "added" && tid < two).then_some(Reason::OutsideWindow),
+    );
+    mirrors.stop();
+}
+
+#[test]
+fn the_thread_of_the_mirrors_applies_the_last_commits_to_the_shadow() {
+    let _serial = serial();
+    let (gate, reached) = Gate::new();
+    let config = Config {
+        hooks: Hooks {
+            before_swap: Some(gate.hook()),
+            ..Hooks::default()
+        },
+        ..Config::default()
+    };
+    let (store, mirrors, mut m, _) = prepared(config);
+    let catalog = m.oid();
+    gate.set(true);
+    m.clear_index("review_state");
+    for i in 0..ENTRIES / 2 {
+        add(&mut m, i, 7);
+    }
+    let stale = commit(&store, Some(&mirrors), &m.records(), &[]);
+    // The shadow rebuild ends its own catch-up and waits.
+    assert_eq!(reached.recv_timeout(WAIT), Ok(catalog));
+    for i in (0..ENTRIES).step_by(3) {
+        add(&mut m, i, 9);
+    }
+    let last = commit(&store, Some(&mirrors), &m.records(), &[]);
+    assert!(applied(&mirrors, catalog, last));
+    gate.set(false);
+    assert!(
+        swapped(&mirrors, catalog, 1),
+        "{:?}",
+        mirrors.status(catalog)
+    );
+    check_with(
+        &store,
+        &mirrors,
+        &m,
+        &[stale, last],
+        "after the swap",
+        |_, _| None,
+    );
+    mirrors.stop();
+}
+
+#[test]
+fn a_refused_record_that_each_commit_rewrites_starts_one_shadow_rebuild() {
+    let _serial = serial();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&builds);
+    let config = Config {
+        hooks: Hooks {
+            before_build: Some(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..Hooks::default()
+        },
+        ..Config::default()
+    };
+    let store = store();
+    let mut m = CatalogModel::new(10, &KINDS, &COLUMNS);
+    for i in 0..ENTRIES {
+        add(&mut m, i, 0);
+    }
+    let mut records = m.records();
+    let root = m.unindex_root("review_state");
+    let place = records.iter().position(|(oid, _)| *oid == root).unwrap();
+    records[place].1 = b"not a pickle".to_vec();
+    let first = commit(&store, None, &records, &[m.key()]);
+    let mirrors = mirrors(&store, config);
+    assert!(ready_again(&mirrors, m.oid(), first));
+    // The first new record of the refused root rebuilds the index, which
+    // refuses it again.
+    let again = commit(
+        &store,
+        Some(&mirrors),
+        &[(root, b"still not".to_vec())],
+        &[],
+    );
+    assert!(
+        swapped(&mirrors, m.oid(), 1),
+        "{:?}",
+        mirrors.status(m.oid())
+    );
+    assert!(ready_again(&mirrors, m.oid(), again));
+    let mut last = again;
+    for turn in 0..3 {
+        let bytes = format!("not a pickle {turn}").into_bytes();
+        last = commit(&store, Some(&mirrors), &[(root, bytes)], &[]);
+    }
+    assert!(ready_again(&mirrors, m.oid(), last));
+    let status = mirrors.status(m.oid()).unwrap();
+    assert_eq!((status.swaps, builds.load(Ordering::SeqCst)), (1, 2));
+    let (_, state, none) = plans().into_iter().find(|(n, ..)| *n == "state").unwrap();
+    assert_eq!(
+        answer(&mirrors, m.oid(), last, &state, &none).err(),
+        Some(Reason::IndexUnavailable)
+    );
     mirrors.stop();
 }

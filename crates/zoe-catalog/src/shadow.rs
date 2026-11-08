@@ -19,7 +19,13 @@
 //! in at one step (`swap`): the change sets lose the changes of the
 //! changed structures and take those of the shadow. A query at a tid
 //! before the stale commit that reads a changed structure then takes
-//! `outside_window`: the base no longer holds that structure before it.
+//! `outside_window`: the base does not hold that structure at those tids.
+//!
+//! The copy of a shadow rebuild is at most the changed structures. New
+//! rows would need a second whole base, so a commit that changes them
+//! starts no shadow rebuild: the mirror drops its base and builds again
+//! from nothing. So does a shadow rebuild that fails, for want of room
+//! or for another reason.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -27,8 +33,7 @@ use std::time::Instant;
 
 use crate::base::{Base, Index, IndexEntry};
 use crate::build::{
-    BuildError, add_index_shapes, build as build_all, build_index, catalog_meta, read_index,
-    read_table,
+    BuildError, add_index_shapes, build_index, catalog_meta, read_index, read_table,
 };
 use crate::change::{ChangeSet, Overrides, Owner, Shapes, Slot, Unfollowed, read_records};
 use crate::mirror::{Snapshot, Versions, rebase};
@@ -122,7 +127,9 @@ pub fn changed_by(
     for what in unfollowed {
         match what {
             Unfollowed::Tree(Slot::Paths) | Unfollowed::Catalog(None) => out.rows = true,
-            Unfollowed::Tree(Slot::Index(i)) | Unfollowed::Index(i, _) => index(&mut out, *i),
+            Unfollowed::Tree(Slot::Index(i)) | Unfollowed::Index(i, _) | Unfollowed::Refused(i) => {
+                index(&mut out, *i)
+            }
             Unfollowed::Tree(_) => out.table = true,
             Unfollowed::Catalog(Some(new)) => {
                 let old = objects
@@ -299,15 +306,12 @@ pub fn build(
     };
     let no_room =
         || ShadowError::Failed("the memory bound has no room for the shadow rebuild".into());
-    let (base, shapes, mut objects, held) = if changed.rows {
-        drop(snapshot);
-        let built = build_all(reads, catalog, tid, threads, room).map_err(failed)?;
-        let mut shapes = built.shapes;
-        // The mirror follows the catalog object itself.
-        shapes.owners.remove(&catalog);
-        let held = built.base.heap_bytes() + shapes.heap_bytes();
-        (built.base, shapes, built.objects, held)
-    } else {
+    // New rows need a second whole base: the mirror builds again from
+    // nothing instead.
+    if changed.rows {
+        return Err(ShadowError::Failed("the rows changed".into()));
+    }
+    let (base, shapes, mut objects, held) = {
         let before = tid.saturating_add(1);
         let bytes = reads
             .load_before(catalog, before)
@@ -364,7 +368,13 @@ pub fn build(
                     read.watch = vec![read.entry.oid];
                     Some((shape, bytes))
                 }
-                None => None,
+                None => {
+                    // An index that its rebuild refuses again watches only
+                    // its index object: a record that each commit rewrites
+                    // starts no rebuild at each commit.
+                    read.watch.retain(|o| *o == read.entry.oid);
+                    None
+                }
             };
             held += read.entry.index.heap_bytes()
                 + found.as_ref().map_or(0, |(shape, _)| shape.heap_bytes());

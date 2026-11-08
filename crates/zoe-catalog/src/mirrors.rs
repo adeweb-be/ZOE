@@ -26,7 +26,9 @@
 //! starts a shadow rebuild (`shadow`) in a thread of its own, one build at
 //! a time in the process. The base keeps serving meanwhile: a query takes
 //! `stale` only at the tid of that commit or later, and only when it reads
-//! a changed structure. The thread lays the new base in at one step.
+//! a changed structure. The thread lays the new base in at one step. A
+//! commit that changes the rows, and a shadow rebuild that fails, drop the
+//! base: the mirror builds again from nothing.
 //!
 //! A query can carry a transaction overlay (`overlay`): the mirror reads it
 //! over the version of the query, with the shapes of the trees that the
@@ -164,7 +166,7 @@ pub struct Status {
     /// The change sets that the mirror holds.
     pub sets: usize,
     /// The tid of the commit that made the mirror stale, while it builds
-    /// again or after its shadow rebuild failed.
+    /// again, from nothing or in a shadow rebuild.
     pub stale_at: Option<u64>,
     /// The rebases that the mirror laid.
     pub rebases: u64,
@@ -195,9 +197,6 @@ enum Shadowing {
         cancel: Arc<AtomicBool>,
         again: bool,
     },
-    /// The last shadow rebuild failed: the base serves the tids before the
-    /// stale commits until the next one.
-    Failed,
 }
 
 struct Entry {
@@ -1229,8 +1228,10 @@ fn read_registration(shared: &Arc<Shared>, store: &dyn Reads) {
         .collect();
     let mut freed = false;
     for catalog in gone {
-        if let Some(e) = inner.entries.remove(&catalog) {
-            freed |= e.bytes > 0;
+        if let Some(mut e) = inner.entries.remove(&catalog) {
+            freed |= e.held() > 0;
+            // A shadow rebuild of a removed catalog drops no other mirror.
+            e.forget_shadow();
         }
     }
     for catalog in listed {
@@ -1459,16 +1460,21 @@ fn apply_commits(shared: &Arc<Shared>, store: &dyn Reads) {
 /// edits of the commit before the versions take its change set, so a query
 /// never reads a version with older shapes than its own.
 fn apply(shared: &Arc<Shared>, catalog: u64, commit: &Commit) {
-    let (base, head, maint) = {
+    let (base, head, maint, rebuilding) = {
         let inner = shared.lock();
         match inner.entries.get(&catalog) {
-            Some(Entry {
-                state: State::Ready(v),
-                maint: Some(maint),
-                ..
-            }) if v.applied < commit.tid => {
-                (Arc::clone(&v.base), Arc::clone(&v.head), Arc::clone(maint))
-            }
+            Some(
+                e @ Entry {
+                    state: State::Ready(v),
+                    maint: Some(maint),
+                    ..
+                },
+            ) if v.applied < commit.tid => (
+                Arc::clone(&v.base),
+                Arc::clone(&v.head),
+                Arc::clone(maint),
+                e.changed(),
+            ),
             _ => return,
         }
     };
@@ -1482,9 +1488,15 @@ fn apply(shared: &Arc<Shared>, catalog: u64, commit: &Commit) {
         lengths,
         edits,
         stale,
-        unfollowed,
+        mut unfollowed,
         ..
     } = got;
+    // A new record of a refused index that a shadow rebuild already builds
+    // starts no other one.
+    unfollowed.retain(|what| match what {
+        Unfollowed::Refused(i) => !rebuilding.has_index(&base.indexes, *i),
+        _ => true,
+    });
     let changed = {
         let mut m = write(&maint);
         let mut changed = shadow::changed_by(&base, &m.objects, &unfollowed);
@@ -1511,7 +1523,13 @@ fn apply(shared: &Arc<Shared>, catalog: u64, commit: &Commit) {
         changed
     };
     let mut inner = shared.lock();
-    if let Some(e) = inner.entries.get_mut(&catalog)
+    if changed.rows {
+        // New rows need a second whole base beside the old one: the mirror
+        // drops its base and builds again from nothing.
+        let first = rebuilding_since(&inner, catalog).unwrap_or(commit.tid);
+        let why = stale.unwrap_or_else(|| "the commit changes the rows".into());
+        make_stale(shared, &mut inner, catalog, first.min(commit.tid), &why);
+    } else if let Some(e) = inner.entries.get_mut(&catalog)
         && matches!(e.state, State::Ready(_))
     {
         let marked = !changed.is_empty();
@@ -1547,6 +1565,14 @@ fn apply(shared: &Arc<Shared>, catalog: u64, commit: &Commit) {
     drop(inner);
     drop(base);
     shared.changed.notify_all();
+}
+
+/// The tid of the first stale commit of the mirror of `catalog`.
+fn rebuilding_since(inner: &Inner, catalog: u64) -> Option<u64> {
+    inner
+        .entries
+        .get(&catalog)
+        .and_then(|e| e.marks.first().map(|(at, _)| *at))
 }
 
 /// Makes the mirror of `catalog` stale at `tid`: it drops its base and
@@ -1610,6 +1636,7 @@ fn start_shadows(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
     let mut jobs = Vec::new();
     {
         let mut inner = shared.lock();
+        let mut failed = Vec::new();
         let mut next = inner.jobs;
         for (catalog, e) in inner.entries.iter_mut() {
             if !matches!(e.shadow, Shadowing::Due) || e.rebasing {
@@ -1623,7 +1650,7 @@ fn start_shadows(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
                 continue;
             };
             let Some(snapshot) = versions.snapshot(tid) else {
-                e.shadow = Shadowing::Failed;
+                failed.push(*catalog);
                 continue;
             };
             next += 1;
@@ -1642,6 +1669,14 @@ fn start_shadows(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
             jobs.push((next, cancel, job));
         }
         inner.jobs = next;
+        for catalog in failed {
+            fall_back(
+                shared,
+                &mut inner,
+                catalog,
+                "the mirror holds no version at the stale commit",
+            );
+        }
     }
     for (id, cancel, job) in jobs {
         let catalog = job.catalog;
@@ -1771,7 +1806,8 @@ fn catch_up(
 
 /// Lays the shadow rebuilds that ended. The thread first applies to each
 /// shadow the commits that the mirror applied after it, then lays its base,
-/// its change sets and its shapes in at one step.
+/// its change sets and its shapes in at one step. A shadow rebuild that
+/// failed, or that panics here, drops the base: the mirror builds again.
 fn install_shadows(shared: &Arc<Shared>, store: &dyn Reads) {
     let results = std::mem::take(&mut shared.lock().shadowed);
     for (catalog, id, result) in results {
@@ -1804,81 +1840,78 @@ fn install_shadows(shared: &Arc<Shared>, store: &dyn Reads) {
                     continue;
                 }
                 Err(ShadowError::Failed(why)) => {
-                    e.shadow = Shadowing::Failed;
-                    let text = format!(
-                        "the shadow rebuild of the catalog mirror of {catalog:#x} failed: \
-                         the queries after its stale commits that read a changed structure \
-                         take the Python path: {why}"
-                    );
-                    shared.event(&mut inner, text);
+                    fall_back(shared, &mut inner, catalog, why);
                     continue;
                 }
             }
             (old, maint)
         };
-        let Ok(mut built) = result else {
+        let Ok(built) = result else {
             continue;
         };
-        // The commits that the mirror applied after the shadow.
-        let cancelled = || shared.cancel.load(AtomicOrdering::Relaxed);
-        let tail = if built.applied < old.applied {
-            catch_up(store, &mut built, old.applied, &cancelled)
-        } else {
-            Ok(())
-        };
-        if let Err(e) = tail {
-            let mut inner = shared.lock();
-            if let Some(entry) = inner.entries.get_mut(&catalog) {
-                match e {
-                    ShadowError::Again(tid) => {
-                        let changed = entry.changed();
-                        entry.marks.push((tid, changed));
-                        entry.shadow = Shadowing::Due;
-                    }
-                    ShadowError::Failed(why) => {
-                        entry.shadow = Shadowing::Failed;
-                        let text = format!(
-                            "the shadow rebuild of the catalog mirror of {catalog:#x} failed: {why}"
-                        );
-                        shared.event(&mut inner, text);
-                    }
-                }
+        let tid = built.tid;
+        let changed = built.changed.clone();
+        let seconds = built.seconds;
+        let laid = catch_unwind(AssertUnwindSafe(|| {
+            let mut built = built;
+            // The commits that the mirror applied after the shadow.
+            let cancelled = || shared.cancel.load(AtomicOrdering::Relaxed);
+            if built.applied < old.applied {
+                catch_up(store, &mut built, old.applied, &cancelled)?;
             }
+            let m = read(&maint);
+            let swapped = shadow::swap(&old, &m.shapes, &m.objects, &m.moved, built);
+            let new_maint = Maint {
+                shapes: swapped.shapes,
+                objects: swapped.objects,
+                moved: swapped.moved,
+                pruned: m.pruned,
+            };
+            Ok((swapped.versions, new_maint))
+        }))
+        .unwrap_or_else(|_| Err(ShadowError::Failed("the swap panicked".into())));
+        drop(old);
+        let mut inner = shared.lock();
+        let current = inner.entries.get(&catalog).is_some_and(|e| {
+            matches!(&e.shadow, Shadowing::Running { id: j, again: false, .. } if *j == id)
+                && matches!(e.state, State::Ready(_))
+        });
+        if !current {
             continue;
         }
-        let seconds = built.seconds;
-        let changed = built.changed.clone();
-        let tid = built.tid;
-        let swapped = {
-            let m = read(&maint);
-            shadow::swap(&old, &m.shapes, &m.objects, &m.moved, built)
-        };
-        let pruned = read(&maint).pruned;
-        drop(old);
-        let new_maint = Maint {
-            shapes: swapped.shapes,
-            objects: swapped.objects,
-            moved: swapped.moved,
-            pruned,
-        };
-        let bytes = swapped.versions.heap_bytes() + new_maint.heap_bytes();
-        let mut inner = shared.lock();
-        if let Some(e) = inner.entries.get_mut(&catalog)
-            && matches!(&e.shadow, Shadowing::Running { id: j, again: false, .. } if *j == id)
-            && matches!(e.state, State::Ready(_))
-        {
-            e.state = State::Ready(swapped.versions);
-            e.maint = Some(Arc::new(RwLock::new(new_maint)));
-            e.shadow = Shadowing::Idle;
-            e.marks.clear();
-            if !changed.rows {
-                e.fresh.push((tid, changed));
+        match laid {
+            Ok((versions, new_maint)) => {
+                if let Some(e) = inner.entries.get_mut(&catalog) {
+                    let bytes = versions.heap_bytes() + new_maint.heap_bytes();
+                    e.state = State::Ready(versions);
+                    e.maint = Some(Arc::new(RwLock::new(new_maint)));
+                    e.shadow = Shadowing::Idle;
+                    e.marks.clear();
+                    e.fresh.push((tid, changed));
+                    e.swaps += 1;
+                    e.build_seconds = seconds;
+                    e.bytes = bytes;
+                }
             }
-            e.swaps += 1;
-            e.build_seconds = seconds;
-            e.bytes = bytes;
+            Err(ShadowError::Again(tid)) => {
+                if let Some(e) = inner.entries.get_mut(&catalog) {
+                    let changed = e.changed();
+                    e.marks.push((tid, changed));
+                    e.shadow = Shadowing::Due;
+                }
+            }
+            Err(ShadowError::Failed(why)) => fall_back(shared, &mut inner, catalog, &why),
         }
         drop(inner);
         shared.changed.notify_all();
+    }
+}
+
+/// Drops the base of a mirror whose shadow rebuild failed: the mirror
+/// builds again from nothing, as of the first of its stale commits.
+fn fall_back(shared: &Shared, inner: &mut Inner, catalog: u64, why: &str) {
+    if let Some(tid) = rebuilding_since(inner, catalog) {
+        let why = format!("its shadow rebuild failed: {why}");
+        make_stale(shared, inner, catalog, tid, &why);
     }
 }

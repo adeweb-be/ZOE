@@ -70,6 +70,9 @@ pub enum Unfollowed {
     Index(usize, Option<Vec<u8>>),
     /// A tree other than the `_unindex` of an index.
     Tree(Slot),
+    /// A new record that an unavailable index at this place watches: the
+    /// index object, or the record that its build refused.
+    Refused(usize),
 }
 
 impl Unfollowed {
@@ -77,9 +80,8 @@ impl Unfollowed {
     fn of(who: Owner) -> Unfollowed {
         match who {
             Owner::Catalog => Unfollowed::Catalog(None),
-            Owner::IndexObject(i) | Owner::Length(i) | Owner::Unavailable(i) => {
-                Unfollowed::Index(i, None)
-            }
+            Owner::IndexObject(i) | Owner::Length(i) => Unfollowed::Index(i, None),
+            Owner::Unavailable(i) => Unfollowed::Refused(i),
             Owner::Node(Slot::Index(i)) => Unfollowed::Index(i, None),
             Owner::Node(slot) => Unfollowed::Tree(slot),
         }
@@ -409,7 +411,7 @@ pub fn read_records<D: AsRef<[u8]>>(
             };
             out.records += 1;
             if let Owner::Unavailable(i) = who {
-                out.unfollowed.push(Unfollowed::Index(i, None));
+                out.unfollowed.push(Unfollowed::Refused(i));
                 continue;
             }
             let Some(data) = data.as_ref().map(AsRef::as_ref) else {
