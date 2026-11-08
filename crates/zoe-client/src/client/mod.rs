@@ -632,14 +632,21 @@ impl Client {
 
     /// Query the catalog mirror of the server (ADR 0059): the catalog whose
     /// `Catalog` object has the oid `catalog`, as of the snapshot that ends
-    /// before `tid`, with `plan` in the form of section 8. Return the reply
-    /// map as the server gives it. The overlay is nil. It needs the
-    /// extension `catalog_query`: without it, it fails with
-    /// `Error::Unsupported` and sends nothing. A plan of another form fails
-    /// with the `ValueError` of the server.
-    pub async fn catalog_query(&self, catalog: Oid, tid: Tid, plan: Value) -> Result<Value, Error> {
+    /// before `tid`, with `plan` in the form of section 8 and the
+    /// transaction overlay `overlay`: nil, or `[[oid, pickle]...]` with
+    /// each oid and each pickle a bin. Return the reply map as the server
+    /// gives it. It needs the extension `catalog_query`: without it, it
+    /// fails with `Error::Unsupported` and sends nothing. A plan or an
+    /// overlay of another form fails with the `ValueError` of the server.
+    pub async fn catalog_query(
+        &self,
+        catalog: Oid,
+        tid: Tid,
+        plan: Value,
+        overlay: Value,
+    ) -> Result<Value, Error> {
         self.check_extension(CATALOG_QUERY)?;
-        let args = vec![p64(catalog.0), p64(tid.0), plan, Value::Nil];
+        let args = vec![p64(catalog.0), p64(tid.0), plan, overlay];
         let reply = self.inner.call("catalog_query", args).await?;
         match reply {
             Value::Map(_) => Ok(reply),

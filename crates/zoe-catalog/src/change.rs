@@ -14,6 +14,8 @@
 //! A record of `data` is a row of the metadata table. Its change goes into
 //! the change set cell by cell: one change for each column whose cell
 //! changed, and one for the length of the record when it changed.
+//!
+//! The read of a transaction overlay (`overlay`) uses the same read.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -83,16 +85,32 @@ impl Shapes {
         }
     }
 
-    /// Lays `edits` into the shapes.
-    pub fn take(&mut self, edits: ShapeEdits) {
-        self.owners.extend(edits.owners);
-        self.inner.extend(edits.inner);
+    /// Lays `edits` into the shapes. Returns the oids whose shape changed:
+    /// a new owner, other children of an inner node, another key range of
+    /// a bucket.
+    pub fn take(&mut self, edits: ShapeEdits) -> Vec<u64> {
+        let mut changed = Vec::new();
+        for (oid, owner) in edits.owners {
+            if self.owners.insert(oid, owner) != Some(owner) {
+                changed.push(oid);
+            }
+        }
+        for (oid, children) in edits.inner {
+            if self.inner.get(&oid) != Some(&children) {
+                changed.push(oid);
+            }
+            self.inner.insert(oid, children);
+        }
         for (oid, range) in edits.buckets {
-            match range {
+            let old = match range {
                 Some(r) => self.buckets.insert(oid, r),
                 None => self.buckets.remove(&oid),
             };
+            if old != range {
+                changed.push(oid);
+            }
         }
+        changed
     }
 
     /// The bytes that the shapes take, estimated.

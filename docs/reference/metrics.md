@@ -59,8 +59,9 @@ Each metric has the label `storage`, the storage name. A duration is a histogram
 | `zoe_backlog_bytes` | gauge | `storage` | The backlog of the write-ahead log, in bytes: the commits that the log holds and the tables do not hold yet. |
 | `zoe_catalog_queries_total` | counter | `storage`, `path` | The `catalog_query` calls that the catalog mirrors of the store read (ADR 0059). `path="native"`: the mirror answered. `path="python"`: the reply gave a reason of the server. |
 | `zoe_catalog_query_latency_seconds` | histogram | `storage` | The time of each catalog query in the server, its wait for the mirror included. |
-| `zoe_catalog_fallbacks_total` | counter | `storage`, `reason`, `side` | The catalog queries that took the Python path, by the reason that the server decided; `side` is `server`. A reason has no sample before its first query. |
+| `zoe_catalog_fallbacks_total` | counter | `storage`, `reason`, `side` | The catalog queries that took the Python path, by the reason that the server decided; `side` is `server`. A query before the mirrors of the store start counts too (`not_registered`). A reason has no sample before its first query. |
 | `zoe_catalog_mirror_drops_total` | counter | `storage` | The catalog mirrors that `--catalog-memory` dropped. |
+| `zoe_catalog_overlay_records` | counter | `storage` | The records of the transaction overlays that the catalog queries sent. |
 | `zoe_catalog_mirror_ready` | gauge | `storage`, `catalog` | 1 when the catalog mirror is ready, else 0. `catalog` is the oid of the `Catalog` object in 16 hex digits. A store whose mirrors did not start has no sample. |
 | `zoe_catalog_mirror_build_seconds` | gauge | `storage`, `catalog` | The time of the last build of the catalog mirror, in seconds. |
 | `zoe_catalog_mirror_lag_tids` | gauge | `storage`, `catalog` | The published commits that the catalog mirror did not apply yet. |
