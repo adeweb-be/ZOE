@@ -216,7 +216,12 @@ impl Transaction {
     ) -> Result<(), Error> {
         self.check()?;
         self.check_text()?;
-        let args = vec![p64(catalog.0), index.into(), Value::from(rid), p64(before.0)];
+        let args = vec![
+            p64(catalog.0),
+            index.into(),
+            Value::from(rid),
+            p64(before.0),
+        ];
         self.inner.notify("text_unindex", args).await
     }
 

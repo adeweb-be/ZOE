@@ -470,7 +470,7 @@ impl Storage {
         catalog_rebase_rows: Option<u64>,
         catalog_wait: Option<f64>,
     ) -> PyResult<Self> {
-        let catalog_config = catalog_config(
+        let mut catalog_config = catalog_config(
             catalog_memory,
             catalog_window_tids,
             catalog_window_seconds,
@@ -559,6 +559,12 @@ impl Storage {
             py.detach(move || drop(shared));
             return Err(error);
         }
+        // The text indexes of the catalogs live in `text/` of the store
+        // directory. A read-only storage writes nothing there.
+        catalog_config.text = zoe_catalog::text::TextConfig {
+            dir: Some(path.clone()),
+            read_only,
+        };
         let storage = Self {
             shared,
             path: path.to_string_lossy().into_owned(),
@@ -978,6 +984,140 @@ impl Storage {
     /// Tell if the storage serves `catalog_query`: a `zoe.Storage` always
     /// does.
     fn catalog_supported(&self) -> bool {
+        true
+    }
+
+    /// Stage the text `text` in `language` of the document `rid` in the
+    /// text index `index` of the catalog `catalog`, in `transaction` (ADR
+    /// 0060, section 8). `catalog` and `before` are 8 bytes; `before` is the
+    /// snapshot of the transaction, exclusive. The vote checks the delta. A
+    /// bad index id, language or rid raises `ValueError`; a delta over a
+    /// limit `StorageError`. The call releases the GIL.
+    #[allow(clippy::too_many_arguments)]
+    fn text_set(
+        &self,
+        py: Python<'_>,
+        catalog: &[u8],
+        index: &str,
+        rid: &Bound<'_, PyAny>,
+        language: &str,
+        text: &str,
+        before: &[u8],
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let oid = Oid(catalog::p64("catalog", catalog)?);
+        let rid = crate::text::rid(rid)?;
+        let before = Tid(catalog::p64("before", before)?);
+        self.stage_kv(py, transaction, |txn| {
+            Ok(txn.text_set(oid, index, rid, language, text, before)?)
+        })
+    }
+
+    /// Stage an unindex of `rid` in the text index `index` of `catalog`, in
+    /// `transaction`, with the rules of `text_set`.
+    fn text_unindex(
+        &self,
+        py: Python<'_>,
+        catalog: &[u8],
+        index: &str,
+        rid: &Bound<'_, PyAny>,
+        before: &[u8],
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let oid = Oid(catalog::p64("catalog", catalog)?);
+        let rid = crate::text::rid(rid)?;
+        let before = Tid(catalog::p64("before", before)?);
+        self.stage_kv(py, transaction, |txn| {
+            Ok(txn.text_unindex(oid, index, rid, before)?)
+        })
+    }
+
+    /// Stage a clear delta of the text index `index` of `catalog`, in
+    /// `transaction`, with the rules of `text_set`.
+    fn text_clear(
+        &self,
+        py: Python<'_>,
+        catalog: &[u8],
+        index: &str,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let oid = Oid(catalog::p64("catalog", catalog)?);
+        self.stage_kv(py, transaction, |txn| Ok(txn.text_clear(oid, index)?))
+    }
+
+    /// Answer the text clause `clause`, a dict in the form of ADR 0060,
+    /// section 12, without `k`, on the text index of `catalog`, as of the
+    /// snapshot that ends before `tid`. `filter` is `None` or the rids of
+    /// the result set. The reply is a dict: `tid`, `r`, every hit in the
+    /// filter in rid order, and `sc`, its integer score. The errors of the
+    /// clause raise: `Unavailable`, `ReadConflictError` or
+    /// `StorageSystemError`. A clause of another form raises `ValueError`.
+    /// The call releases the GIL.
+    #[pyo3(signature = (catalog, tid, clause, filter=None))]
+    fn text_query<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+        tid: &[u8],
+        clause: &Bound<'py, PyAny>,
+        filter: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let oid = catalog::p64("catalog", catalog)?;
+        let before = catalog::p64("tid", tid)?;
+        let clause = catalog::wire(clause)?;
+        let filter = crate::text::filter(filter)?;
+        let store = self.opened(py)?;
+        let mirrors = self.mirrors();
+        let answer = py.detach(|| {
+            let texts = mirrors.as_ref().and_then(|m| m.texts());
+            zoe_catalog::text::engine::text_query(texts, &store, oid, before, &clause, &filter)
+        });
+        py.detach(move || drop(store));
+        match answer {
+            Ok(Ok(hits)) => crate::text::hits(py, tid, &hits),
+            Ok(Err(error)) => Err(crate::text::error(py, &error)),
+            Err(error) => Err(crate::text::call_error(py, error)),
+        }
+    }
+
+    /// Give the documents of the text index `index` of `catalog` at the
+    /// snapshot before `tid`, the distinct words of the index at its tid,
+    /// and the language and the live text of `rid` at the snapshot, as a
+    /// dict: `tid`, `docs`, `words`, `lang` and `text`. The errors raise as
+    /// for `text_query`. The call releases the GIL.
+    #[pyo3(signature = (catalog, index, tid, rid=None))]
+    fn text_info<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+        index: &str,
+        tid: &[u8],
+        rid: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let oid = catalog::p64("catalog", catalog)?;
+        let before = catalog::p64("tid", tid)?;
+        let rid = rid
+            .filter(|r| !r.is_none())
+            .map(crate::text::rid)
+            .transpose()?
+            .map(i64::from);
+        let store = self.opened(py)?;
+        let mirrors = self.mirrors();
+        let answer = py.detach(|| {
+            let texts = mirrors.as_ref().and_then(|m| m.texts());
+            zoe_catalog::text::engine::text_info(texts, &store, oid, index, before, rid)
+        });
+        py.detach(move || drop(store));
+        match answer {
+            Ok(Ok(info)) => crate::text::info(py, tid, &info),
+            Ok(Err(error)) => Err(crate::text::error(py, &error)),
+            Err(error) => Err(crate::text::call_error(py, error)),
+        }
+    }
+
+    /// Tell if the storage serves the text calls: a `zoe.Storage` always
+    /// does.
+    fn text_supported(&self) -> bool {
         true
     }
 

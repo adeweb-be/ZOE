@@ -617,7 +617,12 @@ fn set_state(shared: &Shared, catalog: u64, state: TextState) {
 
 /// Open the index of `catalog`, or rebuild it.
 fn open_index(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>, catalog: u64) {
-    let Some(settings) = shared.lock().entries.get(&catalog).map(|e| e.settings.clone()) else {
+    let Some(settings) = shared
+        .lock()
+        .entries
+        .get(&catalog)
+        .map(|e| e.settings.clone())
+    else {
         return;
     };
     let layout = layout_of(&settings);
@@ -899,7 +904,8 @@ fn rebuild(
             Err(e) => return fail(shared, catalog, &e),
         };
         if !texts.is_empty()
-            && let Err(e) = writer.add_document(index::document(&fields, &mut analyzers, rid, &texts))
+            && let Err(e) =
+                writer.add_document(index::document(&fields, &mut analyzers, rid, &texts))
         {
             set_state(shared, catalog, TextState::Unavailable(e.to_string()));
             return;
@@ -1039,7 +1045,11 @@ fn follow(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
             })
             .collect();
         if mine.iter().any(|c| c.rid.is_none()) {
-            let settings = shared.lock().entries.get(&catalog).map(|e| e.settings.clone());
+            let settings = shared
+                .lock()
+                .entries
+                .get(&catalog)
+                .map(|e| e.settings.clone());
             if let Some(settings) = settings {
                 tracing::info!("a clear delta of {catalog:#x}: its text index builds again");
                 rebuild(shared, store, lives, catalog, &settings);
@@ -1129,7 +1139,11 @@ fn commit_due(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
         .map(|(c, _)| *c)
         .collect();
     for catalog in rebuilds {
-        let settings = shared.lock().entries.get(&catalog).map(|e| e.settings.clone());
+        let settings = shared
+            .lock()
+            .entries
+            .get(&catalog)
+            .map(|e| e.settings.clone());
         if let Some(settings) = settings {
             tracing::warn!(
                 "a pack passed the cap of the text index of {catalog:#x}: it builds again"

@@ -310,9 +310,8 @@ fn decode_node(wire: &Wire, depth: usize) -> Result<Node, String> {
             .map(|n| decode_node(n, depth + 1))
             .collect()
     };
-    let words = || -> Result<Vec<String>, String> {
-        strs_of(get("w").ok_or("a node without w")?, "w")
-    };
+    let words =
+        || -> Result<Vec<String>, String> { strs_of(get("w").ok_or("a node without w")?, "w") };
     let kind = str_of(get("n").ok_or("a node without n")?, "n")?;
     let expect = |keys: &[&str]| -> Result<(), String> {
         if items.len() == keys.len() + 1 && keys.iter().all(|k| get(k).is_some()) {
@@ -385,7 +384,8 @@ fn decode_settings(wire: &Wire) -> Result<IndexSettings, String> {
             "mode" => {
                 let name = str_of(v, "mode")?;
                 mode = Some(
-                    Mode::from_name(name).ok_or_else(|| format!("the mode {name:?} is not known"))?,
+                    Mode::from_name(name)
+                        .ok_or_else(|| format!("the mode {name:?} is not known"))?,
                 );
             }
             "language" => {
@@ -491,7 +491,10 @@ pub fn rids_bin(rids: impl IntoIterator<Item = i32>) -> Wire {
 }
 
 fn tid_item(tid: u64) -> (Wire, Wire) {
-    (Wire::Str("tid".into()), Wire::Bin(tid.to_be_bytes().to_vec()))
+    (
+        Wire::Str("tid".into()),
+        Wire::Bin(tid.to_be_bytes().to_vec()),
+    )
 }
 
 /// The error form of a reply: `{"tid", "e", "why"}`.
@@ -519,7 +522,10 @@ pub fn encode_hits(tid: u64, answer: &Result<TextHits, TextError>) -> Wire {
         Ok(hits) => Wire::Map(vec![
             tid_item(tid),
             (Wire::Str("r".into()), rids_bin(hits.rids.iter().copied())),
-            (Wire::Str("sc".into()), rids_bin(hits.scores.iter().copied())),
+            (
+                Wire::Str("sc".into()),
+                rids_bin(hits.scores.iter().copied()),
+            ),
         ]),
         Err(error) => encode_error(tid, error),
     }
@@ -620,10 +626,7 @@ mod tests {
         }
         let mut deep = atom("w");
         for _ in 0..MAX_DEPTH + 1 {
-            deep = map(vec![
-                ("n", s("or")),
-                ("items", Wire::Array(vec![deep])),
-            ]);
+            deep = map(vec![("n", s("or")), ("items", Wire::Array(vec![deep]))]);
         }
         for bad in [
             clause(map(vec![("n", s("near")), ("w", Wire::Array(vec![]))])),

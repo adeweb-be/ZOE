@@ -132,11 +132,7 @@ enum Step {
     Wait(u64),
 }
 
-fn run_on(
-    store: &Store,
-    q: &Query<'_>,
-    snap: Result<Arc<Snap>, Failure>,
-) -> Result<Step, Failure> {
+fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Result<Step, Failure> {
     let c = q.clause;
     let settings =
         settings_of(c, snap.as_ref().ok().map(|s| &**s)).map_err(|e| match (&snap, e) {
@@ -331,7 +327,11 @@ pub fn info(
                 "the catalog has no text index {index_id}"
             )));
         };
-        if snap.cleared.get(index_id).is_some_and(|&clear| clear >= tid) {
+        if snap
+            .cleared
+            .get(index_id)
+            .is_some_and(|&clear| clear >= tid)
+        {
             return Err(error(
                 TextErrorKind::Cleared,
                 format!("the snapshot is before a clear delta of {index_id} that the index holds"),

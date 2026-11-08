@@ -39,5 +39,4 @@ pub use texts::{Failure, TextConfig, TextState, Texts};
 
 /// The search of a text clause inside the rids of the other clauses of a
 /// plan, sorted, for what the plan wants.
-pub type TextSearch<'a> =
-    dyn FnMut(&[i32], Want) -> Result<search::Found, Failure> + 'a;
+pub type TextSearch<'a> = dyn FnMut(&[i32], Want) -> Result<search::Found, Failure> + 'a;

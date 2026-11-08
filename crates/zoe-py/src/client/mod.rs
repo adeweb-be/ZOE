@@ -892,6 +892,53 @@ impl NativeClient {
         crate::catalog::reply_of_value(py, reply)
     }
 
+    /// Answer the text clause `clause` on the text index of the server
+    /// (ADR 0060, section 12), with the arguments and the reply of
+    /// `zoe.Storage.text_query`. Raise `Unsupported` when the server did
+    /// not accept `text`.
+    #[pyo3(signature = (catalog, tid, clause, filter=None))]
+    fn text_query<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+        tid: &[u8],
+        clause: &Bound<'py, PyAny>,
+        filter: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let oid = crate::catalog::p64("catalog", catalog)?;
+        let before = crate::catalog::p64("tid", tid)?;
+        let clause = crate::catalog::value_of_wire(crate::catalog::wire(clause)?);
+        let filter = crate::catalog::value_of_wire(crate::text::filter(filter)?);
+        let reply = self.run(py, async move |pool| {
+            pool.text_query(Oid(oid), Tid(before), clause, filter).await
+        })?;
+        crate::text::hits_of_value(py, tid, &reply)
+    }
+
+    /// Give the counts of a text index of the server and the live text of
+    /// `rid`, with the arguments and the reply of `zoe.Storage.text_info`.
+    #[pyo3(signature = (catalog, index, tid, rid=None))]
+    fn text_info<'py>(
+        &self,
+        py: Python<'py>,
+        catalog: &[u8],
+        index: &str,
+        tid: &[u8],
+        rid: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let oid = crate::catalog::p64("catalog", catalog)?;
+        let before = crate::catalog::p64("tid", tid)?;
+        let rid = rid
+            .filter(|r| !r.is_none())
+            .map(crate::text::rid)
+            .transpose()?;
+        let index = index.to_owned();
+        let reply = self.run(py, async move |pool| {
+            pool.text_info(Oid(oid), &index, Tid(before), rid).await
+        })?;
+        crate::text::info_of_value(py, tid, &reply)
+    }
+
     /// Return a new owner of early write-intent locks (ADR 0045). It
     /// holds no lock and no connection.
     fn intents(&self) -> NativeIntents {

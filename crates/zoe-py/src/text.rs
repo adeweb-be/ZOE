@@ -63,7 +63,11 @@ pub(crate) fn call_error(py: Python<'_>, error: CallError) -> PyErr {
 
 /// The reply of `text_query` as a dict: `tid`, `r`, the rids as a list of
 /// ints in ascending order, and `sc`, the integer score of each.
-pub(crate) fn hits<'py>(py: Python<'py>, tid: &[u8], hits: &TextHits) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn hits<'py>(
+    py: Python<'py>,
+    tid: &[u8],
+    hits: &TextHits,
+) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("tid", PyBytes::new(py, tid))?;
     out.set_item("r", PyList::new(py, &hits.rids)?)?;
@@ -73,7 +77,11 @@ pub(crate) fn hits<'py>(py: Python<'py>, tid: &[u8], hits: &TextHits) -> PyResul
 
 /// The reply of `text_info` as a dict: `tid`, `docs`, `words`, and `lang`
 /// and `text`, each a str or `None`.
-pub(crate) fn info<'py>(py: Python<'py>, tid: &[u8], info: &TextInfo) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn info<'py>(
+    py: Python<'py>,
+    tid: &[u8],
+    info: &TextInfo,
+) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("tid", PyBytes::new(py, tid))?;
     out.set_item("docs", info.docs)?;
@@ -111,7 +119,9 @@ pub(crate) fn error_of_value(value: &rmpv::Value) -> Option<TextError> {
 /// The ints of `bytes`, each a signed 32-bit big-endian int.
 fn ints(bytes: &[u8]) -> PyResult<Vec<i32>> {
     if !bytes.len().is_multiple_of(4) {
-        return Err(PyValueError::new_err("a text reply with ints that are not 4 bytes each"));
+        return Err(PyValueError::new_err(
+            "a text reply with ints that are not 4 bytes each",
+        ));
     }
     Ok(bytes
         .as_chunks::<4>()
@@ -141,7 +151,8 @@ pub(crate) fn hits_of_value<'py>(
             .find(|(k, _)| k.as_str() == Some(name))
             .map(|(_, v)| v)
     };
-    let (Some(rmpv::Value::Binary(r)), Some(rmpv::Value::Binary(sc))) = (get("r"), get("sc")) else {
+    let (Some(rmpv::Value::Binary(r)), Some(rmpv::Value::Binary(sc))) = (get("r"), get("sc"))
+    else {
         return Err(bad());
     };
     let found = TextHits {
@@ -199,6 +210,8 @@ pub(crate) fn scores_of_value(py: Python<'_>, value: &rmpv::Value) -> PyResult<O
     match items.iter().find(|(k, _)| k.as_str() == Some("sc")) {
         Some((_, rmpv::Value::Binary(sc))) => ints(sc).map(Some),
         Some((_, rmpv::Value::Nil)) | None => Ok(None),
-        Some(_) => Err(PyValueError::new_err("a catalog reply with sc of another form")),
+        Some(_) => Err(PyValueError::new_err(
+            "a catalog reply with sc of another form",
+        )),
     }
 }

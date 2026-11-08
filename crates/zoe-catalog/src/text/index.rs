@@ -86,7 +86,12 @@ pub fn field_of(languages: &[String], language: &str) -> usize {
     if let Some(i) = languages.iter().position(|l| same_language(l, language)) {
         return i;
     }
-    let primary = |t: &str| t.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    let primary = |t: &str| {
+        t.split(['-', '_'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
     let wanted = primary(language);
     languages
         .iter()
@@ -204,7 +209,10 @@ fn tokens(words: impl Iterator<Item = String>) -> Vec<Token> {
 
 /// The pairs of the words in a row of `words`.
 pub fn pairs_of(words: &[String]) -> Vec<String> {
-    words.windows(2).map(|w| analysis::pair(&w[0], &w[1])).collect()
+    words
+        .windows(2)
+        .map(|w| analysis::pair(&w[0], &w[1]))
+        .collect()
 }
 
 /// The document of `rid` with `texts`: for each text index, its language

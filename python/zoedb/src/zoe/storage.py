@@ -30,12 +30,23 @@ from ZODB.interfaces import (
 from ZODB.POSException import (
     ConflictError,
     POSKeyError,
+    StorageError,
     StorageTransactionError,
     UndoError,
 )
 from ZODB.TimeStamp import TimeStamp
 
 from zoe import _zoe, zodb
+
+
+class Unavailable(StorageError):
+    """The text index of a catalog cannot answer a text query (ADR 0060).
+
+    The catalog has no text index, its open or a rebuild runs past
+    `catalog-wait`, or the reply or the staged texts pass the cap of a call.
+    `text_query`, `text_info` and `catalog_query` with a text clause raise
+    it, on `zoe.Storage` and on `zoe.zeo.ClientStorage`.
+    """
 
 
 class WrongThread(StorageTransactionError):

@@ -2160,7 +2160,13 @@ pub fn commit_text(
         )?;
     }
     if register {
-        txn.kv_set(Flavour::Durable, NAMESPACE, &catalog.to_be_bytes(), b"", None)?;
+        txn.kv_set(
+            Flavour::Durable,
+            NAMESPACE,
+            &catalog.to_be_bytes(),
+            b"",
+            None,
+        )?;
     }
     txn.vote()?;
     Ok(txn.finish()?.0)

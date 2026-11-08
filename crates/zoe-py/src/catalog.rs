@@ -447,6 +447,15 @@ pub(crate) fn counts<'py>(py: Python<'py>, counts: Option<Counts>) -> PyResult<B
         mirrors.set_item(PyBytes::new(py, &m.catalog.to_be_bytes()), one)?;
     }
     out.set_item("mirrors", mirrors)?;
+    let texts = PyDict::new(py);
+    for t in &counts.texts {
+        let one = PyDict::new(py);
+        one.set_item("zoe_text_commit_lag_seconds", t.lag_seconds)?;
+        one.set_item("ready", t.ready)?;
+        one.set_item("docs", t.docs)?;
+        texts.set_item(PyBytes::new(py, &t.catalog.to_be_bytes()), one)?;
+    }
+    out.set_item("texts", texts)?;
     Ok(out)
 }
 

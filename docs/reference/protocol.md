@@ -35,7 +35,7 @@ The methods that the `ZEOStorage` of ZEO 6 exposes, and the ZOE extensions:
 | copy and backup | `restorea`, `iterator_start`, `iterator_next`, `iterator_record_start`, `iterator_record_next`, `iterator_gc` | as ZEO | For `zodbconvert`, backups and `zodbverify`. A connection keeps at most 1,000 open iterators. |
 | maintenance | `pack` | as ZEO | Online: the other calls go on while it runs. A read-only connection packs, as in ZEO, and a read-only store refuses. |
 | undo | `undo`, `undoa`, `undoInfo`, `undoLog` | as ZEO | An undo that no tier merges fails the vote with `MultipleUndoErrors`. |
-| extensions | `sequence_next`, `kv_get`, `kv_scan`, `kv_generation`, `kv_set`, `kv_delete`, `lock_intent`, `unlock_intent`, `catalog_query` | ZOE only | Only after the client declared the extension in `register`. Another connection gets `ValueError`, and stays open. |
+| extensions | `sequence_next`, `kv_get`, `kv_scan`, `kv_generation`, `kv_set`, `kv_delete`, `lock_intent`, `unlock_intent`, `catalog_query`, `text_set`, `text_unindex`, `text_clear`, `text_query`, `text_info` | ZOE only | Only after the client declared the extension in `register`. Another connection gets `ValueError`, and stays open. |
 
 After each commit, every other client of the storage gets one `invalidateTransaction(tid, oids)`, also with an empty list, as ZEO 6.2 does. The client that committed gets `info {length, size}`, then the reply of its `tpc_finish`, and no invalidation.
 
@@ -51,8 +51,9 @@ A client declares the extensions that it wants as a third argument of `register`
 | `trace_context` | none | Each message can carry a fifth element, a map whose key `traceparent` holds a W3C traceparent. The span of the call joins the trace of the client. A fifth element on a connection without the extension closes the connection. |
 | `server_writes` | none | The client promises to give every Connection of its process the oids of its commit, also an oid that the vote wrote without a store. Only then can the split merge write in the vote the new bucket of the other side (ADR 0048). The native client of `zoe.zeo.ClientStorage` declares it. |
 | `catalog_query` | `catalog_query(catalog, tid, plan, overlay)` | A query of the catalog mirror of the store (ADR 0059), below. The native client of `zoe.zeo.ClientStorage` declares it. |
+| `text` | `text_set(catalog, index, rid, language, text, before)`, `text_unindex(catalog, index, rid, before)`, `text_clear(catalog, index)`, `text_query(catalog, tid, clause, filter)`, `text_info(catalog, index, tid, rid)` | The native text index of each catalog (ADR 0060), below. The native client of `zoe.zeo.ClientStorage` declares it. |
 
-`zoe.zeo.ClientStorage` declares `sequences`, `lock_intent` and `kv`, `trace_context` when the package `opentelemetry` is installed, and `server_writes` and `catalog_query` with the native client.
+`zoe.zeo.ClientStorage` declares `sequences`, `lock_intent` and `kv`, `trace_context` when the package `opentelemetry` is installed, and `server_writes`, `catalog_query` and `text` with the native client.
 
 ### `catalog_query`
 
@@ -74,3 +75,14 @@ The reply is a map with the key `tid`, the tid of the call. A native answer has 
 | `Message` | ext 3: the msgpack array of the arguments of its `__reduce__` |
 
 A row with a value of another type is nil, and the client makes that brain from `data`.
+
+A plan can hold one text clause, `{"k": "t", "i": index, "q": node, "lg": [language...] | nil, "cl": [index...], "st": [[index, rid, language, text | nil]...], "set": settings | nil}` (ADR 0060, section 12). The mirror runs the other clauses first and gives their rids to the text index of the catalog. With no sort, the reply gets `sc`, the integer score of each rid of `r` as a signed 32-bit big-endian int in one bin, in the order of the scores, then of the rids descending; each other clause adds 1 to the score. With a sort, the hits are a set in the order of the sort, and the reply has no `sc`. When the text clause fails, the reply is `{"tid", "e", "why"}`, with `e` one of `unavailable`, `packed`, `cleared`, `corrupt` and `too_large`. A text clause of another form fails the call with `ValueError`. A setting or a clause in the mode `compat` gives the reason `unsupported`.
+
+### `text`
+
+The extension `text` stages the text deltas of a catalog in the transaction of the connection and reads the text index of the catalog, in `text/<oid>/` of the store directory (ADR 0060). The text indexes start with the catalog mirrors of the store.
+
+- `text_set`, `text_unindex` and `text_clear` have no reply and stage into the open transaction, as `kv_set` does: an error fails the vote. `catalog` and `before` are 8 bytes; `before` is the snapshot of the transaction, exclusive. `index`, `language` and `text` are str, `rid` an int in the signed 32-bit range: another rid fails the vote with `ValueError`. Two transactions that write one document with different texts fail the vote of the second with `ConflictError`, whose oid is the oid of the catalog.
+- `text_query(catalog, tid, clause, filter)` runs on the read pool. `clause` is the text clause without `k`, `filter` nil or the rids as signed 32-bit big-endian ints in one bin. The reply is `{"tid", "r", "sc"}`: every hit in the filter in rid order, and its integer score, each as a bin of signed 32-bit big-endian ints.
+- `text_info(catalog, index, tid, rid)` runs on the read pool. `rid` is an int or nil. The reply is `{"tid", "docs", "words", "lang", "text"}`: the documents of the index at the snapshot, the distinct words of the index at its tid, and the language and the live text of `rid` at the snapshot, or nil.
+- Each reply can be the error form `{"tid", "e", "why"}`. A clause or an argument of another form fails the call with `ValueError`, the mode `compat` with `ZODB.POSException.Unsupported`, and the connection stays open. A reply holds at most 16 MiB; a larger one is `too_large`.

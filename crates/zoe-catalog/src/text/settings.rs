@@ -182,7 +182,9 @@ impl CatalogSettings {
 /// Check an index id: 1 to 255 bytes.
 pub(crate) fn check_index(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 255 {
-        return Err(format!("the index id {name:?} does not have 1 to 255 bytes"));
+        return Err(format!(
+            "the index id {name:?} does not have 1 to 255 bytes"
+        ));
     }
     Ok(())
 }

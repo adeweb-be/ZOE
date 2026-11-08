@@ -150,7 +150,13 @@ impl Site {
         let dir = fresh_dir(name);
         let store = Arc::new(Store::open(dir.path()).unwrap());
         testing::commit_text(&store, CATALOG, &[], Some(settings), true).unwrap();
-        let mirrors = start(&store, dir.path(), false, Duration::from_secs(1), Hooks::default());
+        let mirrors = start(
+            &store,
+            dir.path(),
+            false,
+            Duration::from_secs(1),
+            Hooks::default(),
+        );
         Site {
             dir,
             store,
@@ -176,14 +182,20 @@ impl Site {
     fn ready_at(&self, tid: u64) {
         let texts = self.mirrors.texts().expect("the text indexes");
         assert!(
-            texts.wait_for(self.catalog, WAIT, |c| c.is_some_and(|c| c.ready && c.tid >= tid)),
+            texts.wait_for(self.catalog, WAIT, |c| c
+                .is_some_and(|c| c.ready && c.tid >= tid)),
             "the index reaches {tid:#x}: {:?}",
             texts.counts()
         );
     }
 
     /// `text_query` at the exclusive tid `tid`.
-    fn query(&self, tid: u64, clause: &Wire, filter: Option<&[i32]>) -> Result<TextHits, TextError> {
+    fn query(
+        &self,
+        tid: u64,
+        clause: &Wire,
+        filter: Option<&[i32]>,
+    ) -> Result<TextHits, TextError> {
         let filter = filter.map_or(Wire::Nil, |f| clause::rids_bin(f.iter().copied()));
         engine::text_query(
             self.mirrors.texts(),
@@ -265,13 +277,19 @@ fn committed_deltas_come_into_the_hits_within_the_lag() {
     let tid = site.commit(&[set("Title", 7, "kalo mite"), set("Title", 9, "ruso")]);
     site.ready_at(tid);
     let texts = site.mirrors.texts().unwrap();
-    assert!(texts.wait_for(site.catalog, WAIT, |c| c.is_some_and(|c| c.lag_seconds == 0.0)));
+    assert!(texts.wait_for(site.catalog, WAIT, |c| {
+        c.is_some_and(|c| c.lag_seconds == 0.0)
+    }));
     assert_eq!(
         site.rids(site.now(), &clause_of("Title", atom(&["kalo"]))),
         BTreeSet::from([7])
     );
     let counts = site.mirrors.counts();
-    let text = counts.texts.iter().find(|c| c.catalog == site.catalog).unwrap();
+    let text = counts
+        .texts
+        .iter()
+        .find(|c| c.catalog == site.catalog)
+        .unwrap();
     assert_eq!(text.lag_seconds, 0.0);
     assert_eq!(text.docs, 2);
 }
@@ -367,10 +385,18 @@ fn staged_texts_replace_their_documents_for_their_query_only() {
         "Title",
         atom(&["kalo"]),
         vec![],
-        vec![staged("Title", 1, Some("ruso")), staged("Title", 3, Some("kalo"))],
+        vec![
+            staged("Title", 1, Some("ruso")),
+            staged("Title", 3, Some("kalo")),
+        ],
         Wire::Nil,
     );
-    let found: BTreeSet<i32> = site.query(now, &staging, None).unwrap().rids.into_iter().collect();
+    let found: BTreeSet<i32> = site
+        .query(now, &staging, None)
+        .unwrap()
+        .rids
+        .into_iter()
+        .collect();
     assert_eq!(found, BTreeSet::from([2, 3]));
     // An unindex staged.
     let unindexing = clause_with(
@@ -403,7 +429,10 @@ fn staged_texts_replace_their_documents_for_their_query_only() {
         "Title",
         atom(&["kalo"]),
         vec!["Title"],
-        vec![staged("Title", 8, Some("kalo kalo")), staged("Title", 9, Some("mite"))],
+        vec![
+            staged("Title", 8, Some("kalo kalo")),
+            staged("Title", 9, Some("mite")),
+        ],
         set,
     );
     let hits = site.query(now, &cleared, None).unwrap();
@@ -478,7 +507,10 @@ fn answers(site: &Site, tid: u64) -> Vec<TextHits> {
         glob("ru*"),
     ]
     .into_iter()
-    .map(|q| site.query(tid, &clause_of("SearchableText", q), None).unwrap())
+    .map(|q| {
+        site.query(tid, &clause_of("SearchableText", q), None)
+            .unwrap()
+    })
     .collect()
 }
 
@@ -499,7 +531,11 @@ fn a_rebuilt_index_gives_the_hits_of_the_index_that_followed_the_commits() {
     site.restart(hooks());
     let mut last = 0;
     for i in 0..40 {
-        let text = format!("kalo mite {} ruso{}", if i % 3 == 0 { "kalo" } else { "vite" }, i % 5);
+        let text = format!(
+            "kalo mite {} ruso{}",
+            if i % 3 == 0 { "kalo" } else { "vite" },
+            i % 5
+        );
         last = site.commit(&[
             set("SearchableText", i, &text),
             set("Title", i, if i % 4 == 0 { "kalo" } else { "mite" }),
@@ -509,7 +545,8 @@ fn a_rebuilt_index_gives_the_hits_of_the_index_that_followed_the_commits() {
     site.ready_at(last);
     // The rebuilt index holds no deleted document, so its statistics, and
     // its scores, can differ: the hits are the same.
-    let sets = |hits: Vec<TextHits>| -> Vec<Vec<i32>> { hits.into_iter().map(|h| h.rids).collect() };
+    let sets =
+        |hits: Vec<TextHits>| -> Vec<Vec<i32>> { hits.into_iter().map(|h| h.rids).collect() };
     let followed = sets(answers(&site, site.now()));
     let built = builds.load(Ordering::SeqCst);
     // A missing directory.
@@ -538,14 +575,21 @@ fn a_rebuilt_index_gives_the_hits_of_the_index_that_followed_the_commits() {
     site.ready_at(last);
     assert_eq!(builds.load(Ordering::SeqCst), built + 2);
     // A change of language rebuilds; the words of the test have one form.
-    let t = testing::commit_text(&site.store, site.catalog, &[], Some(&settings(&["de"])), false)
-        .unwrap();
+    let t = testing::commit_text(
+        &site.store,
+        site.catalog,
+        &[],
+        Some(&settings(&["de"])),
+        false,
+    )
+    .unwrap();
     site.mirrors.committed(t);
     assert!(
         site.mirrors
             .texts()
             .unwrap()
-            .wait_for(site.catalog, WAIT, |_| builds.load(Ordering::SeqCst) == built + 3)
+            .wait_for(site.catalog, WAIT, |_| builds.load(Ordering::SeqCst)
+                == built + 3)
     );
     site.ready_at(t);
     assert_eq!(sets(answers(&site, site.now())), followed);
@@ -559,7 +603,12 @@ fn a_rebuilt_index_gives_the_hits_of_the_index_that_followed_the_commits() {
     site.ready_at(t);
     assert_eq!(builds.load(Ordering::SeqCst), built + 4);
     let q = clause_of("SearchableText", atom(&["mite"]));
-    let found: BTreeSet<i32> = site.query(site.now(), &q, None).unwrap().rids.into_iter().collect();
+    let found: BTreeSet<i32> = site
+        .query(site.now(), &q, None)
+        .unwrap()
+        .rids
+        .into_iter()
+        .collect();
     // Only the boosts of Title still hold the word.
     let titles: BTreeSet<i32> = (0..40).filter(|i| i % 4 != 0).collect();
     assert_eq!(found, titles);
@@ -596,8 +645,14 @@ impl Gate {
 fn a_query_waits_for_a_rebuild_then_gets_unavailable() {
     let dir = fresh_dir("text-wait");
     let store = Arc::new(Store::open(dir.path()).unwrap());
-    testing::commit_text(&store, CATALOG, &[set("Title", 1, "kalo")], Some(&settings(&["en"])), true)
-        .unwrap();
+    testing::commit_text(
+        &store,
+        CATALOG,
+        &[set("Title", 1, "kalo")],
+        Some(&settings(&["en"])),
+        true,
+    )
+    .unwrap();
     let gate = Gate::default();
     let (tx, reached) = mpsc::channel();
     let hooks = Hooks {
@@ -615,14 +670,14 @@ fn a_query_waits_for_a_rebuild_then_gets_unavailable() {
     assert!(started.elapsed() >= wait);
     // A catalog with no index is unavailable at once.
     let started = Instant::now();
-    let other = engine::text_query(mirrors.texts(), &store, CATALOG + 1, tid, &q, &Wire::Nil)
-        .unwrap();
+    let other =
+        engine::text_query(mirrors.texts(), &store, CATALOG + 1, tid, &q, &Wire::Nil).unwrap();
     assert_eq!(other.unwrap_err().kind, TextErrorKind::Unavailable);
     assert!(started.elapsed() < wait);
     gate.release();
     let hits = loop {
-        let found = engine::text_query(mirrors.texts(), &store, CATALOG, tid, &q, &Wire::Nil)
-            .unwrap();
+        let found =
+            engine::text_query(mirrors.texts(), &store, CATALOG, tid, &q, &Wire::Nil).unwrap();
         if let Ok(hits) = found {
             break hits;
         }
@@ -689,9 +744,17 @@ fn a_read_only_open_writes_nothing_in_text() {
             true,
         )
         .unwrap();
-        let mirrors = start(&store, dir.path(), false, Duration::from_secs(1), Hooks::default());
+        let mirrors = start(
+            &store,
+            dir.path(),
+            false,
+            Duration::from_secs(1),
+            Hooks::default(),
+        );
         let texts = mirrors.texts().unwrap();
-        assert!(texts.wait_for(CATALOG, WAIT, |c| c.is_some_and(|c| c.ready && c.tid >= tid)));
+        assert!(texts.wait_for(CATALOG, WAIT, |c| {
+            c.is_some_and(|c| c.ready && c.tid >= tid)
+        }));
         mirrors.stop();
     }
     let text = dir.path().join("text");
@@ -699,7 +762,13 @@ fn a_read_only_open_writes_nothing_in_text() {
     let before = (listing(&text), listing(&index_dir));
     std::thread::sleep(Duration::from_millis(20));
     let store = Arc::new(Store::open_read_only(dir.path()).unwrap());
-    let mirrors = start(&store, dir.path(), true, Duration::from_secs(5), Hooks::default());
+    let mirrors = start(
+        &store,
+        dir.path(),
+        true,
+        Duration::from_secs(5),
+        Hooks::default(),
+    );
     let tid = store.last_transaction().0 + 1;
     let q = clause_of("Title", atom(&["kalo"]));
     let hits = engine::text_query(mirrors.texts(), &store, CATALOG, tid, &q, &Wire::Nil)
@@ -737,8 +806,18 @@ fn corpus() -> Vec<(i32, String, String, String)> {
         docs.push((rid - 20, title, description, body.join(" ")));
     }
     // The words of the features: stems, accents, stop words, phrases.
-    docs.push((90, "running".into(), "the café".into(), "runs and ran kalo mite".into()));
-    docs.push((91, "runner".into(), "cafes".into(), "kalo of the mite ruso".into()));
+    docs.push((
+        90,
+        "running".into(),
+        "the café".into(),
+        "runs and ran kalo mite".into(),
+    ));
+    docs.push((
+        91,
+        "runner".into(),
+        "cafes".into(),
+        "kalo of the mite ruso".into(),
+    ));
     docs.push((92, "Café".into(), "run".into(), "mite kalo ruso".into()));
     docs
 }
@@ -750,7 +829,11 @@ fn corpus_queries() -> Vec<(&'static str, &'static str, Wire)> {
         ("folding", "Description", atom(&["cafe"])),
         ("stop_word", "SearchableText", atom(&["the"])),
         ("phrase_two", "Body", phrase(&["kalo", "mite"])),
-        ("phrase_three", "Body", phrase(&["kalo", "the", "mite", "ruso"])),
+        (
+            "phrase_three",
+            "Body",
+            phrase(&["kalo", "the", "mite", "ruso"]),
+        ),
         ("prefix", "Body", glob("kal*")),
         ("fuzzy", "Body", atom(&["kalp"])),
         ("boosts", "SearchableText", atom(&["kalo"])),
@@ -786,8 +869,13 @@ fn corpus_site(name: &str) -> Site {
 }
 
 fn hits_json(hits: &TextHits) -> Json {
-    let mut by_score: Vec<(i32, i32)> = hits.rids.iter().copied().zip(hits.scores.iter().copied()).collect();
-    by_score.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
+    let mut by_score: Vec<(i32, i32)> = hits
+        .rids
+        .iter()
+        .copied()
+        .zip(hits.scores.iter().copied())
+        .collect();
+    by_score.sort_by_key(|a| std::cmp::Reverse((a.1, a.0)));
     Json::Array(by_score.into_iter().map(|(r, s)| json!([r, s])).collect())
 }
 
@@ -821,7 +909,12 @@ fn the_corpus_gives_the_hits_and_the_scores_of_the_test_data() {
         assert_eq!(hits_json(&hits), data[name], "{name}");
     }
     let stem = &data["stemming"];
-    let rids: BTreeSet<i64> = stem.as_array().unwrap().iter().map(|h| h[0].as_i64().unwrap()).collect();
+    let rids: BTreeSet<i64> = stem
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h[0].as_i64().unwrap())
+        .collect();
     // `runner` has a stem of its own.
     assert_eq!(rids, BTreeSet::from([90, 92]));
     assert_eq!(data["stop_word"], json!([]));
@@ -895,9 +988,16 @@ fn mirrored(name: &str, n: i32) -> Mirrored {
         .map(|(rid, text)| set("Title", *rid, text))
         .collect();
     let tid = testing::commit_text(&store, catalog, &ops, Some(&settings(&["en"])), false).unwrap();
-    let mirrors = start(&store, dir.path(), false, Duration::from_secs(5), Hooks::default());
-    assert!(mirrors.wait_for(catalog, WAIT, |s| s
-        .is_some_and(|s| s.state == "ready" && s.applied.is_some_and(|a| a >= tid))));
+    let mirrors = start(
+        &store,
+        dir.path(),
+        false,
+        Duration::from_secs(5),
+        Hooks::default(),
+    );
+    assert!(mirrors.wait_for(catalog, WAIT, |s| {
+        s.is_some_and(|s| s.state == "ready" && s.applied.is_some_and(|a| a >= tid))
+    }));
     let site = Site {
         dir,
         store,
@@ -910,7 +1010,13 @@ fn mirrored(name: &str, n: i32) -> Mirrored {
 
 /// A plan of `catalog_query` with the clause `kind == kind`, the text
 /// clause `text`, a sort on `num` when `sort`, and `b_start` and `b_size`.
-fn text_plan(kind: Option<&str>, text: Wire, sort: bool, b_start: i64, b_size: Option<i64>) -> Wire {
+fn text_plan(
+    kind: Option<&str>,
+    text: Wire,
+    sort: bool,
+    b_start: i64,
+    b_size: Option<i64>,
+) -> Wire {
     let mut clauses = Vec::new();
     if let Some(kind) = kind {
         clauses.push(map(vec![
@@ -967,7 +1073,8 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
     // Every hit of each query, by score then rid descending, with no
     // filter: the reference.
     let all = |q: &Wire| -> Vec<(i64, i32)> {
-        let c = zoe_catalog::text::clause::decode_clause(&clause_of("Title", q.clone()), false).unwrap();
+        let c = zoe_catalog::text::clause::decode_clause(&clause_of("Title", q.clone()), false)
+            .unwrap();
         let query = Query {
             catalog: site.catalog,
             tid: now,
@@ -994,7 +1101,11 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
         ("rare", atom(&["kalo"]), Strategy::FilterDrives),
         ("even", atom(&["ruso"]), Strategy::HitsDrive),
         ("odd", atom(&["kalo"]), Strategy::Bitset),
-        ("even", or(vec![atom(&["mite"]), atom(&["kalo"])]), Strategy::Bitset),
+        (
+            "even",
+            or(vec![atom(&["mite"]), atom(&["kalo"])]),
+            Strategy::Bitset,
+        ),
     ];
     for (kind, q, strategy) in cases {
         let filter = of_kind(kind);
@@ -1026,8 +1137,18 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
         // Through `catalog_query`, with and without `b_size`: each other
         // clause adds 1 to the score.
         for (b_start, b_size) in [(0, None), (0, Some(4)), (2, Some(3))] {
-            let plan = text_plan(Some(kind), plan_clause("Title", q.clone()), false, b_start, b_size);
-            let reply = site.mirrors.query_wire(site.catalog, now, &plan).unwrap().unwrap();
+            let plan = text_plan(
+                Some(kind),
+                plan_clause("Title", q.clone()),
+                false,
+                b_start,
+                b_size,
+            );
+            let reply = site
+                .mirrors
+                .query_wire(site.catalog, now, &plan)
+                .unwrap()
+                .unwrap();
             let reply = zoe_catalog::encode_reply(now, &Ok(reply));
             let page: Vec<(i64, i32)> = match b_size {
                 Some(size) => reference
@@ -1038,7 +1159,10 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
                     .collect(),
                 None => reference.clone(),
             };
-            assert_eq!(bin_ints(get(&reply, "r").unwrap()), page.iter().map(|h| h.1).collect::<Vec<_>>());
+            assert_eq!(
+                bin_ints(get(&reply, "r").unwrap()),
+                page.iter().map(|h| h.1).collect::<Vec<_>>()
+            );
             assert_eq!(
                 bin_ints(get(&reply, "sc").unwrap()),
                 page.iter().map(|h| h.0 as i32 + 1).collect::<Vec<_>>()
@@ -1047,8 +1171,18 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
         }
         // With a sort: the hits are a set, in the order of `num`, which
         // gives each entry its own key.
-        let plan = text_plan(Some(kind), plan_clause("Title", q.clone()), true, 0, Some(6));
-        let reply = site.mirrors.query_wire(site.catalog, now, &plan).unwrap().unwrap();
+        let plan = text_plan(
+            Some(kind),
+            plan_clause("Title", q.clone()),
+            true,
+            0,
+            Some(6),
+        );
+        let reply = site
+            .mirrors
+            .query_wire(site.catalog, now, &plan)
+            .unwrap()
+            .unwrap();
         let reply = zoe_catalog::encode_reply(now, &Ok(reply));
         assert!(get(&reply, "sc").is_none());
         let mut sorted: Vec<i32> = reference.iter().map(|h| h.1).collect();
@@ -1059,9 +1193,14 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
     }
     // The forced strategies give the same hits.
     let filter = of_kind("odd");
-    let c = zoe_catalog::text::clause::decode_clause(&clause_of("Title", atom(&["mite"])), false).unwrap();
+    let c = zoe_catalog::text::clause::decode_clause(&clause_of("Title", atom(&["mite"])), false)
+        .unwrap();
     let mut results = Vec::new();
-    for forced in [Strategy::FilterDrives, Strategy::HitsDrive, Strategy::Bitset] {
+    for forced in [
+        Strategy::FilterDrives,
+        Strategy::HitsDrive,
+        Strategy::Bitset,
+    ] {
         let query = Query {
             catalog: site.catalog,
             tid: now,
@@ -1070,7 +1209,11 @@ fn a_text_clause_with_a_filter_gives_the_hits_filtered_after_the_scores() {
             want: Want::Top(Some(7)),
             forced: Some(forced),
         };
-        results.push(engine::run(site.mirrors.texts(), &site.store, &query).unwrap().found);
+        results.push(
+            engine::run(site.mirrors.texts(), &site.store, &query)
+                .unwrap()
+                .found,
+        );
     }
     assert_eq!(results[0], results[1]);
     assert_eq!(results[1], results[2]);
@@ -1085,16 +1228,22 @@ fn a_hit_never_names_a_rid_that_the_snapshot_does_not_hold() {
     let tid = site.commit(&[set("Title", 7, "kalo kalo kalo")]);
     site.ready_at(tid);
     let now = site.now();
-    assert!(
-        site.mirrors
-            .wait_for(site.catalog, WAIT, |s| s.is_some_and(|s| s.applied.is_some_and(|a| a >= tid)))
-    );
+    assert!(site.mirrors.wait_for(site.catalog, WAIT, |s| {
+        s.is_some_and(|s| s.applied.is_some_and(|a| a >= tid))
+    }));
     let plan = text_plan(None, plan_clause("Title", atom(&["kalo"])), false, 0, None);
-    let reply = site.mirrors.query_wire(site.catalog, now, &plan).unwrap().unwrap();
+    let reply = site
+        .mirrors
+        .query_wire(site.catalog, now, &plan)
+        .unwrap()
+        .unwrap();
     assert!(!reply.rids.contains(&7));
     assert_eq!(reply.rids.len(), 80);
     // `text_query` answers from the texts: the rid has one.
-    assert!(site.rids(now, &clause_of("Title", atom(&["kalo"]))).contains(&7));
+    assert!(
+        site.rids(now, &clause_of("Title", atom(&["kalo"])))
+            .contains(&7)
+    );
 }
 
 #[test]
@@ -1110,23 +1259,48 @@ fn text_query_gives_every_hit_in_rid_order_and_text_info_the_counts() {
     let t2 = site.commit_quietly(&[unindex("Title", 8), set("Title", 20, "vite")]);
     let now = site.now();
     let hits = site
-        .query(now, &clause_of("Title", atom(&["kalo"])), Some(&[-3, 12, 99]))
+        .query(
+            now,
+            &clause_of("Title", atom(&["kalo"])),
+            Some(&[-3, 12, 99]),
+        )
         .unwrap();
     assert_eq!(hits.rids, vec![-3, 12]);
     assert!(hits.scores.iter().all(|s| *s > 0));
-    let info = engine::text_info(site.mirrors.texts(), &site.store, site.catalog, "Title", now, Some(5))
-        .unwrap()
-        .unwrap();
+    let info = engine::text_info(
+        site.mirrors.texts(),
+        &site.store,
+        site.catalog,
+        "Title",
+        now,
+        Some(5),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(info.docs, 4);
     assert_eq!(info.text, Some(("en".into(), "kalo mite".into())));
     // The words of the index at its tid: `vite` waits for the index.
     assert_eq!(info.words, 3);
-    let info = engine::text_info(site.mirrors.texts(), &site.store, site.catalog, "Title", t2, None)
-        .unwrap()
-        .unwrap();
+    let info = engine::text_info(
+        site.mirrors.texts(),
+        &site.store,
+        site.catalog,
+        "Title",
+        t2,
+        None,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(info.docs, 4);
     assert_eq!(info.text, None);
-    let bad = engine::text_info(site.mirrors.texts(), &site.store, site.catalog, "Title", now, Some(1 << 40));
+    let bad = engine::text_info(
+        site.mirrors.texts(),
+        &site.store,
+        site.catalog,
+        "Title",
+        now,
+        Some(1 << 40),
+    );
     assert!(matches!(bad, Err(CallError::Malformed(_))));
 }
 
@@ -1137,13 +1311,24 @@ fn a_clause_of_another_form_is_malformed() {
     for bad in [
         map(vec![("i", s("Title")), ("q", atom(&["kalo"]))]),
         clause_of("Title", map(vec![("n", s("near")), ("w", strs(&["kalo"]))])),
-        clause_with("Title", atom(&["kalo"]), vec![], vec![staged("Title", 1, Some("x"))], s("on")),
+        clause_with(
+            "Title",
+            atom(&["kalo"]),
+            vec![],
+            vec![staged("Title", 1, Some("x"))],
+            s("on"),
+        ),
         plan_clause("Title", atom(&["kalo"])),
         clause_with(
             "Title",
             atom(&["kalo"]),
             vec![],
-            vec![Wire::Array(vec![s("Title"), Wire::Int(1 << 33), s("en"), Wire::Nil])],
+            vec![Wire::Array(vec![
+                s("Title"),
+                Wire::Int(1 << 33),
+                s("en"),
+                Wire::Nil,
+            ])],
             Wire::Nil,
         ),
     ] {
@@ -1159,7 +1344,10 @@ fn a_clause_of_another_form_is_malformed() {
     }
     // A plan with a text clause of another form.
     let plan = map(vec![
-        ("c", Wire::Array(vec![map(vec![("k", s("t")), ("i", s("Title"))])])),
+        (
+            "c",
+            Wire::Array(vec![map(vec![("k", s("t")), ("i", s("Title"))])]),
+        ),
         ("s", Wire::Array(vec![])),
         ("l", Wire::Nil),
         ("bs", Wire::Int(0)),
@@ -1175,6 +1363,13 @@ fn a_clause_of_another_form_is_malformed() {
         ("boosts", Wire::Map(vec![])),
     ]);
     let q = clause_with("Title", atom(&["kalo"]), vec!["Title"], vec![], compat);
-    let found = engine::text_query(site.mirrors.texts(), &site.store, site.catalog, now, &q, &Wire::Nil);
+    let found = engine::text_query(
+        site.mirrors.texts(),
+        &site.store,
+        site.catalog,
+        now,
+        &q,
+        &Wire::Nil,
+    );
     assert!(matches!(found, Err(CallError::Unsupported(_))));
 }

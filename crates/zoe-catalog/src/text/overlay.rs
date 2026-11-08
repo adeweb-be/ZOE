@@ -165,7 +165,10 @@ impl<'s> Scorer<'s> {
     /// The weight of `terms`, one field, boosted by `boost`. `None` when
     /// the statistics do not give a finite weight.
     fn weight(&mut self, terms: &[Term], boost: f32) -> Option<Bm25Weight> {
-        let key = (terms[0].clone(), boost.to_bits() ^ (terms.len() as u32) << 24);
+        let key = (
+            terms[0].clone(),
+            boost.to_bits() ^ (terms.len() as u32) << 24,
+        );
         if terms.len() == 1
             && let Some(w) = self.weights.get(&key)
         {
@@ -300,7 +303,11 @@ impl<'s> Scorer<'s> {
                         continue;
                     }
                     if terms.len() > 2 {
-                        let count = fw.words.windows(terms.len()).filter(|w| *w == terms).count();
+                        let count = fw
+                            .words
+                            .windows(terms.len())
+                            .filter(|w| *w == terms)
+                            .count();
                         if count == 0 {
                             continue;
                         }

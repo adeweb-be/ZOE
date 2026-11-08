@@ -364,14 +364,9 @@ impl Mirrors {
         #[cfg(not(feature = "text"))]
         let text: Option<TextPart> = None;
         match decode_typed(plan) {
-            Ok((plan, columns, kinds)) => Ok(self.query_kinds(
-                catalog,
-                tid,
-                &plan,
-                &columns,
-                &kinds,
-                text.as_ref(),
-            )),
+            Ok((plan, columns, kinds)) => {
+                Ok(self.query_kinds(catalog, tid, &plan, &columns, &kinds, text.as_ref()))
+            }
             Err(PlanError::Malformed(why)) => Err(why),
             Err(PlanError::Unknown(why)) => {
                 self.shared.counters.python(Reason::Plan, Duration::ZERO);

@@ -62,10 +62,8 @@ impl<'a> Translator<'a> {
 
     fn term_query(&self, read: &Read, term: &str) -> Box<dyn Query> {
         let term = Term::from_field_text(read.field.text, term);
-        let exact: Box<dyn Query> = Box::new(TermQuery::new(
-            term.clone(),
-            IndexRecordOption::WithFreqs,
-        ));
+        let exact: Box<dyn Query> =
+            Box::new(TermQuery::new(term.clone(), IndexRecordOption::WithFreqs));
         if self.fuzzy == 0 {
             return exact;
         }
@@ -148,7 +146,8 @@ impl<'a> Translator<'a> {
                 let regex = analysis::glob_regex(pattern);
                 let mut across = Vec::new();
                 for read in self.reads {
-                    let q: Box<dyn Query> = match RegexQuery::from_pattern(&regex, read.field.text) {
+                    let q: Box<dyn Query> = match RegexQuery::from_pattern(&regex, read.field.text)
+                    {
                         Ok(q) => Box::new(q),
                         Err(_) => Box::new(EmptyQuery),
                     };
@@ -210,9 +209,7 @@ impl<'a> Translator<'a> {
                     let terms = self.terms(read, words);
                     let least = match terms.len() {
                         0 => continue,
-                        1 => {
-                            searcher.doc_freq(&Term::from_field_text(read.field.text, &terms[0]))
-                        }
+                        1 => searcher.doc_freq(&Term::from_field_text(read.field.text, &terms[0])),
                         _ => pairs_of(&terms)
                             .iter()
                             .map(|p| searcher.doc_freq(&Term::from_field_text(read.field.pairs, p)))

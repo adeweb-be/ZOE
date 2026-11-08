@@ -522,7 +522,9 @@ impl<'a> View<'a> {
                 rids: page.iter().map(|h| h.1).collect(),
                 scores: Some(
                     page.iter()
-                        .map(|h| (h.0 + sets).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+                        .map(|h| {
+                            (h.0 + sets).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                        })
                         .collect(),
                 ),
                 len,

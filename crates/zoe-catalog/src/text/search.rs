@@ -181,13 +181,8 @@ pub fn search(
     want: Want,
     forced: Option<Strategy>,
 ) -> tantivy::Result<(Found, Strategy)> {
-    let chosen = forced.unwrap_or_else(|| {
-        strategy(
-            maps.num_docs(),
-            scope.filter.map(|f| f.len() as u64),
-            bound,
-        )
-    });
+    let chosen = forced
+        .unwrap_or_else(|| strategy(maps.num_docs(), scope.filter.map(|f| f.len() as u64), bound));
     let chosen = match (scope.filter, chosen) {
         (None, _) => Strategy::None,
         (Some(_), Strategy::None) => Strategy::Bitset,
@@ -457,7 +452,10 @@ mod tests {
     fn the_strategy_follows_the_smaller_side() {
         assert_eq!(strategy(10_000, None, Some(5)), Strategy::None);
         assert_eq!(strategy(10_000, Some(100), None), Strategy::FilterDrives);
-        assert_eq!(strategy(10_000, Some(5_000), Some(100)), Strategy::HitsDrive);
+        assert_eq!(
+            strategy(10_000, Some(5_000), Some(100)),
+            Strategy::HitsDrive
+        );
         assert_eq!(strategy(10_000, Some(5_000), Some(5_000)), Strategy::Bitset);
         assert_eq!(strategy(10_000, Some(5_000), None), Strategy::Bitset);
     }
