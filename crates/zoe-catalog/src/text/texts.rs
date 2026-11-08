@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -40,6 +40,7 @@ use crate::read::NAMESPACE as CATALOGS;
 
 use super::clause::{TextError, TextErrorKind};
 use super::index::{self, Analyzers, Fields, Maps, SegmentRids};
+use super::rebuild::Step;
 use super::settings::{CatalogSettings, Layout, Mode, NAMESPACE};
 
 /// The longest time that the writer holds a delta before a commit.
@@ -544,39 +545,14 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
     if shared.lock().generations == Some(generations) {
         return;
     }
-    let mut wanted: BTreeMap<u64, Result<CatalogSettings, String>> = BTreeMap::new();
-    let mut start: Option<Vec<u8>> = None;
-    loop {
-        let page = match store.kv_scan(Flavour::Durable, CATALOGS, start.as_deref(), None, 1000) {
-            Ok(page) => page,
-            Err(e) => {
-                // The entries stay, and the next pass reads again.
-                tracing::warn!("the read of the registration keys fails: {e}");
-                return;
-            }
-        };
-        let Some((last, _)) = page.last() else {
-            break;
-        };
-        let mut next = last.clone();
-        next.push(0);
-        for (key, _) in &page {
-            let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) else {
-                continue;
-            };
-            let catalog = u64::from_be_bytes(bytes);
-            match store.kv_get(Flavour::Durable, NAMESPACE, key) {
-                Ok(Some(value)) => {
-                    wanted.insert(catalog, CatalogSettings::parse(&value));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    wanted.insert(catalog, Err(e.to_string()));
-                }
-            }
+    let wanted = match registered(store) {
+        Ok(wanted) => wanted,
+        Err(e) => {
+            // The entries stay, and the next pass reads again.
+            tracing::warn!("the read of the registration keys fails: {e}");
+            return;
         }
-        start = Some(next);
-    }
+    };
     let mut inner = shared.lock();
     inner.generations = Some(generations);
     let gone: Vec<u64> = inner
@@ -664,9 +640,43 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
     shared.changed.notify_all();
 }
 
+/// The settings in `zoe.text` of each registered catalog that has them,
+/// or why they do not read.
+pub(super) fn registered(
+    store: &Store,
+) -> Result<BTreeMap<u64, Result<CatalogSettings, String>>, ZoeError> {
+    let mut wanted = BTreeMap::new();
+    let mut start: Option<Vec<u8>> = None;
+    loop {
+        let page = store.kv_scan(Flavour::Durable, CATALOGS, start.as_deref(), None, 1000)?;
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        let mut next = last.clone();
+        next.push(0);
+        for (key, _) in &page {
+            let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) else {
+                continue;
+            };
+            let catalog = u64::from_be_bytes(bytes);
+            match store.kv_get(Flavour::Durable, NAMESPACE, key) {
+                Ok(Some(value)) => {
+                    wanted.insert(catalog, CatalogSettings::parse(&value));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    wanted.insert(catalog, Err(e.to_string()));
+                }
+            }
+        }
+        start = Some(next);
+    }
+    Ok(wanted)
+}
+
 /// The layout of the index of `settings`: its text indexes in the enhanced
 /// mode.
-fn layout_of(settings: &CatalogSettings) -> Layout {
+pub(super) fn layout_of(settings: &CatalogSettings) -> Layout {
     settings
         .layout()
         .into_iter()
@@ -712,6 +722,9 @@ fn open_index(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
     };
     let path = index::directory(dir, catalog);
     let read_only = shared.config.read_only;
+    if !read_only && let Err(e) = super::rebuild::clean(&path) {
+        tracing::warn!("the text index of {catalog:#x} keeps a directory of a rebuild: {e}");
+    }
     let found = open_existing(store, &path, &layout, read_only);
     match found {
         Ok((index, tid)) => {
@@ -799,7 +812,7 @@ fn open_index(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
 /// and the tid of its payload, or why it needs a rebuild.
 fn open_existing(
     store: &Store,
-    path: &std::path::Path,
+    path: &Path,
     layout: &Layout,
     read_only: bool,
 ) -> Result<(Index, u64), String> {
@@ -919,59 +932,68 @@ fn texts_of(
     Ok(out)
 }
 
-/// Rebuild the index of `catalog` from the live texts at the last tid.
-fn rebuild(
-    shared: &Arc<Shared>,
+/// An index of a catalog, built from the live texts at the tid `at` and
+/// committed with the payload of that tid.
+pub(super) struct Built {
+    pub(super) index: Index,
+    pub(super) writer: IndexWriter,
+    pub(super) fields: Fields,
+    pub(super) analyzers: Analyzers,
+    /// The tid of the newest clear delta at or before `at`, by index id.
+    pub(super) cleared: HashMap<String, u64>,
+    pub(super) at: u64,
+    /// The cap of pack at `at`.
+    pub(super) cap: PackCap,
+    /// The documents of the index.
+    pub(super) docs: u64,
+}
+
+/// Why a build stops before its commit.
+pub(super) enum Halt {
+    /// `cancel` is set.
+    Cancelled,
+    /// A pack that started before the cap of the build passed it: the
+    /// caller builds again.
+    Packed,
+    /// A read of the store fails.
+    Store(ZoeError),
+    /// tantivy fails: why.
+    Index(String),
+}
+
+/// Build in `path` the index of `catalog` with `layout`, from the live
+/// texts at the last tid, after the removal of what `path` holds. The
+/// writer has `threads` indexing threads. `step` gets `Step::Created`
+/// when the empty index is in `path`, and `Step::Added` when each document
+/// is in the writer, before the commit.
+///
+/// The build checks the pack watermark before it writes its commit: a
+/// commit on disk with a tid past a lost cap would survive a restart.
+pub(super) fn build(
     store: &Store,
-    lives: &mut HashMap<u64, Live>,
     catalog: u64,
-    settings: &CatalogSettings,
-) {
-    lives.remove(&catalog);
-    set_state(shared, catalog, TextState::Building);
-    if let Some(hook) = &shared.before_build {
-        hook(catalog);
-    }
-    let layout = layout_of(settings);
-    let Some(dir) = &shared.config.dir else {
-        return;
-    };
-    let path = index::directory(dir, catalog);
+    layout: &Layout,
+    path: &Path,
+    threads: usize,
+    cancel: &AtomicBool,
+    step: &dyn Fn(Step),
+) -> Result<Built, Halt> {
     let at = store.last_transaction().0;
     let cap = store.pack_cap(Tid(at));
-    let (index, fields) = match index::create(&path, &layout) {
-        Ok(found) => found,
-        Err(e) => {
-            set_state(
-                shared,
-                catalog,
-                TextState::Unavailable(format!("the rebuild of the text index fails: {e}")),
-            );
-            return;
-        }
-    };
-    let mut writer: IndexWriter = match index.writer_with_num_threads(1, WRITER_BUDGET) {
-        Ok(w) => w,
-        Err(e) => {
-            set_state(
-                shared,
-                catalog,
-                TextState::Unavailable(format!("the writer of the text index fails: {e}")),
-            );
-            return;
-        }
-    };
+    let (index, fields) = index::create(path, layout)
+        .map_err(|e| Halt::Index(format!("the rebuild of the text index fails: {e}")))?;
+    step(Step::Created);
+    let mut writer: IndexWriter = index
+        .writer_with_num_threads(threads, WRITER_BUDGET)
+        .map_err(|e| Halt::Index(format!("the writer of the text index fails: {e}")))?;
     let mut rids = BTreeSet::new();
     let mut cleared: HashMap<String, u64> = HashMap::new();
     let mut after = Some(first_key(catalog));
     'scan: loop {
-        if shared.cancel.load(Ordering::Relaxed) {
-            return;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Halt::Cancelled);
         }
-        let keys = match store.text_keys(after.as_ref(), SCAN) {
-            Ok(k) => k,
-            Err(e) => return fail(shared, catalog, &e),
-        };
+        let keys = store.text_keys(after.as_ref(), SCAN).map_err(Halt::Store)?;
         for k in &keys {
             if k.catalog.0 != catalog {
                 break 'scan;
@@ -995,38 +1017,72 @@ fn rebuild(
         }
     }
     let mut analyzers = Analyzers::default();
+    let mut docs = 0;
     for (n, rid) in rids.into_iter().enumerate() {
-        if n % 1000 == 0 && shared.cancel.load(Ordering::Relaxed) {
-            return;
+        if n % 1000 == 0 && cancel.load(Ordering::Relaxed) {
+            return Err(Halt::Cancelled);
         }
-        let texts = match texts_of(store, catalog, &layout, rid, at + 1) {
-            Ok(t) => t,
-            Err(e) => return fail(shared, catalog, &e),
-        };
-        if !texts.is_empty()
-            && let Err(e) =
-                writer.add_document(index::document(&fields, &mut analyzers, rid, &texts))
-        {
-            set_state(shared, catalog, TextState::Unavailable(e.to_string()));
-            return;
+        let texts = texts_of(store, catalog, layout, rid, at + 1).map_err(Halt::Store)?;
+        if !texts.is_empty() {
+            writer
+                .add_document(index::document(&fields, &mut analyzers, rid, &texts))
+                .map_err(|e| Halt::Index(e.to_string()))?;
+            docs += 1;
         }
     }
-    // A pack that started before the cap of the rebuild can pass it: the
-    // check comes before the write of the commit.
+    step(Step::Added);
+    // A pack that started before the cap of the build can pass it.
     if store.pack_watermark().is_ok_and(|w| w.0 > at) {
-        drop(writer);
-        drop(cap);
-        return rebuild(shared, store, lives, catalog, settings);
+        return Err(Halt::Packed);
     }
-    let committed = writer.prepare_commit().and_then(|mut p| {
-        p.set_payload(&index::payload(at, &layout));
-        p.commit()
-    });
-    if let Err(e) = committed {
-        set_state(shared, catalog, TextState::Unavailable(e.to_string()));
+    writer
+        .prepare_commit()
+        .and_then(|mut p| {
+            p.set_payload(&index::payload(at, layout));
+            p.commit()
+        })
+        .map_err(|e| Halt::Index(e.to_string()))?;
+    Ok(Built {
+        index,
+        writer,
+        fields,
+        analyzers,
+        cleared,
+        at,
+        cap,
+        docs,
+    })
+}
+
+/// Rebuild the index of `catalog` from the live texts at the last tid.
+fn rebuild(
+    shared: &Arc<Shared>,
+    store: &Store,
+    lives: &mut HashMap<u64, Live>,
+    catalog: u64,
+    settings: &CatalogSettings,
+) {
+    lives.remove(&catalog);
+    set_state(shared, catalog, TextState::Building);
+    if let Some(hook) = &shared.before_build {
+        hook(catalog);
+    }
+    let layout = layout_of(settings);
+    let Some(dir) = &shared.config.dir else {
         return;
-    }
-    let reader = match index::reader(&index) {
+    };
+    let path = index::directory(dir, catalog);
+    let built = match build(store, catalog, &layout, &path, 1, &shared.cancel, &|_| {}) {
+        Ok(built) => built,
+        Err(Halt::Cancelled) => return,
+        Err(Halt::Packed) => return rebuild(shared, store, lives, catalog, settings),
+        Err(Halt::Store(e)) => return fail(shared, catalog, &e),
+        Err(Halt::Index(why)) => {
+            set_state(shared, catalog, TextState::Unavailable(why));
+            return;
+        }
+    };
+    let reader = match index::reader(&built.index) {
         Ok(r) => r,
         Err(e) => {
             set_state(shared, catalog, TextState::Unavailable(e.to_string()));
@@ -1034,19 +1090,19 @@ fn rebuild(
         }
     };
     let mut live = Live {
-        _index: index,
-        writer: Some(writer),
+        _index: built.index,
+        writer: Some(built.writer),
         reader,
-        fields,
+        fields: built.fields,
         layout,
         segments: SegmentRids::new(),
-        analyzers,
-        applied: at,
-        committed: at,
-        cleared,
+        analyzers: built.analyzers,
+        applied: built.at,
+        committed: built.at,
+        cleared: built.cleared,
         pending: 0,
         first_pending: None,
-        cap: Some(cap),
+        cap: Some(built.cap),
     };
     if publish(shared, catalog, &mut live, settings).is_ok() {
         lives.insert(catalog, live);

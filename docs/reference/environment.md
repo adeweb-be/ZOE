@@ -39,6 +39,7 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_FORCE` | `zoe convert` | a boolean: convert a store with the data of `zoe.plone` into a `Data.fs` |
 | `ZOE_DAYS` | `zoe pack` | pack as of this number of days ago |
 | `ZOE_DRY_RUN` | `zoe pack` | a boolean: report and change nothing |
+| `ZOE_CATALOG` | `zoe catalog rebuild-text` | the oid of the one catalog whose text index the command rebuilds |
 | `ZOE_STORAGE` | `zoe serve` | one store, as `NAME=PATH` |
 | `ZOE_CONFIG` | `zoe serve` | the configuration file |
 | `ZOE_LISTEN` | `zoe serve` | the address of the ZEO port |
