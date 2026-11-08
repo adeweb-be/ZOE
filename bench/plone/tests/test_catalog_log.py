@@ -201,9 +201,9 @@ def test_the_probe_writes_one_line_for_each_search(site):
     assert all(line["catalog"] == ["", "Plone", "portal_catalog"] for line in lines)
     assert all(line["replayable"] for line in lines)
     # The query as ZCatalog got it: searchResults adds the roles of the
-    # user and the effective range.
+    # user.
     member = [line for line in lines if "allowedRolesAndUsers" in line["indexes"]]
-    assert member and member[0]["indexes"]["effectiveRange"] == "DateRangeIndex"
+    assert member and member[0]["indexes"]["allowedRolesAndUsers"] == "KeywordIndex"
     sorts = [line["sort"] for line in lines if line["sort"]]
     assert "sortable_title" in sorts and ["portal_type", "getId"] in sorts
     assert sum(line["changed"] for line in lines) == 1

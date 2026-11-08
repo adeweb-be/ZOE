@@ -10,7 +10,8 @@ search and asks the mirror of the store, compares the answers and counts.
 
 The reader replays each line of the log with `Catalog.search`, as the
 probe recorded it, on one of two Connections: the fresh one begins a new
-transaction before each search, so it sees the last commit; the pinned one
+transaction before each search, so it sees the last commit; each
+`pinned_every`th search that the hook can plan runs on the pinned one, which
 keeps its snapshot for `pinned_sync` of its searches, so its later searches
 fall outside the mirror window. A line that ran in a transaction that
 changed the catalog runs on the fresh Connection after a change of one
@@ -21,8 +22,10 @@ replay, from a Connection of its own: an edit of a Document (its title and
 its subjects), a new Document in a folder, and a workflow transition. At
 the middle of the replay, it commits one flip of a BooleanIndex
 (`_invert_index`): the pickle of the index object changes, the mirror goes
-stale and builds again. The reader measures the seconds from that commit
-to the first native answer at a snapshot after it.
+stale and builds again. A thread then asks the mirror at the snapshot just
+after that commit until it answers, and measures the seconds from the
+commit to that answer. The saves search the catalog too, in a transaction
+that changed it, and these searches count with the others.
 
 OUT receives a JSON report: the counts by path, by reason and side of the
 Python path, of the comparisons, of the mismatches with the indexes and
@@ -74,12 +77,15 @@ TOOL = site_path()
 
 
 def tool_of(connection):
-    return connection.root()["Application"].unrestrictedTraverse(TOOL)
+    """The catalog tool as `connection` sees it. Its site becomes the site
+    of the thread, as in a request: a sort on `getObjPositionInParent` and
+    the content of Plone look up their components there."""
+    from Acquisition import aq_parent
+    from zope.component.hooks import setSite
 
-
-def start_of(connection):
-    jar_storage = getattr(connection, "_normal_storage", None) or connection._storage
-    return jar_storage._start
+    tool = connection.root()["Application"].unrestrictedTraverse(TOOL)
+    setSite(aq_parent(tool))
+    return tool
 
 
 def wait_ready(oid, timeout):
@@ -118,6 +124,7 @@ class Writer(threading.Thread):
         self.tm = transaction.TransactionManager()
         self.connection = db.open(transaction_manager=self.tm)
         self.documents, self.folders = self.targets()
+        self.oid = aq_base(tool_of(self.connection)._catalog)._p_oid
         self.tm.abort()
 
     def commits(self):
@@ -158,6 +165,9 @@ class Writer(threading.Thread):
                         tid=u64(db.lastTransaction()),
                         at=time.monotonic(),
                     )
+                    threading.Thread(
+                        target=self.measure_flip, name="flip", daemon=True
+                    ).start()
             except ConflictError:
                 self.tm.abort()
                 with self.lock:
@@ -173,7 +183,11 @@ class Writer(threading.Thread):
         self.connection.close()
 
     def save(self, n, documents, folders):
-        root = self.connection.root()["Application"]
+        from Testing.makerequest import makerequest
+
+        tool_of(self.connection)
+        # The workflow tool reads the request of its context.
+        root = makerequest(self.connection.root()["Application"])
         kind = rnd.random()
         if kind < 0.6 and documents:
             obj = root.unrestrictedTraverse(rnd.choice(documents))
@@ -204,6 +218,24 @@ class Writer(threading.Thread):
         with self.lock:
             self.counts[key] += 1
 
+    def measure_flip(self):
+        """Ask the mirror at the snapshot just after the flip until it
+        answers: the seconds of the build again, and the reasons until
+        then."""
+        plan = {"c": [], "s": [], "l": None, "bs": 0, "bz": None, "cols": None}
+        plan["rn"] = 0
+        start = p64(self.flip["tid"] + 1)
+        reasons = {}
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
+            reply = storage.catalog_query(self.oid, start, plan, None)
+            if "f" not in reply:
+                self.flip["seconds"] = round(time.monotonic() - self.flip["at"], 3)
+                break
+            reasons[reply["f"]] = reasons.get(reply["f"], 0) + 1
+            time.sleep(0.01)
+        self.flip["reasons"] = reasons
+
     def do_flip(self):
         """Invert the first BooleanIndex of the catalog, as ZCatalog does
         when the indexed value holds 60 % of the entries."""
@@ -217,9 +249,8 @@ class Writer(threading.Thread):
         self.flip.update(committed=True, missing=True)
 
 
-def run_search(tool, line):
-    """Replay one line on the catalog tool `tool`."""
-    catalog = tool._catalog
+def arguments(catalog, line):
+    """The arguments of `Catalog.search` of one line, on `catalog`."""
     query = querylog.decode(line["query"])
     sort = line.get("sort")
     if sort is None:
@@ -229,10 +260,23 @@ def run_search(tool, line):
     else:
         sort_index = [catalog.getIndex(name) for name in sort]
     reverse = querylog.decode(line.get("reverse", False))
-    result = catalog.search(
-        query, sort_index, reverse, line.get("limit"), line.get("merge", True)
-    )
-    return len(result)
+    return query, sort_index, reverse, line.get("limit"), line.get("merge", True)
+
+
+def served(tool, line):
+    """Tell if the hook makes a plan for the line: the mirror can serve
+    it."""
+    try:
+        plan, _ = backend.plan_of(tool._catalog, *arguments(tool._catalog, line))
+    except Exception:
+        return False
+    return plan is not None
+
+
+def run_search(tool, line):
+    """Replay one line on the catalog tool `tool`."""
+    catalog = tool._catalog
+    return len(catalog.search(*arguments(catalog, line)))
 
 
 def main():
@@ -255,6 +299,7 @@ def main():
     writer.start()
     pinned_at = writer.commits()
     pinned_uses = 0
+    servable = 0
     rounds = settings.get("rounds", 1)
     plan = [line for _ in range(rounds) for line in lines]
     if settings.get("limit"):
@@ -262,7 +307,18 @@ def main():
     flip_at = len(plan) // 2 if settings.get("flip", True) else None
     counts = {"replayed": 0, "skipped": 0, "pinned": 0, "changed": 0}
     errors = {}
-    flip = {}
+    # A build after a stale commit starts the count of the rebases of the
+    # mirror again, so the reader adds up what it sees.
+    rebases = {"seen": before["rebases"] if before else 0, "total": 0}
+
+    def count_rebases():
+        found = status(oid)
+        if found is None or found.get("rebases") is None:
+            return
+        now = found["rebases"]
+        rebases["total"] += now - rebases["seen"] if now >= rebases["seen"] else now
+        rebases["seen"] = now
+
     started = time.monotonic()
     for i, line in enumerate(plan):
         if i == flip_at:
@@ -270,8 +326,14 @@ def main():
         if not line.get("replayable", True):
             counts["skipped"] += 1
             continue
+        # Each `pinned_every`th search that the mirror can serve runs on
+        # the pinned snapshot.
         every = settings["pinned_every"]
-        on_pinned = every and i % every == every - 1 and not line.get("changed")
+        on_pinned = False
+        if every and not line.get("changed") and served(tool_of(fresh), line):
+            servable += 1
+            on_pinned = servable % every == 0
+        fresh_tm.abort()
         if on_pinned:
             if pinned_uses >= settings["pinned_sync"]:
                 pinned_tm.begin()
@@ -290,8 +352,6 @@ def main():
         else:
             fresh_tm.begin()
             connection = fresh
-        snapshot = u64(start_of(connection))
-        native = backend._counts_now()["queries"].get("native", 0)
         try:
             tool = tool_of(connection)
             if line.get("changed") and documents:
@@ -309,11 +369,7 @@ def main():
         finally:
             if connection is fresh:
                 fresh_tm.abort()
-        done = writer.flip
-        if done.get("committed") and "tid" in done and "seconds" not in flip:
-            went_native = backend._counts_now()["queries"].get("native", 0) > native
-            if connection is fresh and went_native and snapshot > done["tid"]:
-                flip["seconds"] = round(time.monotonic() - done["at"], 3)
+        count_rebases()
     seconds = time.monotonic() - started
     writer.stop.set()
     writer.join(30)
@@ -321,6 +377,7 @@ def main():
     pinned.close()
     fresh.close()
     after = status(oid)
+    count_rebases()
     found = backend._counts_now()
     report = {
         "leg": settings["leg"],
@@ -340,15 +397,17 @@ def main():
         "cache_differences": found["cache_differences"],
         "mismatched": list(backend._mismatched),
         "writer": writer.counts,
-        "rebases": (
-            after["rebases"] - (before["rebases"] if before else 0)
+        "rebases": rebases["total"] if after is not None else None,
+        "mirror": (
+            {key: after.get(key) for key in ("state", "sets", "rebases", "bytes")}
             if after is not None
             else None
         ),
         "flip": {
             "committed": bool(writer.flip.get("committed")),
             "index_entries": writer.flip.get("index_entries"),
-            "seconds_to_native": flip.get("seconds"),
+            "seconds_to_native": writer.flip.get("seconds"),
+            "reasons_until_native": writer.flip.get("reasons"),
         },
     }
     with open(out_path, "w") as out:

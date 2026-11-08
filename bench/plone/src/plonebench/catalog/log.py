@@ -147,14 +147,18 @@ def inventory(lines: list[dict]) -> dict:
         classes = line.get("indexes") or {}
         pairs = {str(k): v for k, v in _items(line.get("query"))}
         seen = set()
+        shapes = set()
         for name, value in pairs.items():
             kind = classes.get(name)
             if kind is None:
                 keys[name] += 1
                 continue
             seen.add(kind)
-            options[(kind, ", ".join(_options(value)))] += 1
+            shapes.add((kind, ", ".join(_options(value))))
+        # A share is of the calls: a call counts once for each type, and
+        # once for each type with its options.
         types.update(seen)
+        options.update(shapes)
         sort = line.get("sort")
         if not sort:
             sorts[("none", "")] += 1
