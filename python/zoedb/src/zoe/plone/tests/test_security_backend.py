@@ -331,11 +331,36 @@ class TestTheQueueAndALargeDelete(TokenChecks, unittest.TestCase):
             site.manage_delObjects(["large"])
             transaction.commit()
 
+        left = []
+
+        def after(indexer, keys):
+            # The entries of the folder left after each batch.
+            manager = transaction.TransactionManager()
+            connection = self.db.open(transaction_manager=manager)
+            try:
+                pc = connection.root()["Application"]["plone"].portal_catalog
+                paths = pc._catalog.uids.keys("/plone/large", "/plone/large/\uffff")
+                left.append(
+                    sum(
+                        1
+                        for path in paths
+                        if path == "/plone/large" or path.startswith("/plone/large/")
+                    )
+                )
+            finally:
+                manager.abort()
+                connection.close()
+
         def run():
             with opened(self.db) as site:
-                indexing.Indexer(site, batch_size=100).run()
+                indexer = indexing.Indexer(site, batch_size=100)
+                indexer.after_batch = after
+                indexer.run()
 
         queued = records(run)
+        # The first batch holds the path of the folder: it finds the folder
+        # gone and removes the whole subtree.
+        self.assertEqual(left[0], 0, left)
         print(
             f"\na delete of {deleted} entries wrote {queued} records through"
             f" the queue, and {stock} in one transaction"
@@ -348,6 +373,43 @@ class TestTheQueueAndALargeDelete(TokenChecks, unittest.TestCase):
                 )
                 self.assertEqual(list(found), [])
         self.check(self.db, storage=self.storage, what="a large delete")
+
+
+class TestTheQueueAndADeletedComment(TokenChecks, unittest.TestCase):
+    layer = zoe_testing.ZOE_SITE
+
+    def setUp(self):
+        make_site(self)
+        indexing.install()
+        self.addCleanup(indexing.uninstall)
+
+    def comments(self):
+        with opened(self.db) as site:
+            found = site.portal_catalog.unrestrictedSearchResults(
+                path="/plone/public/doc-0", portal_type="Discussion Item"
+            )
+            return sorted(brain.getPath() for brain in found)
+
+    def test_the_other_comment_of_the_document_stays_in_the_catalog(self):
+        from plone.app.discussion.interfaces import IConversation
+
+        with opened(self.db) as site:
+            acceptance.comment(site["public"]["doc-0"], "A second comment")
+            transaction.commit()
+        with opened(self.db) as site:
+            indexing.Indexer(site).run()
+        before = self.comments()
+        self.assertEqual(len(before), 2, before)
+        with opened(self.db) as site:
+            conversation = IConversation(site["public"]["doc-0"])
+            gone = before[0].rpartition("/")[2]
+            del conversation[gone]
+            transaction.commit()
+        with opened(self.db) as site:
+            indexing.Indexer(site).run()
+        self.assertEqual(self.comments(), before[1:])
+        self.check(self.db, storage=self.storage, what="a deleted comment")
+        self.check_tokens(self.db, self.storage, what="a deleted comment", stock=True)
 
 
 class TestASearchInATransactionThatChangedSecurity(TokenChecks, unittest.TestCase):

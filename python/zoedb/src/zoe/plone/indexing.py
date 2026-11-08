@@ -648,7 +648,7 @@ class Indexer:
         uid_index = inner.indexes.get("UID")
         removals = []
         updates = []
-        # The paths without an object.
+        # The paths of the batch that traversal does not find.
         gone = []
         for path, entry in entries.items():
             if not entry.keys and path in self._broken:
@@ -658,7 +658,8 @@ class Indexer:
             if obj is None:
                 if rid is not None:
                     removals.append(path)
-                gone.append(path)
+                if self._guarded(path, _missing, app, path):
+                    gone.append(path)
                 continue
             uid = _uid(obj)
             if uid is not None and uid_index is not None:
@@ -688,7 +689,7 @@ class Indexer:
         # entries below the highest such container go in this batch, so no
         # chain below it is written for a removal that a later batch
         # applies.
-        for top in highest(self._gone_tops(app, site, gone)):
+        for top in highest(self._gone_tops(app, site, uids, gone)):
             for below in uids.keys(top + "/", top + "0", excludemax=True):
                 if below not in self._broken:
                     removals.append(below)
@@ -699,15 +700,22 @@ class Indexer:
             # get its inputs in their chains, once for the batch.
             self._guarded(removed[0][1], index._write_chains, removed, fresh)
 
-    def _gone_tops(self, app, site, gone):
-        """Return, for each path of `gone`, the highest container of it
-        below the site that has no object either, or the path."""
+    def _gone_tops(self, app, site, uids, gone):
+        """Return, for each path of `gone`, its highest container below the
+        site that traversal does not find either, through the paths that
+        the batch lists as gone and the catalog entries. The climb stops
+        at the first container that exists, or that is neither."""
         root = "/".join(site.getPhysicalPath())
+        listed = set(gone)
         found = {}
 
         def missing(path):
+            if path in listed:
+                return True
+            if uids.get(path) is None:
+                return False
             if path not in found:
-                found[path] = self._guarded(path, _resolve, app, path) is None
+                found[path] = self._guarded(path, _missing, app, path)
             return found[path]
 
         tops = []
@@ -886,6 +894,26 @@ def _resolve(app, path):
     if getattr(aq_base(obj), "reindexObject", None) is None:
         return None
     return obj
+
+
+def _missing(app, path):
+    """Tell if traversal finds no object at `path`: a missing name, or an
+    object of another path. An object that the catalog cannot index, as a
+    conversation of plone.app.discussion, is not missing. A read error of
+    the store stays an error."""
+    from zExceptions import NotFound
+    from ZODB.POSException import POSKeyError
+
+    try:
+        obj = app.unrestrictedTraverse(path)
+    except (TransientError, POSKeyError):
+        raise
+    except (KeyError, AttributeError, NotFound):
+        return True
+    try:
+        return "/".join(obj.getPhysicalPath()) != path
+    except AttributeError:
+        return False
 
 
 def _uid(obj):
