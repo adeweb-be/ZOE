@@ -11,6 +11,9 @@ acceptance tests of `test_security_index`, on the same synthetic sites:
   cache;
 - an entry that leaves the catalog leaves its inputs in the chains of the
   entries below it, so their values stay those of the stock index;
+- the Indexer removes the entries below a path only when traversal does
+  not find the path: a deleted comment leaves its siblings, and an object
+  of another physical path leaves the entries below it;
 - the index answers through the `Indexes` of the catalog tool, as the ZMI
   wraps it;
 - with `security` in `ZOE_PLONE_BACKENDS`, the site of the fixture of
@@ -410,6 +413,46 @@ class TestTheQueueAndADeletedComment(TokenChecks, unittest.TestCase):
         self.assertEqual(self.comments(), before[1:])
         self.check(self.db, storage=self.storage, what="a deleted comment")
         self.check_tokens(self.db, self.storage, what="a deleted comment", stock=True)
+
+
+class TestTheQueueAndAnObjectOfAnotherPath(TokenChecks, unittest.TestCase):
+    layer = zoe_testing.ZOE_SITE
+
+    def setUp(self):
+        make_site(self)
+        indexing.install()
+        self.addCleanup(indexing.uninstall)
+
+    def entries(self, path):
+        with opened(self.db) as site:
+            found = site.portal_catalog.unrestrictedSearchResults(path=path)
+            return sorted(brain.getPath() for brain in found)
+
+    def test_the_entries_below_a_held_object_of_another_path_stay(self):
+        with opened(self.db) as site:
+            site["public"].invokeFactory("Folder", "held", title="Held")
+            for name in ("one", "two"):
+                site["public"]["held"].invokeFactory("Document", name, title=name)
+            transaction.commit()
+        with opened(self.db) as site:
+            indexing.Indexer(site).run()
+        before = self.entries("/plone/public/held")
+        self.assertEqual(len(before), 3, before)
+        with opened(self.db) as site:
+            held = site["public"]["held"]
+            # The queue gets the path of `one`, which then goes without
+            # events. The folder keeps its key, with another id.
+            held["one"].unindexObject()
+            held._delObject("one", suppress_events=True)
+            held.id = "other"
+            self.assertEqual(held.getPhysicalPath()[-1], "other")
+            transaction.commit()
+        with opened(self.db) as site:
+            indexing.Indexer(site).run()
+        self.assertEqual(
+            self.entries("/plone/public/held"),
+            ["/plone/public/held", "/plone/public/held/two"],
+        )
 
 
 class TestASearchInATransactionThatChangedSecurity(TokenChecks, unittest.TestCase):

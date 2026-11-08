@@ -898,22 +898,40 @@ def _resolve(app, path):
 
 def _missing(app, path):
     """Tell if traversal finds no object at `path`: a missing name, or an
-    object of another path. An object that the catalog cannot index, as a
-    conversation of plone.app.discussion, is not missing. A read error of
-    the store stays an error."""
+    object of another path that traversal reached by acquisition. An
+    object that its container holds under the last id of `path` is not
+    missing, whatever its physical path, and neither is an object that
+    the catalog cannot index, as a conversation of plone.app.discussion. A
+    read error of the store stays an error."""
+    from Acquisition import aq_base
     from zExceptions import NotFound
     from ZODB.POSException import POSKeyError
 
-    try:
-        obj = app.unrestrictedTraverse(path)
-    except (TransientError, POSKeyError):
-        raise
-    except (KeyError, AttributeError, NotFound):
+    def traverse(where):
+        try:
+            return app.unrestrictedTraverse(where)
+        except (TransientError, POSKeyError):
+            raise
+        except (KeyError, AttributeError, NotFound):
+            return None
+
+    obj = traverse(path)
+    if obj is None:
         return True
     try:
-        return "/".join(obj.getPhysicalPath()) != path
+        if "/".join(obj.getPhysicalPath()) == path:
+            return False
     except AttributeError:
         return False
+    parent, _, name = path.rpartition("/")
+    container = traverse(parent)
+    if container is None:
+        return True
+    base = aq_base(container)
+    has = getattr(base, "hasObject", None)
+    if callable(has):
+        return not has(name)
+    return name not in getattr(base, "__dict__", {})
 
 
 def _uid(obj):
