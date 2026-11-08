@@ -45,6 +45,9 @@ rustls-native-certs = "0.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The handlers of SIGTERM and SIGHUP of the extension module (zoe-py).
+# The native text index of the catalogs (ADR 0060). Only zoe-catalog uses
+# it, behind its feature `text`.
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "stopwords", "stemmer"] }
 signal-hook = { version = "0.4.5", default-features = false, features = ["iterator"] }
 thiserror = "2"
 # The configuration file of `zoe serve`.

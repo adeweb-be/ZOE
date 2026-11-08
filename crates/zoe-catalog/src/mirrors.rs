@@ -78,6 +78,10 @@ pub struct Config {
     pub threads: usize,
     /// The hooks of the tests.
     pub hooks: Hooks,
+    /// Where the text indexes of the store live (ADR 0060). A store with
+    /// no directory has no text index.
+    #[cfg(feature = "text")]
+    pub text: crate::text::TextConfig,
 }
 
 impl Default for Config {
@@ -90,9 +94,19 @@ impl Default for Config {
             wait: Duration::from_secs(1),
             threads: thread::available_parallelism().map_or(4, |n| n.get()),
             hooks: Hooks::default(),
+            #[cfg(feature = "text")]
+            text: crate::text::TextConfig::default(),
         }
     }
 }
+
+/// The text clause of a plan (ADR 0060, section 12), with the feature
+/// `text`.
+#[cfg(feature = "text")]
+type TextPart = crate::text::TextClause;
+/// No text clause without the feature `text`.
+#[cfg(not(feature = "text"))]
+type TextPart = ();
 
 /// The hooks of the tests. Each runs in a thread of the mirrors, with no
 /// lock held.
@@ -104,6 +118,10 @@ pub struct Hooks {
     pub before_apply: Option<Hook>,
     /// Before a rebase lays its new base, with the oid of the catalog.
     pub before_swap: Option<Hook>,
+    /// Before a rebuild of a text index reads the deltas, with the oid of
+    /// the catalog.
+    #[cfg(feature = "text")]
+    pub before_text_build: Option<Hook>,
 }
 
 /// The state of one mirror, as `status` gives it.
@@ -202,16 +220,29 @@ struct Maint {
     objects: HashMap<u64, Vec<u8>>,
 }
 
-/// The mirrors of one store.
+/// The mirrors of one store, and the text indexes of its catalogs.
 pub struct Mirrors {
     shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The text indexes, when the store has a directory (ADR 0060).
+    #[cfg(feature = "text")]
+    texts: Option<crate::text::Texts>,
 }
 
 impl Mirrors {
     /// Starts the thread of the mirrors of the store that `open` gives. The
     /// store has published each commit up to `published`.
     pub fn start(open: Opener, published: u64, config: Config) -> Mirrors {
+        #[cfg(feature = "text")]
+        let texts = config.text.dir.is_some().then(|| {
+            crate::text::Texts::start(
+                Arc::clone(&open),
+                published,
+                config.text.clone(),
+                config.wait,
+                config.hooks.before_text_build.clone(),
+            )
+        });
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 entries: BTreeMap::new(),
@@ -246,7 +277,15 @@ impl Mirrors {
         Mirrors {
             shared,
             thread: Mutex::new(thread),
+            #[cfg(feature = "text")]
+            texts,
         }
+    }
+
+    /// The text indexes of the store, when it has a directory.
+    #[cfg(feature = "text")]
+    pub fn texts(&self) -> Option<&crate::text::Texts> {
+        self.texts.as_ref()
     }
 
     /// Hands the commit `tid` to the thread, after its publication. It
@@ -261,6 +300,10 @@ impl Mirrors {
         inner.dirty = true;
         drop(inner);
         self.shared.changed.notify_all();
+        #[cfg(feature = "text")]
+        if let Some(texts) = &self.texts {
+            texts.committed(tid);
+        }
     }
 
     /// Answers `plan` on the catalog `catalog` as of the snapshot that ends
@@ -277,7 +320,7 @@ impl Mirrors {
         plan: &Plan,
         columns: &Columns,
     ) -> Result<Reply, Fallback> {
-        self.query_kinds(catalog, tid, plan, columns, &[])
+        self.query_kinds(catalog, tid, plan, columns, &[], None)
     }
 
     /// Answers `plan` as `query_rows` does, after a check of the kind of
@@ -289,9 +332,10 @@ impl Mirrors {
         plan: &Plan,
         columns: &Columns,
         kinds: &[ClauseKind],
+        text: Option<&TextPart>,
     ) -> Result<Reply, Fallback> {
         let started = Instant::now();
-        let answer = self.answer(catalog, tid, plan, columns, kinds);
+        let answer = self.answer(catalog, tid, plan, columns, kinds, text);
         match &answer {
             Ok(_) => self.shared.counters.native(started.elapsed()),
             Err(f) => self.shared.counters.python(f.reason, started.elapsed()),
@@ -310,10 +354,24 @@ impl Mirrors {
         tid: u64,
         plan: &Wire,
     ) -> Result<Result<Reply, Fallback>, String> {
+        #[cfg(feature = "text")]
+        let (rest, text) = match crate::plan::split_text(plan) {
+            Ok(split) => split,
+            Err(PlanError::Malformed(why) | PlanError::Unknown(why)) => return Err(why),
+        };
+        #[cfg(feature = "text")]
+        let plan = &rest;
+        #[cfg(not(feature = "text"))]
+        let text: Option<TextPart> = None;
         match decode_typed(plan) {
-            Ok((plan, columns, kinds)) => {
-                Ok(self.query_kinds(catalog, tid, &plan, &columns, &kinds))
-            }
+            Ok((plan, columns, kinds)) => Ok(self.query_kinds(
+                catalog,
+                tid,
+                &plan,
+                &columns,
+                &kinds,
+                text.as_ref(),
+            )),
             Err(PlanError::Malformed(why)) => Err(why),
             Err(PlanError::Unknown(why)) => {
                 self.shared.counters.python(Reason::Plan, Duration::ZERO);
@@ -329,7 +387,10 @@ impl Mirrors {
         plan: &Plan,
         columns: &Columns,
         kinds: &[ClauseKind],
+        text: Option<&TextPart>,
     ) -> Result<Reply, Fallback> {
+        #[cfg(not(feature = "text"))]
+        let _ = text;
         let shared = &self.shared;
         let v = tid.saturating_sub(1);
         let Some(store) = (shared.open)() else {
@@ -396,9 +457,43 @@ impl Mirrors {
             let (base, over) = snapshot.resolve();
             let view = View::new(&base, &over);
             view.check_kinds(plan, kinds)?;
+            #[cfg(feature = "text")]
+            if let Some(clause) = text {
+                return self.answer_text(&view, catalog, tid, plan, clause, columns);
+            }
             view.query_rows(plan, columns)
         }));
         answer.unwrap_or_else(|_| Err(Fallback::new(Reason::Refused, "the query panicked")))
+    }
+
+    /// Answers `plan` with its text clause `clause` on `view`.
+    #[cfg(feature = "text")]
+    fn answer_text(
+        &self,
+        view: &View<'_>,
+        catalog: u64,
+        tid: u64,
+        plan: &Plan,
+        clause: &crate::text::TextClause,
+        columns: &Columns,
+    ) -> Result<Reply, Fallback> {
+        let Some(reads) = (self.shared.open)() else {
+            return Err(Fallback::new(Reason::NotReady, "the store is closed"));
+        };
+        let Some(store) = reads.store() else {
+            return Err(Fallback::new(Reason::NotReady, "the store gives no deltas"));
+        };
+        view.query_text(plan, columns, &mut |filter, want| {
+            let query = crate::text::Query {
+                catalog,
+                tid,
+                clause,
+                filter: Some(filter),
+                want,
+                forced: None,
+            };
+            crate::text::engine::run(self.texts.as_ref(), store, &query).map(|a| a.found)
+        })
     }
 
     /// Counts a query that the host of the mirrors refused before the
@@ -471,6 +566,11 @@ impl Mirrors {
                 }
             })
             .collect();
+        drop(inner);
+        #[cfg(feature = "text")]
+        if let Some(texts) = &self.texts {
+            counts.texts = texts.counts();
+        }
         counts
     }
 
@@ -484,11 +584,19 @@ impl Mirrors {
     /// `stop` waits.
     pub fn signal_stop(&self) {
         self.shared.signal_stop();
+        #[cfg(feature = "text")]
+        if let Some(texts) = &self.texts {
+            texts.signal_stop();
+        }
     }
 
     /// Stops the thread and the builds, and waits for them.
     pub fn stop(&self) {
         self.shared.signal_stop();
+        #[cfg(feature = "text")]
+        if let Some(texts) = &self.texts {
+            texts.stop();
+        }
         let thread = self
             .thread
             .lock()
