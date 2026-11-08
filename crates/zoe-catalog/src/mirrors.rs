@@ -132,6 +132,10 @@ pub struct Hooks {
     /// checked the index, with the oid of the catalog.
     #[cfg(feature = "text")]
     pub before_text_cap: Option<Hook>,
+    /// Before a text index checks its cap of pack, at a commit of its
+    /// writer or at an advance of its tid, with the oid of the catalog.
+    #[cfg(feature = "text")]
+    pub before_text_check: Option<Hook>,
 }
 
 /// The state of one mirror, as `status` gives it.
@@ -317,8 +321,11 @@ impl Mirrors {
                 published,
                 config.text.clone(),
                 config.wait,
-                config.hooks.before_text_build.clone(),
-                config.hooks.before_text_cap.clone(),
+                crate::text::TextHooks {
+                    before_build: config.hooks.before_text_build.clone(),
+                    before_cap: config.hooks.before_text_cap.clone(),
+                    before_check: config.hooks.before_text_check.clone(),
+                },
             )
         });
         let shared = Arc::new(Shared {

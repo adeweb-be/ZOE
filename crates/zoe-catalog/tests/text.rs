@@ -249,6 +249,25 @@ impl Site {
         );
     }
 
+    /// Stop the mirrors, then start them again with the hand-offs up to
+    /// `published` only: the index follows no later commit until the test
+    /// hands it one.
+    fn restart_at(&mut self, hooks: Hooks, published: u64) {
+        self.mirrors.stop();
+        let weak = Arc::downgrade(&self.store);
+        let open: Opener = Arc::new(move || weak.upgrade().map(|s| s as Arc<dyn Reads>));
+        let config = Config {
+            wait: Duration::from_secs(1),
+            hooks,
+            text: TextConfig {
+                dir: Some(self.dir.path().to_owned()),
+                read_only: false,
+            },
+            ..Config::default()
+        };
+        self.mirrors = Mirrors::start(open, published, config);
+    }
+
     fn text_dir(&self) -> PathBuf {
         self.dir
             .path()
@@ -1615,4 +1634,163 @@ fn a_pack_that_started_before_the_cap_rebuilds_the_index() {
     }
     assert_eq!(packed.load(Ordering::SeqCst), 1);
     site.ready_at(t2);
+}
+
+/// A pack that reads the caps of the store, then waits until the test
+/// releases it, from a hook of the open of the text index: the cap that the
+/// open takes after it does not hold the pack.
+struct HeldPack {
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl HeldPack {
+    fn new() -> Arc<HeldPack> {
+        Arc::new(HeldPack {
+            release: Arc::default(),
+            thread: Mutex::new(None),
+        })
+    }
+
+    /// Start the pack of `store` at `at`, and return once it read the caps.
+    fn start(&self, store: &Arc<Store>, at: Tid) {
+        let (tx, rx) = mpsc::channel();
+        let store = Arc::clone(store);
+        let release = Arc::clone(&self.release);
+        let thread = std::thread::spawn(move || {
+            store
+                .pack_after_caps(at, || {
+                    tx.send(()).unwrap();
+                    let (lock, cv) = &*release;
+                    let mut open = lock.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                })
+                .unwrap();
+        });
+        rx.recv_timeout(WAIT).expect("the pack reads the caps");
+        *self.thread.lock().unwrap() = Some(thread);
+    }
+
+    /// Release the pack and wait for its end.
+    fn finish(&self) {
+        let (lock, cv) = &*self.release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+/// The hooks of a test of a pack that passes the cap of the index after its
+/// open: the pack starts before the cap, and ends at the first check of the
+/// cap after `armed`. Then the hook signals `checked` and waits for `gate`.
+fn passed_cap_hooks(
+    store: &Arc<Store>,
+    at: Tid,
+    armed: &Arc<std::sync::atomic::AtomicBool>,
+    checked: mpsc::Sender<()>,
+    gate: &Gate,
+) -> (Arc<AtomicUsize>, Hooks) {
+    let (builds, mut hooks) = counting();
+    let pack = HeldPack::new();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (store, starting) = (Arc::clone(store), Arc::clone(&pack));
+    hooks.before_text_cap = Some(Arc::new(move |_| {
+        if !started.swap(true, Ordering::SeqCst) {
+            starting.start(&store, at);
+        }
+    }));
+    let armed = Arc::clone(armed);
+    let checked = Mutex::new(checked);
+    let (tx, _rx) = mpsc::channel();
+    let hold = gate.hook(tx);
+    hooks.before_text_check = Some(Arc::new(move |catalog| {
+        if armed.swap(false, Ordering::SeqCst) {
+            pack.finish();
+            let _ = checked.lock().unwrap().send(());
+            hold(catalog);
+        }
+    }));
+    (builds, hooks)
+}
+
+#[test]
+fn a_commit_checks_the_cap_before_it_writes_and_a_query_waits_below_the_watermark() {
+    let mut site = Site::without_gc("text-commit-cap", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo"), set("Title", 2, "kalo")]);
+    site.ready_at(t1);
+    site.mirrors.stop();
+    let t2 = testing::commit_text(
+        &site.store,
+        site.catalog,
+        &[unindex("Title", 1)],
+        None,
+        false,
+    )
+    .unwrap();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (checked, on_check) = mpsc::channel();
+    let gate = Gate::default();
+    let (builds, hooks) = passed_cap_hooks(&site.store, Tid(t2), &armed, checked, &gate);
+    site.restart_at(hooks, t1);
+    site.ready_at(t1);
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    // A commit to apply: the writer commits it, and the check of its cap
+    // runs before the write, after the pack removed the unindex.
+    armed.store(true, Ordering::SeqCst);
+    let t3 = site.commit(&[set("Title", 3, "kalo")]);
+    on_check
+        .recv_timeout(WAIT)
+        .expect("the commit checks its cap");
+    assert!(site.store.pack_watermark().unwrap().0 >= t2);
+    // The index is below the watermark: a query waits for its rebuild,
+    // then gets `unavailable`.
+    let q = clause_of("Title", atom(&["kalo"]));
+    let started = Instant::now();
+    let failed = site.query(site.now(), &q, None).unwrap_err();
+    assert_eq!(failed.kind, TextErrorKind::Unavailable);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    gate.release();
+    site.ready_at(t3);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(site.rids(site.now(), &q), BTreeSet::from([2, 3]));
+}
+
+#[test]
+fn an_advance_checks_the_cap_while_a_pack_runs() {
+    let mut site = Site::without_gc("text-advance-cap", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo"), set("Title", 2, "kalo")]);
+    site.ready_at(t1);
+    site.mirrors.stop();
+    // A commit with no delta of the catalog: the index only advances its
+    // tid past it.
+    let t2 = testing::commit_text(
+        &site.store,
+        CATALOG + 1,
+        &[set("Title", 9, "x")],
+        None,
+        false,
+    )
+    .unwrap();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (checked, on_check) = mpsc::channel();
+    let gate = Gate::default();
+    let (builds, hooks) = passed_cap_hooks(&site.store, Tid(t2), &armed, checked, &gate);
+    site.restart_at(hooks, t1);
+    site.ready_at(t1);
+    armed.store(true, Ordering::SeqCst);
+    site.mirrors.committed(t2);
+    on_check
+        .recv_timeout(WAIT)
+        .expect("the advance checks its cap");
+    gate.release();
+    site.ready_at(t2);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        site.rids(site.now(), &clause_of("Title", atom(&["kalo"]))),
+        BTreeSet::from([1, 2])
+    );
 }

@@ -35,7 +35,7 @@ pub use clause::{
 pub use engine::{Answer, Query};
 pub use search::{Strategy, Want};
 pub use settings::{CatalogSettings, IndexSettings, Mode};
-pub use texts::{Failure, TextConfig, TextState, Texts};
+pub use texts::{Failure, TextConfig, TextHooks, TextState, Texts};
 
 /// The search of a text clause inside the rids of the other clauses of a
 /// plan, sorted, for what the plan wants.

@@ -133,6 +133,22 @@ struct Shared {
     /// The hook of the tests between the check of an open and the cap of
     /// pack that the open takes.
     before_cap: Option<Hook>,
+    /// The hook of the tests before the check of the cap of a commit or of
+    /// an advance of the tid.
+    before_check: Option<Hook>,
+}
+
+/// The hooks of the tests of the text indexes, each called with the oid of
+/// the catalog in the thread of the text indexes.
+#[derive(Clone, Default)]
+pub struct TextHooks {
+    /// Before a rebuild reads the deltas.
+    pub before_build: Option<Hook>,
+    /// Between the checks of an open and the cap of pack that it takes.
+    pub before_cap: Option<Hook>,
+    /// Before the check of the cap of a commit of the writer or of an
+    /// advance of the tid.
+    pub before_check: Option<Hook>,
 }
 
 impl Shared {
@@ -152,16 +168,13 @@ impl Texts {
     /// Start the thread of the text indexes of the store that `open`
     /// gives. The store published each commit up to `published`. A query
     /// waits at most `wait` for an index that opens or builds.
-    /// `before_build` is a hook of the tests, called before each rebuild
-    /// reads the deltas, and `before_cap` one called between the checks of
-    /// an open and the cap of pack that it takes.
+    /// `hooks` are the hooks of the tests.
     pub fn start(
         open: Opener,
         published: u64,
         config: TextConfig,
         wait: Duration,
-        before_build: Option<Hook>,
-        before_cap: Option<Hook>,
+        hooks: TextHooks,
     ) -> Texts {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -177,8 +190,9 @@ impl Texts {
             open,
             config,
             cancel: AtomicBool::new(false),
-            before_build,
-            before_cap,
+            before_build: hooks.before_build,
+            before_cap: hooks.before_cap,
+            before_check: hooks.before_check,
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -983,6 +997,13 @@ fn rebuild(
             return;
         }
     }
+    // A pack that started before the cap of the rebuild can pass it: the
+    // check comes before the write of the commit.
+    if store.pack_watermark().is_ok_and(|w| w.0 > at) {
+        drop(writer);
+        drop(cap);
+        return rebuild(shared, store, lives, catalog, settings);
+    }
     let committed = writer.prepare_commit().and_then(|mut p| {
         p.set_payload(&index::payload(at, &layout));
         p.commit()
@@ -1013,10 +1034,6 @@ fn rebuild(
         first_pending: None,
         cap: Some(cap),
     };
-    // A pack that started before the cap of the rebuild can pass it too.
-    if cap_lost(store, &live) {
-        return rebuild(shared, store, lives, catalog, settings);
-    }
     if publish(shared, catalog, &mut live, settings).is_ok() {
         lives.insert(catalog, live);
     }
@@ -1230,6 +1247,9 @@ fn apply(
     live.applied = target;
     if live.pending == 0 {
         // The check comes before the queries see the new tid.
+        if let Some(hook) = &shared.before_check {
+            hook(catalog);
+        }
         if cap_lost(store, live) {
             return Ok(true);
         }
@@ -1268,6 +1288,17 @@ fn commit_due(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
 /// queries the new snap. Tell if a pack passed the cap of the index: the
 /// check runs before the publication, and a lost cap publishes nothing.
 fn commit(shared: &Shared, store: &Store, live: &mut Live, catalog: u64) -> Result<bool, ZoeError> {
+    if live.writer.is_none() {
+        return Ok(false);
+    }
+    // The check comes before the write of the commit: a commit on disk
+    // with a tid past a lost cap would survive a restart.
+    if let Some(hook) = &shared.before_check {
+        hook(catalog);
+    }
+    if cap_lost(store, live) {
+        return Ok(true);
+    }
     let Some(writer) = live.writer.as_mut() else {
         return Ok(false);
     };
@@ -1282,9 +1313,6 @@ fn commit(shared: &Shared, store: &Store, live: &mut Live, catalog: u64) -> Resu
     live.committed = live.applied;
     live.pending = 0;
     live.first_pending = None;
-    if cap_lost(store, live) {
-        return Ok(true);
-    }
     if let Some(cap) = &live.cap {
         cap.advance(Tid(live.committed));
     }
