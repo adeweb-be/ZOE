@@ -30,6 +30,9 @@ It counts:
 The times overlap: the commit holds the vote and the finish, and a
 request holds all of them. The report never adds them up.
 
+When `PLONEBENCH_CATALOG_LOG` names a file, the probe also installs the
+query log of the catalog (`plonebench_catalog.py`) at the first request.
+
 A thread of the probe writes a snapshot of the process every 5 seconds:
 the requests in flight, the objects in the caches of the ZODB connections,
 and the size of the storage client cache when the client tells it.
@@ -349,6 +352,10 @@ class ProbeMiddleware:
             import Zope2
 
             _install(Zope2.DB)
+            # The query log of the catalog, when the runner asks for it.
+            import plonebench_catalog
+
+            plonebench_catalog.install_from_environment()
             threading.Thread(
                 target=_snapshots, args=(Zope2.DB, 5.0), daemon=True, name="probe"
             ).start()

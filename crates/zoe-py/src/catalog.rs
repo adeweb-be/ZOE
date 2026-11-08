@@ -500,3 +500,130 @@ pub(crate) fn p64(what: &str, bytes: &[u8]) -> PyResult<u64> {
         .map(u64::from_be_bytes)
         .map_err(|_| PyValueError::new_err(format!("{what} is 8 bytes")))
 }
+
+/// What a throwaway mirror reads: the records that the Python callable
+/// `load` gives, `load(oid)` as 8 bytes to a pickle or `None`. The callable
+/// reads the test storage at the snapshot of the Connection, so the tid of
+/// each read is that of the build. The build reads no commit and no
+/// registration.
+struct Loads {
+    load: Py<PyAny>,
+    tid: u64,
+}
+
+impl zoe_catalog::Reads for Loads {
+    fn last_tid(&self) -> u64 {
+        self.tid
+    }
+
+    fn load_before(&self, oid: u64, _tid: u64) -> Result<Option<Vec<u8>>, String> {
+        Python::attach(|py| {
+            let found = self
+                .load
+                .call1(py, (PyBytes::new(py, &oid.to_be_bytes()),))
+                .map_err(|e| format!("load of {oid:#x}: {e}"))?;
+            let found = found.bind(py);
+            if found.is_none() {
+                return Ok(None);
+            }
+            found
+                .cast::<PyBytes>()
+                .map(|b| Some(b.as_bytes().to_vec()))
+                .map_err(|_| format!("load of {oid:#x} gave no bytes"))
+        })
+    }
+
+    fn commits(
+        &self,
+        _from: u64,
+        _to: u64,
+        _each: &mut dyn FnMut(zoe_catalog::read::Commit) -> bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn registrations(&self) -> Result<Vec<Vec<u8>>, String> {
+        Ok(Vec::new())
+    }
+
+    fn registration_generation(&self) -> Result<u64, String> {
+        Ok(0)
+    }
+}
+
+/// Answer `plan` from a throwaway mirror of the catalog `catalog`, 8
+/// bytes, as of the snapshot that ends before `tid`, 8 bytes (ADR 0059,
+/// section 9). This is a private function of `zoe.plone.catalog`, for the
+/// mode `compare` on a test storage.
+///
+/// `load(oid)` gives the pickle of an oid of 8 bytes as the Connection
+/// sees it, or `None`. The build reads the catalog through it, then the
+/// query reads the transaction overlay `overlay` over the base, as a query
+/// of the mirror of a store reads it. The mirror answers this query only,
+/// and is dropped: it never enters the mirrors of a store. The reply is
+/// that of `Storage.catalog_query`. A plan of another form raises
+/// `ValueError`.
+#[pyfunction]
+#[pyo3(signature = (load, catalog, tid, plan, overlay=None))]
+pub(crate) fn _catalog_throwaway<'py>(
+    py: Python<'py>,
+    load: Py<PyAny>,
+    catalog: &[u8],
+    tid: &[u8],
+    plan: &Bound<'py, PyAny>,
+    overlay: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use zoe_catalog::build::{BuildError, build};
+    use zoe_catalog::change::Overrides;
+    use zoe_catalog::query::View;
+    use zoe_catalog::{PlanError, Reason, decode_typed};
+
+    let oid = p64("catalog", catalog)?;
+    let before = p64("tid", tid)?;
+    let wire = wire(plan)?;
+    let records = self::overlay(overlay)?;
+    let (plan, columns, kinds) = match decode_typed(&wire) {
+        Ok(decoded) => decoded,
+        Err(PlanError::Malformed(why)) => return Err(PyValueError::new_err(why)),
+        Err(PlanError::Unknown(why)) => {
+            return reply(py, tid, &Err(Fallback::new(Reason::Plan, why)));
+        }
+    };
+    // The version holds each commit before `tid`.
+    let at = before.saturating_sub(1);
+    let reads = Loads { load, tid: at };
+    let answer = py.detach(|| {
+        catch_unwind(AssertUnwindSafe(|| {
+            // The loads take the GIL in turn, so one thread walks the
+            // trees.
+            let built = match build(&reads, oid, at, 1, &|_| true) {
+                Ok(built) => built,
+                Err(BuildError::Refused(why)) => {
+                    return Err(Fallback::new(Reason::Refused, why));
+                }
+                Err(BuildError::Dropped) => {
+                    return Err(Fallback::new(Reason::Dropped, "no room for the build"));
+                }
+            };
+            let empty = Overrides::default();
+            View::new(&built.base, &empty).check_kinds(&plan, &kinds)?;
+            let over = match records.as_deref().filter(|r| !r.is_empty()) {
+                None => empty,
+                Some(records) => zoe_catalog::overlay::read(
+                    &built.base,
+                    &empty,
+                    &built.shapes,
+                    &built.objects,
+                    &HashMap::new(),
+                    at,
+                    records,
+                )?,
+            };
+            View::new(&built.base, &over).query_rows(&plan, &columns)
+        }))
+        .unwrap_or_else(|_| Err(Fallback::new(Reason::Refused, "the query panicked")))
+    });
+    reply(py, tid, &answer)
+}

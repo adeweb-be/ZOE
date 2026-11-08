@@ -69,7 +69,29 @@ class, at WARNING, and the search takes the Python path (`unsupported`).
 The modes: `on`, the default, and `compare`, which also runs the stock
 search, logs each difference at ERROR with the indexes and the options of
 the query and no value, counts it, and returns the stock result.
-`ZOE_PLONE_CATALOG_MODE` gives the mode of a process.
+`ZOE_PLONE_CATALOG_MODE` gives the mode of a process. ZCatalog keeps the
+interim sets of an index in a cache of the request, and a hit of that cache
+can give another answer than a miss. So a difference runs the stock search
+again with an empty cache for the catalog: when that answer equals the
+native answer, the difference comes from the cache of ZCatalog. It logs at
+WARNING and counts apart, and it is no mismatch.
+
+The throwaway mirror (ADR 0059, section 9). A test storage, a `DemoStorage`
+whose chain of bases ends at a ZOE storage, has no mirror. In the mode
+`compare`, a search there builds a throwaway mirror with the private
+function `zoe._zoe._catalog_throwaway`: the build reads the test storage
+at the snapshot of the Connection, then the query reads the transaction
+overlay. The mirror answers the one search and is dropped. In the mode
+`on`, the search takes the Python path (`unsupported`).
+
+The counts. `_counts_now()` gives the queries by path, the reasons of the
+Python path with their side (`client` for the reasons of the hook,
+`server` for the reasons of a reply), the comparisons of the mode
+`compare` and the throwaway mirrors among them, the mismatches, and the
+differences of the cache of the request. With `ZOE_PLONE_CATALOG_COUNTS`,
+the process adds its counts and the indexes and the options of each
+mismatch, with no value, as one JSON line to the end of that file when it
+exits.
 
 The registration. The backend writes one registration key for the catalog
 of each Plone site to the durable namespace `zoe.catalog` of the store that
@@ -87,8 +109,10 @@ the databases that the process has open.
 Only `install()` and the functions that Plone calls import Plone.
 """
 
+import atexit
 import collections
 import functools
+import json
 import logging
 import os
 import threading
@@ -132,9 +156,19 @@ _installed = {}
 _root = {}
 
 # The counts of this process: `("queries", path)`, `("fallbacks", reason)`
-# for the reasons that the hook decides, and `("mismatches",)`.
+# for the reasons that the hook decides, `("refusals", reason)` for the
+# reasons of a reply, `("compared",)`, `("throwaways",)`, `("mismatches",)`
+# and `("cache_differences",)`.
 _counts = collections.Counter()
 _counts_lock = threading.Lock()
+
+# The indexes and the options of each mismatch of the mode `compare`, as
+# the log gives them, at most `_KEPT`.
+_mismatched = []
+_KEPT = 1000
+
+# The file of `ZOE_PLONE_CATALOG_COUNTS`, once its write is registered.
+_counts_file = {}
 
 # A function that the tests give to change a native result before the
 # comparison of the mode `compare`. None outside the tests.
@@ -185,6 +219,10 @@ def install():
     current = mode()
     _installed.update(stock=Catalog.search, mode=current)
     Catalog.search = _search
+    path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
+    if path and not _counts_file:
+        _counts_file["path"] = path
+        atexit.register(_write_counts, path)
     db = _root.get("db")
     if db is not None:
         register(db)
@@ -372,17 +410,55 @@ def _count(*key):
 
 def _counts_now():
     """The counts of this process, with the names of ADR 0059, section 11:
-    the queries by path, the fallbacks that the hook decided, with
-    `side="client"`, and the mismatches of the mode `compare`."""
+    the queries by path, the fallbacks by reason and side (`client` for the
+    reasons that the hook decided, `server` for the reasons of a reply),
+    the comparisons of the mode `compare`, the throwaway mirrors, the
+    mismatches and the differences of the cache of the request."""
     with _counts_lock:
         counts = dict(_counts)
-    out = {"queries": {}, "fallbacks": {}, "mismatches": counts.get(("mismatches",), 0)}
+    out = {
+        "queries": {},
+        "fallbacks": {},
+        "compared": counts.get(("compared",), 0),
+        "throwaways": counts.get(("throwaways",), 0),
+        "mismatches": counts.get(("mismatches",), 0),
+        "cache_differences": counts.get(("cache_differences",), 0),
+    }
     for key, n in counts.items():
         if key[0] == "queries":
             out["queries"][key[1]] = n
         elif key[0] == "fallbacks":
             out["fallbacks"][(key[1], "client")] = n
+        elif key[0] == "refusals":
+            out["fallbacks"][(key[1], "server")] = n
     return out
+
+
+def _write_counts(path):
+    """Add the counts of this process and the indexes and the options of
+    each mismatch, with no value, to the end of the file `path`, as one
+    JSON line."""
+    counts = _counts_now()
+    with _counts_lock:
+        mismatched = list(_mismatched)
+    line = {
+        "pid": os.getpid(),
+        "queries": counts["queries"],
+        "fallbacks": [
+            [reason, side, n]
+            for (reason, side), n in sorted(counts["fallbacks"].items())
+        ],
+        "compared": counts["compared"],
+        "throwaways": counts["throwaways"],
+        "mismatches": counts["mismatches"],
+        "cache_differences": counts["cache_differences"],
+        "mismatched": mismatched,
+    }
+    try:
+        with open(path, "a") as out:
+            out.write(json.dumps(line, sort_keys=True) + "\n")
+    except OSError:
+        logger.exception("catalog mirror: the counts were not written to %s", path)
 
 
 def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True):
@@ -402,9 +478,17 @@ def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True)
     if _installed.get("mode") == "compare":
         result = stock(self, query, sort_index, reverse, limit, merge)
         if native is not None:
+            _count("compared")
             if _plant is not None:
                 native = _plant(native)
-            _compare(plan, native, result)
+            _compare(
+                plan,
+                native,
+                result,
+                lambda: _uncached(
+                    self, lambda: stock(self, query, sort_index, reverse, limit, merge)
+                ),
+            )
         return result
     if native is not None:
         return native
@@ -421,8 +505,11 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
         return None, "unsupported", None
     storage = jar.db().storage
     supported = getattr(storage, "catalog_supported", None)
+    throwaway = False
     if supported is None or not supported():
-        return None, "unsupported", None
+        if _installed.get("mode") != "compare" or not _test_storage(storage):
+            return None, "unsupported", None
+        throwaway = True
     start = _start_of(jar)
     if start is None:
         return None, "unsupported", None
@@ -454,18 +541,53 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     if _too_large(plan, overlay):
         return None, "too_large", plan
 
-    try:
-        reply = storage.catalog_query(oid, start, plan, overlay)
-    except (Unsupported, StorageError) as e:
-        # The server stopped serving the extension, as an older server
-        # after a failover, or the connection is lost. The stock search
-        # answers. A plan of another form raises `ValueError`, a fault of
-        # the hook, which goes on.
-        _log_once(e, "catalog_query failed")
-        return None, "unsupported", plan
+    if throwaway:
+        _count("throwaways")
+        reply = _throwaway(storage, oid, start, plan, overlay)
+    else:
+        try:
+            reply = storage.catalog_query(oid, start, plan, overlay)
+        except (Unsupported, StorageError) as e:
+            # The server stopped serving the extension, as an older server
+            # after a failover, or the connection is lost. The stock search
+            # answers. A plan of another form raises `ValueError`, a fault
+            # of the hook, which goes on.
+            _log_once(e, "catalog_query failed")
+            return None, "unsupported", plan
     if "f" in reply:
+        _count("refusals", reply["f"])
         return None, None, plan
     return _result(catalog, reply, jar, start, overlay is None), None, plan
+
+
+def _test_storage(storage):
+    """Tell if `storage` is a test storage: a `DemoStorage` whose chain of
+    bases ends at a storage with KV namespaces, a ZOE storage."""
+    from ZODB.DemoStorage import DemoStorage
+
+    if not isinstance(storage, DemoStorage):
+        return False
+    base = storage
+    while isinstance(base, DemoStorage):
+        base = base.base
+    return zoe.kv._has_namespaces(base)
+
+
+def _throwaway(storage, oid, start, plan, overlay):
+    """Answer the plan from a throwaway mirror of the catalog `oid` of the
+    test storage `storage`, as of the snapshot `start`, with the overlay."""
+    from ZODB.POSException import POSKeyError
+
+    from zoe import _zoe
+
+    def load(oid):
+        try:
+            found = storage.loadBefore(oid, start)
+        except POSKeyError:
+            return None
+        return None if found is None else found[0]
+
+    return _zoe._catalog_throwaway(load, oid, start, plan, overlay)
 
 
 def _log_once(error, what):
@@ -953,10 +1075,9 @@ def _path_clause(index, name, rec):
     }, None
 
 
-def _compare(plan, native, stock):
-    """Log and count a difference between the native and the stock result
-    of a search, with the indexes and the options of the plan and no
-    value."""
+def _differences(native, stock):
+    """The names of the parts of the answer where the native and the stock
+    result of a search differ."""
     differences = []
     if list(native._seq if hasattr(native, "_seq") else []) != _rids(stock):
         differences.append("rids")
@@ -965,9 +1086,43 @@ def _compare(plan, native, stock):
     actual = getattr(stock, "actual_result_count", len(stock))
     if getattr(native, "actual_result_count", len(native)) != actual:
         differences.append("actual_result_count")
+    return differences
+
+
+def _uncached(catalog, run):
+    """Return `run()` with an empty cache of the request for `catalog`, and
+    keep the cache of the request as it was. Without a cache of the
+    request, return None: the stock search had no cache."""
+    from Acquisition import aq_base, aq_get
+    from Products.PluginIndexes.cache import RequestCache
+
+    request = aq_get(catalog, "REQUEST", None)
+    container = request.get("__catalog_cache__") if hasattr(request, "get") else None
+    if container is None:
+        return None
+    key = aq_base(catalog)
+    kept = container.get(key)
+    container[key] = RequestCache()
+    try:
+        return run()
+    finally:
+        if kept is None:
+            container.pop(key, None)
+        else:
+            container[key] = kept
+
+
+def _compare(plan, native, stock, uncached=None):
+    """Log and count a difference between the native and the stock result
+    of a search, with the indexes and the options of the plan and no
+    value. `uncached()` gives the stock result with an empty cache of the
+    request, or None when the search had no such cache: a difference that
+    it does not show comes from the cache of ZCatalog."""
+    differences = _differences(native, stock)
     if not differences:
         return
-    _count("mismatches")
+    again = uncached() if uncached is not None else None
+    cache = again is not None and not _differences(native, again)
     clauses = []
     for clause in plan["c"]:
         options = [
@@ -983,16 +1138,26 @@ def _compare(plan, native, stock):
         ]
         clauses.append(f"{clause['i']}({','.join(options)})")
     sort = [f"{name}:{'desc' if r else 'asc'}" for name, r in plan["s"]]
-    logger.error(
-        "catalog mirror: a mismatch of %s for the clauses %s, the sort %s,"
-        " sort_limit %s, b_start %s, b_size %s",
-        ", ".join(differences),
-        " ".join(clauses) or "none",
-        " ".join(sort) or "none",
-        "set" if plan["l"] is not None else "none",
-        "set" if plan["bs"] else "none",
-        "set" if plan["bz"] is not None else "none",
+    shape = (
+        f"{', '.join(differences)} for the clauses {' '.join(clauses) or 'none'},"
+        f" the sort {' '.join(sort) or 'none'},"
+        f" sort_limit {'set' if plan['l'] is not None else 'none'},"
+        f" b_start {'set' if plan['bs'] else 'none'},"
+        f" b_size {'set' if plan['bz'] is not None else 'none'}"
     )
+    if cache:
+        _count("cache_differences")
+        logger.warning(
+            "catalog mirror: the cache of the request of ZCatalog gives a"
+            " difference of %s; the search without the cache equals the mirror",
+            shape,
+        )
+        return
+    _count("mismatches")
+    with _counts_lock:
+        if len(_mismatched) < _KEPT:
+            _mismatched.append(shape)
+    logger.error("catalog mirror: a mismatch of %s", shape)
 
 
 def _rids(result):

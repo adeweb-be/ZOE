@@ -209,6 +209,10 @@ class Settings:
     server_port: int = 18100
     admin_port: int = 18199
     probe: bool = True
+    # The query log of the catalog: each instance writes one JSON line for
+    # each call of `Catalog.search` (`probe/plonebench_catalog.py`). It
+    # needs the probe.
+    catalog_log: bool = False
     # How the ZEO server syncs a commit on macOS: `plain` keeps stock
     # fsync(2), as `zoe serve` does (ADR 0040); `full` makes os.fsync use
     # F_FULLFSYNC, a stronger sync than the one of `zoe serve`. Linux

@@ -37,6 +37,8 @@ def settings_of(args) -> stack.Settings:
         zope_cpus=tuple(args.zope_cpus.split(";")),
         locust_cpus=args.locust_cpus,
         probe=not args.no_probe,
+        # Only `run` and `campaign` take the switch.
+        catalog_log=getattr(args, "catalog_log", False),
         zeo_fsync=args.zeo_fsync,
         zoe_cache_size=args.zoe_cache_size,
         zoe_compression=args.zoe_compression,
@@ -114,6 +116,12 @@ def add_run(parser: argparse.ArgumentParser) -> None:
         "--trim", type=float, default=5.0, help="seconds left out of each step"
     )
     parser.add_argument("--keep-store", action="store_true")
+    parser.add_argument(
+        "--catalog-log",
+        action="store_true",
+        help="each instance writes the query log of the catalog to "
+        "probe/catalog-instanceN.jsonl of the run",
+    )
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--label", default="")
     add_settings(parser)
