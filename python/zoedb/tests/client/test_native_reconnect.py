@@ -20,7 +20,9 @@ again on the same port and the same store.
   step with `ClientDisconnected`. It never commits on the next connection,
   so it leaves no lock on the server.
 - With `read_only_fallback`, the client opens on a read-only server and
-  takes the writable server when it starts on the other address.
+  takes the writable server when it starts on the other address. A
+  `new_oids` call that loses the read-only listener during the move runs
+  once more on the writable listener.
 - With `wait=False`, the open does not wait for a server, and the first
   load raises `ClientDisconnected`.
 - The client takes `min_disconnect_poll`, `max_disconnect_poll` and
@@ -33,6 +35,7 @@ while the server is down goes through `zoe.Storage` on the store.
 """
 
 import logging
+import threading
 
 import pytest
 from client_support import AdminServer
@@ -316,6 +319,65 @@ def test_read_only_fallback_takes_the_writable_server_when_it_starts(
     writable = serve("writable", address=address)
     wait_for(lambda: not storage.isReadOnly())
     oid = storage.new_oid()
+    tid = commit(storage, [(oid, ZERO, b"written")])
+    check = native(writable.address)
+    assert check.load(oid) == (b"written", tid)
+
+
+class HeldNewOids:
+    """The native client of a storage, with a hold on `new_oids`.
+
+    The first `new_oids` that raises `ClientDisconnected` sets `failed`.
+    It then waits until the client has a listener again, and raises.
+    """
+
+    def __init__(self, native):
+        self.native = native
+        self.failed = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+    def new_oids(self, n):
+        try:
+            return self.native.new_oids(n)
+        except ClientDisconnected:
+            if self.failed.is_set():
+                raise
+            self.failed.set()
+            wait_for(self.native.is_connected, "the writable listener")
+            raise
+
+
+def test_a_new_oids_call_during_the_move_to_the_writable_server_runs_again(
+    tmp_path, serve, native, monkeypatch
+):
+    zoe.Storage(str(tmp_path / "read-only")).close()
+    read_only = serve("read-only", "--read-only")
+    address = free_address()
+    storage = native([read_only.address, address], read_only_fallback=True)
+    assert storage.isReadOnly()
+
+    # The client takes the writable listener only after the DB got the
+    # loss of the read-only listener. The hold of that loss ends when a
+    # `new_oids` call failed without a listener. The call then raises only
+    # after the writable listener is up.
+    held = HeldNewOids(storage._native)
+    monkeypatch.setattr(storage, "_native", held)
+    moving = threading.Event()
+    disconnected = storage.notify_disconnected
+
+    def hold_the_move():
+        disconnected()
+        moving.set()
+        held.failed.wait(TIMEOUT)
+
+    monkeypatch.setattr(storage, "notify_disconnected", hold_the_move)
+
+    writable = serve("writable", address=address)
+    assert moving.wait(TIMEOUT), "the read-only listener stayed"
+    oid = storage.new_oid()
+    assert held.failed.is_set()
     tid = commit(storage, [(oid, ZERO, b"written")])
     check = native(writable.address)
     assert check.load(oid) == (b"written", tid)

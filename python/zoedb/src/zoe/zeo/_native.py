@@ -845,13 +845,21 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
             if self._operational.wait(min(left, 0.1)):
                 time.sleep(min(left, 0.01))
 
-    def _with_server(self, call, timeout=None):
+    def _with_server(self, call, timeout=None, again=False):
         """Return `call()`. Without a server, wait for one as ZEO does and
-        call again. A call that loses its server raises."""
+        call again, once.
+
+        `ClientDisconnected` tells that the call lost its connection. When
+        the client is connected after that, it has a new listener. Give
+        `again` only to a call that writes nothing on the server: such a
+        call runs once more on the new listener. Any other call raises when
+        the client has a new listener, because it can have written on the
+        server.
+        """
         try:
             return call()
         except ClientDisconnected:
-            if self._closed or self._native.is_connected():
+            if self._closed or (not again and self._native.is_connected()):
                 raise
         self._wait(timeout)
         return call()
@@ -1227,7 +1235,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
 
     def load(self, oid, version=""):
         # The current entry of the cache answers, as for ZEO.
-        result = self._with_server(lambda: self._native.load(oid))
+        result = self._with_server(lambda: self._native.load(oid), again=True)
         if result is None:
             raise POSKeyError(oid)
         return result
@@ -1235,17 +1243,19 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
     def loadBefore(self, oid, tid):
         # A connected client calls the native client at once: a hit runs no
         # other frame. Without a server, the load does what `_with_server`
-        # does.
+        # does with `again`.
         try:
             return self._native.load_before(oid, tid)
         except ClientDisconnected:
-            if self._closed or self._native.is_connected():
+            if self._closed:
                 raise
         self._wait()
         return self._native.load_before(oid, tid)
 
     def loadSerial(self, oid, serial):
-        return self._with_server(lambda: self._native.load_serial(oid, serial))
+        return self._with_server(
+            lambda: self._native.load_serial(oid, serial), again=True
+        )
 
     def getTid(self, oid):
         return self.load(oid)[1]
@@ -1256,7 +1266,9 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
             raise ReadOnlyError()
         with self._oids_lock:
             if not self._oids:
-                oids = self._with_server(lambda: self._native.new_oids(_NEW_OIDS))
+                oids = self._with_server(
+                    lambda: self._native.new_oids(_NEW_OIDS), again=True
+                )
                 self._oids = list(reversed(oids))
             return self._oids.pop()
 
@@ -1279,15 +1291,17 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         return self._kv_accepted
 
     def kv_get(self, flavour, name, key):
-        return self._with_server(lambda: self._native.kv_get(flavour, name, key))
+        return self._with_server(
+            lambda: self._native.kv_get(flavour, name, key), again=True
+        )
 
     def kv_scan(self, flavour, name, start=None, stop=None, limit=1000):
         return self._with_server(
-            lambda: self._native.kv_scan(flavour, name, start, stop, limit)
+            lambda: self._native.kv_scan(flavour, name, start, stop, limit), again=True
         )
 
     def kv_generation(self, name):
-        return self._with_server(lambda: self._native.kv_generation(name))
+        return self._with_server(lambda: self._native.kv_generation(name), again=True)
 
     def kv_set(self, flavour, name, key, value, ttl, transaction):
         native = self._check_trans(transaction, "kv_set")
@@ -1313,7 +1327,8 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         server, over the transaction overlay `overlay` when it is given,
         with the arguments and the reply of `zoe.Storage.catalog_query`."""
         return self._with_server(
-            lambda: self._native.catalog_query(catalog, tid, plan, overlay)
+            lambda: self._native.catalog_query(catalog, tid, plan, overlay),
+            again=True,
         )
 
     # The owners of the early write-intent locks of `zodb._IntentOwners`
