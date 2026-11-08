@@ -819,13 +819,15 @@ class TestAStepThatFailsHalfway(TextTests):
             site.portal_setup.runAllImportStepsFromProfile(profile)
             transaction.commit()
 
-    def check(self, kind):
+    def check(self, kind, pending=False):
+        """Check that the indexes of `kind` serve and hold every object.
+        With `pending`, the pending indexes of a failed step are there."""
         with opened(self.db) as site:
             pc = site.portal_catalog
             entries = len(pc._catalog.uids)
-            self.assertFalse(
-                [k for k in pc._catalog.indexes if k.startswith(textindex.PENDING)]
-            )
+            keys = [k for k in pc._catalog.indexes if k.startswith(textindex.PENDING)]
+            expected = [textindex.PENDING + n for n in textindex.TEXT_INDEXES]
+            self.assertEqual(sorted(keys), sorted(expected) if pending else [])
             for name in textindex.TEXT_INDEXES:
                 index = pc._catalog.getIndex(name)
                 self.assertIsInstance(index.aq_base, kind, name)
@@ -835,12 +837,13 @@ class TestAStepThatFailsHalfway(TextTests):
 
     def test_both_steps_resume_after_a_failure(self):
         self.import_failing("profile-zoe.plone:text-uninstall", after=5)
-        # The text index still serves, and the backend still refuses.
-        self.check(textindex.ZoeTextIndex)
+        # The text index still serves, and the batches before the failure
+        # are committed in the pending indexes.
+        self.check(textindex.ZoeTextIndex, pending=True)
         self.import_again("profile-zoe.plone:text-uninstall")
         self.check(ZCTextIndex)
         self.import_failing("profile-zoe.plone:text", after=5)
-        self.check(ZCTextIndex)
+        self.check(ZCTextIndex, pending=True)
         self.import_again("profile-zoe.plone:text")
         wait_text(self.storage, self.key)
         self.check(textindex.ZoeTextIndex)
