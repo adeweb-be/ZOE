@@ -289,14 +289,17 @@ def run(app, out, synthetic=False, opaque=False):
     """Run the check. Return the report."""
     import transaction
     from AccessControl.SecurityManagement import newSecurityManager
-    from AccessControl.SpecialUsers import system
+    from AccessControl.users import UnrestrictedUser
     from zoe.plone import catalog, security
     from zope.component.hooks import setSite
 
-    newSecurityManager(None, system)
+    # A Manager, so that the guards of the workflow let the transitions run.
+    user = UnrestrictedUser("security-check", "", ["Manager"], [])
+    newSecurityManager(None, user.__of__(app.acl_users))
     if synthetic:
         build_synthetic(app)
         members = ["member-000", "member-001"]
+        newSecurityManager(None, user.__of__(app.acl_users))
     else:
         members = []
     site = app[SITE_ID]
