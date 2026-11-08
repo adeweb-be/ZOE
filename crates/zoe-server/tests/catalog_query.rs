@@ -615,7 +615,7 @@ fn a_plan_that_does_not_decode_gets_value_error_and_an_unknown_kind_gets_plan() 
     // The connection stays open.
     assert_eq!(conn.call("ping", vec![]).unwrap(), Value::Nil);
     let text = plan(map(vec![
-        ("k", s("t")),
+        ("k", s("x-unknown")),
         ("i", s("SearchableText")),
         ("q", s("word")),
     ]));

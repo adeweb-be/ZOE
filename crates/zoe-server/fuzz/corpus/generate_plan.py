@@ -148,7 +148,7 @@ SEEDS = {
             )
         ]
     ),
-    "unknown-kind": plan([{"k": "o", "i": "getObjPositionInParent", "q": [1]}]),
+    "unknown-kind": plan([{"k": "x-unknown", "i": "getObjPositionInParent", "q": [1]}]),
     "unknown-key": {**plan([keys("getId", ["a"])]), "o": [["getId", 1]]},
     "malformed": {"c": "not a list"},
     "empty": plan([]),
