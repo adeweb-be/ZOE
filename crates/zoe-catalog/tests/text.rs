@@ -1734,7 +1734,24 @@ fn a_commit_checks_the_cap_before_it_writes_and_a_query_waits_below_the_watermar
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (checked, on_check) = mpsc::channel();
     let gate = Gate::default();
-    let (builds, hooks) = passed_cap_hooks(&site.store, Tid(t2), &armed, checked, &gate);
+    // A failed assertion opens the gate, so the thread of the index ends
+    // and the test fails in place of a hang.
+    let _open = ReleaseOnDrop(gate.clone());
+    let (builds, mut hooks) = passed_cap_hooks(&site.store, Tid(t2), &armed, checked, &gate);
+    // At the start of the rebuild, the payload on disk still gives the tid
+    // of the index before the lost cap: the commit wrote nothing.
+    let on_disk = Arc::new(Mutex::new(None));
+    let (seen, dir, count) = (
+        Arc::clone(&on_disk),
+        site.text_dir(),
+        hooks.before_text_build.take(),
+    );
+    hooks.before_text_build = Some(Arc::new(move |catalog| {
+        *seen.lock().unwrap() = Some(payload_tid(&dir));
+        if let Some(count) = &count {
+            count(catalog);
+        }
+    }));
     site.restart_at(hooks, t1);
     site.ready_at(t1);
     assert_eq!(builds.load(Ordering::SeqCst), 0);
@@ -1756,7 +1773,35 @@ fn a_commit_checks_the_cap_before_it_writes_and_a_query_waits_below_the_watermar
     gate.release();
     site.ready_at(t3);
     assert_eq!(builds.load(Ordering::SeqCst), 1);
+    let found = on_disk
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the rebuild reads the payload");
+    assert_eq!(
+        found,
+        Some(t1),
+        "the payload before the rebuild, t3 is {t3:#x}"
+    );
     assert_eq!(site.rids(site.now(), &q), BTreeSet::from([2, 3]));
+}
+
+/// Open the gate at the drop.
+struct ReleaseOnDrop(Gate);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// The tid of the payload of the last commit of the index in `dir`, or
+/// `None` when it does not read.
+fn payload_tid(dir: &Path) -> Option<u64> {
+    let meta: Json =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).ok()?).ok()?;
+    let payload = meta.get("payload")?.as_str()?;
+    zoe_catalog::text::index::read_payload(payload).map(|(tid, _)| tid)
 }
 
 #[test]
