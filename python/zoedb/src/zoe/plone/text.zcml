@@ -1,0 +1,39 @@
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:genericsetup="http://namespaces.zope.org/genericsetup"
+    xmlns:zcml="http://namespaces.zope.org/zcml"
+    >
+
+  <!-- The text index of zoe.plone (ADR 0060): the index class
+       ZoeTextIndex with its meta type, and its two profiles.
+       ZoeTextIndex needs the backend catalog in each instance and a
+       storage with the extension text. configure.zcml includes this
+       file. -->
+  <include
+      package="z3c.zcmlhook"
+      file="meta.zcml"
+      />
+  <include
+      package="Products.GenericSetup"
+      file="meta.zcml"
+      />
+  <zcml:customAction handler=".register_text_index" />
+
+  <genericsetup:registerProfile
+      name="text"
+      title="ZOE text index"
+      directory="profiles/text"
+      description="Replaces the ZCTextIndex indexes SearchableText, Title and Description of portal_catalog with ZoeTextIndex indexes of the same ids, then indexes the catalog in batches. It needs the backend catalog of zoe.plone and a storage with the extension text."
+      provides="Products.GenericSetup.interfaces.EXTENSION"
+      post_handler=".textindex.install_text"
+      />
+  <genericsetup:registerProfile
+      name="text-uninstall"
+      title="ZOE text index (uninstall)"
+      directory="profiles/text-uninstall"
+      description="Stages a clear delta for each ZoeTextIndex of portal_catalog, puts ZCTextIndex indexes with the same attributes and lexicons back, and reindexes them."
+      provides="Products.GenericSetup.interfaces.EXTENSION"
+      post_handler=".textindex.uninstall_text"
+      />
+
+</configure>

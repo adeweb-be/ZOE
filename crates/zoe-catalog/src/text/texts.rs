@@ -108,6 +108,10 @@ struct Entry {
     held: Option<u64>,
     /// When the open or the rebuild began.
     since: Instant,
+    /// True when no index serves the catalog: its settings name no text
+    /// index in the enhanced mode, or do not parse. Such an entry has no
+    /// lag.
+    indexless: bool,
 }
 
 struct Inner {
@@ -323,11 +327,15 @@ impl Texts {
     /// The counts of the text indexes. The lag of an index is the age of
     /// the oldest commit after its tid that it did not apply yet, also while
     /// it opens or rebuilds; an index that holds no tid yet counts from the
-    /// start of its open or its rebuild.
+    /// start of its open or its rebuild. A catalog that no index serves has
+    /// no lag.
     pub fn counts(&self) -> Vec<TextCounts> {
         let inner = self.shared.lock();
         let now = unix_now();
         let lag = |e: &Entry| -> f64 {
+            if e.indexless {
+                return 0.0;
+            }
             let held = e.snap.as_ref().map(|s| s.tid).or(e.held);
             match held {
                 Some(held) => inner
@@ -594,6 +602,7 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
                     settings: s,
                     held: None,
                     since: Instant::now(),
+                    indexless: true,
                 };
                 inner.entries.insert(catalog, entry);
                 lives.remove(&catalog);
@@ -607,6 +616,7 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
                     settings: CatalogSettings::default(),
                     held: None,
                     since: Instant::now(),
+                    indexless: true,
                 };
                 inner.entries.insert(catalog, entry);
                 lives.remove(&catalog);
@@ -643,6 +653,7 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
                         settings,
                         held: None,
                         since: Instant::now(),
+                        indexless: false,
                     },
                 );
             }

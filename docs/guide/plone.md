@@ -116,11 +116,19 @@ transaction.commit()
 
 `registry.move_back(site.portal_registry)` and a commit give the records back to the registry, with nothing lost. Move the registry back before you leave ZOE, before you copy the site, and before you delete it.
 
+### The text index
+
+`ZoeTextIndex` answers the text searches of `SearchableText`, `Title` and `Description` from the native text index of the store, with stemming in the language of the site, accent folding, phrases, prefixes and the boosts `Title^3` and `Description^1.5`. A save writes the texts of the object as text deltas, and no tree of a text index. It needs the backend `catalog` in each instance (`ZOE_PLONE_BACKENDS catalog`), and `zoe.Storage` or `zoe.zeo.ClientStorage` with `native on`. On a stock ZEO client or FileStorage, each save and each search of the index fails with `Unsupported`.
+
+Import the profile `zoe.plone:text`, "ZOE text index", on each site. It replaces the three ZCTextIndex indexes with `ZoeTextIndex` indexes, then indexes the catalog in batches of 1,000 objects, one commit each. It refuses an instance without the backend `catalog` and a storage without text, and changes nothing. The query syntax stays that of ZCTextIndex: `AND`, `OR`, `NOT`, quoted phrases, `*` and `?`. The search form of Plone puts `*` after the last word, so `running` also finds the other words of the stem `run`, such as `runway`.
+
+To go back, import the profile `zoe.plone:text-uninstall`. It puts the ZCTextIndex indexes back and indexes them again. The backend `catalog` refuses its uninstall while a site holds a `ZoeTextIndex`.
+
 ## Uninstall
 
 A client without `zoedb` cannot read the classes of `zoe.plone`. It loads the properties of the members and groups, and the workflow histories of the types with the behaviour, as broken objects. So remove `zoe.plone` in this order:
 
-1. On each site, move each registry back with `registry.move_back`, and commit.
+1. On each site, move each registry back with `registry.move_back`, and commit. With `ZoeTextIndex`, import the profile `zoe.plone:text-uninstall`.
 2. With `indexing`, let the indexer empty the queue: `pending` of `@@zoe-indexing` is 0.
 3. On each site, import the profile `zoe.plone:uninstall`, "ZOE (uninstall)". It removes the behaviour from the types, gives each workflow history back as a `PersistentMapping`, gives the properties back as dicts, and switches off the merges that the profile turned on.
 4. Pack the store with garbage collection, at a time after the uninstall (see [Pack](pack.md)). The pack removes the old records of the classes of `zoe.plone`.

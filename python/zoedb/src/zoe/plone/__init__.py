@@ -16,11 +16,46 @@ lets the records of a registry move to a durable namespace (`registry`),
 store (`catalog`), and `security.zcml` keeps `allowedRolesAndUsers` as
 inherited inputs, so a share or a transition of a folder writes the entry
 of the folder alone (`security`).
+
+`text.zcml`, which `configure.zcml` includes, registers the index class
+`ZoeTextIndex` of `textindex` (`register_text_index`) and the profiles
+`zoe.plone:text` and `zoe.plone:text-uninstall`. `ZoeTextIndex` needs the
+backend `catalog`.
 """
 
 import os
 
-__all__ = ["backends_from_environment"]
+__all__ = ["backends_from_environment", "register_text_index"]
+
+# The meta type of the text index.
+_TEXT_META_TYPE = "ZoeTextIndex"
+
+
+def register_text_index():
+    """Register the index class `ZoeTextIndex` with its meta type, so
+    `ZCatalog.addIndex` and `catalog.xml` can add it. A second call does
+    nothing."""
+    import Products
+    from zope.interface import implementedBy
+
+    from zoe.plone.textindex import ZoeTextIndex
+
+    entries = getattr(Products, "meta_types", ())
+    if any(entry.get("name") == _TEXT_META_TYPE for entry in entries):
+        return
+    Products.meta_types = (
+        *entries,
+        {
+            "name": _TEXT_META_TYPE,
+            "action": "",
+            "product": "zoe.plone",
+            "permission": "Add Pluggable Index",
+            "visibility": None,
+            "interfaces": tuple(implementedBy(ZoeTextIndex)),
+            "instance": ZoeTextIndex,
+            "container_filter": None,
+        },
+    )
 
 
 def backends_from_environment():

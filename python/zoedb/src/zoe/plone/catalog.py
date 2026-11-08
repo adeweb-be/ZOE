@@ -153,6 +153,8 @@ _CLAUSES = {
     "Products.ExtendedPathIndex.ExtendedPathIndex.ExtendedPathIndex": "p",
     # The security index of `zoe.plone` (ADR 0061): a clause of tokens.
     "zoe.plone.security.ZoeSecurityIndex": "v",
+    # The text index of `zoe.plone` (ADR 0060): the text clause.
+    "zoe.plone.textindex.ZoeTextIndex": "t",
 }
 _SORTS = {
     f"{_PLUGIN_INDEXES}.FieldIndex.FieldIndex.FieldIndex",
@@ -165,6 +167,10 @@ _installed = {}
 
 # The root database of the process, from `IDatabaseOpenedWithRoot`.
 _root = {}
+
+# The stock `Catalog.addIndex` and `Catalog.delIndex`, from the first
+# `install()`.
+_stock_methods = {}
 
 # The counts of this process: `("queries", path)`, `("fallbacks", reason)`
 # for the reasons that the hook decides, `("refusals", reason)` for the
@@ -236,8 +242,18 @@ def install():
     from Products.ZCatalog.Catalog import Catalog
 
     current = mode()
-    _installed.update(stock=Catalog.search, mode=current, code=_code(Catalog))
+    _installed.update(
+        stock=Catalog.search,
+        mode=current,
+        code=_code(Catalog),
+        addIndex=Catalog.addIndex,
+        delIndex=Catalog.delIndex,
+    )
+    # The stock methods stay here after `uninstall()`, for a call in flight.
+    _stock_methods.update(addIndex=Catalog.addIndex, delIndex=Catalog.delIndex)
     Catalog.search = _search
+    Catalog.addIndex = _add_index
+    Catalog.delIndex = _del_index
     path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
     if path and not _counts_file:
         _counts_file["path"] = path
@@ -295,18 +311,71 @@ def _unchecked(catalog):
 def uninstall():
     """Give the stock search back, then remove, in a transaction of its own,
     the registration keys of each database that the process has open. A
-    second call does nothing."""
+    second call does nothing. While a catalog of the databases that the
+    process has open holds a `ZoeTextIndex`, raise `Unsupported` and change
+    nothing: the profile step `zoe.plone:text-uninstall` puts ZCTextIndex
+    back first."""
     if not _installed:
         return
     from Products.ZCatalog.Catalog import Catalog
+    from ZODB.POSException import Unsupported
 
+    held = _text_index_held()
+    if held:
+        raise Unsupported(
+            f"the catalog of {held} holds a ZoeTextIndex: import the profile"
+            " zoe.plone:text-uninstall before the uninstall of the backend"
+        )
     Catalog.search = _installed["stock"]
+    Catalog.addIndex = _installed["addIndex"]
+    Catalog.delIndex = _installed["delIndex"]
     _installed.clear()
     db = _root.get("db")
     if db is None:
         return
     for each in _databases(db):
         _write_keys(each, set())
+
+
+def _text_index_held():
+    """The oid of a catalog of a site of the databases that the process has
+    open that holds a `ZoeTextIndex`, as a text, or None."""
+    db = _root.get("db")
+    if db is None:
+        return None
+    for catalog in _catalogs(db):
+        for index in catalog.indexes.values():
+            if _class_of(index) == _TEXT:
+                return f"the oid {catalog._p_oid.hex()}"
+    return None
+
+
+# The class of the text index of `zoe.plone`.
+_TEXT = "zoe.plone.textindex.ZoeTextIndex"
+
+
+def _add_index(self, name, index_type):
+    """`Catalog.addIndex`, which also writes the settings of a
+    `ZoeTextIndex` in `zoe.text` before the commit."""
+    _stock_methods["addIndex"](self, name, index_type)
+    if _class_of(self.indexes[name]) == _TEXT:
+        from zoe.plone.textindex import settings_changed
+
+        settings_changed(self)
+
+
+def _del_index(self, name):
+    """`Catalog.delIndex`, which first stages a clear delta of a
+    `ZoeTextIndex`, so an index added again with the same id starts empty,
+    and writes the settings in `zoe.text` before the commit."""
+    text = name in self.indexes and _class_of(self.indexes[name]) == _TEXT
+    if text:
+        self.getIndex(name).clear()
+    _stock_methods["delIndex"](self, name)
+    if text:
+        from zoe.plone.textindex import settings_changed
+
+        settings_changed(self)
 
 
 def database_opened(event):
@@ -606,7 +675,14 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     plan, reason = plan_of(catalog, query, sort_index, reverse, limit, merge)
     if plan is None:
         return None, reason, None
+    text = any(c["k"] == "t" for c in plan["c"])
+    if throwaway and text:
+        # A throwaway mirror has no text index.
+        return None, "unsupported", plan
+    shift = _shift(plan) if text else 0
     from ZODB.POSException import ConflictError, POSKeyError, StorageError, Unsupported
+
+    from zoe.storage import Unavailable
 
     overlay = None
     if jar._registered_objects or _savepoint_records(jar):
@@ -637,6 +713,10 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     else:
         try:
             reply = storage.catalog_query(oid, start, plan, overlay)
+        except Unavailable:
+            # The text index of the catalog cannot answer: the Python path
+            # cannot either.
+            raise
         except (Unsupported, StorageError) as e:
             # The server stopped serving the extension, as an older server
             # after a failover, or the connection is lost. The stock search
@@ -654,7 +734,40 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
             # The text names oids and records, never a value of a query.
             _count("refused", why[:200])
         return None, None, plan
+    if shift:
+        reply = _unshift(reply, shift)
     return _result(catalog, reply, jar, start, overlay is None), None, plan
+
+
+def _shift(plan):
+    """For a plan with a text clause and no sort, ask the hits from the
+    first one: the score of the first hit gives the normalized scores, as
+    `Catalog.search` computes them. Return `b_start`, which the reply skips
+    in the client, or 0."""
+    size = plan["bz"] if plan["bz"] is not None else (plan["l"] or None)
+    start = plan["bs"]
+    if plan["s"] or not start or size is None:
+        return 0
+    plan["bs"], plan["bz"] = 0, start + size
+    if plan["cols"]:
+        page = max(1, _CELLS // max(1, len(plan["cols"])))
+        plan["rn"] = max(0, min(start + size, page))
+    return start
+
+
+def _unshift(reply, shift):
+    """The reply of a shifted plan, with the first `shift` hits out of it,
+    but the score of the first hit kept in `max`."""
+    out = dict(reply)
+    scores = list(reply.get("sc") or [])
+    out["max"] = scores[0] if scores else None
+    out["r"] = list(reply["r"])[shift:]
+    out["sc"] = scores[shift:]
+    out["n"] = len(out["r"])
+    for name in ("rows", "paths"):
+        if reply.get(name) is not None:
+            out[name] = list(reply[name])[shift:]
+    return out
 
 
 def _test_storage(storage):
@@ -884,13 +997,35 @@ def _savepoint_records(jar):
 
 def _result(catalog, reply, jar, start, rows=True):
     """The lazy result of a reply, as ZCatalog gives it. Without `rows`,
-    each brain comes from `Catalog.__getitem__`."""
+    each brain comes from `Catalog.__getitem__`.
+
+    A reply with scores (`sc`) gives the result of `Catalog.search` for a
+    text index and no sort: a `LazyMap` of `(score, rid)` pairs, whose
+    brains hold the score and the normalized score, `100 * score / max`
+    with `max` the score of the first hit."""
     from ZTUtils.Lazy import LazyCat, LazyMap
 
     if not reply["r"] and not reply["a"]:
         return LazyCat([])
+    brain = _brains(catalog, reply, jar, start) if rows else None
+    scores = reply.get("sc")
+    if scores is not None:
+        seq = list(zip(scores, reply["r"], strict=True))
+        top = reply.get("max", scores[0] if scores else None)
+        top = float(top) if top is not None else 1.0
+
+        def scored(item):
+            score, rid = item
+            norm = int(100.0 * score / top)
+            if brain is not None:
+                return brain(rid, (score, norm))
+            return catalog.instantiate(
+                (rid, catalog.data[rid]), score_data=(score, norm)
+            )
+
+        return LazyMap(scored, seq, reply["n"], actual_result_count=reply["a"])
     return LazyMap(
-        _brains(catalog, reply, jar, start) if rows else catalog.__getitem__,
+        brain or catalog.__getitem__,
         list(reply["r"]),
         reply["n"],
         actual_result_count=reply["a"],
@@ -912,8 +1047,14 @@ def _brains(catalog, reply, jar, start):
 
     rows = reply.get("rows")
     paths = reply.get("paths")
+
+    def stock(rid, score=None):
+        if score is None:
+            return catalog.__getitem__(rid)
+        return catalog.instantiate((rid, catalog.data[rid]), score_data=score)
+
     if not rows or not paths:
-        return catalog.__getitem__
+        return stock
     rids = reply["r"]
     places = {}
 
@@ -930,19 +1071,19 @@ def _brains(catalog, reply, jar, start):
             or _start_of(jar) != start
         )
 
-    def brain(rid):
+    def brain(rid, score=None):
         k = place(rid)
         if k is None or paths[k] is None or moved():
-            return catalog.__getitem__(rid)
+            return stock(rid, score)
         row = rows[k]
         klass = catalog._v_result_class
         # The fast path of `instantiate`: one value for each column, then
         # the rid and the two scores.
         if row is None or len(row) + 3 != len(klass.__record_schema__):
-            return catalog.__getitem__(rid)
+            return stock(rid, score)
         path = paths[k]
         catalog._maintain_zodb_cache()
-        record = klass(row + (rid, 1, 1))
+        record = klass(row + (rid, *(score or (1, 1))))
         # A brain takes no attribute outside its schema, but keeps a dict:
         # the path of the reply shadows `getPath`, which reads `paths`.
         record.__dict__["getPath"] = lambda: path
@@ -1009,6 +1150,24 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
         except Exception:
             return None, "option"
         if rec.keys is None:
+            continue
+        if kind == "t":
+            if any(c["k"] == "t" for c in clauses):
+                # A plan holds one text clause at most.
+                return None, "index"
+            text = " ".join(rec.keys)
+            if not text:
+                # `query_index` gives None: the stock search gives no row.
+                return None, "option"
+            from zoe.plone.textindex import _query_languages
+
+            try:
+                clauses.append(index._plan_clause(text, _query_languages(made)))
+            except Exception:
+                # A query that the parser refuses, a storage without the
+                # extension text, or staged texts past the cap: the stock
+                # search raises as `query_index` does.
+                return None, "option"
             continue
         if kind == "b":
             # `BooleanIndex.query_index` reads the truth of the first key.

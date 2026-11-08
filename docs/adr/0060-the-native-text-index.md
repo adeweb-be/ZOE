@@ -181,7 +181,7 @@ A storage without the write path: a stock ZEO client, the asyncio mode of `zoe.z
 - A query on a test storage goes to its base, a ZOE storage with the extension `text`, in the process or behind a server, at the last tid of the base. The client sends the texts of each `DemoStorage` of the stack, then the staged texts of the transaction, as the staged texts of the clause (section 12).
 - On a test storage, the clause carries the settings of the index (`mode`, `language` and the boosts): the base cannot read the namespace `zoe.text` of the overlay of `zoe.kv`.
 - The clause lists the index in `cl` when the base holds no record of the catalog, when the base has no text index for the catalog, and when a `DemoStorage` holds a clear delta of the index. The base has no text index for the catalog when its registration key or its settings are only in the overlay of `zoe.kv`. The base then answers from the staged texts alone, with the settings of the clause. A site that a test layer creates is such a catalog.
-- So the base gives the statistics and the scores, in the process or in the reply of the server. The test storage holds no text index. With a base in the process, the text index of the base is in the process, as N1 decided.
+- So the base gives the statistics and the scores, in the process or in the reply of the server. The test storage holds no text index. With a base in the process, the text index of the base is in the process.
 - The Plone suites run on an empty `zoe.Storage` base. There each query runs on the text overlay alone, not on tantivy. So the replay of section 11 runs on a ZOE store.
 - A test storage whose texts pass the cap of a call (section 12) fails its searches with `Unavailable`.
 
