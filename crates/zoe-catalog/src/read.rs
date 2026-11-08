@@ -348,10 +348,26 @@ pub struct WalkStats {
     pub bytes: usize,
 }
 
+/// Why a walk failed: the record that it refused, when one is known, and
+/// the reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failed {
+    /// The oid of the refused record.
+    pub oid: Option<u64>,
+    /// The reason, with the oid.
+    pub why: String,
+}
+
+impl From<Failed> for String {
+    fn from(failed: Failed) -> String {
+        failed.why
+    }
+}
+
 struct Queue {
     todo: Vec<u64>,
     busy: usize,
-    failed: Option<String>,
+    failed: Option<Failed>,
 }
 
 /// Walks the tree at `root` as of before `tid` with `threads` threads, as
@@ -363,7 +379,7 @@ pub fn walk_tree<W, M, F>(
     threads: usize,
     make: M,
     each: F,
-) -> Result<(TreeShape, Vec<W>, WalkStats), String>
+) -> Result<(TreeShape, Vec<W>, WalkStats), Failed>
 where
     W: Send,
     M: Fn() -> W + Sync,
@@ -377,7 +393,7 @@ where
 /// for the items of each bucket that it reads. `reader` decodes the
 /// records and reads the values. Returns the shape of the tree, the state
 /// of each thread and what the walk read. A record that does not decode,
-/// or that `each` refuses, fails the walk.
+/// or that `each` refuses, fails the walk, with the oid of the record.
 pub fn walk_tree_with<W, M, F>(
     reads: &dyn Reads,
     tid: u64,
@@ -386,7 +402,7 @@ pub fn walk_tree_with<W, M, F>(
     reader: Reader,
     make: M,
     each: F,
-) -> Result<(TreeShape, Vec<W>, WalkStats), String>
+) -> Result<(TreeShape, Vec<W>, WalkStats), Failed>
 where
     W: Send,
     M: Fn() -> W + Sync,
@@ -461,7 +477,10 @@ where
                         match result {
                             Ok(children) => q.todo.extend(children),
                             Err(e) => {
-                                q.failed.get_or_insert(format!("oid {oid:#x}: {e}"));
+                                q.failed.get_or_insert(Failed {
+                                    oid: Some(oid),
+                                    why: format!("oid {oid:#x}: {e}"),
+                                });
                             }
                         }
                         ready.notify_all();
@@ -474,7 +493,10 @@ where
             .map(|h| h.join())
             .collect::<Result<Vec<W>, _>>()
     });
-    let states = states.map_err(|_| "a thread of the walk panicked".to_owned())?;
+    let states = states.map_err(|_| Failed {
+        oid: None,
+        why: "a thread of the walk panicked".to_owned(),
+    })?;
     let q = queue.into_inner().unwrap_or_else(PoisonError::into_inner);
     if let Some(e) = q.failed {
         return Err(e);

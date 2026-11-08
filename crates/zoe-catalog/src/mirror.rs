@@ -28,8 +28,9 @@ use crate::change::{ChangeSet, Overrides, Slot};
 use crate::table;
 use crate::value::Val;
 
-/// The versions of a mirror that queries read.
-#[derive(Debug)]
+/// The versions of a mirror that queries read. A clone shares the base and
+/// the change sets.
+#[derive(Clone, Debug)]
 pub struct Versions {
     /// The base.
     pub base: Arc<Base>,

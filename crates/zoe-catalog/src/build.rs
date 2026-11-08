@@ -20,7 +20,9 @@ use crate::base::{
     PathIndex, Rows, date_range_of, rid_of,
 };
 use crate::change::{Owner, Shapes, Slot};
-use crate::read::{RECORDS, Reads, Record, TreeShape, oid_of, walk_tree, walk_tree_with};
+use crate::read::{
+    RECORDS, Reads, Record, TreeShape, WalkStats, oid_of, walk_tree, walk_tree_with,
+};
 use crate::security::SecurityIndex;
 use crate::table::{Table, TablePart};
 use crate::value::{StrArena, Val};
@@ -47,7 +49,7 @@ pub struct Built {
 }
 
 /// The values of an `_unindex` tree as a build collects them.
-enum Part {
+pub(crate) enum Part {
     /// The keys and their rows: one pair for each key of a row.
     Pairs(Pairs),
     /// The bounds of each row of a DateRangeIndex.
@@ -123,29 +125,22 @@ pub enum BuildError {
     Dropped,
 }
 
-/// Builds the base of the catalog at `catalog` as of `tid`, with
-/// `threads` threads. The base holds each commit up to `tid`. `room` tells
-/// if the bound has room for a build that holds the given bytes; when it
-/// has none, the build stops with `Dropped`.
-pub fn build(
-    reads: &dyn Reads,
-    catalog: u64,
-    tid: u64,
-    threads: usize,
-    room: &(dyn Fn(usize) -> bool + Sync),
-) -> Result<Built, BuildError> {
-    let started = Instant::now();
-    let before = tid.saturating_add(1);
+/// What the record of the catalog object gives the mirror.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogMeta {
+    /// The oids of `paths`, `uids` and `data`.
+    pub trees: CatalogTrees,
+    /// The position of each column, as `schema_of` gives it.
+    pub schema: HashMap<String, usize>,
+    /// The id of each index, in ascending order, with the oid of its
+    /// object; `None` for an index that is not a persistent object.
+    pub indexes: Vec<(String, Option<u64>)>,
+}
+
+/// Reads the record `bytes` of the catalog object `catalog`.
+pub fn catalog_meta(catalog: u64, bytes: &[u8]) -> Result<CatalogMeta, BuildError> {
     let refused = |what: &str, e: String| BuildError::Refused(format!("{what}: {e}"));
-    let load = |oid: u64| -> Result<Vec<u8>, String> {
-        reads
-            .load_before(oid, before)?
-            .ok_or_else(|| format!("no record {oid:#x}"))
-    };
-    let mut read_records = 1usize;
-    let catalog_bytes = load(catalog).map_err(|e| refused("the catalog", e))?;
-    let mut read_bytes = catalog_bytes.len();
-    let record = Record::decode(&catalog_bytes).map_err(|e| refused("the catalog", e.0))?;
+    let record = Record::decode(bytes).map_err(|e| refused("the catalog", e.0))?;
     if !record.is(CATALOG.0, CATALOG.1) {
         return Err(BuildError::Refused(format!(
             "{catalog:#x} is a {}.{}, not a Catalog",
@@ -164,8 +159,7 @@ pub fn build(
             .ok_or_else(|| BuildError::Refused("the catalog has no data".into()))?,
     };
     let schema = schema_of(&record);
-    let names: Vec<(String, Value)> = match record.attr("indexes").and_then(|v| record.heap.dict(v))
-    {
+    let indexes = match record.attr("indexes").and_then(|v| record.heap.dict(v)) {
         Some(items) => {
             let mut names = Vec::new();
             for (k, v) in items {
@@ -173,7 +167,7 @@ pub fn build(
                     .heap
                     .str(*k)
                     .ok_or_else(|| BuildError::Refused("an index without a str id".into()))?;
-                names.push((name.to_owned(), *v));
+                names.push((name.to_owned(), oid_of(&record.heap, *v)));
             }
             names.sort_by(|a, b| a.0.cmp(&b.0));
             names
@@ -184,6 +178,310 @@ pub fn build(
             ));
         }
     };
+    Ok(CatalogMeta {
+        trees,
+        schema,
+        indexes,
+    })
+}
+
+/// One index as a build reads it, before its structure builds.
+pub(crate) struct ReadIndex {
+    /// The entry, with `Index::Unavailable` until the structure builds.
+    pub entry: IndexEntry,
+    /// The values of its tree, the shape of the tree and the pickle of the
+    /// index object, when the mirror serves the index and its records read.
+    pub found: Option<(Part, TreeShape, Vec<u8>)>,
+    /// `_depth` and `multi_valued` of an ExtendedPathIndex.
+    pub path_record: (i64, bool),
+    /// The oids whose new record can make an unavailable index available:
+    /// the index object, and the record that the read refused.
+    pub watch: Vec<u64>,
+    /// The records and the bytes that the read read.
+    pub stats: WalkStats,
+}
+
+impl ReadIndex {
+    /// The transient bytes of the build of its structure.
+    pub fn transient(&self) -> usize {
+        let Some((part, shape, _)) = &self.found else {
+            return 0;
+        };
+        let mut bytes = part.heap_bytes() + shape.heap_bytes();
+        match (self.entry.kind, part) {
+            (Some(Kind::Keyword), Part::Pairs(pairs)) => bytes += KeywordIndex::build_bytes(pairs),
+            (_, Part::Paths(texts, items)) => bytes += PathIndex::build_bytes(texts, items),
+            _ => {}
+        }
+        bytes
+    }
+}
+
+/// Reads the index `name`, whose object is at `oid`, as of before
+/// `before`, over the rows `rows`.
+pub(crate) fn read_index(
+    reads: &dyn Reads,
+    before: u64,
+    name: &str,
+    oid: Option<u64>,
+    rows: &Rows,
+    threads: usize,
+) -> ReadIndex {
+    let mut read = ReadIndex {
+        entry: IndexEntry {
+            name: name.to_owned(),
+            class: String::new(),
+            kind: None,
+            oid: oid.unwrap_or(0),
+            tree: None,
+            length_oid: None,
+            length: -1,
+            index: Index::Unavailable(String::new()),
+        },
+        found: None,
+        path_record: (0, false),
+        watch: Vec::new(),
+        stats: WalkStats::default(),
+    };
+    let Some(oid) = oid else {
+        read.entry.index = Index::Unavailable("the index is not a persistent object".into());
+        return read;
+    };
+    let load = |oid: u64| -> Result<Vec<u8>, String> {
+        reads
+            .load_before(oid, before)?
+            .ok_or_else(|| format!("no record {oid:#x}"))
+    };
+    let mut watch = vec![oid];
+    let mut stats = WalkStats::default();
+    let entry = &mut read.entry;
+    let path_record = &mut read.path_record;
+    let result = (|| -> Result<Option<(Part, TreeShape, Vec<u8>)>, String> {
+        let bytes = load(oid)?;
+        stats.records += 1;
+        stats.bytes += bytes.len();
+        let index_record = Record::decode(&bytes).map_err(|e| e.0)?;
+        entry.class = format!("{}.{}", index_record.module, index_record.name);
+        entry.kind = Kind::of(&index_record.module, &index_record.name);
+        let Some(kind) = entry.kind else {
+            return Ok(None);
+        };
+        if kind == Kind::Path {
+            *path_record = path_meta(&index_record)?;
+        }
+        let make = || match kind {
+            Kind::DateRange => Part::Ranges(Vec::new()),
+            Kind::Path => Part::Paths(StrArena::default(), Vec::new()),
+            Kind::Security => Part::Inputs(Vec::new()),
+            _ => Part::Pairs(Pairs::Empty),
+        };
+        let tree = index_record
+            .attr_oid(kind.tree())
+            .ok_or_else(|| format!("no {}", kind.tree()))?;
+        let length_oid = index_record.attr_oid("_length").ok_or("no _length")?;
+        entry.tree = Some(tree);
+        entry.length_oid = Some(length_oid);
+        // A `_length` that does not read is the refused record.
+        watch.push(length_oid);
+        let length = load(length_oid)?;
+        stats.records += 1;
+        stats.bytes += length.len();
+        entry.length = Record::decode(&length)
+            .map_err(|e| e.0)?
+            .int_state()
+            .ok_or("a _length that is not an int")?;
+        watch.pop();
+        let walked = walk_tree(
+            reads,
+            before,
+            tree,
+            threads,
+            make,
+            |part: &mut Part, items| {
+                for (rid, value) in items {
+                    let rid = rid_of(&rid)?;
+                    let row = rows
+                        .row(rid)
+                        .ok_or_else(|| format!("the rid {rid} is not in paths"))?;
+                    part.push(kind, value, row)?;
+                }
+                Ok(())
+            },
+        );
+        let (shape, parts, walk_stats) = match walked {
+            Ok(found) => found,
+            Err(failed) => {
+                watch.extend(failed.oid);
+                return Err(failed.why);
+            }
+        };
+        stats.records += walk_stats.records;
+        stats.bytes += walk_stats.bytes;
+        let mut all = make();
+        for part in parts {
+            all.append(part);
+        }
+        Ok(Some((all, shape, bytes)))
+    })();
+    read.stats = stats;
+    match result {
+        Ok(None) => {
+            read.entry.index =
+                Index::Unavailable(format!("the class {} is not mirrored", read.entry.class));
+        }
+        Err(e) => {
+            read.entry.index = Index::Unavailable(e);
+            watch.sort_unstable();
+            watch.dedup();
+            read.watch = watch;
+        }
+        Ok(Some(found)) => read.found = Some(found),
+    }
+    read
+}
+
+/// Builds the structure of an index of `kind` from the values `part` of its
+/// tree, over `rows`. `path_record` gives `_depth` and `multi_valued` of an
+/// ExtendedPathIndex.
+pub(crate) fn build_index(
+    kind: Option<Kind>,
+    part: Part,
+    rows: &Rows,
+    (depth, multi_valued): (i64, bool),
+) -> Result<Index, String> {
+    let count = rows.len();
+    match (kind, part) {
+        (Some(Kind::Keyword), Part::Pairs(pairs)) => {
+            KeywordIndex::build(pairs, count).map(|i| Index::Keyword(Arc::new(i)))
+        }
+        (_, Part::Ranges(items)) => Ok(Index::DateRange(Arc::new(DateRangeIndex::build(
+            items, count,
+        )))),
+        (_, Part::Paths(texts, items)) => Ok(Index::Path(Arc::new(PathIndex::build(
+            texts,
+            items,
+            count,
+            depth,
+            multi_valued,
+        )))),
+        (_, Part::Inputs(items)) => {
+            SecurityIndex::build(items, rows).map(|i| Index::Security(Arc::new(i)))
+        }
+        (_, Part::Pairs(pairs)) => {
+            FieldIndex::build(pairs, count).map(|i| Index::Field(Arc::new(i)))
+        }
+    }
+}
+
+/// Lays the index at place `i` into `shapes` and `objects`: its object, its
+/// `_length` and the shape of its tree when it is mirrored, else the oids
+/// that `watch` gives.
+pub(crate) fn add_index_shapes(
+    shapes: &mut Shapes,
+    objects: &mut HashMap<u64, Vec<u8>>,
+    i: usize,
+    entry: &IndexEntry,
+    found: Option<(TreeShape, Vec<u8>)>,
+    watch: &[u64],
+) {
+    let mirrored = !matches!(entry.index, Index::Unavailable(_));
+    match (mirrored, found, entry.tree) {
+        (true, Some((shape, bytes)), Some(tree)) => {
+            shapes.owners.insert(entry.oid, Owner::IndexObject(i));
+            objects.insert(entry.oid, bytes);
+            if let Some(length) = entry.length_oid {
+                shapes.owners.insert(length, Owner::Length(i));
+            }
+            shapes.add_tree(Slot::Index(i), tree, &shape);
+        }
+        _ => {
+            for oid in watch {
+                shapes.owners.insert(*oid, Owner::Unavailable(i));
+            }
+        }
+    }
+}
+
+/// Walks `data` as of before `before` over the rows `rows` into the cells
+/// of a table of `width` columns. The cells count against the bound as the
+/// walk collects them, beside the `held` bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_table(
+    reads: &dyn Reads,
+    before: u64,
+    data: u64,
+    width: usize,
+    rows: &Rows,
+    threads: usize,
+    room: &(dyn Fn(usize) -> bool + Sync),
+    held: usize,
+) -> Result<(TablePart, TreeShape, WalkStats), BuildError> {
+    let walked = AtomicUsize::new(0);
+    let over = AtomicBool::new(false);
+    let walk = walk_tree_with(
+        reads,
+        before,
+        data,
+        threads,
+        RECORDS,
+        || TablePart::new(width),
+        |part: &mut TablePart, items| {
+            let start = part.heap_bytes();
+            for (rid, value) in items {
+                if let Some(row) = rows.row(rid_of(&rid)?) {
+                    part.push(row, &value)?;
+                }
+            }
+            let grown = part.heap_bytes().saturating_sub(start);
+            let now = walked.fetch_add(grown, AtomicOrdering::Relaxed) + grown;
+            if !room(held + now) {
+                over.store(true, AtomicOrdering::Relaxed);
+                return Err("the memory bound has no room for data".into());
+            }
+            Ok(())
+        },
+    );
+    if over.load(AtomicOrdering::Relaxed) {
+        return Err(BuildError::Dropped);
+    }
+    let refused = |e: String| BuildError::Refused(format!("data: {e}"));
+    let (shape, parts, stats) = walk.map_err(|e| refused(e.why))?;
+    let mut table_part = TablePart::new(width);
+    for part in parts {
+        table_part.append(part).map_err(refused)?;
+    }
+    Ok((table_part, shape, stats))
+}
+
+/// The shape of the tree and the pickle of the object of a mirrored
+/// index, and the oids that an unavailable index watches.
+type IndexFound = (Option<(TreeShape, Vec<u8>)>, Vec<u64>);
+
+/// Builds the base of the catalog at `catalog` as of `tid`, with
+/// `threads` threads. The base holds each commit up to `tid`. `room` tells
+/// if the bound has room for a build that holds the given bytes; when it
+/// has none, the build stops with `Dropped`.
+pub fn build(
+    reads: &dyn Reads,
+    catalog: u64,
+    tid: u64,
+    threads: usize,
+    room: &(dyn Fn(usize) -> bool + Sync),
+) -> Result<Built, BuildError> {
+    let started = Instant::now();
+    let before = tid.saturating_add(1);
+    let refused = |what: &str, e: String| BuildError::Refused(format!("{what}: {e}"));
+    let mut read_records = 1usize;
+    let catalog_bytes = reads
+        .load_before(catalog, before)
+        .and_then(|found| found.ok_or_else(|| format!("no record {catalog:#x}")))
+        .map_err(|e| refused("the catalog", e))?;
+    let mut read_bytes = catalog_bytes.len();
+    let CatalogMeta {
+        trees,
+        schema,
+        indexes: names,
+    } = catalog_meta(catalog, &catalog_bytes)?;
     // The rows: the rids of `paths`, with their paths.
     let (paths_shape, parts, stats) = walk_tree(
         reads,
@@ -199,7 +497,7 @@ pub fn build(
             Ok(())
         },
     )
-    .map_err(|e| refused("paths", e))?;
+    .map_err(|e| refused("paths", e.why))?;
     read_records += stats.records;
     read_bytes += stats.bytes;
     let mut pairs: Vec<(i32, String)> = parts.into_iter().flatten().collect();
@@ -237,7 +535,7 @@ pub fn build(
             Ok(())
         },
     )
-    .map_err(|e| refused("uids is not the inverse of paths", e))?;
+    .map_err(|e| refused("uids is not the inverse of paths", e.why))?;
     read_records += stats.records;
     read_bytes += stats.bytes;
     if counts.iter().sum::<usize>() != rows.len() {
@@ -246,44 +544,19 @@ pub fn build(
         ));
     }
     // The records of `data`, cell by cell. A record of a rid that `paths`
-    // does not hold is in no result: the table does not keep it. The cells
-    // count against the bound as the walk collects them.
-    let width = schema.len();
-    let walked = AtomicUsize::new(0);
-    let over = AtomicBool::new(false);
-    let walk = walk_tree_with(
+    // does not hold is in no result: the table does not keep it.
+    let (table_part, data_shape, stats) = read_table(
         reads,
         before,
         trees.data,
+        schema.len(),
+        rows_ref,
         threads,
-        RECORDS,
-        || TablePart::new(width),
-        |part: &mut TablePart, items| {
-            let start = part.heap_bytes();
-            for (rid, value) in items {
-                if let Some(row) = rows_ref.row(rid_of(&rid)?) {
-                    part.push(row, &value)?;
-                }
-            }
-            let grown = part.heap_bytes().saturating_sub(start);
-            let now = walked.fetch_add(grown, AtomicOrdering::Relaxed) + grown;
-            if !room(held.load(AtomicOrdering::Relaxed) + now) {
-                over.store(true, AtomicOrdering::Relaxed);
-                return Err("the memory bound has no room for data".into());
-            }
-            Ok(())
-        },
-    );
-    if over.load(AtomicOrdering::Relaxed) {
-        return Err(BuildError::Dropped);
-    }
-    let (data_shape, parts, stats) = walk.map_err(|e| refused("data", e))?;
+        room,
+        held.load(AtomicOrdering::Relaxed),
+    )?;
     read_records += stats.records;
     read_bytes += stats.bytes;
-    let mut table_part = TablePart::new(width);
-    for part in parts {
-        table_part.append(part).map_err(|e| refused("data", e))?;
-    }
     if !room(held.load(AtomicOrdering::Relaxed) + table_part.heap_bytes() + data_shape.heap_bytes())
     {
         return Err(BuildError::Dropped);
@@ -297,7 +570,9 @@ pub fn build(
     // The indexes. The structure of each index builds in a thread
     // while the next tree is walked.
     let mut entries: Vec<IndexEntry> = Vec::with_capacity(names.len());
-    let mut tree_shapes: Vec<Option<TreeShape>> = Vec::with_capacity(names.len());
+    // The shape and the pickle of each mirrored index, and the oids that
+    // each unavailable index watches.
+    let mut found: Vec<IndexFound> = Vec::with_capacity(names.len());
     let mut stopped = false;
     let mut table = Table::default();
     std::thread::scope(|scope| {
@@ -310,153 +585,36 @@ pub fn build(
             table
         });
         let mut pending = Vec::new();
-        for (name, reference) in &names {
-            let Some(oid) = oid_of(&record.heap, *reference) else {
+        for (name, oid) in &names {
+            let mut read = read_index(reads, before, name, *oid, rows_ref, threads);
+            read_records += read.stats.records;
+            read_bytes += read.stats.bytes;
+            let transient = read.transient();
+            let Some((part, shape, bytes)) = read.found.take() else {
                 pending.push(None);
-                entries.push(IndexEntry {
-                    name: name.clone(),
-                    class: String::new(),
-                    kind: None,
-                    oid: 0,
-                    tree: None,
-                    length_oid: None,
-                    length: -1,
-                    index: Index::Unavailable("the index is not a persistent object".into()),
-                });
-                tree_shapes.push(None);
+                found.push((None, read.watch));
+                entries.push(read.entry);
                 continue;
             };
-            let mut entry = IndexEntry {
-                name: name.clone(),
-                class: String::new(),
-                kind: None,
-                oid,
-                tree: None,
-                length_oid: None,
-                length: -1,
-                index: Index::Unavailable(String::new()),
-            };
-            // `_depth` and `multi_valued` of an ExtendedPathIndex.
-            let mut path_record = (0i64, false);
-            let read = (|| -> Result<Option<(Part, TreeShape, Vec<u8>)>, String> {
-                let bytes = load(oid)?;
-                read_records += 1;
-                read_bytes += bytes.len();
-                let index_record = Record::decode(&bytes).map_err(|e| e.0)?;
-                entry.class = format!("{}.{}", index_record.module, index_record.name);
-                entry.kind = Kind::of(&index_record.module, &index_record.name);
-                let Some(kind) = entry.kind else {
-                    return Ok(None);
-                };
-                if kind == Kind::Path {
-                    path_record = path_meta(&index_record)?;
-                }
-                let make = || match kind {
-                    Kind::DateRange => Part::Ranges(Vec::new()),
-                    Kind::Path => Part::Paths(StrArena::default(), Vec::new()),
-                    Kind::Security => Part::Inputs(Vec::new()),
-                    _ => Part::Pairs(Pairs::Empty),
-                };
-                let tree = index_record
-                    .attr_oid(kind.tree())
-                    .ok_or_else(|| format!("no {}", kind.tree()))?;
-                let length_oid = index_record.attr_oid("_length").ok_or("no _length")?;
-                entry.tree = Some(tree);
-                entry.length_oid = Some(length_oid);
-                let length = load(length_oid)?;
-                read_records += 1;
-                read_bytes += length.len();
-                entry.length = Record::decode(&length)
-                    .map_err(|e| e.0)?
-                    .int_state()
-                    .ok_or("a _length that is not an int")?;
-                let (shape, parts, stats) = walk_tree(
-                    reads,
-                    before,
-                    tree,
-                    threads,
-                    make,
-                    |part: &mut Part, items| {
-                        for (rid, value) in items {
-                            let rid = rid_of(&rid)?;
-                            let row = rows_ref
-                                .row(rid)
-                                .ok_or_else(|| format!("the rid {rid} is not in paths"))?;
-                            part.push(kind, value, row)?;
-                        }
-                        Ok(())
-                    },
-                )?;
-                read_records += stats.records;
-                read_bytes += stats.bytes;
-                let mut all = make();
-                for part in parts {
-                    all.append(part);
-                }
-                Ok(Some((all, shape, bytes)))
-            })();
-            match read {
-                Ok(None) => {
-                    entry.index =
-                        Index::Unavailable(format!("the class {} is not mirrored", entry.class));
-                    pending.push(None);
-                    tree_shapes.push(None);
-                }
-                Err(e) => {
-                    entry.index = Index::Unavailable(e);
-                    pending.push(None);
-                    tree_shapes.push(None);
-                }
-                Ok(Some((part, shape, bytes))) => {
-                    let mut transient = part.heap_bytes() + shape.heap_bytes();
-                    match (entry.kind, &part) {
-                        (Some(Kind::Keyword), Part::Pairs(pairs)) => {
-                            transient += KeywordIndex::build_bytes(pairs);
-                        }
-                        (_, Part::Paths(texts, items)) => {
-                            transient += PathIndex::build_bytes(texts, items);
-                        }
-                        _ => {}
-                    }
-                    if !room(held.load(AtomicOrdering::Relaxed) + transient) {
-                        stopped = true;
-                        pending.push(None);
-                        tree_shapes.push(None);
-                        entries.push(entry);
-                        break;
-                    }
-                    objects.insert(oid, bytes);
-                    tree_shapes.push(Some(shape));
-                    let held = &held;
-                    let count = rows_ref.len();
-                    let kind = entry.kind;
-                    let (depth, multi_valued) = path_record;
-                    pending.push(Some(scope.spawn(move || {
-                        let built = match (kind, part) {
-                            (Some(Kind::Keyword), Part::Pairs(pairs)) => {
-                                KeywordIndex::build(pairs, count)
-                                    .map(|i| Index::Keyword(Arc::new(i)))
-                            }
-                            (_, Part::Ranges(items)) => Ok(Index::DateRange(Arc::new(
-                                DateRangeIndex::build(items, count),
-                            ))),
-                            (_, Part::Paths(texts, items)) => Ok(Index::Path(Arc::new(
-                                PathIndex::build(texts, items, count, depth, multi_valued),
-                            ))),
-                            (_, Part::Inputs(items)) => SecurityIndex::build(items, rows_ref)
-                                .map(|i| Index::Security(Arc::new(i))),
-                            (_, Part::Pairs(pairs)) => {
-                                FieldIndex::build(pairs, count).map(|i| Index::Field(Arc::new(i)))
-                            }
-                        };
-                        if let Ok(index) = &built {
-                            held.fetch_add(index.heap_bytes(), AtomicOrdering::Relaxed);
-                        }
-                        built
-                    })));
-                }
+            if !room(held.load(AtomicOrdering::Relaxed) + transient) {
+                stopped = true;
+                pending.push(None);
+                found.push((None, Vec::new()));
+                entries.push(read.entry);
+                break;
             }
-            entries.push(entry);
+            found.push((Some((shape, bytes)), vec![read.entry.oid]));
+            let held = &held;
+            let kind = read.entry.kind;
+            let path_record = read.path_record;
+            pending.push(Some(scope.spawn(move || {
+                let built = build_index(kind, part, rows_ref, path_record);
+                if let Ok(index) = &built {
+                    held.fetch_add(index.heap_bytes(), AtomicOrdering::Relaxed);
+                }
+                built
+            })));
+            entries.push(read.entry);
         }
         for (entry, handle) in entries.iter_mut().zip(pending) {
             if let Some(handle) = handle {
@@ -476,17 +634,8 @@ pub fn build(
     if stopped || !room(held.load(AtomicOrdering::Relaxed)) {
         return Err(BuildError::Dropped);
     }
-    for (i, (entry, shape)) in entries.iter().zip(&tree_shapes).enumerate() {
-        let mirrored = !matches!(entry.index, Index::Unavailable(_));
-        if let (true, Some(shape), Some(tree)) = (mirrored, shape, entry.tree) {
-            shapes.owners.insert(entry.oid, Owner::IndexObject(i));
-            if let Some(length) = entry.length_oid {
-                shapes.owners.insert(length, Owner::Length(i));
-            }
-            shapes.add_tree(Slot::Index(i), tree, shape);
-        } else {
-            objects.remove(&entry.oid);
-        }
+    for (i, (entry, (shape, watch))) in entries.iter().zip(found).enumerate() {
+        add_index_shapes(&mut shapes, &mut objects, i, entry, shape, &watch);
     }
     let by_name = entries
         .iter()

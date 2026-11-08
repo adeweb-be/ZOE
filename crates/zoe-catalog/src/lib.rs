@@ -18,6 +18,8 @@
 //!   of the query for that query only.
 //! - `mirrors`: the mirrors of a store, their registration, their thread
 //!   and the memory bound.
+//! - `shadow`: the shadow rebuild of the structures that a stale commit
+//!   changed, beside the base, and the swap.
 //! - `reason` and `counts`: the reasons of a fallback and the counts.
 //! - `text`, with the feature `text`: the native text index of each
 //!   registered catalog, on tantivy (ADR 0060).
@@ -41,6 +43,7 @@ pub mod query;
 pub mod read;
 pub mod reason;
 pub mod security;
+pub mod shadow;
 pub mod table;
 #[cfg(feature = "testing")]
 pub mod testing;

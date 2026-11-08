@@ -1853,6 +1853,7 @@ pub struct CatalogModel {
     paths: Tree,
     length: (u64, i64),
     dirty: BTreeSet<u64>,
+    fanout: Option<usize>,
 }
 
 impl CatalogModel {
@@ -1890,6 +1891,7 @@ impl CatalogModel {
             paths,
             length,
             dirty: BTreeSet::from([oid, length.0]),
+            fanout,
         }
     }
 
@@ -2062,6 +2064,56 @@ impl CatalogModel {
         index.counter.1 += 1;
         index.dirty = true;
         self.dirty.insert(index.counter.0);
+    }
+
+    /// Clears the catalog, as `Catalog.clear` does for
+    /// `manage_catalogClear` and `clearFindAndRebuild`: new `data`, `uids`,
+    /// `paths` and `_length`, and a clear of each index.
+    pub fn clear(&mut self) {
+        let next = &mut self.next;
+        self.data = Tree::new(take(next), IO, self.fanout);
+        self.uids = Tree::new(take(next), OI, self.fanout);
+        self.paths = Tree::new(take(next), IO, self.fanout);
+        self.length = (take(next), 0);
+        self.dirty.insert(self.oid);
+        self.dirty.insert(self.length.0);
+        let ids: Vec<String> = self.indexes.iter().map(|i| i.id.clone()).collect();
+        for id in ids {
+            self.clear_index(&id);
+        }
+    }
+
+    /// Adds the index `id` of `kind`, as `Catalog.addIndex` does: a new
+    /// pickle of the catalog object, and an index that holds no row.
+    pub fn add_index(&mut self, id: &str, kind: IndexKind) {
+        let index = IndexModel::new(id, kind, &mut self.next, self.fanout);
+        self.indexes.push(index);
+        self.dirty.insert(self.oid);
+    }
+
+    /// Removes the index `id`, as `Catalog.delIndex` does: a new pickle of
+    /// the catalog object.
+    pub fn del_index(&mut self, id: &str) {
+        self.indexes.retain(|i| i.id != id);
+        self.dirty.insert(self.oid);
+    }
+
+    /// Adds the column `name`, as `Catalog.addColumn` does: a new schema,
+    /// and each record of `data` with `Missing.Value` at its end.
+    pub fn add_column(&mut self, name: &str) {
+        self.columns.push(name.to_owned());
+        let items: Vec<(Val, Item)> = self.data.items().into_iter().cloned().collect();
+        let next = &mut self.next;
+        let mut new_oid = || take(next);
+        for (key, item) in items {
+            if let Item::Val(Val::Tuple(cells)) = item {
+                let mut cells = cells.into_vec();
+                cells.push(Val::Missing);
+                self.data
+                    .set(key, Item::Val(Val::Tuple(cells.into())), &mut new_oid);
+            }
+        }
+        self.dirty.insert(self.oid);
     }
 
     /// The records of the objects that changed since the last call: each
