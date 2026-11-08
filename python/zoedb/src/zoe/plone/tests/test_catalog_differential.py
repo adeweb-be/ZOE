@@ -492,7 +492,12 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
                 brain.__dict__["getPath"] = lambda: "/elsewhere"
                 return brain
 
-            return LazyMap(other, list(result._seq), len(result))
+            return LazyMap(
+                other,
+                list(result._seq),
+                len(result),
+                actual_result_count=result.actual_result_count,
+            )
 
         query = {"portal_type": list(TYPES), "sort_on": "getId", "sort_limit": 5}
         with (
