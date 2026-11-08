@@ -5,7 +5,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 ## Layout
 
 - `src/main.rs`: the binary `zoe`. It only calls `cli::main` and exits with its code.
-- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`, `verify.rs` holds `zoe verify` and its `--backup`, `backup.rs` holds `zoe backup`, `restore.rs` holds `zoe restore`.
+- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`, `verify.rs` holds `zoe verify` and its `--backup`, `backup.rs` holds `zoe backup`, `restore.rs` holds `zoe restore`, `migrate.rs` holds `zoe migrate`, `catalog.rs` holds `zoe catalog rebuild-text`, which calls `zoe_catalog::text::rebuild` (with the feature `text` in every build, so the console script has it too).
 - `src/cli/serve.rs`: `zoe serve`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/cli/config.rs`: the TOML configuration file of `zoe serve`. It compiles only with the feature `serve`, so the extension never links the TOML parser.
 - `src/cli/mcp.rs`: `zoe mcp`. It calls `zoe-mcp`. Without the feature `serve` it fails with 1 and names the `zoe` binary.

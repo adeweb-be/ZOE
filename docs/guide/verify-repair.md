@@ -60,7 +60,7 @@ A process that ends without a close leaves the database file open: after SIGKILL
 The repair happens on its own:
 
 - A writer, such as the Zope instance or `zoe serve`, repairs the file at its next open. The open then reads every page of the file, and takes longer on a large store.
-- A tool that only reads, such as `zoe verify`, `zoe backup`, `zoe mcp` or Loupe, repairs the file first, then opens it read-only. It writes one line that says so:
+- A tool that only reads the tables, such as `zoe verify`, `zoe backup`, `zoe mcp`, `zoe catalog rebuild-text` or Loupe, repairs the file first, then opens it read-only. It writes one line that says so:
 
   ```text
   zoe verify: var/zoe: the store was not closed cleanly: repaired the store
@@ -88,3 +88,18 @@ A finding means damage or a missing part:
 | a class that the application does not provide | Install the add-on that provides the class, or remove its objects in the application. |
 
 No tool of ZOE edits records yet. Loupe and `zoe mcp` read a store and show each object and its history (see [Loupe](loupe.md) and [MCP](mcp.md)).
+
+## Rebuild a text index
+
+The text index of each catalog, in `text/<oid>/` of the store directory, is a cache: the text deltas of the store are the source of truth. The store rebuilds an index on its own when its directory is missing or a file fails its checksum at the open. tantivy does not check its files after the open, so a file damaged later gives wrong results until a rebuild. `zoe catalog rebuild-text` rebuilds each text index from the deltas, with no Plone and no server. Stop the Zope instance or the server first: the command takes the lock of the store.
+
+```sh
+zoe catalog rebuild-text var/zoe
+```
+
+```text
+The text indexes of the store var/zoe at tid 0x03f6db4f22222222:
+  catalog 0x0000000000000010  rebuilt  25 documents  0.04 s
+```
+
+The command writes nothing in the tables, and keeps the old index until the new one is complete. `--catalog OID` rebuilds the index of one catalog (see [The zoe command](../reference/cli.md#zoe-catalog-rebuild-text)).

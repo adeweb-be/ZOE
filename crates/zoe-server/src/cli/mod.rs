@@ -14,6 +14,7 @@
 //! before it opens a file.
 
 mod backup;
+mod catalog;
 #[cfg(feature = "serve")]
 mod config;
 mod convert;
@@ -120,6 +121,9 @@ enum Command {
     /// ZOE format 3 to ZOE format 4. A store of ZOE format 4 stays as it
     /// is.
     Migrate(migrate::MigrateArgs),
+    /// The tools of the catalogs of a store: rebuild-text rebuilds the
+    /// text index of each registered catalog from the deltas.
+    Catalog(catalog::CatalogArgs),
 }
 
 impl Command {
@@ -134,6 +138,7 @@ impl Command {
             Self::Backup(_) => "backup",
             Self::Restore(_) => "restore",
             Self::Migrate(_) => "migrate",
+            Self::Catalog(_) => "catalog",
         }
     }
 }
@@ -302,6 +307,7 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
         Command::Backup(args) => backup::run(args, out),
         Command::Restore(args) => restore::run(args, out),
         Command::Migrate(args) => migrate::run(args, out),
+        Command::Catalog(args) => catalog::run(args, out),
     };
     // The console script runs this code in the Python process. Nothing
     // flushes stdout there when the process ends, so flush it here.
