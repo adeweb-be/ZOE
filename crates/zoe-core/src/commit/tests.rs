@@ -1411,3 +1411,20 @@ fn staged_class_name_reads_the_class_pickle() {
         assert_eq!(txn.staged_class_name(oid), None, "{oid:?}");
     }
 }
+
+#[test]
+fn a_clear_delta_counts_the_transaction_without_the_deltas_that_it_drops() {
+    // A text delta of 69 bytes, its key and its payload, and a clear delta
+    // of 13 bytes. Both together pass the limit, the clear alone fits.
+    let options = Options {
+        max_transaction_size: Some(75),
+        ..Options::default()
+    };
+    let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    let text = "x".repeat(50);
+    txn.text_set(Oid(1), "idx", 1, "en", &text, Tid(1)).unwrap();
+    txn.text_clear(Oid(1), "idx").unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+}

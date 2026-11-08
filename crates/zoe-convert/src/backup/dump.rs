@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-use zoe_core::{BlobRecord, DurableRow, Oid, Store, Tid, ZoeError};
+use zoe_core::{BlobRecord, DurableRow, LiveText, Oid, Store, TextDelta, Tid, ZoeError};
 
 use super::Backup;
 use super::chain::DumpFile;
@@ -14,8 +14,16 @@ use crate::fsutil::{CHUNK, io_error};
 use crate::walk::each_durable_row;
 
 /// The first 8 bytes of a dump file: the name of the format, then its
-/// version, 2. A restore refuses a file with other bytes there.
-pub(super) const MAGIC: &[u8; 8] = b"ZOEDUMP\x02";
+/// version, 3. A restore refuses a file with other bytes there.
+pub(super) const MAGIC: &[u8; 8] = b"ZOEDUMP\x03";
+
+/// The first 8 bytes of a dump file of version 2, which this build does
+/// not read.
+const MAGIC_2: &[u8; 8] = b"ZOEDUMP\x02";
+
+/// The reason of the refusal of a dump of version 2.
+pub(super) const VERSION_2: &str = "a dump of version 2, which this build does not read: \
+     write a new full dump into a new directory";
 
 /// The length of the header: the magic, then two tids.
 pub(super) const HEADER: usize = 24;
@@ -35,6 +43,12 @@ const RECORD: u8 = b'R';
 const DELETION: u8 = b'D';
 /// The tag of a record with its blob.
 const BLOB: u8 = b'B';
+/// The tag of a text delta.
+const TEXT: u8 = b'X';
+/// The tag of an unindex.
+const UNINDEX: u8 = b'Y';
+/// The tag of a clear delta.
+const CLEAR: u8 = b'C';
 /// The tag of the end of the file. The hash follows it.
 const END: u8 = b'E';
 
@@ -79,6 +93,9 @@ pub(super) fn read_header(path: &Path) -> Result<(Tid, Tid), Error> {
 
 /// Check the magic of `header` and return its two tids.
 fn parse_header(path: &Path, header: &[u8; HEADER]) -> Result<(Tid, Tid), Error> {
+    if header[..8] == MAGIC_2[..] {
+        return Err(damaged(path, VERSION_2.to_owned()));
+    }
     if header[..8] != MAGIC[..] {
         return Err(damaged(path, "not a dump file of ZOE".to_owned()));
     }
@@ -167,6 +184,10 @@ pub(super) fn write_dump(
             }
             report.records += 1;
         }
+        for delta in store.text_deltas_at(txn.tid)? {
+            out.delta(&delta)?;
+            report.deltas += 1;
+        }
         report.transactions += 1;
     }
     out.finish()
@@ -196,6 +217,28 @@ impl DumpWriter<'_> {
         };
         self.put(&len.to_be_bytes())?;
         self.put(bytes)
+    }
+
+    /// Write the entry of `delta`: `X` for a text delta, `Y` for an
+    /// unindex, `C` for a clear delta. The rid is a signed 32-bit
+    /// big-endian int.
+    fn delta(&mut self, delta: &TextDelta) -> Result<(), Error> {
+        let tag = match (delta.rid, &delta.text) {
+            (None, _) => CLEAR,
+            (Some(_), None) => UNINDEX,
+            (Some(_), Some(_)) => TEXT,
+        };
+        self.put(&[tag])?;
+        self.put(&delta.catalog.0.to_be_bytes())?;
+        self.bytes(delta.index.as_bytes())?;
+        if let Some(text) = &delta.text {
+            self.bytes(text.language.as_bytes())?;
+            self.bytes(text.text.as_bytes())?;
+        }
+        if let Some(rid) = delta.rid {
+            self.put(&rid.to_be_bytes())?;
+        }
+        Ok(())
     }
 
     /// Copy the `size` bytes of the blob of `oid` at `tid` from `blob`.
@@ -262,6 +305,8 @@ pub(super) enum Entry {
         /// The size and the hash of the blob.
         blob: Option<BlobRecord>,
     },
+    /// A delta of the transaction before it.
+    Delta(TextDelta),
     /// The end of the file. The hash matches.
     End,
 }
@@ -282,7 +327,8 @@ enum State {
     Sequences,
     /// Inside a transaction: `left` records follow, after the oid `oid`.
     Records { left: u64, oid: Option<Oid> },
-    /// After the records of a transaction.
+    /// After the records of a transaction: its deltas, or the next
+    /// transaction.
     Transactions,
     /// After the end.
     Ended,
@@ -317,6 +363,9 @@ pub(super) struct DumpReader {
     tid: Tid,
     /// The blob of the last record, which the caller did not read yet.
     blob: Option<(Oid, BlobRecord)>,
+    /// The key without its tid of the last delta of the transaction, in
+    /// `text_deltas`.
+    delta_key: Option<Vec<u8>>,
 }
 
 impl DumpReader {
@@ -335,6 +384,7 @@ impl DumpReader {
             state: State::Sequences,
             tid: dump.after,
             blob: None,
+            delta_key: None,
         };
         let mut header = [0; HEADER];
         reader.exact(&mut header, "the header")?;
@@ -379,6 +429,7 @@ impl DumpReader {
                 Ok(Entry::Durable(DurableRow { name, key, payload }))
             }
             (TRANSACTION, State::Sequences | State::Transactions) => self.transaction(at),
+            (TEXT | UNINDEX | CLEAR, State::Transactions) => self.delta(tag, at),
             (END, State::Sequences | State::Transactions) => self.end(),
             _ => Err(self.damaged(format!("an unexpected tag {tag:#04x} at offset {at}"))),
         }
@@ -397,6 +448,7 @@ impl DumpReader {
             return Err(self.damaged(reason));
         }
         self.tid = tid;
+        self.delta_key = None;
         let user = self.field("a user")?;
         let description = self.field("a description")?;
         let extension = self.field("an extension")?;
@@ -467,6 +519,65 @@ impl DumpReader {
             oid,
             data: Some(data),
             blob: Some(blob),
+        })
+    }
+
+    /// Read a delta, after its tag `tag` at offset `at`. The deltas of a
+    /// transaction come in the key order of `text_deltas`.
+    fn delta(&mut self, tag: u8, at: u64) -> Result<Entry, Error> {
+        let catalog = Oid(self.u64("a delta")?);
+        let index = self.text_field("the index id of a delta", at)?;
+        let text = match tag {
+            TEXT => {
+                let language = self.text_field("the language of a delta", at)?;
+                let text = self.text_field("the text of a delta", at)?;
+                Some(LiveText { language, text })
+            }
+            _ => None,
+        };
+        let rid = match tag {
+            CLEAR => None,
+            _ => {
+                let mut rid = [0; 4];
+                self.exact(&mut rid, "a delta")?;
+                Some(i32::from_be_bytes(rid))
+            }
+        };
+        if index.is_empty() || index.len() > 255 {
+            let reason = format!("the delta at offset {at} has an index id of a bad length");
+            return Err(self.damaged(reason));
+        }
+        // The key of the delta in `text_deltas`, without its tid: the
+        // catalog, the byte 0 for a clear delta, the length of the index
+        // id, the index id, then the rid with its sign bit flipped.
+        let mut key = catalog.0.to_be_bytes().to_vec();
+        if rid.is_none() {
+            key.push(0);
+        }
+        key.push(index.len() as u8);
+        key.extend_from_slice(index.as_bytes());
+        if let Some(rid) = rid {
+            key.extend_from_slice(&((rid as u32) ^ 0x8000_0000).to_be_bytes());
+        }
+        if self.delta_key.as_ref().is_some_and(|last| key <= *last) {
+            let reason = format!("the deltas are not in key order at offset {at}");
+            return Err(self.damaged(reason));
+        }
+        self.delta_key = Some(key);
+        Ok(Entry::Delta(TextDelta {
+            catalog,
+            index,
+            rid,
+            text,
+        }))
+    }
+
+    /// Read a field that holds UTF-8 text, for an entry at offset `at`.
+    fn text_field(&mut self, what: &str, at: u64) -> Result<String, Error> {
+        let bytes = self.field(what)?;
+        String::from_utf8(bytes).map_err(|_| {
+            let reason = format!("{what} at offset {at} is not UTF-8");
+            self.damaged(reason)
         })
     }
 

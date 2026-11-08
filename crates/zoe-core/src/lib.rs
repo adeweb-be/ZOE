@@ -43,11 +43,11 @@ pub use kv::{
 };
 pub use lock::LockCancel;
 pub use merge::{Mode, Reason, Resolution, Resolved, StructuralMerges};
-pub use pack::{ClassTotals, PackReport};
+pub use pack::{ClassTotals, PackCap, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use sequence::Sequence;
 pub use store::{Migrated, Options, Store, WriteLog};
-pub use text::{LiveText, TextChange, TextCheck, TextFinding, check_rid};
+pub use text::{LiveText, TextChange, TextCheck, TextDelta, TextFinding, check_rid};
 pub use types::{Oid, Tid};
 pub use undo::{UndoConflict, Undone, undo_id, undo_tid};
 

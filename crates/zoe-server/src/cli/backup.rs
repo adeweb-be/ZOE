@@ -80,6 +80,7 @@ fn write_report(out: &mut dyn Write, path: &Path, to: &Path, report: &Backup) ->
             ("blobs", &format!("{blobs} ({bytes} bytes)")),
             ("sequences", &report.sequences),
             ("durable rows", &report.durable_rows),
+            ("deltas", &report.deltas),
         ],
     )
 }
@@ -101,6 +102,7 @@ mod tests {
             blob_bytes: 10,
             sequences: 1,
             durable_rows: 0,
+            deltas: 2,
         }
     }
 

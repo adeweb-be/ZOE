@@ -428,6 +428,10 @@ impl WriteTxn for RedbWrite<'_> {
         text::put(&self.txn, key, prev, payload, self.compression)
     }
 
+    fn remove_text(&mut self, key: &[u8]) -> Result<()> {
+        text::remove(&self.txn, key)
+    }
+
     fn migrate_format(&mut self) -> Result<()> {
         text::create(&self.txn)?;
         let mut meta = self.txn.open_table(META).map_err(backend)?;

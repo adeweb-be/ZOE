@@ -48,9 +48,10 @@
 //! it belongs to that commit: a record and a blob record have the tid of
 //! the row, and the key of a delta ends in that tid. The deltas of a
 //! commit come after its namespace ops. The fold derives the key of
-//! `text_txn` of each delta from its key. The transaction rows come in tid order: the first tid is after
-//! the previous tid, and the last one is the last tid of the header. A
-//! frame is the value that the tables store under its key, byte for byte.
+//! `text_txn` of each delta from its key. The transaction rows come in
+//! tid order: the first tid is after the previous tid, and the last one is
+//! the last tid of the header. A frame is the value that the tables store
+//! under its key, byte for byte.
 
 use std::ops::Range;
 

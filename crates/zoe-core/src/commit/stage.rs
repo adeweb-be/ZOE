@@ -194,7 +194,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         crate::text::check_language(language)?;
         let payload = format::text::encode_payload(language, text);
         let key = format::text::text_prefix(catalog, index, rid);
-        let stored_bytes = self.check_text_size(&key, payload.len())?;
+        let stored_bytes = self.check_text_size(&key, payload.len(), 0)?;
         self.stage_text(key, Some(&payload), before, false, stored_bytes)
     }
 
@@ -203,7 +203,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     pub fn text_unindex(&mut self, catalog: Oid, index: &str, rid: i32, before: Tid) -> Result<()> {
         self.check_text(index, false)?;
         let key = format::text::text_prefix(catalog, index, rid);
-        let stored_bytes = self.check_text_size(&key, 0)?;
+        let stored_bytes = self.check_text_size(&key, 0, 0)?;
         self.stage_text(key, None, before, false, stored_bytes)
     }
 
@@ -215,14 +215,16 @@ impl<S: Deref<Target = Store>> Txn<S> {
     pub fn text_clear(&mut self, catalog: Oid, index: &str) -> Result<()> {
         self.check_text(index, false)?;
         let key = format::text::clear_prefix(catalog, index);
-        let stored_bytes = self.check_text_size(&key, 0)?;
         // The keys of the text deltas of the index: the catalog, the
         // length of the index id and the index id, then the rid.
         let mut texts = catalog.0.to_be_bytes().to_vec();
         texts.push(index.len() as u8);
         texts.extend_from_slice(index.as_bytes());
-        let dropped = self.staged.remove_texts(&texts);
-        let stored_bytes = stored_bytes.saturating_sub(dropped);
+        // The size check counts the transaction without the deltas that
+        // the call drops.
+        let dropped = self.staged.texts_bytes(&texts);
+        let stored_bytes = self.check_text_size(&key, 0, dropped)?;
+        self.staged.remove_texts(&texts);
         self.stage_text(key, None, Tid::ZERO, false, stored_bytes)
     }
 
@@ -276,8 +278,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Check a payload of `size` bytes for the delta `key` against
     /// `max-record-size` and `max-transaction-size`, as `check_kv_size`
-    /// does for a namespace write. Return the new value of `stored_bytes`.
-    fn check_text_size(&self, key: &[u8], size: usize) -> Result<u64> {
+    /// does for a namespace write. `freed` is the bytes of the staged
+    /// deltas that the call drops. Return the new value of `stored_bytes`.
+    pub(super) fn check_text_size(&self, key: &[u8], size: usize, freed: u64) -> Result<u64> {
         let guardrails = &self.store.guardrails;
         guardrails.check_text(SizeLimit::Record, size as u64)?;
         let size = (key.len() + size) as u64;
@@ -288,6 +291,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let stored_bytes = self
             .stored_bytes
             .saturating_sub(staged)
+            .saturating_sub(freed)
             .saturating_add(size);
         guardrails.check_text(SizeLimit::Transaction, stored_bytes)?;
         Ok(stored_bytes)
@@ -296,7 +300,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// Stage the delta `key` with `payload`, and make `stored_bytes` the
     /// transaction size. A stage that fails keeps the size and the staged
     /// deltas.
-    fn stage_text(
+    pub(super) fn stage_text(
         &mut self,
         key: Vec<u8>,
         payload: Option<&[u8]>,

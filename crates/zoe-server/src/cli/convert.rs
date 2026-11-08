@@ -318,6 +318,9 @@ fn to_data_fs(
     if report.durable_keys > 0 {
         eprintln!("{}", left_out_warning(report.durable_keys));
     }
+    if report.deltas > 0 {
+        eprintln!("{}", deltas_warning(report.deltas));
+    }
     if !moved.is_empty() {
         eprintln!("{}", forced_warning(&moved));
     }
@@ -442,6 +445,16 @@ fn left_out_warning(keys: u64) -> String {
     )
 }
 
+/// Return the warning of a conversion into a `Data.fs` that leaves out
+/// `deltas` deltas of the text indexes.
+fn deltas_warning(deltas: u64) -> String {
+    format!(
+        "warning: the Data.fs leaves out {deltas} deltas of the text indexes: a Data.fs \
+         holds no delta. Put the ZCTextIndex indexes back before the move, or the \
+         text indexes of the copy find nothing."
+    )
+}
+
 /// Return the failure of a conversion with the store in `path`. A
 /// mismatch lists all its differences, one per line.
 fn convert_failure(path: &Path, error: zoe_convert::Error) -> Failure {
@@ -487,6 +500,14 @@ fn write_report(
             report.durable_keys
         )?;
         writeln!(out, "  {}", left_out_warning(report.durable_keys))?;
+    }
+    if report.deltas > 0 {
+        writeln!(
+            out,
+            "  left out      {} deltas of the text indexes: a Data.fs holds no delta",
+            report.deltas
+        )?;
+        writeln!(out, "  {}", deltas_warning(report.deltas))?;
     }
     if !moved.is_empty() {
         writeln!(

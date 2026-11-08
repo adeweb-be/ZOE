@@ -6,9 +6,8 @@
 //!
 //! Every record, every blob record, every transaction row, every sequence
 //! row, every row of a KV namespace, every text delta and every intent
-//! file is a frame: a
-//! 32-byte header, the typed-field slots, then the payload. The header
-//! fields are little-endian:
+//! file is a frame: a 32-byte header, the typed-field slots, then the
+//! payload. The header fields are little-endian:
 //!
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
@@ -31,8 +30,8 @@
 //! file is the 8 bytes of `txn_key`. The key of a sequence row is the
 //! UTF-8 bytes of the name of the sequence. The key of a row of a KV
 //! namespace is the bytes of `kv_key`. The key of a text delta is its key
-//! in `text_deltas` (`text`). So a frame that is read under
-//! another key, or in another key space, fails the check.
+//! in `text_deltas` (`text`). So a frame that is read under another key,
+//! or in another key space, fails the check.
 //!
 //! The payload holds the data in the form that the codec byte gives. The
 //! checksum covers the payload as stored, so a read verifies the stored

@@ -663,6 +663,16 @@ impl Backend for Logged {
         core.redb.text_newest(prefix, before)
     }
 
+    fn text_newest_key(&self, prefix: &[u8], before: Tid) -> Result<Option<Bytes>> {
+        let core = &self.core;
+        if let Some((p, table)) = core.view()
+            && let Some((key, _)) = table.text_newest(prefix, before, p)
+        {
+            return Ok(Some(key.to_vec()));
+        }
+        core.redb.text_newest_key(prefix, before)
+    }
+
     fn text_rows(
         &self,
         from: Bound<&[u8]>,

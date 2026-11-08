@@ -1,6 +1,6 @@
 # 0030. Dump files: a format of ZOE's own, one file per tid range
 
-Status: accepted.
+Status: accepted. Amended by ADR 0060, section 6: the version `0x03` adds the entries `X`, `Y` and `C` of the text deltas after the records of each transaction, and a build that writes it refuses a dump of version `0x02`.
 
 ## Context
 

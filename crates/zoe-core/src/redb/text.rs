@@ -51,6 +51,25 @@ pub(crate) fn empty_range(from: Bound<&[u8]>, to: Bound<&[u8]>) -> bool {
 /// tid, with a tid before `before`: its key and its stored frame. A key
 /// that the scan gives outside the prefix is `CorruptText`.
 pub(super) fn newest(db: &Db, prefix: &[u8], before: Tid) -> Result<Option<(Bytes, Bytes)>> {
+    newest_with(db, prefix, before, |key, frame| {
+        (key.to_vec(), frame.to_vec())
+    })
+}
+
+/// Return the key of the newest row of `prefix` with a tid before
+/// `before`, as `newest` does. The read copies no frame.
+pub(super) fn newest_key(db: &Db, prefix: &[u8], before: Tid) -> Result<Option<Bytes>> {
+    newest_with(db, prefix, before, |key, _| key.to_vec())
+}
+
+/// Find the newest row of `prefix` with a tid before `before`, and give
+/// its key and its stored frame to `take`.
+fn newest_with<T>(
+    db: &Db,
+    prefix: &[u8],
+    before: Tid,
+    take: impl FnOnce(&[u8], &[u8]) -> T,
+) -> Result<Option<T>> {
     if before == Tid::ZERO {
         return Ok(None);
     }
@@ -73,7 +92,7 @@ pub(super) fn newest(db: &Db, prefix: &[u8], before: Tid) -> Result<Option<(Byte
     if key < start.as_slice() || key >= end.as_slice() {
         return Err(crate::text::corrupt(prefix, key));
     }
-    Ok(Some((key.to_vec(), value.value().to_vec())))
+    Ok(Some(take(key, value.value())))
 }
 
 /// Return the rows of `text_deltas` in `db` from `from` to `to`, at most
@@ -171,6 +190,23 @@ pub(super) fn put_frame(txn: &WriteTransaction, key: &[u8], frame: &[u8]) -> Res
     rows.insert(key, frame).map_err(backend)?;
     let mut keys = txn.open_table(TEXT_TXN).map_err(backend)?;
     keys.insert(index.as_slice(), ()).map_err(backend)?;
+    Ok(())
+}
+
+/// Stage the removal of the delta `key` in `txn`, and of its key in
+/// `text_txn`, which the call derives from `key`. A key without a tid is a
+/// `Backend` error. A missing row or index key is `CorruptText`, so the
+/// write does not erase the evidence of a damaged store.
+pub(super) fn remove(txn: &WriteTransaction, key: &[u8]) -> Result<()> {
+    let index = text::txn_key_of(key)
+        .ok_or_else(|| ZoeError::Backend("a key of a delta without its tid".into()))?;
+    let mut rows = txn.open_table(TEXT_DELTAS).map_err(backend)?;
+    let row = rows.remove(key).map_err(backend)?.is_some();
+    let mut keys = txn.open_table(TEXT_TXN).map_err(backend)?;
+    let indexed = keys.remove(index.as_slice()).map_err(backend)?.is_some();
+    if !row || !indexed {
+        return Err(crate::text::corrupt_key(key));
+    }
     Ok(())
 }
 
