@@ -1243,11 +1243,11 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
     def loadBefore(self, oid, tid):
         # A connected client calls the native client at once: a hit runs no
         # other frame. Without a server, the load does what `_with_server`
-        # does with `again`.
+        # does without `again`.
         try:
             return self._native.load_before(oid, tid)
         except ClientDisconnected:
-            if self._closed:
+            if self._closed or self._native.is_connected():
                 raise
         self._wait()
         return self._native.load_before(oid, tid)
