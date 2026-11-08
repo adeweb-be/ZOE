@@ -853,9 +853,13 @@ fn a_new_root_of_a_mirrored_tree_makes_the_mirror_stale_and_it_builds_again() {
         mirrors.query(catalog, clear + 1, &p).unwrap_err().reason,
         Reason::Stale
     );
-    assert_eq!(
-        mirrors.query(catalog, before + 1, &p).unwrap_err().reason,
-        Reason::NotReady
+    let reply = mirrors
+        .query(catalog, before + 1, &p)
+        .unwrap_or_else(|f| panic!("{name} before the clear: {f:?}"));
+    same_answer(
+        &reply,
+        &data["answers"][name][2],
+        &format!("{name} before the clear"),
     );
     gate.release();
     assert!(ready_at(&mirrors, catalog, clear));
