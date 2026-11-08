@@ -391,6 +391,9 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
             site["dif-1"]["item-01"].reindexObject()
             site["dif-2"].manage_renameObject("item-02", "item-02-moved")
             site["dif-0"].manage_delObjects(["item-00"])
+            # The changes search the catalog too: count the fixed set only.
+            catalog._counts.clear()
+            sent.clear()
             got = run(self, site, named)
         refused = {name: reason for name, reason in got.items() if reason}
         self.assertEqual(refused, EXPECTED, refused)
