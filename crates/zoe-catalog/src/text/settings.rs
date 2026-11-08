@@ -273,7 +273,8 @@ mod tests {
     fn the_settings_read_back_what_they_write() {
         let mut settings = CatalogSettings::default();
         let mut s = IndexSettings::enhanced(&["en", "fr"]);
-        s.boosts = vec![("Title".into(), 3.0), ("Description".into(), 1.5)];
+        // The boosts read back in the order of their index ids.
+        s.boosts = vec![("Description".into(), 1.5), ("Title".into(), 3.0)];
         s.indexed_attrs = vec!["SearchableText".into()];
         s.fuzzy = 1;
         settings.indexes.insert("SearchableText".into(), s);

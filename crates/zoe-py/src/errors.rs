@@ -1,5 +1,5 @@
-//! The exceptions that `zoe.Storage` raises: the exceptions of ZODB, and
-//! `zoe.WrongThread`. The native client also raises `ClientDisconnected`
+//! The exceptions that `zoe.Storage` raises: the exceptions of ZODB,
+//! `zoe.WrongThread` and `zoe.storage.Unavailable`. The native client also raises `ClientDisconnected`
 //! of ZEO, and `LockError` of `zc.lockfile` for a cache file that another
 //! open holds.
 //!
@@ -45,6 +45,7 @@ exception!(read_only_error, "ZODB.POSException", "ReadOnlyError");
 exception!(undo_error, "ZODB.POSException", "UndoError");
 exception!(unsupported, "ZODB.POSException", "Unsupported");
 exception!(wrong_thread, "zoe.storage", "WrongThread");
+exception!(unavailable, "zoe.storage", "Unavailable");
 exception!(
     client_disconnected_error,
     "ZEO.Exceptions",
@@ -83,6 +84,23 @@ pub(crate) fn storage_failure(py: Python<'_>, text: String) -> PyErr {
 /// Return a `StorageTransactionError` of ZODB with the text `text`.
 pub(crate) fn transaction_failure(py: Python<'_>, text: String) -> PyErr {
     raise(storage_transaction_error(py), (text,), None)
+}
+
+/// Return a `zoe.storage.Unavailable` with the text `text`: a text query
+/// that the text index cannot answer (ADR 0060).
+pub(crate) fn unavailable_failure(py: Python<'_>, text: String) -> PyErr {
+    raise(unavailable(py), (text,), None)
+}
+
+/// Return a `ReadConflictError` of ZODB with the text `text`: a text query
+/// at a snapshot that the text index refuses.
+pub(crate) fn read_conflict_failure(py: Python<'_>, text: String) -> PyErr {
+    raise(read_conflict_error(py), (text,), None)
+}
+
+/// Return a `StorageSystemError` of ZODB with the text `text`.
+pub(crate) fn storage_system_failure(py: Python<'_>, text: String) -> PyErr {
+    raise(storage_system_error(py), (text,), None)
 }
 
 /// Return an `Unsupported` of ZODB with the text `text`.

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use rmpv::Value;
 use tokio::sync::OwnedMutexGuard;
 use zoe_core::{Flavour, Oid, Tid};
-use zoe_wire::extension::KV;
+use zoe_wire::extension::{KV, TEXT};
 use zoe_wire::{p64, u64_of};
 
 use super::connection::Inner;
@@ -59,17 +59,20 @@ pub struct Transaction {
     guard: Option<OwnedMutexGuard<()>>,
     /// True when the server accepted the extension `kv`.
     kv: bool,
+    /// True when the server accepted the extension `text`.
+    text: bool,
 }
 
 impl Transaction {
     /// Hold the transaction `id` of the connection `inner`, which began
-    /// under the commit lock `guard`. `kv` tells if the server accepted the
-    /// extension `kv`.
+    /// under the commit lock `guard`. `kv` and `text` tell if the server
+    /// accepted the extensions `kv` and `text`.
     pub(super) fn new(
         inner: Arc<Inner>,
         id: u64,
         guard: OwnedMutexGuard<()>,
         kv: bool,
+        text: bool,
     ) -> Transaction {
         Transaction {
             inner,
@@ -78,6 +81,7 @@ impl Transaction {
             ended: false,
             guard: Some(guard),
             kv,
+            text,
         }
     }
 
@@ -172,6 +176,65 @@ impl Transaction {
             return Ok(());
         }
         Err(unsupported(KV))
+    }
+
+    /// Stage a text delta (ADR 0060, section 8): `text_set`, without a
+    /// reply. `before` is the snapshot of the transaction, exclusive. The
+    /// server reports an error of the delta at the vote. It needs the
+    /// extension `text`: without it, it fails with `Error::Unsupported` and
+    /// sends nothing. After a failed vote, it fails with `Error::Invalid`
+    /// and sends nothing.
+    pub async fn text_set(
+        &mut self,
+        catalog: Oid,
+        index: &str,
+        rid: i32,
+        language: &str,
+        text: &str,
+        before: Tid,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.check_text()?;
+        let args = vec![
+            p64(catalog.0),
+            index.into(),
+            Value::from(rid),
+            language.into(),
+            text.into(),
+            p64(before.0),
+        ];
+        self.inner.notify("text_set", args).await
+    }
+
+    /// Stage an unindex: `text_unindex`, with the rules of `text_set`.
+    pub async fn text_unindex(
+        &mut self,
+        catalog: Oid,
+        index: &str,
+        rid: i32,
+        before: Tid,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.check_text()?;
+        let args = vec![p64(catalog.0), index.into(), Value::from(rid), p64(before.0)];
+        self.inner.notify("text_unindex", args).await
+    }
+
+    /// Stage a clear delta: `text_clear`, with the rules of `text_set`.
+    pub async fn text_clear(&mut self, catalog: Oid, index: &str) -> Result<(), Error> {
+        self.check()?;
+        self.check_text()?;
+        let args = vec![p64(catalog.0), index.into()];
+        self.inner.notify("text_clear", args).await
+    }
+
+    /// Fail with `Error::Unsupported` when the server did not accept the
+    /// extension `text`.
+    fn check_text(&self) -> Result<(), Error> {
+        if self.text {
+            return Ok(());
+        }
+        Err(unsupported(TEXT))
     }
 
     /// Copy a record of another storage into a transaction that began with

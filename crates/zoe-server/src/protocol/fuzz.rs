@@ -1,6 +1,7 @@
 //! The entry of the fuzz targets in `fuzz/`: the frame decoder and the
-//! message decoder of `zoe serve`, and the decoder of the plan of a
-//! catalog query, on any bytes.
+//! message decoder of `zoe serve`, and the decoders of the plan of a
+//! catalog query, of its text clause and of the arguments of `text_query`,
+//! on any bytes.
 //!
 //! This module compiles with the feature `fuzz`, and in the unit tests of
 //! the crate.
@@ -35,7 +36,10 @@ pub fn read_messages(data: &[u8], max_frame_size: u32) -> usize {
 
 /// Read `data` as the server reads the argument `plan` of a
 /// `catalog_query` call: one msgpack value within the bounds of a frame,
-/// then a plan of ADR 0059, section 8, with the kind of each clause.
+/// then a plan of ADR 0059, section 8, with the kind of each clause, and
+/// its text clause of ADR 0060, section 12. The same value also goes
+/// through the decoders of the arguments `clause` and `filter` of
+/// `text_query`, and of the cap of a call.
 ///
 /// Return true when the plan reads, false when the call fails or gives the
 /// reason `plan`. The function never panics.
@@ -46,7 +50,13 @@ pub fn read_plan(data: &[u8]) -> bool {
     let Ok(wire) = catalog::wire_of(&value) else {
         return false;
     };
-    zoe_catalog::decode_typed(&wire).is_ok()
+    let _ = zoe_catalog::text::clause::decode_clause(&wire, false);
+    let _ = zoe_catalog::text::clause::decode_filter(&wire);
+    let _ = zoe_catalog::text::clause::too_large(&wire);
+    let Ok((rest, _)) = zoe_catalog::split_text(&wire) else {
+        return false;
+    };
+    zoe_catalog::decode_typed(&rest).is_ok()
 }
 
 /// Read one frame of at most `max` bytes from `reader`. Return `None` at

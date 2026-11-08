@@ -219,6 +219,11 @@ pub(crate) fn catalog_of(key: &[u8]) -> Oid {
 /// meanwhile: `pending` counts the commits that write one, and `generation`
 /// grows at the end of each. A commit adds its clear deltas to the lists
 /// before its backend write, under the commit sequencer.
+///
+/// The memory stays bounded: an index with no clear delta keeps no list, so
+/// an index id that a client invents leaves nothing; the struct keeps at
+/// most `CLEAR_LISTS` lists of at most `CLEAR_TIDS` tids each. A list past
+/// its bound leaves, and its reads go to the store.
 #[derive(Default)]
 pub(crate) struct Clears {
     inner: Mutex<ClearsInner>,
@@ -244,6 +249,9 @@ impl Clears {
                 && list.last().is_none_or(|last| last < tid)
             {
                 list.push(*tid);
+                if list.len() > CLEAR_TIDS {
+                    inner.lists.remove(prefix);
+                }
             }
         }
     }
@@ -268,7 +276,12 @@ impl Clears {
         let list = store.read_clears(prefix)?;
         let newest = newest_of(&list, before);
         let mut inner = crate::lock(&self.inner);
-        if inner.pending == 0 && inner.generation == generation {
+        if inner.pending == 0
+            && inner.generation == generation
+            && !list.is_empty()
+            && list.len() <= CLEAR_TIDS
+            && inner.lists.len() < CLEAR_LISTS
+        {
             inner.lists.insert(prefix.to_vec(), list);
         }
         Ok(newest)
@@ -283,6 +296,16 @@ fn newest_of(list: &[Tid], before: Tid) -> Option<Tid> {
 
 /// The rows that one backend read of a scan gives.
 const SCAN_CHUNK: usize = 256;
+
+/// The distinct tids that `Store::verify_text` keeps before it checks
+/// their transaction rows.
+const VERIFY_TIDS: usize = 65_536;
+
+/// The most lists of clear deltas that `Clears` keeps.
+const CLEAR_LISTS: usize = 4_096;
+
+/// The most clear deltas of one index that `Clears` keeps.
+const CLEAR_TIDS: usize = 4_096;
 
 /// Return the bounds of the keys of `text_deltas` of `prefix`, a key
 /// without its tid, at every tid.
@@ -555,8 +578,15 @@ impl Store {
     pub fn verify_text(&self) -> Result<TextCheck> {
         let mut check = TextCheck::default();
         let watermark = self.pack_watermark()?;
-        // The first delta of each tid, and the number of its deltas.
+        // The first delta of each tid since the last check of the rows of
+        // the transactions, and the number of its deltas. The check runs
+        // when the map holds `VERIFY_TIDS` tids, so its memory stays
+        // bounded on a store with a long history.
         let mut tids: BTreeMap<Tid, (TextFinding, u64)> = BTreeMap::new();
+        // The tids without a transaction row, with their finding and the
+        // number of their deltas: a tid that comes back after a check adds
+        // its deltas to its finding.
+        let mut missing: HashMap<Tid, (usize, u64)> = HashMap::new();
         // The prefix and the tid of the row before, in key order.
         let mut previous: Option<(Vec<u8>, Tid)> = None;
         let mut low: Bound<Vec<u8>> = Unbounded;
@@ -575,25 +605,46 @@ impl Store {
             for (key, frame) in &rows {
                 self.verify_row(key, frame, watermark, &mut previous, &mut tids, &mut check);
             }
+            if tids.len() >= VERIFY_TIDS {
+                self.verify_txn_rows(&mut tids, &mut missing, &mut check);
+            }
             match rows.last() {
                 Some((last, _)) if full => low = Excluded(last.clone()),
                 _ => break,
             }
         }
-        for (tid, (first, deltas)) in tids {
-            let row = self.backend.iter_txns(tid, tid).next();
-            if !matches!(row, Some(Ok(ref meta)) if meta.tid == tid) {
-                let problem = match deltas {
-                    1 => "a delta without its transaction row".to_owned(),
-                    n => format!(
-                        "a delta without its transaction row, the first of {n} deltas of the tid"
-                    ),
-                };
-                check.findings.push(TextFinding { problem, ..first });
-            }
-        }
+        self.verify_txn_rows(&mut tids, &mut missing, &mut check);
         self.verify_index(&mut check);
         Ok(check)
+    }
+
+    /// Check that each tid of `tids` has its transaction row, for
+    /// `verify_text`, and empty `tids`.
+    fn verify_txn_rows(
+        &self,
+        tids: &mut BTreeMap<Tid, (TextFinding, u64)>,
+        missing: &mut HashMap<Tid, (usize, u64)>,
+        check: &mut TextCheck,
+    ) {
+        let problem = |deltas: u64| match deltas {
+            1 => "a delta without its transaction row".to_owned(),
+            n => format!("a delta without its transaction row, the first of {n} deltas of the tid"),
+        };
+        for (tid, (first, deltas)) in std::mem::take(tids) {
+            if let Some((at, total)) = missing.get_mut(&tid) {
+                *total += deltas;
+                check.findings[*at].problem = problem(*total);
+                continue;
+            }
+            let row = self.backend.iter_txns(tid, tid).next();
+            if !matches!(row, Some(Ok(ref meta)) if meta.tid == tid) {
+                missing.insert(tid, (check.findings.len(), deltas));
+                check.findings.push(TextFinding {
+                    problem: problem(deltas),
+                    ..first
+                });
+            }
+        }
     }
 
     /// Check one row of `text_deltas` for `verify_text`.

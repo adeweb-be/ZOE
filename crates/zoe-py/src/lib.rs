@@ -20,7 +20,9 @@
 //!
 //! `Storage.catalog_query` answers a catalog query from the catalog mirrors
 //! of the store (`catalog`, ADR 0059). Their thread starts at the open of a
-//! store with a registered catalog, never at the import of the module.
+//! store with a registered catalog, never at the import of the module. The
+//! text methods of the storages (`text`, ADR 0060) stage the text deltas
+//! and read the text index of each catalog, which the mirrors host.
 
 mod catalog;
 mod cli;
@@ -32,6 +34,7 @@ mod reader;
 mod sequence;
 mod signals;
 mod storage;
+mod text;
 
 /// The extension module.
 #[pyo3::pymodule(gil_used = false)]

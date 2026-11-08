@@ -232,11 +232,20 @@ pub(crate) fn reply<'py>(
     tid: &[u8],
     answer: &Result<Reply, Fallback>,
 ) -> PyResult<Bound<'py, PyDict>> {
+    if let Ok(Reply {
+        error: Some(error), ..
+    }) = answer
+    {
+        return Err(crate::text::error(py, error));
+    }
     let out = PyDict::new(py);
     out.set_item("tid", PyBytes::new(py, tid))?;
     match answer {
         Ok(reply) => {
             out.set_item("r", PyList::new(py, &reply.rids)?)?;
+            if let Some(scores) = &reply.scores {
+                out.set_item("sc", PyList::new(py, scores)?)?;
+            }
             out.set_item("n", reply.len)?;
             out.set_item("a", reply.actual)?;
             match (&reply.rows, &reply.paths) {
@@ -294,6 +303,8 @@ pub(crate) fn reply_of_value<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     use rmpv::Value;
     let bad = |what: &str| PyValueError::new_err(format!("a catalog reply with {what}"));
+    // The scores of a text clause, or the exception of its error form.
+    let scores = crate::text::scores_of_value(py, &value)?;
     let Value::Map(items) = value else {
         return Err(bad("another form"));
     };
@@ -376,6 +387,9 @@ pub(crate) fn reply_of_value<'py>(
     if answered {
         out.set_item("rows", rows)?;
         out.set_item("paths", paths)?;
+        if let Some(scores) = scores {
+            out.set_item("sc", PyList::new(py, scores)?)?;
+        }
     }
     Ok(out)
 }
