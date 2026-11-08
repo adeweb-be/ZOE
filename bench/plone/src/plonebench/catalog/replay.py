@@ -16,7 +16,9 @@ with the backend `catalog` of zoe.plone in the mode `compare`:
 
 Each leg sets `catalog-rebase-rows`, `catalog-window-tids` and
 `catalog-window-seconds` low, so the run holds rebases and queries outside
-the window. A writer commits saves of the shapes of B5 during the replay,
+the window. A copy of an older format moves to the format of the binary
+with `zoe migrate`. A writer commits saves of the shapes of B5 during the
+replay,
 and one flip of a BooleanIndex, which makes the mirror stale.
 
 The report gives, for each leg, the counts by path, by reason and side of
@@ -43,7 +45,7 @@ from pathlib import Path
 
 from benchcommon import servers
 
-from plonebench import stack
+from plonebench import fixture, stack
 from plonebench.catalog import log as querylog
 
 WORK = stack.REPO / "target" / "bench" / "catalog" / "replay"
@@ -61,6 +63,8 @@ class Settings:
     rebase_rows: int = 50
     window_tids: int = 20
     window_seconds: int = 30
+    # The bound of the mirrors, such as 6GB; None keeps the default.
+    catalog_memory: str | None = None
     # The seconds between two commits of the writer.
     writer_interval: float = 0.02
     # Each `pinned_every`th search runs on the pinned Connection, which
@@ -122,11 +126,14 @@ default-zpublisher-encoding utf-8
 
 
 def zoe_section(store: Path, settings: Settings) -> str:
+    memory = ""
+    if settings.catalog_memory:
+        memory = f"\n      catalog-memory {settings.catalog_memory}"
     return f"""    <zoe>
       path {store}
       catalog-rebase-rows {settings.rebase_rows}
       catalog-window-tids {settings.window_tids}
-      catalog-window-seconds {settings.window_seconds}
+      catalog-window-seconds {settings.window_seconds}{memory}
     </zoe>"""
 
 
@@ -141,7 +148,9 @@ def client_section(address: str, home: Path) -> str:
 
 
 def serve_args(settings: Settings) -> tuple[str, ...]:
+    memory = ("--catalog-memory", settings.catalog_memory)
     return (
+        *(memory if settings.catalog_memory else ()),
         "--catalog-rebase-rows",
         str(settings.rebase_rows),
         "--catalog-window-tids",
@@ -157,6 +166,9 @@ def _run_leg(leg: str, log: Path, store: Path, home: Path, settings: Settings):
         (home / sub).mkdir(parents=True, exist_ok=True)
     copy = home / "store"
     stack.copy_store(store, copy)
+    # A store of an older format moves to the format of the binary, as the
+    # fixtures of B5 do.
+    fixture.migrate(copy)
     leg_settings = dataclasses.asdict(settings) | {"leg": leg}
     (home / "settings.json").write_text(json.dumps(leg_settings, indent=1))
     out = home / "report.json"

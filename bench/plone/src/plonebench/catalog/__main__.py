@@ -55,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
             f"--{name.replace('_', '-')}", type=int, default=getattr(defaults, name)
         )
     replaying.add_argument("--limit", type=int, default=None)
+    replaying.add_argument("--catalog-memory", default=None)
     replaying.add_argument(
         "--writer-interval", type=float, default=defaults.writer_interval
     )
@@ -101,6 +102,7 @@ def _replay(args) -> int:
         pinned_sync=args.pinned_sync,
         rounds=args.rounds,
         limit=args.limit,
+        catalog_memory=args.catalog_memory,
         flip=not args.no_flip,
         seed=args.seed,
     )
