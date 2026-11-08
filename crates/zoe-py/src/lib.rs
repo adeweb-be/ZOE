@@ -20,9 +20,11 @@
 //!
 //! `Storage.catalog_query` answers a catalog query from the catalog mirrors
 //! of the store (`catalog`, ADR 0059). Their thread starts at the open of a
-//! store with a registered catalog, never at the import of the module. The
-//! text methods of the storages (`text`, ADR 0060) stage the text deltas
-//! and read the text index of each catalog, which the mirrors host.
+//! store with a registered catalog, never at the import of the module.
+//! `_catalog_throwaway` answers one query from a throwaway mirror, for the
+//! mode `compare` of `zoe.plone.catalog` on a test storage. The text
+//! methods of the storages (`text`, ADR 0060) stage the text deltas and
+//! read the text index of each catalog, which the mirrors host.
 
 mod catalog;
 mod cli;
@@ -41,6 +43,8 @@ mod text;
 mod _zoe {
     use pyo3::prelude::*;
 
+    #[pymodule_export]
+    use crate::catalog::_catalog_throwaway;
     #[pymodule_export]
     use crate::cli::main;
     #[pymodule_export]

@@ -278,7 +278,13 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
 # that follow go to `bin/test`. `just plone zeoclient suites` runs them
 # against a `zoe serve` on a new store, which it starts and stops, and
 # `just plone filestorage suites` runs them on the stock storages of
-# plone.testing. `just plone zoe backends` runs the suite of plone.locking
+# plone.testing. `just plone zoe catalog` runs the suites of `suites` on
+# the zoe scenario with the backend catalog of zoe.plone in the mode
+# compare: each search runs the stock search and a throwaway mirror of the
+# test storage, and compares their answers. It prints the counts by path,
+# by reason and side of the Python path and of the mismatches, and fails
+# when a mismatch occurs; the options that follow go to `bin/test`.
+# `just plone zoe backends` runs the suite of plone.locking
 # on the locking backend of zoe.plone, with the tests of zoe.plone; it
 # builds the `zoe` binary first, for the tests that start `zoe serve`.
 # `just plone <scenario> creators THREADS ITEMS SEED` creates a Plone site,
@@ -399,7 +405,7 @@ plone scenario="zoe" command="start" *args:
         esac
         parts=("buildout:parts+=test")
     fi
-    if [ "{{ command }}" = backends ]; then
+    if [ "{{ command }}" = backends ] || [ "{{ command }}" = catalog ]; then
         if [ "{{ scenario }}" != zoe ]; then
             echo "just plone: the suites of the backends run on zoe." >&2
             exit 2
@@ -541,6 +547,23 @@ plone scenario="zoe" command="start" *args:
             ZOE_BINARY="$zoe" ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
                 -s plone.locking -s zoe.plone "$@"
             ;;
+        catalog)
+            # The suites of `suites`, unchanged, with the backend catalog in
+            # the mode compare. Each process of bin/test adds its counts to
+            # the file of ZOE_PLONE_CATALOG_COUNTS when it exits; the
+            # summary adds them up. The suites pass or fail as with the
+            # stock search, since the mode compare returns the stock result.
+            set -- "${args[@]}"
+            counts="$target/zoe/var/catalog-counts.jsonl"
+            rm -f "$counts"
+            status=0
+            ZOE_PLONE_BACKENDS=catalog ZOE_PLONE_CATALOG_MODE=compare \
+                ZOE_PLONE_CATALOG_COUNTS="$counts" \
+                "$target/zoe/bin/test" -s Products.CMFPlone \
+                -s plone.app.contenttypes -s plone.restapi "$@" || status=$?
+            python3.13 plone/catalog_counts.py "$counts" || status=1
+            exit "$status"
+            ;;
         creators | history)
             # The script runs in the instance with the storage of the
             # scenario, after a new site. The instance must not run.
@@ -579,7 +602,7 @@ plone scenario="zoe" command="start" *args:
             "$instance" run "plone/{{ command }}.py" "$@"
             ;;
         *)
-            echo "just plone: unknown command {{ command }}. Use start, build, check, suites, creators or history." >&2
+            echo "just plone: unknown command {{ command }}. Use start, build, check, suites, catalog, backends, creators or history." >&2
             exit 2
             ;;
     esac
@@ -646,6 +669,15 @@ plone scenario="zoe" command="start" *args:
 # FileStorage and in a ZOE store, under target/bench/catalog/fixtures. It
 # needs `just plone zeo build` and `just plone zoeclient build`, and builds
 # `zoe` in release first. `just bench catalog fixtures` lists the fixtures.
+# `just bench catalog inventory LOG...` prints the index types, the
+# options and the sorts of the query logs of the catalog that the runs of
+# B5 write with `--catalog-log`. `just bench catalog replay LOG... STORE`
+# replays them in the mode compare of the catalog backend on copies of the
+# ZOE store STORE, in-process and through zoe serve, with a writer that
+# commits during the replay, and prints the counts by path, by reason and
+# of the mismatches, never a value; it fails on a mismatch. It needs
+# `just plone zoeclient build`, builds `zoe` in release first and holds
+# the bench lock.
 # `just bench replay RUN` runs the log replay of bench/replay (B6): the
 # transactions of the store that the B5 run RUN kept (`--keep-store` on
 # zeo), against ZEO and against zoe serve, in the interpreter of the
@@ -726,7 +758,7 @@ bench *args="run":
         "shootout run "* | "shootout client run" | "shootout native run" | zoe-bench\ *) lock=true ;;
         "shootout profile terms" | "shootout profile loop") lock=true ;;
         "plone prepare "* | "plone run "* | "plone campaign "* | "plone loadpath "*) lock=true ;;
-        "plone catalog prepare") lock=true ;;
+        "plone catalog prepare" | "plone catalog replay") lock=true ;;
         "replay test "* | "replay report "*) lock=false ;;
         replay\ *) lock=true ;;
         *) lock=false ;;
@@ -761,7 +793,7 @@ _bench-plone *args:
         exec "${plonebench[@]}" pytest -q "${@:-bench/plone/tests}"
     fi
     case "${1:-} ${2:-}" in
-        "prepare "* | "run "* | "campaign "* | "serve "* | "loadpath "* | "catalog prepare")
+        "prepare "* | "run "* | "campaign "* | "serve "* | "loadpath "* | "catalog prepare" | "catalog replay")
             ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
             export ZOE_BINARY
             ;;
