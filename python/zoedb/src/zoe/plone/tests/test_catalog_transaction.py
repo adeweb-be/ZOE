@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 import transaction
+from Products.CMFCore.indexing import processQueue
 from zope.event import notify
 from zope.processlifetime import DatabaseOpenedWithRoot
 
@@ -140,20 +141,26 @@ class TransactionTests:
         self,
     ):
         with opened(self.db) as site:
-            site.invokeFactory("Document", "t-sp", title="Item 99 savepoint")
             first = transaction.savepoint()
+            site.invokeFactory("Document", "t-sp", title="Item 99 savepoint")
+            processQueue()
+            second = transaction.savepoint()
             jar = site._p_jar
             self.assertFalse(jar._registered_objects)
             self.assertTrue(catalog._savepoint_records(jar))
             self.check(site)
             site["item-0"].setTitle("Changed after the savepoint")
             site["item-0"].reindexObject()
-            second = transaction.savepoint()
+            # Nested savepoints.
+            third = transaction.savepoint()
             site.manage_delObjects(["item-12"])
             self.check(site)
-            second.rollback()
+            third.rollback()
             self.check(site)
             self.assertIn("item-12", site.objectIds())
+            second.rollback()
+            self.check(site)
+            self.assertIn("t-sp", site.objectIds())
             first.rollback()
             self.check(site)
             self.assertNotIn("t-sp", site.objectIds())
@@ -179,15 +186,18 @@ class TransactionTests:
         with opened(self.db) as site, overlays() as sent:
             for i in range(80):
                 site[FOLDER].invokeFactory("Document", f"many-{i}", title=f"Many {i}")
+            processQueue()
             jar = site._p_jar
             registered = list(jar._registered_objects)
             added = dict(jar._added)
-            self.check(site)
-            provisional = {oid for oid, _ in sent[-1] if oid[0] & 0x80}
+            records = catalog._overlay(jar)
+            provisional = {oid for oid, _ in records if oid[0] & 0x80}
             self.assertTrue(provisional)
             # The hook registered and added no object.
             self.assertEqual(jar._registered_objects, registered)
             self.assertEqual(jar._added, added)
+            self.check(site)
+            self.assertTrue(any(oid[0] & 0x80 for oid, _ in sent[-1]))
 
     def test_a_brain_made_late_reads_the_state_at_that_moment(self):
         with opened(self.db) as site:
@@ -197,6 +207,7 @@ class TransactionTests:
             found = pc.unrestrictedSearchResults(portal_type="Document")
             site["item-0"].setTitle("Changed late")
             site["item-0"].reindexObject()
+            processQueue()
             cat = site.portal_catalog._catalog
             for k, rid in enumerate(found._seq):
                 self.assertEqual(found[k].Title, cat[rid].Title)
@@ -223,10 +234,12 @@ class TransactionTests:
             changed = answer(site.portal_catalog.unrestrictedSearchResults(**query))
             self.assertNotEqual(changed, committed)
             transaction.abort()
+            overlays_before, native = len(sent), self.counts()[0]
             got = answer(site.portal_catalog.unrestrictedSearchResults(**query))
             self.assertEqual(got, committed)
-            self.assertEqual(len(sent), 1)
-        self.assertEqual(self.counts(), (2, 0))
+            # The search after the abort sends no overlay, and is native.
+            self.assertEqual(len(sent), overlays_before)
+            self.assertEqual(self.counts(), (native + 1, 0))
 
 
 class TestTheOverlayOfATransaction(TransactionTests, unittest.TestCase):
