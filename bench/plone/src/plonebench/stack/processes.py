@@ -193,7 +193,11 @@ class Stack:
             cpus = instance_cpus(self.settings)[index]
             log = open(home / "log" / "stdout.log", "w")
             self.logs.append(log)
-            env = clean_environment(PYTHONPATH=str(PROBE))
+            extra = {"PYTHONPATH": str(PROBE)}
+            if self.settings.probe and self.settings.catalog_log:
+                queries = self.run / "probe" / f"catalog-instance{index}.jsonl"
+                extra["PLONEBENCH_CATALOG_LOG"] = str(queries)
+            env = clean_environment(**extra)
             process = subprocess.Popen(
                 [
                     *pin(cpus),
