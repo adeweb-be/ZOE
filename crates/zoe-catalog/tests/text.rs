@@ -1839,3 +1839,84 @@ fn an_advance_checks_the_cap_while_a_pack_runs() {
         BTreeSet::from([1, 2])
     );
 }
+
+#[test]
+fn a_security_clause_and_a_text_clause_run_in_one_plan() {
+    let dir = fresh_dir("text-security");
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let index = "allowedRolesAndUsers";
+    let mut model = CatalogModel::new(0x2000, &[(index, IndexKind::Security)], &[]);
+    // An entry whose inputs give its value as it is: the roles that may
+    // view it.
+    let allowed = |role: &str| {
+        Val::Tuple(
+            vec![
+                Val::Str("v".into()),
+                Val::Tuple(vec![Val::Str(role.into())].into()),
+                Val::Tuple(Vec::new().into()),
+                Val::Bool(false),
+                Val::Tuple(Vec::new().into()),
+            ]
+            .into(),
+        )
+    };
+    let mut ops_texts = Vec::new();
+    for i in 0..6 {
+        let rid = 100 + i;
+        let role = if i % 2 == 0 { "Anonymous" } else { "Reader" };
+        model.catalog(rid, &format!("/site/item-{i}"), &[(index, allowed(role))]);
+        ops_texts.push((rid, if i < 4 { "kalo" } else { "mite" }));
+    }
+    let catalog = model.oid();
+    testing::commit(&store, &model.records(), &[model.key()], &[]).unwrap();
+    let ops: Vec<TextOp<'_>> = ops_texts
+        .iter()
+        .map(|(rid, text)| set("Title", *rid, text))
+        .collect();
+    let tid = testing::commit_text(&store, catalog, &ops, Some(&settings(&["en"])), false).unwrap();
+    let mirrors = start(
+        &store,
+        dir.path(),
+        false,
+        Duration::from_secs(5),
+        Hooks::default(),
+    );
+    assert!(mirrors.wait_for(catalog, WAIT, |s| {
+        s.is_some_and(|s| s.state == "ready" && s.applied.is_some_and(|a| a >= tid))
+    }));
+    let texts = mirrors.texts().unwrap();
+    assert!(texts.wait_for(catalog, WAIT, |c| {
+        c.is_some_and(|c| c.ready && c.tid >= tid)
+    }));
+    let security = map(vec![
+        ("k", s("v")),
+        ("i", s(index)),
+        ("q", Wire::Array(vec![s("Anonymous")])),
+        ("and", Wire::Bool(false)),
+        ("r", Wire::Nil),
+        ("not", Wire::Array(vec![])),
+    ]);
+    let plan = map(vec![
+        (
+            "c",
+            Wire::Array(vec![security, plan_clause("Title", atom(&["kalo"]))]),
+        ),
+        ("s", Wire::Array(vec![])),
+        ("l", Wire::Nil),
+        ("bs", Wire::Int(0)),
+        ("bz", Wire::Nil),
+        ("cols", Wire::Nil),
+        ("rn", Wire::Int(0)),
+    ]);
+    let reply = mirrors
+        .query_wire(catalog, tid + 1, &plan)
+        .unwrap()
+        .unwrap();
+    let mut rids = reply.rids.clone();
+    rids.sort_unstable();
+    // The entries that Anonymous may view, and whose title holds the word.
+    assert_eq!(rids, vec![100, 102]);
+    let scores = reply.scores.expect("the scores of the text clause");
+    assert!(scores.iter().all(|s| *s > 1));
+    mirrors.stop();
+}
