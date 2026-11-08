@@ -381,10 +381,13 @@ pub fn info(
                 format!("the snapshot is before a clear delta of {index_id} that the index holds"),
             ));
         }
+        // A document of the index: one with a text in it, also an empty
+        // text, as in ZCTextIndex.
+        let present = snap.fields.present.get(index_id).copied();
         let has_text = |ord: usize, doc: u32| -> bool {
             let seg = &snap.searcher.segment_readers()[ord];
-            fields.iter().any(|f| {
-                seg.get_fieldnorms_reader(f.text)
+            present.is_some_and(|f| {
+                seg.get_fieldnorms_reader(f)
                     .is_ok_and(|r| r.fieldnorm(doc) > 0)
             })
         };

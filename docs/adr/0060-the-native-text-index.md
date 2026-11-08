@@ -181,7 +181,7 @@ A storage without the write path: a stock ZEO client, the asyncio mode of `zoe.z
 - A query on a test storage goes to its base, a ZOE storage with the extension `text`, in the process or behind a server, at the last tid of the base. The client sends the texts of each `DemoStorage` of the stack, then the staged texts of the transaction, as the staged texts of the clause (section 12).
 - On a test storage, the clause carries the settings of the index (`mode`, `language` and the boosts): the base cannot read the namespace `zoe.text` of the overlay of `zoe.kv`.
 - The clause lists the index in `cl` when the base holds no record of the catalog, when the base has no text index for the catalog, and when a `DemoStorage` holds a clear delta of the index. The base has no text index for the catalog when its registration key or its settings are only in the overlay of `zoe.kv`. The base then answers from the staged texts alone, with the settings of the clause. A site that a test layer creates is such a catalog.
-- So the base gives the statistics and the scores, in the process or in the reply of the server. The test storage holds no text index. With a base in the process, the text index of the base is in the process, as N1 decided.
+- So the base gives the statistics and the scores, in the process or in the reply of the server. The test storage holds no text index. With a base in the process, the text index of the base is in the process.
 - The Plone suites run on an empty `zoe.Storage` base. There each query runs on the text overlay alone, not on tantivy. So the replay of section 11 runs on a ZOE store.
 - A test storage whose texts pass the cap of a call (section 12) fails its searches with `Unavailable`.
 
@@ -244,7 +244,7 @@ error   = "unavailable" | "packed" | "cleared" | "corrupt" | "too_large"
 - `st` holds the staged texts of the indexes that the query reads: the index of the clause, and with the boosts `Title` and `Description`. It has one entry for each key. A `nil` text is an unindex.
 - `cl` lists the indexes that the transaction cleared, and on a test storage the indexes of section 9. The server answers for them from the staged texts alone.
 - `set` holds the settings of the index on a test storage (section 9), and `nil` elsewhere: the server then reads `zoe.text`.
-- `lg` lists the languages whose fields the query reads, from the `Language` clause of the catalog query. `nil` reads every field of the index.
+- `lg` lists the fields that the query reads, from the `Language` clause of the catalog query. The client sends it only when the catalog has an index `Language`, and `nil` otherwise: ZCatalog ignores a key that has no index. It maps each language of the clause to a field of the index as a delta goes to its field: the same tag, else the same primary subtag, else the first language of the settings, so the neutral language `""` maps to the first field. `nil` reads every field of the index. `lg` only narrows the fields: the index `Language` still filters the rows, so the hit set is the hit set of the Python path.
 - `sc` comes when the plan has a text clause and no sort. An error comes from the text clause (sections 10 and 13). `unavailable` and `too_large` raise `zoe.storage.Unavailable`, `packed` and `cleared` raise `ReadConflictError`, and `corrupt` raises `StorageSystemError`.
 
 The mirror runs the other clauses of the plan first and gives the bitmap of their rids with the text clause. The result follows `Catalog.search`:

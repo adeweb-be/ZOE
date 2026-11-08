@@ -126,6 +126,10 @@
       description="Removes the behaviour zoe.plone.history from the types, gives each workflow history back as a PersistentMapping, gives the properties of each member and group back as a dict, and switches off for this site the merges that the profile default switched on: folder_orders, split_merges and the tier 2 entries of the stock container classes."
       provides="Products.GenericSetup.interfaces.EXTENSION"
       />
+  <!-- The index class ZoeTextIndex and the profiles zoe.plone:text and
+       zoe.plone:text-uninstall (ADR 0060). -->
+  <include file="text.zcml" />
+
   <genericsetup:importStep
       name="zoe.plone.merge_policy"
       title="ZOE merge policy"

@@ -40,6 +40,15 @@ need the catalog mirror of the store use it. Its resources are `zoeDB`,
 the database, and `zoeStorage`, its storage. The module makes the layer at
 its first use, so it imports plone.app.testing only then.
 
+`ZOE_TEXT_SITE` is the site of `ZOE_SITE` in a store of its own, with the
+backend `catalog` installed and the profile `zoe.plone:text` imported:
+`SearchableText`, `Title` and `Description` are `ZoeTextIndex` indexes
+(ADR 0060). The layer loads `text.zcml` of `zoe.plone` in a stacked
+registry, so the profile is there. The mirror window of its store holds
+`TEXT_WINDOW_TIDS` tids, so a test reaches a snapshot outside the window
+with a few commits. Its resources are those of `ZOE_SITE`. `tearDown`
+uninstalls the backend when `setUp` installed it.
+
 `ZOE_SERVE_SITE` is the same site in a database whose storage is a
 `zoe.zeo.ClientStorage` with the native client inside, of a `zoe serve`
 on a store of its own, with no `DemoStorage` on it: the server holds the
@@ -238,6 +247,80 @@ class ZoeSite(Layer):
         shutil.rmtree(self._directory, ignore_errors=True)
 
 
+#: The tids of the mirror window of the store of `ZOE_TEXT_SITE`.
+TEXT_WINDOW_TIDS = 4
+
+
+class ZoeTextSite(ZoeSite):
+    """The site of `ZoeSite` with the backend `catalog` and the profile
+    `zoe.plone:text`."""
+
+    def open(self, directory):
+        import zoe
+
+        return zoe.Storage(f"{directory}/zoe", catalog_window_tids=TEXT_WINDOW_TIDS)
+
+    def setUp(self):
+        from plone.app.testing import SITE_OWNER_NAME
+        from plone.testing import zope as zope_testing
+        from Products.GenericSetup.registry import _profile_registry
+        from Testing.makerequest import makerequest
+        from zope.component.hooks import getSite, setSite
+        from zope.configuration import xmlconfig
+
+        import zoe.plone
+        from zoe.plone import catalog
+
+        self["configurationContext"] = zca.stackConfigurationContext(
+            self.get("configurationContext"), name="ZoeTextSite"
+        )
+        zca.pushGlobalRegistry()
+        known = set(_profile_registry.listProfiles())
+        xmlconfig.file("text.zcml", zoe.plone, context=self["configurationContext"])
+        self._profiles = set(_profile_registry.listProfiles()) - known
+        self._backend = not catalog.installed()
+        catalog.install()
+        super().setUp()
+        db = self["zoeDB"]
+        self._root = catalog._root.get("db")
+        catalog._root["db"] = db
+        catalog.register(db)
+        site = getSite()
+        connection = db.open()
+        try:
+            app = makerequest(connection.root()["Application"])
+            zope_testing.login(app["acl_users"], SITE_OWNER_NAME)
+            setSite(app["plone"])
+            app["plone"].portal_setup.runAllImportStepsFromProfile(
+                "profile-zoe.plone:text"
+            )
+            transaction.commit()
+        finally:
+            transaction.abort()
+            zope_testing.logout()
+            setSite(site)
+            connection.close()
+
+    def tearDown(self):
+        from Products.GenericSetup.registry import _profile_registry
+
+        from zoe.plone import catalog
+
+        super().tearDown()
+        if self._root is None:
+            catalog._root.pop("db", None)
+        else:
+            catalog._root["db"] = self._root
+        if self._backend:
+            catalog.uninstall()
+        for profile in self._profiles:
+            product, name = profile.split(":", 1)
+            _profile_registry.unregisterProfile(name, product)
+        zca.popGlobalRegistry()
+        del self["configurationContext"]
+        del self._backend, self._root, self._profiles
+
+
 class ZoeServeSite(ZoeSite):
     """The Plone site of `ZoeSite` in a database whose storage is a
     `zoe.zeo.ClientStorage` with the native client inside, of a `zoe serve`
@@ -278,6 +361,7 @@ def __getattr__(name):
     made = {
         "ZOE_SITE": (ZoeSite, "ZoeSite"),
         "ZOE_SERVE_SITE": (ZoeServeSite, "ZoeServeSite"),
+        "ZOE_TEXT_SITE": (ZoeTextSite, "ZoeTextSite"),
     }
     if name in made:
         if name not in _layers:

@@ -116,11 +116,21 @@ transaction.commit()
 
 `registry.move_back(site.portal_registry)` and a commit give the records back to the registry, with nothing lost. Move the registry back before you leave ZOE, before you copy the site, and before you delete it.
 
+### The text index
+
+`ZoeTextIndex` answers the text searches of `SearchableText`, `Title` and `Description` from the native text index of the store, with stemming in the language of the site, accent folding, phrases, prefixes and the boosts `Title^3` and `Description^1.5`. A save writes the texts of the object as text deltas, and no tree of a text index. It needs the backend `catalog` in each instance (`ZOE_PLONE_BACKENDS catalog`), and `zoe.Storage` or `zoe.zeo.ClientStorage` with `native on`. On a stock ZEO client or FileStorage, each save and each search of the index fails with `Unsupported`.
+
+Import the profile `zoe.plone:text`, "ZOE text index", on each site. It fills new `ZoeTextIndex` indexes in batches of 1,000 objects, one commit each, while the ZCTextIndex indexes serve, then puts them in their places in the last commit. When the import fails halfway, for example with a `ConflictError`, import the profile again: it finishes the work, and no document is lost. To back out instead, import `zoe.plone:text-uninstall`: it drops the work of the failed import. Import the profile at a quiet time: a save whose transaction began before the first batch commit keeps the text of the batch until its next save. Else reindex the three indexes after the import. It refuses an instance without the backend `catalog` and a storage without text, and changes nothing. The query syntax stays that of ZCTextIndex: `AND`, `OR`, `NOT`, quoted phrases, `*` and `?`. The search form of Plone puts `*` after the last word, so `running` also finds the words that start with the stem `run`, such as `runway`. A word with `*` gets the same score in each document that holds a match, so these hits rank by the fields that hold them only. The enhanced mode drops the stop words of the language: `the` alone finds nothing.
+
+The enhanced mode does not split CJK, Thai or Hangul text as the splitter of Plone does, so a search of such text finds nothing. A site with such content keeps ZCTextIndex until the compatibility mode is built. An index that `catalog.xml` adds gets the languages of its `language` extra, such as `<extra name="language" value="en" />`; without it, the index has no stemmer and no stop words.
+
+To go back, import the profile `zoe.plone:text-uninstall`. It fills ZCTextIndex indexes of the type `Okapi BM25 Rank` while the `ZoeTextIndex` indexes serve, then puts them in their places. It also resumes after a failure halfway when you import it again. The backend `catalog` refuses its uninstall while a site holds a `ZoeTextIndex`.
+
 ## Uninstall
 
 A client without `zoedb` cannot read the classes of `zoe.plone`. It loads the properties of the members and groups, and the workflow histories of the types with the behaviour, as broken objects. So remove `zoe.plone` in this order:
 
-1. On each site, move each registry back with `registry.move_back`, and commit.
+1. On each site, move each registry back with `registry.move_back`, and commit. With `ZoeTextIndex`, import the profile `zoe.plone:text-uninstall`.
 2. With `indexing`, let the indexer empty the queue: `pending` of `@@zoe-indexing` is 0.
 3. On each site, import the profile `zoe.plone:uninstall`, "ZOE (uninstall)". It removes the behaviour from the types, gives each workflow history back as a `PersistentMapping`, gives the properties back as dicts, and switches off the merges that the profile turned on.
 4. Pack the store with garbage collection, at a time after the uninstall (see [Pack](pack.md)). The pack removes the old records of the classes of `zoe.plone`.
