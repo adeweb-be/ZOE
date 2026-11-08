@@ -344,8 +344,12 @@ fn decode_node(wire: &Wire, depth: usize) -> Result<Node, String> {
         }
         "glob" => {
             expect(&["p"])?;
+            let pattern = str_of(get("p").expect("p"), "p")?;
+            if pattern.chars().count() > super::analysis::MAX_GLOB {
+                return malformed("a glob longer than 255 characters");
+            }
             Ok(Node::Glob {
-                pattern: str_of(get("p").expect("p"), "p")?.to_owned(),
+                pattern: pattern.to_owned(),
             })
         }
         other => malformed(format!("a node of the kind {other:?}")),
@@ -628,7 +632,9 @@ mod tests {
         for _ in 0..MAX_DEPTH + 1 {
             deep = map(vec![("n", s("or")), ("items", Wire::Array(vec![deep]))]);
         }
+        let long = s(&"a".repeat(super::super::analysis::MAX_GLOB + 1));
         for bad in [
+            clause(map(vec![("n", s("glob")), ("p", long)])),
             clause(map(vec![("n", s("near")), ("w", Wire::Array(vec![]))])),
             clause(map(vec![("n", s("atom"))])),
             clause(s("word")),

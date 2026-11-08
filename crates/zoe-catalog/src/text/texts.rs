@@ -23,7 +23,7 @@
 //! A delta that fails its checksum stops the index of its catalog: each
 //! text query of the catalog then fails with `corrupt`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,8 +103,11 @@ struct Entry {
     state: TextState,
     snap: Option<Arc<Snap>>,
     settings: CatalogSettings,
-    /// The tid of the oldest delta that the index does not hold yet.
-    oldest: Option<u64>,
+    /// The tid up to which the index held the deltas before its open or
+    /// its rebuild began, for the lag; `None` for none.
+    held: Option<u64>,
+    /// When the open or the rebuild began.
+    since: Instant,
 }
 
 struct Inner {
@@ -114,6 +117,8 @@ struct Inner {
     dirty: bool,
     /// True after the first read of the registration and the settings.
     loaded: bool,
+    /// The tids of the recent hand-offs, for the lag.
+    handed: VecDeque<u64>,
     generations: Option<(u64, u64)>,
 }
 
@@ -125,6 +130,9 @@ struct Shared {
     cancel: AtomicBool,
     /// The hook of the tests before a rebuild.
     before_build: Option<Hook>,
+    /// The hook of the tests between the check of an open and the cap of
+    /// pack that the open takes.
+    before_cap: Option<Hook>,
 }
 
 impl Shared {
@@ -145,13 +153,15 @@ impl Texts {
     /// gives. The store published each commit up to `published`. A query
     /// waits at most `wait` for an index that opens or builds.
     /// `before_build` is a hook of the tests, called before each rebuild
-    /// reads the deltas.
+    /// reads the deltas, and `before_cap` one called between the checks of
+    /// an open and the cap of pack that it takes.
     pub fn start(
         open: Opener,
         published: u64,
         config: TextConfig,
         wait: Duration,
         before_build: Option<Hook>,
+        before_cap: Option<Hook>,
     ) -> Texts {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -160,6 +170,7 @@ impl Texts {
                 stop: false,
                 dirty: true,
                 loaded: false,
+                handed: VecDeque::new(),
                 generations: None,
             }),
             changed: Condvar::new(),
@@ -167,6 +178,7 @@ impl Texts {
             config,
             cancel: AtomicBool::new(false),
             before_build,
+            before_cap,
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -189,6 +201,10 @@ impl Texts {
     pub fn committed(&self, tid: u64) {
         let mut inner = self.shared.lock();
         inner.target = inner.target.max(tid);
+        inner.handed.push_back(tid);
+        if inner.handed.len() > 100_000 {
+            inner.handed.pop_front();
+        }
         inner.dirty = true;
         drop(inner);
         self.shared.changed.notify_all();
@@ -203,7 +219,17 @@ impl Texts {
     /// `wait` for an index that opens or builds, and for one that holds
     /// the deltas up to `at` when `at` is given.
     pub fn snap(&self, catalog: u64, at: Option<u64>) -> Result<Arc<Snap>, Failure> {
-        let deadline = Instant::now() + self.wait;
+        self.snap_by(catalog, at, Instant::now() + self.wait)
+    }
+
+    /// The index of `catalog` as `snap` gives it, with a wait until
+    /// `deadline` at most.
+    pub fn snap_by(
+        &self,
+        catalog: u64,
+        at: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Arc<Snap>, Failure> {
         let mut inner = self.shared.lock();
         loop {
             if inner.loaded {
@@ -280,19 +306,32 @@ impl Texts {
         }
     }
 
-    /// The counts of the text indexes.
+    /// The counts of the text indexes. The lag of an index is the age of
+    /// the oldest commit after its tid that it did not apply yet, also while
+    /// it opens or rebuilds; an index that holds no tid yet counts from the
+    /// start of its open or its rebuild.
     pub fn counts(&self) -> Vec<TextCounts> {
         let inner = self.shared.lock();
         let now = unix_now();
+        let lag = |e: &Entry| -> f64 {
+            let held = e.snap.as_ref().map(|s| s.tid).or(e.held);
+            match held {
+                Some(held) => inner
+                    .handed
+                    .iter()
+                    .find(|t| **t > held)
+                    .map_or(0.0, |t| (now - tid_seconds(*t)).max(0.0)),
+                None if e.state == TextState::Ready => 0.0,
+                None => e.since.elapsed().as_secs_f64(),
+            }
+        };
         inner
             .entries
             .iter()
             .map(|(catalog, e)| TextCounts {
                 catalog: *catalog,
                 ready: e.state == TextState::Ready,
-                lag_seconds: e
-                    .oldest
-                    .map_or(0.0, |tid| (now - tid_seconds(tid)).max(0.0)),
+                lag_seconds: lag(e),
                 docs: e.snap.as_ref().map_or(0, |s| s.maps.num_docs()),
                 tid: e.snap.as_ref().map_or(0, |s| s.tid),
             })
@@ -486,9 +525,13 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
     let mut wanted: BTreeMap<u64, Result<CatalogSettings, String>> = BTreeMap::new();
     let mut start: Option<Vec<u8>> = None;
     loop {
-        let Ok(page) = store.kv_scan(Flavour::Durable, CATALOGS, start.as_deref(), None, 1000)
-        else {
-            break;
+        let page = match store.kv_scan(Flavour::Durable, CATALOGS, start.as_deref(), None, 1000) {
+            Ok(page) => page,
+            Err(e) => {
+                // The entries stay, and the next pass reads again.
+                tracing::warn!("the read of the registration keys fails: {e}");
+                return;
+            }
         };
         let Some((last, _)) = page.last() else {
             break;
@@ -535,7 +578,8 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
                     ),
                     snap: None,
                     settings: s,
-                    oldest: None,
+                    held: None,
+                    since: Instant::now(),
                 };
                 inner.entries.insert(catalog, entry);
                 lives.remove(&catalog);
@@ -547,7 +591,8 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
                     state: TextState::Unavailable(format!("the settings of zoe.text: {why}")),
                     snap: None,
                     settings: CatalogSettings::default(),
-                    oldest: None,
+                    held: None,
+                    since: Instant::now(),
                 };
                 inner.entries.insert(catalog, entry);
                 lives.remove(&catalog);
@@ -582,7 +627,8 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
                         state: TextState::Opening,
                         snap: None,
                         settings,
-                        oldest: None,
+                        held: None,
+                        since: Instant::now(),
                     },
                 );
             }
@@ -607,7 +653,12 @@ fn set_state(shared: &Shared, catalog: u64, state: TextState) {
     let mut inner = shared.lock();
     if let Some(e) = inner.entries.get_mut(&catalog) {
         if state != TextState::Ready {
-            e.snap = None;
+            if let Some(snap) = e.snap.take() {
+                e.held = Some(snap.tid);
+            }
+            if e.state == TextState::Ready {
+                e.since = Instant::now();
+            }
         }
         e.state = state;
     }
@@ -667,6 +718,24 @@ fn open_index(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
                 }
             };
             let fields = index::schema(&layout).1;
+            let cap = if read_only {
+                None
+            } else {
+                if let Some(hook) = &shared.before_cap {
+                    hook(catalog);
+                }
+                let cap = store.pack_cap(Tid(tid));
+                // A pack that started before the cap is not held by it: its
+                // watermark passes the tid of the index.
+                if store.pack_watermark().is_ok_and(|w| w.0 > tid) {
+                    drop(cap);
+                    tracing::warn!(
+                        "a pack passed the tid of the text index of {catalog:#x}: it builds again"
+                    );
+                    return rebuild(shared, store, lives, catalog, &settings);
+                }
+                Some(cap)
+            };
             let mut live = Live {
                 _index: index,
                 writer,
@@ -680,7 +749,7 @@ fn open_index(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
                 cleared,
                 pending: 0,
                 first_pending: None,
-                cap: (!read_only).then(|| store.pack_cap(Tid(tid))),
+                cap,
             };
             if publish(shared, catalog, &mut live, &settings).is_err() {
                 return;
@@ -868,6 +937,9 @@ fn rebuild(
     let mut cleared: HashMap<String, u64> = HashMap::new();
     let mut after = Some(first_key(catalog));
     'scan: loop {
+        if shared.cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let keys = match store.text_keys(after.as_ref(), SCAN) {
             Ok(k) => k,
             Err(e) => return fail(shared, catalog, &e),
@@ -941,6 +1013,10 @@ fn rebuild(
         first_pending: None,
         cap: Some(cap),
     };
+    // A pack that started before the cap of the rebuild can pass it too.
+    if cap_lost(store, &live) {
+        return rebuild(shared, store, lives, catalog, settings);
+    }
     if publish(shared, catalog, &mut live, settings).is_ok() {
         lives.insert(catalog, live);
     }
@@ -977,13 +1053,24 @@ fn publish(
     if let Some(e) = inner.entries.get_mut(&catalog) {
         e.snap = Some(Arc::new(snap));
         e.state = TextState::Ready;
-        if live.pending == 0 {
-            e.oldest = None;
-        }
     }
+    prune_handed(&mut inner);
     drop(inner);
     shared.changed.notify_all();
     Ok(())
+}
+
+/// Drop the hand-offs that each index holds.
+fn prune_handed(inner: &mut Inner) {
+    let low = inner
+        .entries
+        .values()
+        .map(|e| e.snap.as_ref().map(|s| s.tid).or(e.held).unwrap_or(0))
+        .min()
+        .unwrap_or(u64::MAX);
+    while inner.handed.front().is_some_and(|t| *t <= low) {
+        inner.handed.pop_front();
+    }
 }
 
 /// Give queries the tid `tid` of `live` with no new document: the index
@@ -1002,15 +1089,46 @@ fn advance(shared: &Shared, catalog: u64, tid: u64) {
             tid,
             cleared: old.cleared.clone(),
         }));
-        e.oldest = None;
     }
+    prune_handed(&mut inner);
     drop(inner);
     shared.changed.notify_all();
 }
 
+/// The settings of the text indexes of `catalog`.
+fn settings_of(shared: &Shared, catalog: u64) -> Option<CatalogSettings> {
+    shared
+        .lock()
+        .entries
+        .get(&catalog)
+        .map(|e| e.settings.clone())
+}
+
+/// Rebuild the index of `catalog`, after a pack passed its cap.
+fn rebuild_after_pack(
+    shared: &Arc<Shared>,
+    store: &Store,
+    lives: &mut HashMap<u64, Live>,
+    catalog: u64,
+) {
+    lives.remove(&catalog);
+    if let Some(settings) = settings_of(shared, catalog) {
+        tracing::warn!("a pack passed the cap of the text index of {catalog:#x}: it builds again");
+        rebuild(shared, store, lives, catalog, &settings);
+    }
+}
+
 /// Apply the commits up to the last hand-off to each index, and commit the
-/// writers that are due.
+/// writers that are due. An index whose cap a pack passed rebuilds first.
 fn follow(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
+    let passed: Vec<u64> = lives
+        .iter()
+        .filter(|(_, l)| cap_lost(store, l))
+        .map(|(c, _)| *c)
+        .collect();
+    for catalog in passed {
+        rebuild_after_pack(shared, store, lives, catalog);
+    }
     let target = shared.lock().target.min(store.last_transaction().0);
     let Some(from) = lives
         .values()
@@ -1030,6 +1148,9 @@ fn follow(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
     };
     let catalogs: Vec<u64> = lives.keys().copied().collect();
     for catalog in catalogs {
+        if shared.cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let Some(live) = lives.get_mut(&catalog) else {
             continue;
         };
@@ -1045,27 +1166,28 @@ fn follow(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
             })
             .collect();
         if mine.iter().any(|c| c.rid.is_none()) {
-            let settings = shared
-                .lock()
-                .entries
-                .get(&catalog)
-                .map(|e| e.settings.clone());
-            if let Some(settings) = settings {
+            if let Some(settings) = settings_of(shared, catalog) {
                 tracing::info!("a clear delta of {catalog:#x}: its text index builds again");
                 rebuild(shared, store, lives, catalog, &settings);
             }
             continue;
         }
-        if let Err(e) = apply(shared, store, live, catalog, &mine, target) {
-            lives.remove(&catalog);
-            fail(shared, catalog, &e);
+        match apply(shared, store, live, catalog, &mine, target) {
+            Ok(false) => {}
+            Ok(true) => rebuild_after_pack(shared, store, lives, catalog),
+            Err(e) => {
+                lives.remove(&catalog);
+                fail(shared, catalog, &e);
+            }
         }
     }
     commit_due(shared, store, lives);
 }
 
 /// Apply `changes`, the deltas of `catalog` after the tid of `live`, up to
-/// `target`, in batches of whole commits of at most 10,000 deltas.
+/// `target`, in batches of whole commits of at most 10,000 deltas. Tell if
+/// a pack passed the cap of the index: then the caller rebuilds it, and
+/// nothing is published.
 fn apply(
     shared: &Shared,
     store: &Store,
@@ -1073,13 +1195,7 @@ fn apply(
     catalog: u64,
     changes: &[&TextChange],
     target: u64,
-) -> Result<(), ZoeError> {
-    if let Some(first) = changes.first() {
-        let mut inner = shared.lock();
-        if let Some(e) = inner.entries.get_mut(&catalog) {
-            e.oldest.get_or_insert(first.tid.0);
-        }
-    }
+) -> Result<bool, ZoeError> {
     let mut start = 0;
     while start < changes.len() {
         // A batch ends at the end of a commit.
@@ -1090,7 +1206,10 @@ fn apply(
         let at = changes[end - 1].tid.0;
         let rids: BTreeSet<i32> = changes[start..end].iter().filter_map(|c| c.rid).collect();
         let writer = live.writer.as_ref().expect("a writer");
-        for rid in rids {
+        for (n, rid) in rids.into_iter().enumerate() {
+            if n % 1000 == 999 && shared.cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
             let texts = texts_of(store, catalog, &live.layout, rid, at + 1)?;
             writer.delete_term(Term::from_field_i64(live.fields.rid, i64::from(rid)));
             if !texts.is_empty() {
@@ -1103,18 +1222,24 @@ fn apply(
         live.pending += end - start;
         live.first_pending.get_or_insert_with(Instant::now);
         live.applied = at;
-        if live.pending >= COMMIT_DELTAS {
-            commit(shared, store, live, catalog)?;
+        if live.pending >= COMMIT_DELTAS && commit(shared, store, live, catalog)? {
+            return Ok(true);
         }
         start = end;
     }
     live.applied = target;
     if live.pending == 0 {
+        // The check comes before the queries see the new tid.
+        if cap_lost(store, live) {
+            return Ok(true);
+        }
         live.committed = target;
-        check_pack(shared, store, live, catalog);
+        if let Some(cap) = &live.cap {
+            cap.advance(Tid(target));
+        }
         advance(shared, catalog, target);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Commit the writers whose oldest delta waits 500 ms or more.
@@ -1128,35 +1253,23 @@ fn commit_due(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
         let Some(live) = lives.get_mut(&catalog) else {
             continue;
         };
-        if let Err(e) = commit(shared, store, live, catalog) {
-            lives.remove(&catalog);
-            fail(shared, catalog, &e);
-        }
-    }
-    let rebuilds: Vec<u64> = lives
-        .iter()
-        .filter(|(_, l)| l.cap.is_none() && l.writer.is_some())
-        .map(|(c, _)| *c)
-        .collect();
-    for catalog in rebuilds {
-        let settings = shared
-            .lock()
-            .entries
-            .get(&catalog)
-            .map(|e| e.settings.clone());
-        if let Some(settings) = settings {
-            tracing::warn!(
-                "a pack passed the cap of the text index of {catalog:#x}: it builds again"
-            );
-            rebuild(shared, store, lives, catalog, &settings);
+        match commit(shared, store, live, catalog) {
+            Ok(false) => {}
+            Ok(true) => rebuild_after_pack(shared, store, lives, catalog),
+            Err(e) => {
+                lives.remove(&catalog);
+                fail(shared, catalog, &e);
+            }
         }
     }
 }
 
-/// Commit the writer of `live` with the tid of its last delta.
-fn commit(shared: &Shared, store: &Store, live: &mut Live, catalog: u64) -> Result<(), ZoeError> {
+/// Commit the writer of `live` with the tid of its last delta, then give
+/// queries the new snap. Tell if a pack passed the cap of the index: the
+/// check runs before the publication, and a lost cap publishes nothing.
+fn commit(shared: &Shared, store: &Store, live: &mut Live, catalog: u64) -> Result<bool, ZoeError> {
     let Some(writer) = live.writer.as_mut() else {
-        return Ok(());
+        return Ok(false);
     };
     let payload = index::payload(live.applied, &live.layout);
     writer
@@ -1169,27 +1282,22 @@ fn commit(shared: &Shared, store: &Store, live: &mut Live, catalog: u64) -> Resu
     live.committed = live.applied;
     live.pending = 0;
     live.first_pending = None;
-    let settings = shared
-        .lock()
-        .entries
-        .get(&catalog)
-        .map(|e| e.settings.clone())
-        .unwrap_or_default();
+    if cap_lost(store, live) {
+        return Ok(true);
+    }
+    if let Some(cap) = &live.cap {
+        cap.advance(Tid(live.committed));
+    }
+    let settings = settings_of(shared, catalog).unwrap_or_default();
     let _ = publish(shared, catalog, live, &settings);
-    check_pack(shared, store, live, catalog);
-    Ok(())
+    Ok(false)
 }
 
-/// Move the cap of `live` to its tid, or drop it when a pack passed it:
-/// the next pass rebuilds the index.
-fn check_pack(_shared: &Shared, store: &Store, live: &mut Live, _catalog: u64) {
-    let Some(cap) = &live.cap else {
-        return;
-    };
-    let held = cap.tid();
-    match store.pack_watermark() {
-        Ok(watermark) if watermark > held => live.cap = None,
-        Ok(_) => cap.advance(Tid(live.committed)),
-        Err(_) => {}
-    }
+/// Tell if a pack passed the cap of `live`: the pack watermark is above the
+/// tid of its cap. Such a pack started before the cap, so it may have
+/// removed an unindex that the index did not read.
+fn cap_lost(store: &Store, live: &Live) -> bool {
+    live.cap
+        .as_ref()
+        .is_some_and(|cap| store.pack_watermark().is_ok_and(|w| w > cap.tid()))
 }

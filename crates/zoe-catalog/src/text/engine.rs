@@ -32,6 +32,7 @@ use super::settings::{IndexSettings, Mode};
 use super::texts::{Failure, Snap, Texts};
 use super::translate::{Read, Translator};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::clause::TextError;
 
@@ -64,8 +65,9 @@ fn error(kind: TextErrorKind, why: impl Into<String>) -> Failure {
     Failure::Text(TextError::new(kind, why))
 }
 
-/// Refuse a snapshot at or before the pack watermark.
-fn check_packed(store: &Store, tid: u64) -> Result<(), Failure> {
+/// Refuse a snapshot at or before the pack watermark. Return the
+/// watermark.
+fn check_packed(store: &Store, tid: u64) -> Result<u64, Failure> {
     let watermark = store.pack_watermark().map_err(|e| Failure::of(&e))?;
     if watermark.0 > 0 && tid <= watermark.0 {
         return Err(error(
@@ -76,7 +78,7 @@ fn check_packed(store: &Store, tid: u64) -> Result<(), Failure> {
             ),
         ));
     }
-    Ok(())
+    Ok(watermark.0)
 }
 
 /// The settings of the index of `clause`: those of the clause, else those
@@ -106,24 +108,34 @@ fn settings_of(clause: &TextClause, snap: Option<&Snap>) -> Result<IndexSettings
 
 /// Answer the text query `q`. `texts` is the text indexes of the store,
 /// `None` when the store has none.
+///
+/// An index whose tid is below the pack watermark may lack an unindex that
+/// pack removed: the query waits for its rebuild, as for a clear delta
+/// that the index lacks. All the waits of one query take at most
+/// `catalog-wait` together.
 pub fn run(texts: Option<&Texts>, store: &Store, q: &Query<'_>) -> Result<Answer, Failure> {
-    check_packed(store, q.tid)?;
-    let mut at = None;
-    // A clear delta that the index lacks makes the query wait once for the
-    // rebuild.
-    for _ in 0..2 {
-        let snap = match texts {
-            Some(t) => t.snap(q.catalog, at),
-            None => Err(Failure::unavailable("the catalog has no text index")),
+    let watermark = check_packed(store, q.tid)?;
+    let deadline = texts.map(|t| Instant::now() + t.wait());
+    let mut at = (watermark > 0).then_some(watermark);
+    for _ in 0..3 {
+        let snap = match (texts, deadline) {
+            (Some(t), Some(deadline)) => t.snap_by(q.catalog, at, deadline),
+            _ => Err(Failure::unavailable("the catalog has no text index")),
         };
         match run_on(store, q, snap)? {
             Step::Done(answer) => return Ok(answer),
-            Step::Wait(tid) => at = Some(tid),
+            Step::Wait(tid) => at = Some(at.map_or(tid, |a| a.max(tid))),
         }
     }
     Err(Failure::unavailable(
-        "the text index did not reach a clear delta of the snapshot",
+        "the text index did not reach the tid that the snapshot needs",
     ))
+}
+
+/// The pack watermark, `None` before the first pack.
+fn q_watermark(store: &Store) -> Result<Option<u64>, Failure> {
+    let watermark = store.pack_watermark().map_err(|e| Failure::of(&e))?;
+    Ok((watermark.0 > 0).then_some(watermark.0))
 }
 
 enum Step {
@@ -140,7 +152,11 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
             (_, e) => e,
         })?;
     let weights = settings.read(&c.index);
-    let alone = weights.iter().any(|(i, _)| c.cleared.contains(i));
+    let cleared = |i: &str| c.cleared.iter().any(|x| x == i);
+    // Each index in `cl` answers from the staged texts alone; the others
+    // answer from the index too. With every index of the query in `cl`,
+    // the query needs no index.
+    let alone = weights.iter().all(|(i, _)| cleared(i));
     let snap = match snap {
         Ok(s) => Some(s),
         Err(_) if alone => None,
@@ -166,12 +182,31 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         })
         .collect();
     let read_indexes: Vec<&str> = weights.iter().map(|(i, _)| i.as_str()).collect();
+    // The fields that the search of the index reads: those of the indexes
+    // that the transaction did not clear.
+    let committed: Vec<Read> = weights
+        .iter()
+        .filter(|(i, _)| !cleared(i))
+        .flat_map(|(i, w)| {
+            fields
+                .of(i, c.languages.as_deref())
+                .into_iter()
+                .map(move |field| Read { field, weight: *w })
+        })
+        .collect();
     let catalog = Oid(q.catalog);
     let tid = q.tid;
     // The documents that the snapshot replaces.
     let mut replaced: BTreeSet<i32> = BTreeSet::new();
     if !alone && let Some(s) = &snap {
-        for i in &read_indexes {
+        if let Some(at) = q_watermark(store)?
+            && s.tid < at
+        {
+            // A pack may have removed an unindex that the index lacks: it
+            // rebuilds.
+            return Ok(Step::Wait(at));
+        }
+        for i in read_indexes.iter().filter(|i| !cleared(i)) {
             if s.cleared.get(*i).is_some_and(|&clear| clear >= tid) {
                 return Err(error(
                     TextErrorKind::Cleared,
@@ -185,7 +220,10 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
             .text_changed(Tid(lo), Tid(hi))
             .map_err(|e| Failure::of(&e))?;
         for change in changes {
-            if change.catalog != catalog || !read_indexes.contains(&change.index.as_str()) {
+            if change.catalog != catalog
+                || !read_indexes.contains(&change.index.as_str())
+                || cleared(&change.index)
+            {
                 continue;
             }
             match change.rid {
@@ -226,7 +264,7 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
                 }
                 continue;
             }
-            if c.cleared.iter().any(|x| x == i) {
+            if cleared(i) {
                 continue;
             }
             if let Some(t) = store
@@ -259,11 +297,13 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
     }
     let mut found = Found::default();
     let mut strategy = None;
+    let mut index_translator = Translator::new(&committed, settings.fuzzy);
     if !alone
+        && !committed.is_empty()
         && let Some(s) = &snap
-        && let Some(query) = translator.translate(&c.node)
+        && let Some(query) = index_translator.translate(&c.node)
     {
-        let bound = translator.bound(&s.searcher, &c.node);
+        let bound = index_translator.bound(&s.searcher, &c.node);
         let replaced_all: HashSet<i32> = overlay_rids.iter().copied().collect();
         let scope = Scope {
             filter: q.filter,
@@ -295,7 +335,9 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
             }
         }
     }
-    if found.hits.len().saturating_mul(8) > MAX_BYTES {
+    // A reply of hits with their scores holds 8 bytes for each; a set
+    // goes through a sort, and the reply caps what the sort keeps.
+    if matches!(q.want, Want::Top(_)) && found.hits.len().saturating_mul(8) > MAX_BYTES {
         return Err(error(
             TextErrorKind::TooLarge,
             format!("{} hits pass the cap of a reply", found.hits.len()),
@@ -315,13 +357,15 @@ pub fn info(
     tid: u64,
     rid: Option<i32>,
 ) -> Result<TextInfo, Failure> {
-    check_packed(store, tid)?;
+    let watermark = check_packed(store, tid)?;
     let Some(texts) = texts else {
         return Err(Failure::unavailable("the catalog has no text index"));
     };
-    let mut at = None;
+    let deadline = Instant::now() + texts.wait();
+    // An index below the pack watermark rebuilds first.
+    let mut at = (watermark > 0).then_some(watermark);
     for _ in 0..2 {
-        let snap = texts.snap(catalog, at)?;
+        let snap = texts.snap_by(catalog, at, deadline)?;
         let Some(fields) = snap.fields.indexes.get(index_id) else {
             return Err(Failure::unavailable(format!(
                 "the catalog has no text index {index_id}"

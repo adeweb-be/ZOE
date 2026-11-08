@@ -147,8 +147,23 @@ impl Site {
     /// A new store with the catalog `CATALOG`, registered, and its
     /// settings, with no mirror of its trees.
     fn new(name: &str, settings: &CatalogSettings) -> Site {
+        Site::open(name, settings, zoe_core::Options::default())
+    }
+
+    /// A new store as `new` gives it, whose pack keeps the deltas of a
+    /// catalog that no record reaches: the catalog of these tests has no
+    /// record.
+    fn without_gc(name: &str, settings: &CatalogSettings) -> Site {
+        let options = zoe_core::Options {
+            pack_gc: false,
+            ..zoe_core::Options::default()
+        };
+        Site::open(name, settings, options)
+    }
+
+    fn open(name: &str, settings: &CatalogSettings, options: zoe_core::Options) -> Site {
         let dir = fresh_dir(name);
-        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let store = Arc::new(Store::open_with(dir.path(), options).unwrap());
         testing::commit_text(&store, CATALOG, &[], Some(settings), true).unwrap();
         let mirrors = start(
             &store,
@@ -662,6 +677,10 @@ fn a_query_waits_for_a_rebuild_then_gets_unavailable() {
     let wait = Duration::from_millis(300);
     let mirrors = start(&store, dir.path(), false, wait, hooks);
     reached.recv_timeout(WAIT).expect("the rebuild starts");
+    // The lag grows while the rebuild runs.
+    std::thread::sleep(Duration::from_millis(50));
+    let lag = mirrors.counts().texts[0].lag_seconds;
+    assert!(lag > 0.0, "{lag}");
     let tid = store.last_transaction().0 + 1;
     let q = clause_of("Title", atom(&["kalo"]));
     let started = Instant::now();
@@ -1372,4 +1391,228 @@ fn a_clause_of_another_form_is_malformed() {
         &Wire::Nil,
     );
     assert!(matches!(found, Err(CallError::Unsupported(_))));
+}
+
+#[test]
+fn a_glob_of_any_form_answers_in_bounded_time() {
+    let site = Site::new("text-globs", &settings(&["en"]));
+    let tid = site.commit(&[set("Title", 1, "kalo")]);
+    site.ready_at(tid);
+    let now = site.now();
+    let word = "e".repeat(39);
+    let st = || {
+        vec![
+            staged("Title", 2, Some(&word)),
+            staged("Title", 3, Some("abz")),
+        ]
+    };
+    let started = Instant::now();
+    // `*e` 120 times, then `z`: a backtracking match takes exponential
+    // time on a long word of `e`.
+    let slow = clause_with(
+        "Title",
+        glob(&format!("{}z", "*e".repeat(120))),
+        vec![],
+        st(),
+        Wire::Nil,
+    );
+    assert_eq!(
+        site.query(now, &slow, None).unwrap().rids,
+        Vec::<i32>::new()
+    );
+    // A long run of `*` is one `*`.
+    let stars = clause_with(
+        "Title",
+        glob(&format!("a{}z", "*".repeat(253))),
+        vec![],
+        st(),
+        Wire::Nil,
+    );
+    assert_eq!(site.query(now, &stars, None).unwrap().rids, vec![3]);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // A pattern past 255 characters does not have the form of a clause.
+    let long = clause_with("Title", glob(&"a".repeat(256)), vec![], st(), Wire::Nil);
+    let found = engine::text_query(
+        site.mirrors.texts(),
+        &site.store,
+        site.catalog,
+        now,
+        &long,
+        &Wire::Nil,
+    );
+    assert!(matches!(found, Err(CallError::Malformed(_))));
+}
+
+#[test]
+fn a_glob_matches_the_analysed_and_the_folded_literal_part() {
+    let site = Site::new("text-glob-stems", &settings(&["en"]));
+    let tid = site.commit(&[set("Title", 1, "documents"), set("Title", 2, "docker")]);
+    site.ready_at(tid);
+    let now = site.now();
+    // The stemmer makes `document` of `documents`: the pattern finds the
+    // stem, in the index and in the text overlay.
+    assert_eq!(
+        site.rids(now, &clause_of("Title", glob("documents*"))),
+        BTreeSet::from([1])
+    );
+    let staging = clause_with(
+        "Title",
+        glob("documents*"),
+        vec![],
+        vec![staged("Title", 3, Some("Documents"))],
+        Wire::Nil,
+    );
+    let found: BTreeSet<i32> = site
+        .query(now, &staging, None)
+        .unwrap()
+        .rids
+        .into_iter()
+        .collect();
+    assert_eq!(found, BTreeSet::from([1, 3]));
+    // The folded literal part as it is still finds each term that starts
+    // with it.
+    assert_eq!(
+        site.rids(now, &clause_of("Title", glob("doc*"))),
+        BTreeSet::from([1, 2])
+    );
+}
+
+#[test]
+fn an_index_in_cl_leaves_the_committed_hits_of_the_other_indexes() {
+    let site = Site::new("text-cleared-boost", &settings(&["en"]));
+    let tid = site.commit(&[
+        set("SearchableText", 1, "kalo"),
+        set("SearchableText", 2, "kalo mite"),
+        set("Title", 2, "kalo"),
+        set("Title", 4, "kalo"),
+    ]);
+    site.ready_at(tid);
+    let now = site.now();
+    let q = || atom(&["kalo"]);
+    assert_eq!(
+        site.rids(now, &clause_of("SearchableText", q())),
+        BTreeSet::from([1, 2, 4])
+    );
+    // The transaction cleared Title and staged one title: the committed
+    // hits of SearchableText stay, and the committed titles leave.
+    let cleared = clause_with(
+        "SearchableText",
+        q(),
+        vec!["Title"],
+        vec![staged("Title", 5, Some("kalo"))],
+        Wire::Nil,
+    );
+    let found: BTreeSet<i32> = site
+        .query(now, &cleared, None)
+        .unwrap()
+        .rids
+        .into_iter()
+        .collect();
+    assert_eq!(found, BTreeSet::from([1, 2, 5]));
+}
+
+#[test]
+fn a_text_index_caps_a_pack_at_its_tid() {
+    let site = Site::without_gc("text-cap", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo"), set("Title", 2, "kalo")]);
+    site.ready_at(t1);
+    // The index stays at t1: the unindex is after its cap.
+    site.commit_quietly(&[unindex("Title", 1)]);
+    let last = site.store.last_transaction();
+    site.store.pack(last).unwrap();
+    let watermark = site.store.pack_watermark().unwrap().0;
+    assert!(watermark <= t1, "{watermark:#x} {t1:#x}");
+    assert_eq!(
+        site.rids(site.now(), &clause_of("Title", atom(&["kalo"]))),
+        BTreeSet::from([2])
+    );
+}
+
+/// Count the rebuilds of the text indexes.
+fn counting() -> (Arc<AtomicUsize>, Hooks) {
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&builds);
+    let hooks = Hooks {
+        before_text_build: Some(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..Hooks::default()
+    };
+    (builds, hooks)
+}
+
+#[test]
+fn a_restart_below_the_pack_watermark_rebuilds_the_index() {
+    let mut site = Site::without_gc("text-restart-packed", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo"), set("Title", 2, "kalo")]);
+    site.ready_at(t1);
+    site.mirrors.stop();
+    let t2 = testing::commit_text(
+        &site.store,
+        site.catalog,
+        &[unindex("Title", 1)],
+        None,
+        false,
+    )
+    .unwrap();
+    // No cap holds this pack: it removes the unindex and its text.
+    site.store.pack(Tid(t2)).unwrap();
+    assert!(site.store.pack_watermark().unwrap().0 >= t2);
+    let (builds, hooks) = counting();
+    site.restart(hooks);
+    site.ready_at(t2);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        site.rids(site.now(), &clause_of("Title", atom(&["kalo"]))),
+        BTreeSet::from([2])
+    );
+}
+
+#[test]
+fn a_pack_that_started_before_the_cap_rebuilds_the_index() {
+    let mut site = Site::without_gc("text-pack-race", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo"), set("Title", 2, "kalo")]);
+    site.ready_at(t1);
+    site.mirrors.stop();
+    let t2 = testing::commit_text(
+        &site.store,
+        site.catalog,
+        &[unindex("Title", 1)],
+        None,
+        false,
+    )
+    .unwrap();
+    // The open checks the index, then a pack that holds no cap runs before
+    // the open takes its cap: the pack removes the unindex after the tid of
+    // the index.
+    let (builds, mut hooks) = counting();
+    let store = Arc::clone(&site.store);
+    let packed = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::clone(&packed);
+    hooks.before_text_cap = Some(Arc::new(move |_| {
+        if ran.fetch_add(1, Ordering::SeqCst) == 0 {
+            store.pack(Tid(t2)).unwrap();
+        }
+    }));
+    site.restart(hooks);
+    let texts = site.mirrors.texts().unwrap();
+    let now = site.now();
+    let q = clause_of("Title", atom(&["kalo"]));
+    // No answer names the document whose unindex the pack removed.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match site.query(now, &q, None) {
+            Ok(hits) => {
+                assert_eq!(hits.rids, vec![2]);
+                if builds.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+            }
+            Err(e) => assert_eq!(e.kind, TextErrorKind::Unavailable),
+        }
+        assert!(Instant::now() < deadline, "{:?}", texts.counts());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(packed.load(Ordering::SeqCst), 1);
+    site.ready_at(t2);
 }

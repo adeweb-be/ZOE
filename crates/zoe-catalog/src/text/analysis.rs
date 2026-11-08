@@ -97,99 +97,126 @@ pub fn fold(text: &str) -> String {
     words(&mut analyzer, text).concat()
 }
 
-/// The regular expression of the glob `pattern` over the terms of a field:
-/// `*` is any run of characters, `?` one character, and the literal parts
-/// are folded.
-pub fn glob_regex(pattern: &str) -> String {
-    let mut out = String::new();
-    let mut literal = String::new();
-    let flush = |literal: &mut String, out: &mut String| {
-        if !literal.is_empty() {
-            out.push_str(&regex_escape(&fold(literal)));
-            literal.clear();
-        }
-    };
-    for c in pattern.chars() {
-        match c {
-            '*' => {
-                flush(&mut literal, &mut out);
-                out.push_str(".*");
-            }
-            '?' => {
-                flush(&mut literal, &mut out);
-                out.push('.');
-            }
-            c => literal.push(c),
-        }
-    }
-    flush(&mut literal, &mut out);
-    out
+/// The most characters of a glob. A word of the index holds at most 39
+/// bytes, so a longer pattern finds nothing that this one misses.
+pub const MAX_GLOB: usize = 255;
+
+/// One position of a glob: a character, `?` or `*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobChar {
+    /// A literal character.
+    Char(char),
+    /// `?`: one character.
+    One,
+    /// `*`: any run of characters.
+    Any,
 }
 
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "\\.+*?()|[]{}^$#&-~\"<>@".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Tell if `word` matches the glob `pattern` after the fold of its
-/// literal parts: the check of the text overlay.
-pub fn glob_matches(pattern: &[GlobPart], word: &str) -> bool {
-    let w: Vec<char> = word.chars().collect();
-    fn go(p: &[GlobPart], w: &[char]) -> bool {
-        match p.split_first() {
-            None => w.is_empty(),
-            Some((GlobPart::Any, rest)) => (0..=w.len()).any(|i| go(rest, &w[i..])),
-            Some((GlobPart::One, rest)) => !w.is_empty() && go(rest, &w[1..]),
-            Some((GlobPart::Lit(l), rest)) => {
-                w.len() >= l.len() && w[..l.len()] == l[..] && go(rest, &w[l.len()..])
-            }
-        }
-    }
-    go(pattern, &w)
-}
-
-/// A part of a glob.
+/// A part of a pattern before its analysis: a run of literal characters,
+/// `?` or `*`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GlobPart {
     /// `*`.
     Any,
     /// `?`.
     One,
-    /// Folded literal characters.
-    Lit(Vec<char>),
+    /// Literal characters, as the user wrote them.
+    Lit(String),
 }
 
-/// The parts of the glob `pattern`.
+/// The parts of the glob `pattern`. A run of `*` is one part.
 pub fn glob_parts(pattern: &str) -> Vec<GlobPart> {
     let mut out = Vec::new();
     let mut literal = String::new();
-    let flush = |literal: &mut String, out: &mut Vec<GlobPart>| {
-        if !literal.is_empty() {
-            out.push(GlobPart::Lit(fold(literal).chars().collect()));
-            literal.clear();
-        }
-    };
     for c in pattern.chars() {
         match c {
-            '*' => {
-                flush(&mut literal, &mut out);
-                out.push(GlobPart::Any);
-            }
-            '?' => {
-                flush(&mut literal, &mut out);
-                out.push(GlobPart::One);
+            '*' | '?' => {
+                if !literal.is_empty() {
+                    out.push(GlobPart::Lit(std::mem::take(&mut literal)));
+                }
+                if c == '?' {
+                    out.push(GlobPart::One);
+                } else if out.last() != Some(&GlobPart::Any) {
+                    out.push(GlobPart::Any);
+                }
             }
             c => literal.push(c),
         }
     }
-    flush(&mut literal, &mut out);
+    if !literal.is_empty() {
+        out.push(GlobPart::Lit(literal));
+    }
     out
+}
+
+/// The positions of `parts`, each literal part through `literal`.
+pub fn glob_chars(parts: &[GlobPart], mut literal: impl FnMut(&str) -> String) -> Vec<GlobChar> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            GlobPart::Any => {
+                if out.last() != Some(&GlobChar::Any) {
+                    out.push(GlobChar::Any);
+                }
+            }
+            GlobPart::One => out.push(GlobChar::One),
+            GlobPart::Lit(text) => out.extend(literal(text).chars().map(GlobChar::Char)),
+        }
+    }
+    out
+}
+
+/// The regular expression of the positions `pattern` over the terms of a
+/// field.
+pub fn glob_regex(pattern: &[GlobChar]) -> String {
+    let mut out = String::new();
+    for p in pattern {
+        match p {
+            GlobChar::Any => out.push_str(".*"),
+            GlobChar::One => out.push('.'),
+            GlobChar::Char(c) => {
+                if "\\.+*?()|[]{}^$#&-~\"<>@".contains(*c) {
+                    out.push('\\');
+                }
+                out.push(*c);
+            }
+        }
+    }
+    out
+}
+
+/// Tell if `word` matches the positions `pattern`. The match is
+/// iterative: two cursors and the place of the last `*`, so its time is at
+/// most the product of the two lengths, and it uses no recursion.
+pub fn glob_matches(pattern: &[GlobChar], word: &str) -> bool {
+    let w: Vec<char> = word.chars().collect();
+    let (mut p, mut i) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while i < w.len() {
+        match pattern.get(p) {
+            Some(GlobChar::One) => {
+                p += 1;
+                i += 1;
+            }
+            Some(GlobChar::Char(c)) if *c == w[i] => {
+                p += 1;
+                i += 1;
+            }
+            Some(GlobChar::Any) => {
+                star = Some((p, i));
+                p += 1;
+            }
+            _ => match star {
+                Some((s, mark)) => {
+                    star = Some((s, mark + 1));
+                    p = s + 1;
+                    i = mark + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|c| *c == GlobChar::Any)
 }
 
 /// The edit distance of `a` and `b`, with a transposition of two
@@ -233,13 +260,47 @@ mod tests {
         );
     }
 
+    fn folded(pattern: &str) -> Vec<GlobChar> {
+        glob_chars(&glob_parts(pattern), fold)
+    }
+
     #[test]
     fn a_glob_folds_its_literal_parts() {
-        assert_eq!(glob_regex("Caf*"), "caf.*");
-        assert_eq!(glob_regex("c?fé*"), "c.fe.*");
-        let parts = glob_parts("Caf*");
-        assert!(glob_matches(&parts, "cafe"));
-        assert!(!glob_matches(&parts, "coffee"));
+        assert_eq!(glob_regex(&folded("Caf*")), "caf.*");
+        assert_eq!(glob_regex(&folded("c?fé**")), "c.fe.*");
+        let caf = folded("Caf*");
+        assert!(glob_matches(&caf, "cafe"));
+        assert!(!glob_matches(&caf, "coffee"));
+        assert!(glob_matches(&folded("*a?e"), "cafe"));
+        assert!(!glob_matches(&folded("*a?e"), "cafes"));
+    }
+
+    #[test]
+    fn a_run_of_stars_is_one_star() {
+        let pattern = format!("a{}z", "*".repeat(200_000));
+        let parts = glob_parts(&pattern);
+        assert_eq!(parts.len(), 3);
+        let started = std::time::Instant::now();
+        assert!(glob_matches(&folded(&pattern), "abcz"));
+        assert!(!glob_matches(&folded(&pattern), "abcy"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_pattern_of_many_stars_matches_in_bounded_time() {
+        // `*e` ten and more times, then `z`, against a long word of `e`:
+        // a backtracking match takes exponential time on it.
+        let pattern = format!("{}z", "*e".repeat(120));
+        let word = "e".repeat(39);
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(!glob_matches(&folded(&pattern), &word));
+        }
+        assert!(glob_matches(
+            &folded(&pattern),
+            &format!("{}z", "e".repeat(200))
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

@@ -128,6 +128,10 @@ pub struct Hooks {
     /// the catalog.
     #[cfg(feature = "text")]
     pub before_text_build: Option<Hook>,
+    /// Before the open of a text index takes its cap of pack, after it
+    /// checked the index, with the oid of the catalog.
+    #[cfg(feature = "text")]
+    pub before_text_cap: Option<Hook>,
 }
 
 /// The state of one mirror, as `status` gives it.
@@ -314,6 +318,7 @@ impl Mirrors {
                 config.text.clone(),
                 config.wait,
                 config.hooks.before_text_build.clone(),
+                config.hooks.before_text_cap.clone(),
             )
         });
         let shared = Arc::new(Shared {

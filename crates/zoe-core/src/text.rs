@@ -220,10 +220,13 @@ pub(crate) fn catalog_of(key: &[u8]) -> Oid {
 /// grows at the end of each. A commit adds its clear deltas to the lists
 /// before its backend write, under the commit sequencer.
 ///
-/// The memory stays bounded: an index with no clear delta keeps no list, so
-/// an index id that a client invents leaves nothing; the struct keeps at
-/// most `CLEAR_LISTS` lists of at most `CLEAR_TIDS` tids each. A list past
-/// its bound leaves, and its reads go to the store.
+/// The memory stays bounded: the struct keeps at most `CLEAR_LISTS` lists
+/// of at most `CLEAR_TIDS` tids each, and a list past its bound leaves, so
+/// its reads go to the store. An index with no clear delta keeps no list:
+/// a negative entry tells that it has none up to a tid, so its reads up to
+/// that tid read nothing from the store. The struct keeps at most
+/// `CLEAR_NONE` negative entries, and drops them all past that bound. A
+/// commit with a clear delta of an index drops its negative entry.
 #[derive(Default)]
 pub(crate) struct Clears {
     inner: Mutex<ClearsInner>,
@@ -234,6 +237,9 @@ struct ClearsInner {
     /// The tids of the clear deltas of each index, in ascending order, by
     /// key of the clear delta without its tid.
     lists: HashMap<Vec<u8>, Vec<Tid>>,
+    /// The indexes with no clear delta up to a tid, by key of the clear
+    /// delta without its tid.
+    none: HashMap<Vec<u8>, Tid>,
     pending: u64,
     generation: u64,
 }
@@ -245,6 +251,7 @@ impl Clears {
         let mut inner = crate::lock(&self.inner);
         inner.pending += 1;
         for (prefix, tid) in clears {
+            inner.none.remove(prefix);
             if let Some(list) = inner.lists.get_mut(prefix)
                 && list.last().is_none_or(|last| last < tid)
             {
@@ -271,18 +278,30 @@ impl Clears {
             if let Some(list) = inner.lists.get(prefix) {
                 return Ok(newest_of(list, before));
             }
+            // No clear delta up to `upto`: a read before the tid after it
+            // finds none.
+            if inner
+                .none
+                .get(prefix)
+                .is_some_and(|upto| before.0 <= upto.0.saturating_add(1))
+            {
+                return Ok(None);
+            }
             inner.generation
         };
+        let upto = store.last_transaction();
         let list = store.read_clears(prefix)?;
         let newest = newest_of(&list, before);
         let mut inner = crate::lock(&self.inner);
-        if inner.pending == 0
-            && inner.generation == generation
-            && !list.is_empty()
-            && list.len() <= CLEAR_TIDS
-            && inner.lists.len() < CLEAR_LISTS
-        {
-            inner.lists.insert(prefix.to_vec(), list);
+        if inner.pending == 0 && inner.generation == generation {
+            if list.is_empty() {
+                if inner.none.len() >= CLEAR_NONE {
+                    inner.none.clear();
+                }
+                inner.none.insert(prefix.to_vec(), upto);
+            } else if list.len() <= CLEAR_TIDS && inner.lists.len() < CLEAR_LISTS {
+                inner.lists.insert(prefix.to_vec(), list);
+            }
         }
         Ok(newest)
     }
@@ -294,18 +313,37 @@ fn newest_of(list: &[Tid], before: Tid) -> Option<Tid> {
     at.checked_sub(1).map(|at| list[at])
 }
 
-/// The rows that one backend read of a scan gives.
+/// The rows that one backend read of a scan gives. The tests use a small
+/// value, so their scans take several reads.
+#[cfg(not(test))]
 const SCAN_CHUNK: usize = 256;
+#[cfg(test)]
+const SCAN_CHUNK: usize = 4;
 
 /// The distinct tids that `Store::verify_text` keeps before it checks
 /// their transaction rows.
+#[cfg(not(test))]
 const VERIFY_TIDS: usize = 65_536;
+#[cfg(test)]
+const VERIFY_TIDS: usize = 4;
 
 /// The most lists of clear deltas that `Clears` keeps.
+#[cfg(not(test))]
 const CLEAR_LISTS: usize = 4_096;
+#[cfg(test)]
+const CLEAR_LISTS: usize = 4;
 
 /// The most clear deltas of one index that `Clears` keeps.
+#[cfg(not(test))]
 const CLEAR_TIDS: usize = 4_096;
+#[cfg(test)]
+const CLEAR_TIDS: usize = 4;
+
+/// The most negative entries that `Clears` keeps.
+#[cfg(not(test))]
+const CLEAR_NONE: usize = 65_536;
+#[cfg(test)]
+const CLEAR_NONE: usize = 4;
 
 /// Return the bounds of the keys of `text_deltas` of `prefix`, a key
 /// without its tid, at every tid.
@@ -797,5 +835,135 @@ fn bound(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
         Included(key) => Included(key.as_slice()),
         Excluded(key) => Excluded(key.as_slice()),
         Unbounded => Unbounded,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{MAIN_BRANCH, encode_frame};
+    use crate::vfs::MemVfs;
+
+    const CATALOG: Oid = Oid(7);
+
+    fn commit(store: &Store, stage: impl FnOnce(&mut crate::Txn<&Store>)) -> Tid {
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        stage(&mut txn);
+        txn.vote().unwrap();
+        txn.finish().unwrap()
+    }
+
+    fn lists(store: &Store) -> (usize, usize) {
+        let inner = crate::lock(&store.text_clears.inner);
+        (inner.lists.len(), inner.none.len())
+    }
+
+    #[test]
+    fn the_clear_lists_stay_within_their_bounds() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        // An index with more clear deltas than the bound keeps no list.
+        for _ in 0..CLEAR_TIDS + 1 {
+            commit(&store, |txn| txn.text_clear(CATALOG, "many").unwrap());
+        }
+        store.text_before(CATALOG, "many", 1, Tid::MAX).unwrap();
+        assert_eq!(lists(&store).0, 0);
+        // At most `CLEAR_LISTS` indexes keep their lists.
+        let names: Vec<String> = (0..CLEAR_LISTS + 2).map(|i| format!("i{i}")).collect();
+        commit(&store, |txn| {
+            for name in &names {
+                txn.text_clear(CATALOG, name).unwrap();
+            }
+        });
+        for name in &names {
+            store.text_before(CATALOG, name, 1, Tid::MAX).unwrap();
+        }
+        assert_eq!(lists(&store).0, CLEAR_LISTS);
+        // A list that a commit fills past the bound leaves.
+        for _ in 0..CLEAR_TIDS {
+            commit(&store, |txn| txn.text_clear(CATALOG, "i0").unwrap());
+        }
+        assert_eq!(lists(&store).0, CLEAR_LISTS - 1);
+    }
+
+    #[test]
+    fn an_index_with_no_clear_keeps_a_bounded_negative_entry() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let t1 = commit(&store, |txn| {
+            txn.text_set(CATALOG, "T", 1, "en", "kalo", Tid(1)).unwrap()
+        });
+        let text = store.text_before(CATALOG, "T", 1, Tid(t1.0 + 1)).unwrap();
+        assert_eq!(text.unwrap().text, "kalo");
+        assert_eq!(lists(&store).1, 1);
+        // A clear delta of the index drops its negative entry.
+        let t2 = commit(&store, |txn| txn.text_clear(CATALOG, "T").unwrap());
+        assert_eq!(lists(&store).1, 0);
+        assert_eq!(
+            store.text_before(CATALOG, "T", 1, Tid(t2.0 + 1)).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .text_before(CATALOG, "T", 1, t2)
+                .unwrap()
+                .unwrap()
+                .text,
+            "kalo"
+        );
+        // The negative entries stay within their bound.
+        for i in 0..CLEAR_NONE * 3 {
+            store
+                .text_before(CATALOG, &format!("n{i}"), 1, Tid::MAX)
+                .unwrap();
+            assert!(lists(&store).1 <= CLEAR_NONE);
+        }
+    }
+
+    #[test]
+    fn verify_checks_the_transaction_rows_in_chunks() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut last = Tid::ZERO;
+        for i in 0..(VERIFY_TIDS * 3) {
+            let before = Tid(last.0 + 1);
+            last = commit(&store, |txn| {
+                txn.text_set(CATALOG, "T", 1, "en", &format!("a{i}"), before)
+                    .unwrap();
+                txn.text_set(CATALOG, "T", 2, "en", &format!("b{i}"), before)
+                    .unwrap();
+            });
+        }
+        let check = store.verify_text().unwrap();
+        assert!(check.findings.is_empty(), "{:?}", check.findings);
+        assert_eq!(check.text_deltas, (VERIFY_TIDS * 6) as u64);
+        // One tid without its transaction row, with a delta of each rid:
+        // the scan meets it in two chunks, and one finding counts both.
+        store.fold().unwrap();
+        let ghost = Tid(last.0 + 1000);
+        for rid in [1, 2] {
+            let prefix = format::text::text_prefix(CATALOG, "T", rid);
+            let key = format::text::delta_key(&prefix, ghost);
+            let payload = format::text::encode_payload("en", "ghost");
+            let frame = encode_frame(KeySpace::TextDeltas, &key, MAIN_BRANCH, last, &payload);
+            store
+                .backend
+                .write_text_stored(false, &key, Some(&frame))
+                .unwrap();
+            let index_key = format::text::txn_key(ghost, &prefix);
+            store
+                .backend
+                .write_text_stored(true, &index_key, Some(&[]))
+                .unwrap();
+        }
+        let check = store.verify_text().unwrap();
+        let rowless: Vec<_> = check
+            .findings
+            .iter()
+            .filter(|f| f.problem.starts_with("a delta without its transaction row"))
+            .collect();
+        assert_eq!(rowless.len(), 1, "{:?}", check.findings);
+        assert!(
+            rowless[0].problem.contains("the first of 2 deltas"),
+            "{:?}",
+            rowless
+        );
     }
 }

@@ -15,7 +15,7 @@ use tantivy::query::{Bm25StatisticsProvider, Bm25Weight};
 use tantivy::schema::Field;
 use tantivy::{Score, Term};
 
-use super::analysis::{self, GlobPart};
+use super::analysis;
 use super::clause::Node;
 use super::index::{Fields, field_of, pairs_of};
 use super::translate::{Read, Translator};
@@ -326,13 +326,15 @@ impl<'s> Scorer<'s> {
                 }
             }
             Node::Glob { pattern } => {
-                let parts: Vec<GlobPart> = analysis::glob_parts(pattern);
                 let mut total: Option<Score> = None;
                 for read in reads {
                     let Some(fw) = doc.fields.get(&read.field.text) else {
                         continue;
                     };
-                    if fw.tf.keys().any(|w| analysis::glob_matches(&parts, w)) {
+                    let Some(glob) = translator.glob(read, pattern) else {
+                        continue;
+                    };
+                    if fw.tf.keys().any(|w| glob.matches(w)) {
                         total = Some(total.unwrap_or(0.0) + read.weight);
                     }
                 }
