@@ -31,6 +31,7 @@ A catalog without a `ZoeSecurityIndex` runs the stock methods.
 Only the functions that Plone calls import Plone.
 """
 
+import contextlib
 import logging
 import os
 import threading
@@ -361,6 +362,48 @@ def _snapshot_values(index):
     return values
 
 
+def _reach(chain, path, top, entry):
+    """Return the number of items of `chain`, the chain of the entry at
+    `path`, between that entry and its container at `top`, or None when the
+    entry does not resolve through `top`: an entry of the catalog
+    (`entry(path)` is true) or a path without an item comes first."""
+    at = _parent(path)
+    count = 0
+    while at is not None and at != top:
+        if entry(at) or count >= len(chain) or chain[count][0] != at:
+            return None
+        count += 1
+        at = _parent(at)
+    return count if at == top else None
+
+
+# The batch that the Indexer applies in this thread: the index, the list of
+# its removed entries, and the set of the rids that it indexed.
+_batch = threading.local()
+
+
+@contextlib.contextmanager
+def _deferred(index):
+    """Keep the removed entries of `index` and the rids that it indexes
+    while the block runs, and yield the pair `(removed, fresh)`. The
+    Indexer gives them to `_write_chains` at the end of its batch, once."""
+    removed = []
+    fresh = set()
+    _batch.state = (aq_base(index), removed, fresh)
+    try:
+        yield removed, fresh
+    finally:
+        _batch.state = None
+
+
+def _batch_of(index):
+    """Return the state of the batch of the Indexer for `index`, or None."""
+    state = getattr(_batch, "state", None)
+    if state is None or state[0] is not aq_base(index):
+        return None
+    return state
+
+
 class ZoeSecurityIndex(KeywordIndex):
     """`allowedRolesAndUsers` with the inherited inputs of each entry,
     resolved at query time through the paths of the catalog."""
@@ -456,6 +499,10 @@ class ZoeSecurityIndex(KeywordIndex):
 
     def index_object(self, documentId, obj, threshold=None):
         inputs, opaque = self.entry_inputs(obj)
+        state = _batch_of(self)
+        if state is not None:
+            # The chain of this entry reads the containers now.
+            state[2].add(documentId)
         if self._inputs.get(documentId) == inputs:
             return 0
         self._inputs[documentId] = inputs
@@ -467,13 +514,63 @@ class ZoeSecurityIndex(KeywordIndex):
         return 1
 
     def unindex_object(self, documentId):
-        if self._inputs.get(documentId) is None:
+        inputs = self._inputs.get(documentId)
+        if inputs is None:
             return None
+        path = self._catalog().paths.get(documentId)
+        if path is not None and inputs[0] != OPAQUE:
+            removed = (documentId, path, inputs)
+            state = _batch_of(self)
+            if state is not None:
+                # The Indexer writes the chains at the end of its batch.
+                state[1].append(removed)
+            else:
+                self._write_chains([removed])
         del self._inputs[documentId]
         if documentId in self._opaque:
             self._opaque.remove(documentId)
         self._increment_counter()
         return None
+
+    def _write_chains(self, removed, fresh=()):
+        """Write the inputs of each removed entry into the chains of the
+        entries below it that stay in the catalog and resolve through it.
+
+        `removed` holds the triples `(rid, path, inputs)` of the removed
+        entries that are not opaque. The deepest go first, so a chain gets
+        the items of each removed entry above it. An entry at the path of a
+        removed entry that the catalog holds again takes its place. An
+        entry that resolves through another entry, an entry whose chain
+        does not reach the removed entry, and an entry of `fresh`, whose
+        chain read the containers after the removal, do not change."""
+        catalog = self._catalog()
+        uids = catalog.uids
+        gone = {rid for rid, _path, _inputs in removed}
+
+        def entry(path):
+            rid = uids.get(path)
+            return rid is not None and rid not in gone
+
+        changed = False
+        for _rid, top, own in sorted(removed, key=lambda r: r[1], reverse=True):
+            if entry(top):
+                continue
+            tail = ((top, *own[:4]), *own[4])
+            for path, below in uids.items(top + "/", top + "0", excludemax=True):
+                if below in gone or below in fresh:
+                    continue
+                found = self._inputs.get(below)
+                if found is None or found[0] == OPAQUE:
+                    continue
+                count = _reach(found[4], path, top, entry)
+                if count is None:
+                    continue
+                chain = (*found[4][:count], *tail)
+                if chain != found[4]:
+                    self._inputs[below] = (*found[:4], chain)
+                    changed = True
+        if changed:
+            self._increment_counter()
 
     def opaque(self, obj):
         """Tell if `obj` gives an opaque entry. The answer reads the object
@@ -604,7 +701,7 @@ def replace_index(catalog):
     return True
 
 
-def _restore_index(catalog):
+def restore_index(catalog):
     """Put the stock `KeywordIndex` back in the place of the
     `ZoeSecurityIndex` of the catalog tool `catalog`, and index every
     entry. Return False when the catalog holds no `ZoeSecurityIndex`."""
@@ -793,7 +890,7 @@ def uninstall():
     if db is None:
         return
     for path in _sites(db):
-        _swap(db, path, _restore_index)
+        _swap(db, path, restore_index)
 
 
 def _root_db():
@@ -968,7 +1065,7 @@ class _Lease:
 
 
 def _swap(db, path, change):
-    """Run `change` (`replace_index` or `_restore_index`) on the catalog of
+    """Run `change` (`replace_index` or `restore_index`) on the catalog of
     the site at `path` of the root database `db`, in a transaction of its
     own, under the lease of the site. Retry it after a conflict. Take no
     lease when the catalog needs no change."""

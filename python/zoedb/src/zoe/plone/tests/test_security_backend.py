@@ -9,6 +9,8 @@ acceptance tests of `test_security_index`, on the same synthetic sites:
   and the lease, and takes no lease when the catalog holds the index;
 - a connection with a change of its transaction resolves without the
   cache;
+- an entry that leaves the catalog leaves its inputs in the chains of the
+  entries below it, so their values stay those of the stock index;
 - the index answers through the `Indexes` of the catalog tool, as the ZMI
   wraps it;
 - with `security` in `ZOE_PLONE_BACKENDS`, the site of the fixture of
@@ -96,9 +98,12 @@ def candidate_tokens(site):
 class TokenChecks(acceptance.Checks):
     """The check of each token, on the mirror and on the Python path."""
 
-    def check_tokens(self, db, storage, path=("plone",), what=""):
+    def check_tokens(self, db, storage, path=("plone",), what="", stock=False):
         """For each token that an entry can hold, the mirror gives the rids
-        whose value on the Python path holds the token, and no other."""
+        whose value on the Python path holds the token, and no other. With
+        `stock`, the stock index, indexed again in full, gives them too."""
+        if stock:
+            self.index_stock(db, path)
         with opened(db, path) as site:
             pc = site.portal_catalog
             index = security.security_index(pc)
@@ -107,7 +112,10 @@ class TokenChecks(acceptance.Checks):
             for rid in index._inputs.keys():
                 for token in resolver.value(rid):
                     python.setdefault(token, set()).add(rid)
-            tokens = sorted(set(python) | candidate_tokens(site))
+            tokens = set(python) | candidate_tokens(site)
+            if stock:
+                tokens.update(pc._catalog.getIndex(acceptance.STOCK).uniqueValues())
+            tokens = sorted(tokens)
             acceptance.wait_applied(storage, aq_base(pc)._catalog._p_oid)
             catalog._counts.clear()
             for token in tokens:
@@ -116,6 +124,13 @@ class TokenChecks(acceptance.Checks):
                 self.assertEqual(
                     native, python.get(token, set()), f"{what}: the token {token}"
                 )
+                if stock:
+                    query = {acceptance.STOCK: [token]}
+                    self.assertEqual(
+                        native,
+                        set(acceptance.stock_search(site, query)),
+                        f"{what}: the stock index, {token}",
+                    )
             counts = catalog._counts_now()["queries"]
             self.assertEqual(counts.get("native", 0), len(tokens), what)
             self.assertNotIn("python", counts, what)
@@ -178,6 +193,74 @@ class TestQueuedIndexingAndAFolderThatTurnsOpaque(TokenChecks, unittest.TestCase
             self.assertIn("Manager", index.getEntryForObject(rid))
         self.check(self.db, storage=self.storage, what="one run of the queue")
         self.check_tokens(self.db, self.storage, what="one run of the queue")
+
+
+class TestAContainerThatLeavesTheCatalog(TokenChecks, unittest.TestCase):
+    layer = zoe_testing.ZOE_SITE
+
+    def setUp(self):
+        make_site(self)
+
+    def checks(self, what):
+        self.check(self.db, storage=self.storage, what=what)
+        self.check_tokens(self.db, self.storage, what=what, stock=True)
+
+    def test_the_entries_below_resolve_through_its_inputs_until_it_comes_back(self):
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            pc.unindexObject(site["private"]["blocked"])
+            pc.unindexObject(site["private"])
+            transaction.commit()
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            index = security.security_index(pc)
+            rid = pc._catalog.uids["/plone/private/blocked/below"]
+            self.assertEqual(
+                [item[0] for item in index._inputs[rid][4]],
+                ["/plone/private/blocked", "/plone/private"],
+            )
+        self.checks("two containers out of the catalog")
+        # A share on a container outside the catalog reindexes the entries
+        # below it, which read the container again.
+        with opened(self.db) as site:
+            site["private"].manage_setLocalRoles(MEMBER, ["Editor"])
+            site["private"].reindexObjectSecurity()
+            transaction.commit()
+        self.checks("a share on a container out of the catalog")
+        with opened(self.db) as site:
+            site["private"].reindexObject()
+            site["private"]["blocked"].reindexObject()
+            transaction.commit()
+        self.checks("the containers back in the catalog")
+
+    def test_the_indexer_writes_the_chains_once_at_the_end_of_its_batch(self):
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            index = security.security_index(pc)
+            rid = pc._catalog.uids["/plone/private/secret"]
+            before = index._inputs[rid]
+            with security._deferred(index) as (removed, fresh):
+                pc.uncatalog_object("/plone/private")
+                # The chain waits for the end of the batch.
+                self.assertEqual(index._inputs[rid], before)
+            self.assertEqual([item[1] for item in removed], ["/plone/private"])
+            index._write_chains(removed, fresh)
+            self.assertEqual(index._inputs[rid][4][0][0], "/plone/private")
+            transaction.commit()
+        self.checks("a container out of the catalog in a batch")
+
+    def test_a_delete_across_batches_of_the_queue(self):
+        indexing.install()
+        self.addCleanup(indexing.uninstall)
+        with opened(self.db) as site:
+            site.manage_delObjects(["private"])
+            transaction.commit()
+        with opened(self.db) as site:
+            indexing.Indexer(site, batch_size=2).run()
+        with opened(self.db) as site:
+            found = site.portal_catalog.unrestrictedSearchResults(path="/plone/private")
+            self.assertEqual(list(found), [])
+        self.checks("a delete")
 
 
 class TestTheCacheOfTheSnapshots(unittest.TestCase):
