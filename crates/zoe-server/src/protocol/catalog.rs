@@ -12,8 +12,11 @@
 //! `catalog_query(catalog, tid, plan, overlay)` runs on the read pool. A
 //! query whose snapshot holds a commit that the mirror did not apply waits
 //! for it, at most `catalog-wait`, on its thread of the read pool. The
-//! server reads no transaction overlay: an overlay that is not nil gives
-//! the reason `plan`.
+//! mirror reads the transaction overlay over the version of the query, for
+//! that query only (`zoe_catalog::overlay`).
+//!
+//! The host keeps the counters of the mirrors from its start, so a query
+//! that the store refuses before the mirrors start counts too.
 //!
 //! The mirrors also host the text index of each registered catalog with
 //! settings in `zoe.text` (ADR 0060), in `text/<oid>/` of the store
@@ -26,12 +29,14 @@
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+use std::time::Duration;
+
 use rmpv::Value;
-use zoe_catalog::counts::LATENCY_BUCKETS;
+use zoe_catalog::counts::{Counters, LATENCY_BUCKETS};
 use zoe_catalog::text::{CallError, clause, engine};
 use zoe_catalog::{
     Config, Fallback, Mirrors, NAMESPACE, Opener, PlanError, Reads, Reason, Wire, decode_typed,
-    encode_reply, split_text,
+    encode_reply, overlay, split_text,
 };
 use zoe_core::{Flavour, Store};
 
@@ -62,6 +67,8 @@ pub(crate) struct Catalog {
     store: Weak<Store>,
     /// Held while the mirrors start, so they start once.
     starting: Mutex<()>,
+    /// The counters of the mirrors, from the start of the host.
+    counters: Arc<Counters>,
 }
 
 impl Catalog {
@@ -72,7 +79,13 @@ impl Catalog {
             config,
             store: Arc::downgrade(store),
             starting: Mutex::new(()),
+            counters: Arc::default(),
         }
+    }
+
+    /// The counters of the mirrors of the store.
+    pub(crate) fn counters(&self) -> Arc<Counters> {
+        Arc::clone(&self.counters)
     }
 
     /// Start the mirrors of the store when its namespace `zoe.catalog`
@@ -99,7 +112,12 @@ impl Catalog {
         }
         let weak = self.store.clone();
         let open: Opener = Arc::new(move || weak.upgrade().map(|s| s as Arc<dyn Reads>));
-        let mirrors = Arc::new(Mirrors::start(open, hub.published().0, self.config.clone()));
+        let mirrors = Arc::new(Mirrors::start_counting(
+            open,
+            hub.published().0,
+            self.config.clone(),
+            Arc::clone(&self.counters),
+        ));
         hub.follow(Arc::clone(&mirrors));
         // A commit that the hub published between the start and the follow
         // reaches the mirrors here.
@@ -120,54 +138,62 @@ impl Catalog {
             mirrors.stop();
         }
     }
-}
 
-/// Tell if a `kv_set` or a `kv_delete` in the namespace `name` of
-/// `flavour` writes the registration keys.
-pub(crate) fn registers(flavour: Flavour, name: &str) -> bool {
-    flavour == Flavour::Durable && name == NAMESPACE
-}
-
-/// Answer `catalog_query` on the catalog `catalog`, at the exclusive tid
-/// `tid`, with the plan `plan` and the overlay `overlay`. A plan that does
-/// not have the form of section 8 is an error: its text.
-pub(crate) fn query(
-    hub: &Invalidations,
-    catalog: u64,
-    tid: u64,
-    plan: &Value,
-    overlay: &Value,
-) -> Result<Value, String> {
-    let wire = wire_of(plan)?;
-    let mirrors = hub.follower();
-    // The text clause comes apart from the plan; the mirrors take the
-    // whole plan.
-    let (rest, _) = split_text(&wire).map_err(|e| match e {
-        PlanError::Malformed(why) | PlanError::Unknown(why) => why,
-    })?;
-    let answer = match decode_typed(&rest) {
-        Err(PlanError::Malformed(why)) => return Err(why),
-        Err(PlanError::Unknown(why)) => Err(Fallback::new(Reason::Plan, why)),
-        Ok(_) if !overlay.is_nil() => Err(Fallback::new(
-            Reason::Plan,
-            "the server reads no transaction overlay",
-        )),
-        Ok(_) => match mirrors {
-            None => Err(Fallback::new(
-                Reason::NotRegistered,
-                "the store has no registration key",
-            )),
-            Some(mirrors) => {
-                let answer = mirrors.query_wire(catalog, tid, &wire)?;
-                log(mirrors);
-                return Ok(value_of(encode_reply(tid, &answer)));
+    /// Answer `catalog_query` on the catalog `catalog`, at the exclusive
+    /// tid `tid`, with the plan `plan` and the overlay `overlay`, on the
+    /// mirrors that follow `hub`. A plan or an overlay that does not have
+    /// the form of section 8 is an error: its text. The plan is decoded
+    /// once.
+    pub(crate) fn query(
+        &self,
+        hub: &Invalidations,
+        catalog: u64,
+        tid: u64,
+        plan: &Value,
+        overlay: &Value,
+    ) -> Result<Value, String> {
+        // The text clause comes apart from the plan.
+        let (rest, text) = split_text(&Wire::from_value(plan)?).map_err(|e| match e {
+            PlanError::Malformed(why) | PlanError::Unknown(why) => why,
+        })?;
+        let decoded = decode_typed(&rest);
+        let records = match decoded {
+            Err(PlanError::Malformed(why)) => return Err(why),
+            _ => overlay::decode(overlay)?,
+        };
+        let answer = match (decoded, hub.follower()) {
+            (Err(e), _) => {
+                self.counters.python(Reason::Plan, Duration::ZERO);
+                Err(e
+                    .fallback()
+                    .unwrap_or_else(|| Fallback::new(Reason::Plan, "")))
             }
-        },
-    };
-    if let (Some(mirrors), Err(fallback)) = (mirrors, &answer) {
-        mirrors.count_fallback(fallback.reason);
+            (Ok(_), None) => {
+                if let Some(records) = &records {
+                    self.counters.overlay(records.len());
+                }
+                self.counters.python(Reason::NotRegistered, Duration::ZERO);
+                Err(Fallback::new(
+                    Reason::NotRegistered,
+                    "the store has no registration key",
+                ))
+            }
+            (Ok((plan, columns, kinds)), Some(mirrors)) => {
+                let answer = mirrors.query_with_text(
+                    catalog,
+                    tid,
+                    &plan,
+                    &columns,
+                    &kinds,
+                    records.as_deref(),
+                    text.as_ref(),
+                );
+                log(mirrors);
+                answer
+            }
+        };
+        Ok(encode_reply(tid, &answer).into_value())
     }
-    Ok(value_of(encode_reply(tid, &answer)))
 }
 
 /// Answer `text_query(catalog, tid, clause, filter)` (ADR 0060, section
@@ -180,11 +206,11 @@ pub(crate) fn text_query(
     clause: &Value,
     filter: &Value,
 ) -> Result<Value, CallError> {
-    let clause = wire_of(clause).map_err(CallError::Malformed)?;
-    let filter = wire_of(filter).map_err(CallError::Malformed)?;
+    let clause = Wire::from_value(clause).map_err(CallError::Malformed)?;
+    let filter = Wire::from_value(filter).map_err(CallError::Malformed)?;
     let texts = hub.follower().and_then(|m| m.texts());
     let answer = engine::text_query(texts, store, catalog, tid, &clause, &filter)?;
-    Ok(value_of(clause::encode_hits(tid, &answer)))
+    Ok(clause::encode_hits(tid, &answer).into_value())
 }
 
 /// Answer `text_info(catalog, index, tid, rid)` with the text index of the
@@ -199,7 +225,13 @@ pub(crate) fn text_info(
 ) -> Result<Value, CallError> {
     let texts = hub.follower().and_then(|m| m.texts());
     let answer = engine::text_info(texts, store, catalog, index, tid, rid)?;
-    Ok(value_of(clause::encode_info(tid, &answer)))
+    Ok(clause::encode_info(tid, &answer).into_value())
+}
+
+/// Tell if a `kv_set` or a `kv_delete` in the namespace `name` of
+/// `flavour` writes the registration keys.
+pub(crate) fn registers(flavour: Flavour, name: &str) -> bool {
+    flavour == Flavour::Durable && name == NAMESPACE
 }
 
 /// Log the events of `mirrors`: a refused catalog, a drop, a stale mirror.
@@ -209,68 +241,22 @@ pub(crate) fn log(mirrors: &Mirrors) {
     }
 }
 
-/// The plan `value` as a tree of msgpack values. The frame decoder bounds
-/// its depth and its number of values. An int past 64 signed bits, and a
-/// str that is not UTF-8, are errors.
-pub(crate) fn wire_of(value: &Value) -> Result<Wire, String> {
-    Ok(match value {
-        Value::Nil => Wire::Nil,
-        Value::Boolean(b) => Wire::Bool(*b),
-        Value::Integer(n) => Wire::Int(
-            n.as_i64()
-                .ok_or_else(|| "an int of the plan beyond 64 bits".to_owned())?,
-        ),
-        Value::F32(f) => Wire::Float(f64::from(*f)),
-        Value::F64(f) => Wire::Float(*f),
-        Value::String(s) => Wire::Str(
-            s.as_str()
-                .ok_or_else(|| "a str of the plan that is not UTF-8".to_owned())?
-                .to_owned(),
-        ),
-        Value::Binary(b) => Wire::Bin(b.clone()),
-        Value::Array(items) => Wire::Array(items.iter().map(wire_of).collect::<Result<_, _>>()?),
-        Value::Map(items) => Wire::Map(
-            items
-                .iter()
-                .map(|(k, v)| Ok((wire_of(k)?, wire_of(v)?)))
-                .collect::<Result<_, String>>()?,
-        ),
-        Value::Ext(kind, data) => Wire::Ext(*kind, data.clone()),
-    })
-}
-
-/// The msgpack value of `wire`.
-pub(crate) fn value_of(wire: Wire) -> Value {
-    match wire {
-        Wire::Nil => Value::Nil,
-        Wire::Bool(b) => Value::Boolean(b),
-        Wire::Int(i) => Value::from(i),
-        Wire::Float(f) => Value::F64(f),
-        Wire::Str(s) => Value::from(s),
-        Wire::Bin(b) => Value::Binary(b),
-        Wire::Array(items) => Value::Array(items.into_iter().map(value_of).collect()),
-        Wire::Map(items) => Value::Map(
-            items
-                .into_iter()
-                .map(|(k, v)| (value_of(k), value_of(v)))
-                .collect(),
-        ),
-        Wire::Ext(kind, data) => Value::Ext(kind, data),
-    }
-}
-
 /// Write the metrics of the catalog of `storages` in the Prometheus text
 /// format (ADR 0059, section 11). Each sample has the label `storage`; the
 /// gauges of a mirror also have the label `catalog`, the oid of its
 /// `Catalog` object in 16 hex digits. A storage whose mirrors did not
-/// start gives 0 for each counter, and no gauge of a mirror.
+/// start gives the counts of the queries that its host refused, and no
+/// gauge of a mirror.
 pub(crate) fn render(storages: &[Exported]) -> String {
     let mut out = String::new();
     let counts: Vec<(String, zoe_catalog::counts::Counts)> = storages
         .iter()
         .map(|s| {
             let labels = format!("storage=\"{}\"", super::metrics::escape(&s.name));
-            let counts = s.hub.follower().map(|m| m.counts()).unwrap_or_default();
+            let counts = s
+                .hub
+                .follower()
+                .map_or_else(|| s.catalog.snapshot(), |m| m.counts());
             (labels, counts)
         })
         .collect();
@@ -322,6 +308,16 @@ pub(crate) fn render(storages: &[Exported]) -> String {
                 "{name}{{{labels},reason=\"{reason}\",side=\"server\"}} {n}"
             );
         }
+    }
+    let name = "zoe_catalog_overlay_records";
+    head(
+        &mut out,
+        name,
+        "counter",
+        "The number of records of the transaction overlays that the catalog queries sent.",
+    );
+    for (labels, c) in &counts {
+        let _ = writeln!(out, "{name}{{{labels}}} {}", c.overlay_records);
     }
     let name = "zoe_catalog_mirror_drops_total";
     head(

@@ -1312,11 +1312,13 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
             self._catalog_accepted = _CATALOG_QUERY in extensions
         return self._catalog_accepted
 
-    def catalog_query(self, catalog, tid, plan):
+    def catalog_query(self, catalog, tid, plan, overlay=None):
         """Answer the catalog query `plan` on the catalog mirror of the
-        server, with the arguments and the reply of
-        `zoe.Storage.catalog_query`."""
-        return self._with_server(lambda: self._native.catalog_query(catalog, tid, plan))
+        server, over the transaction overlay `overlay` when it is given,
+        with the arguments and the reply of `zoe.Storage.catalog_query`."""
+        return self._with_server(
+            lambda: self._native.catalog_query(catalog, tid, plan, overlay)
+        )
 
     # The native text index (ADR 0060).
 

@@ -1,7 +1,8 @@
 //! The codec of a plan and of a reply, in the form of ADR 0059, section 8.
 //!
 //! The form is a tree of msgpack values: `Wire`. The extension module
-//! makes it from a Python dict; the server makes it from msgpack. This
+//! makes it from a Python dict; the server and the native client convert
+//! it from and to msgpack (`Wire::from_value`, `Wire::into_value`). This
 //! version reads the clauses of keys (`"k": "v"`), of a BooleanIndex
 //! (`"k": "b"`), of a DateRangeIndex (`"k": "d"`) and of an
 //! ExtendedPathIndex (`"k": "p"`).
@@ -73,6 +74,65 @@ pub enum Wire {
     Map(Vec<(Wire, Wire)>),
     /// An ext: its type and its data.
     Ext(i8, Vec<u8>),
+}
+
+impl Wire {
+    /// The tree of the msgpack value `value`. An int past 64 signed bits,
+    /// and a str that is not UTF-8, are errors: their text. The caller
+    /// bounds the depth of `value`.
+    pub fn from_value(value: &rmpv::Value) -> Result<Wire, String> {
+        use rmpv::Value;
+        Ok(match value {
+            Value::Nil => Wire::Nil,
+            Value::Boolean(b) => Wire::Bool(*b),
+            Value::Integer(n) => Wire::Int(
+                n.as_i64()
+                    .ok_or_else(|| "an int of the plan beyond 64 bits".to_owned())?,
+            ),
+            Value::F32(f) => Wire::Float(f64::from(*f)),
+            Value::F64(f) => Wire::Float(*f),
+            Value::String(s) => Wire::Str(
+                s.as_str()
+                    .ok_or_else(|| "a str of the plan that is not UTF-8".to_owned())?
+                    .to_owned(),
+            ),
+            Value::Binary(b) => Wire::Bin(b.clone()),
+            Value::Array(items) => Wire::Array(
+                items
+                    .iter()
+                    .map(Wire::from_value)
+                    .collect::<Result<_, _>>()?,
+            ),
+            Value::Map(items) => Wire::Map(
+                items
+                    .iter()
+                    .map(|(k, v)| Ok((Wire::from_value(k)?, Wire::from_value(v)?)))
+                    .collect::<Result<_, String>>()?,
+            ),
+            Value::Ext(kind, data) => Wire::Ext(*kind, data.clone()),
+        })
+    }
+
+    /// The msgpack value of the tree.
+    pub fn into_value(self) -> rmpv::Value {
+        use rmpv::Value;
+        match self {
+            Wire::Nil => Value::Nil,
+            Wire::Bool(b) => Value::Boolean(b),
+            Wire::Int(i) => Value::from(i),
+            Wire::Float(f) => Value::F64(f),
+            Wire::Str(s) => Value::from(s),
+            Wire::Bin(b) => Value::Binary(b),
+            Wire::Array(items) => Value::Array(items.into_iter().map(Wire::into_value).collect()),
+            Wire::Map(items) => Value::Map(
+                items
+                    .into_iter()
+                    .map(|(k, v)| (k.into_value(), v.into_value()))
+                    .collect(),
+            ),
+            Wire::Ext(kind, data) => Value::Ext(kind, data),
+        }
+    }
 }
 
 /// The kind of a clause on the wire (`"k"`): the classes of index that it

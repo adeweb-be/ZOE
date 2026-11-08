@@ -12,6 +12,8 @@
 //! - `mirror`: the versions of a mirror, the window and the rebase.
 //! - `query`: the clauses and the four sort paths of ZCatalog.
 //! - `plan`: the codec of a plan and of a reply.
+//! - `overlay`: the transaction overlay of a query, read over the version
+//!   of the query for that query only.
 //! - `mirrors`: the mirrors of a store, their registration, their thread
 //!   and the memory bound.
 //! - `reason` and `counts`: the reasons of a fallback and the counts.
@@ -31,6 +33,7 @@ pub mod change;
 pub mod counts;
 pub mod mirror;
 pub mod mirrors;
+pub mod overlay;
 pub mod plan;
 pub mod query;
 pub mod read;

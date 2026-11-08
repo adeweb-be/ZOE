@@ -649,7 +649,8 @@ fn a_plan_that_does_not_decode_gets_value_error_and_an_unknown_kind_gets_plan() 
     ]));
     let found = answer(&query(&mut conn, oid, tid + 1, &boolean).unwrap());
     assert_eq!(found.map(|r| r.len()), Ok(4));
-    // The server reads no transaction overlay yet.
+    // The server reads the transaction overlay: a record of an object that
+    // the mirror does not read leaves the answer native.
     let overlay = Value::Array(vec![Value::Array(vec![p64(1), Value::Binary(vec![])])]);
     let reply = conn
         .call(
@@ -657,7 +658,7 @@ fn a_plan_that_does_not_decode_gets_value_error_and_an_unknown_kind_gets_plan() 
             vec![p64(oid), p64(tid + 1), of_type("Document"), overlay],
         )
         .unwrap();
-    assert_eq!(answer(&reply), Err("plan".to_owned()));
+    assert_eq!(answer(&reply), Ok(catalog.rids("Document")));
     assert_eq!(get(&reply, "tid"), Some(&p64(tid + 1)));
     server.stop();
 }

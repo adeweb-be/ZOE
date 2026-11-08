@@ -1,6 +1,7 @@
 //! The counts of the mirrors of a store (ADR 0059, section 11), as the
 //! store gives them: the queries by path, their latency, the fallbacks by
-//! reason, the drops, and the state of each mirror.
+//! reason, the drops, the records of the transaction overlays, and the
+//! state of each mirror.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -22,6 +23,7 @@ pub struct Counters {
     latency: [AtomicU64; LATENCY_BUCKETS.len() + 1],
     latency_micros: AtomicU64,
     drops: AtomicU64,
+    overlay_records: AtomicU64,
 }
 
 impl Counters {
@@ -51,6 +53,12 @@ impl Counters {
             .fetch_add(took.as_micros() as u64, Ordering::Relaxed);
     }
 
+    /// Counts the records of a transaction overlay that a query sent.
+    pub fn overlay(&self, records: usize) {
+        self.overlay_records
+            .fetch_add(records as u64, Ordering::Relaxed);
+    }
+
     /// Counts the drop of a mirror by the memory bound.
     pub fn drop_mirror(&self) {
         self.drops.fetch_add(1, Ordering::Relaxed);
@@ -71,6 +79,7 @@ impl Counters {
             latency: self.latency.iter().map(load).collect(),
             latency_seconds: load(&self.latency_micros) as f64 / 1e6,
             drops: load(&self.drops),
+            overlay_records: load(&self.overlay_records),
             mirrors: Vec::new(),
             texts: Vec::new(),
         }
@@ -94,6 +103,9 @@ pub struct Counts {
     pub latency_seconds: f64,
     /// `zoe_catalog_mirror_drops_total`.
     pub drops: u64,
+    /// `zoe_catalog_overlay_records`: the records of the transaction
+    /// overlays that the queries sent.
+    pub overlay_records: u64,
     /// The state of each mirror.
     pub mirrors: Vec<MirrorCounts>,
     /// The state of the text index of each catalog (ADR 0060).

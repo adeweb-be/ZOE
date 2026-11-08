@@ -97,16 +97,28 @@ class TestTheCatalogMirrorOverZoeServe(unittest.TestCase):
 
     def test_a_search_sees_a_commit_of_its_own_connection(self):
         query = {"portal_type": "Document"}
+        # The searches of the test, by path. The changes of the content
+        # search the catalog too, outside these counts.
+        searched = {"native": 0, "python": 0}
+
+        def search(site):
+            before = dict(catalog._counts_now()["queries"])
+            found = answer(site.portal_catalog.unrestrictedSearchResults(**query))
+            after = catalog._counts_now()["queries"]
+            for path in searched:
+                searched[path] += after.get(path, 0) - before.get(path, 0)
+            return found
+
         with opened(self.db) as site:
-            before = answer(site.portal_catalog.unrestrictedSearchResults(**query))
+            before = search(site)
             site.invokeFactory("Document", "later", title="Later")
             transaction.commit()
-            later = answer(site.portal_catalog.unrestrictedSearchResults(**query))
+            later = search(site)
             self.assertEqual(len(later[0]), len(before[0]) + 1)
             self.assertEqual(later, stock(site, query))
             site.manage_delObjects(["later"])
             transaction.commit()
-        self.assertEqual(catalog._counts_now()["queries"].get("native"), 2)
+        self.assertEqual(searched, {"native": 2, "python": 0})
 
     def test_an_error_of_the_call_takes_the_python_path_unsupported(self):
         from unittest import mock

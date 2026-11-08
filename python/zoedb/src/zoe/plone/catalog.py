@@ -16,6 +16,26 @@ Connection to `catalog_query` of the storage, and gives a `LazyMap` of
 brains in the order of the reply. For a refusal, or for a query that it
 cannot type, the hook runs the stock search, whole.
 
+The transaction overlay. A search in a transaction that changed records of
+the database of the catalog sends these records with the query (ADR 0059,
+section 8): the pickles of the objects that the Connection registered, the
+records of its savepoint storage that no registered object replaces, and
+the new objects that they reach. A new object that no savepoint stored has
+no oid, so the hook names it with a provisional oid: the high bit set, then
+a counter of the overlay. The hook pickles copies of the states with
+ZODB's `ObjectWriter` and changes no object: a new object, and a weak
+reference to a new object, get no oid and no jar; the stock writer sees
+only the objects that it does not change. It sends every record, with no
+filter, and pickles the overlay again for each search. A plan and an
+overlay that pass the cap of a call, 50,000 msgpack values or 16 MiB, take
+the Python path (`too_large`): the hook counts the records before any
+pickle, and stops as soon as the overlay passes the cap. An object that the
+hook cannot name without a change to it (a weak reference to an object of
+another database, a persistent class without an oid), and an overlay that
+does not pickle, take the Python path (`overlay`); the second goes to the
+log once for each class. A `ConflictError` and a `POSKeyError` of a pickle
+go on to the caller.
+
 The brains. The plan names the columns of the `schema` of the catalog, in
 the order of their positions (`cols`), and the number of rids that get
 their rows (`rn`): a page of `_CELLS` cells, or `b_size` when it is
@@ -28,8 +48,10 @@ rid whose row is `None` (a cell of a type that the mirror does not model),
 a rid past `rn`, and each brain made after the Connection registered an
 object, stored a savepoint record or moved to another snapshot, gets the
 brain of the stock `Catalog.__getitem__`, which reads `data` as the
-Connection sees it then. A schema that does not give each position from 0
-once sends no columns.
+Connection sees it then. A search with an overlay sends no columns: a
+change of a registered object leaves no trace, so each of its brains comes
+from `Catalog.__getitem__`. A schema that does not give each position from
+0 once sends no columns.
 
 This version types the clauses of FieldIndex, KeywordIndex, DateIndex and
 UUIDIndex (`"k": "v"`), of BooleanIndex (`"k": "b"`, the truth of the first
@@ -39,10 +61,10 @@ its level, the options of `ExtendedPathIndex.query_index` and the
 physical path of the index), and a sort on FieldIndexes, DateIndexes and
 UUIDIndexes. A sort on an ExtendedPathIndex takes the Python path
 (`sort`). The hook decides the reasons `unsupported`, `index`, `option`,
-`and_range`, `sort` and `transaction`; the store decides the others. A search in a
-transaction whose connection holds a registered object or a savepoint
-record takes the Python path (`transaction`): no overlay carries the
-changes of the transaction yet.
+`and_range`, `sort`, `too_large` and the `overlay` that it cannot pickle;
+the store decides the others. An error of `catalog_query` that the hook
+catches (`Unsupported`, `StorageError`) goes to the log once for each
+class, at WARNING, and the search takes the Python path (`unsupported`).
 
 The modes: `on`, the default, and `compare`, which also runs the stock
 search, logs each difference at ERROR with the indexes and the options of
@@ -66,6 +88,7 @@ Only `install()` and the functions that Plone calls import Plone.
 """
 
 import collections
+import functools
 import logging
 import os
 import threading
@@ -122,6 +145,17 @@ _INT = 2**63
 
 # The cells of the rows that a reply gives for a query without `b_size`.
 _CELLS = 50_000
+
+# The cap of a call (ADR 0059, section 8): the msgpack values and the bytes
+# of the plan and of the overlay.
+_CAP_VALUES = 50_000
+_CAP_BYTES = 16 * 1024 * 1024
+
+# The high bit of a provisional oid.
+_PROVISIONAL = 1 << 63
+
+# The classes of the errors of `catalog_query` that went to the log.
+_logged = set()
 
 
 def installed():
@@ -389,27 +423,229 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     supported = getattr(storage, "catalog_supported", None)
     if supported is None or not supported():
         return None, "unsupported", None
-    start = getattr(getattr(jar, "_storage", None), "_start", None)
+    start = _start_of(jar)
     if start is None:
         return None, "unsupported", None
-    if jar._registered_objects or _savepoint_records(jar):
-        return None, "transaction", None
     plan, reason = plan_of(catalog, query, sort_index, reverse, limit, merge)
     if plan is None:
         return None, reason, None
-    from ZODB.POSException import StorageError, Unsupported
+    from ZODB.POSException import ConflictError, POSKeyError, StorageError, Unsupported
+
+    overlay = None
+    if jar._registered_objects or _savepoint_records(jar):
+        # Each brain of a result over an overlay comes from
+        # `Catalog.__getitem__`.
+        cols, rn = plan["cols"], plan["rn"]
+        plan["cols"], plan["rn"] = None, 0
+        try:
+            overlay = _overlay(jar)
+        except _TooLarge:
+            return None, "too_large", plan
+        except _Unsure:
+            return None, "overlay", plan
+        except (ConflictError, POSKeyError):
+            raise
+        except Exception as e:
+            _log_once(e, "the transaction overlay does not pickle")
+            return None, "overlay", plan
+        if not overlay:
+            overlay = None
+            plan["cols"], plan["rn"] = cols, rn
+    if _too_large(plan, overlay):
+        return None, "too_large", plan
 
     try:
-        reply = storage.catalog_query(oid, start, plan)
-    except (Unsupported, StorageError):
+        reply = storage.catalog_query(oid, start, plan, overlay)
+    except (Unsupported, StorageError) as e:
         # The server stopped serving the extension, as an older server
         # after a failover, or the connection is lost. The stock search
         # answers. A plan of another form raises `ValueError`, a fault of
         # the hook, which goes on.
+        _log_once(e, "catalog_query failed")
         return None, "unsupported", plan
     if "f" in reply:
         return None, None, plan
-    return _result(catalog, reply, jar, start), None, plan
+    return _result(catalog, reply, jar, start, overlay is None), None, plan
+
+
+def _log_once(error, what):
+    """Log an error that the hook caught, with `what` it was doing, once for
+    each class and each `what` in the process."""
+    cls = type(error)
+    name = f"{cls.__module__}.{cls.__qualname__}"
+    with _counts_lock:
+        if (what, name) in _logged:
+            return
+        _logged.add((what, name))
+    logger.warning(
+        "catalog mirror: %s with %s: %s; the search takes the Python path",
+        what,
+        name,
+        error,
+    )
+
+
+class _TooLarge(Exception):
+    """The overlay passes the cap of a call."""
+
+
+class _Unsure(Exception):
+    """The overlay holds an object that the hook cannot name without a
+    change to it."""
+
+
+def _overlay(jar):
+    """The transaction overlay of the Connection `jar`: a list of `(oid,
+    pickle)` pairs of bytes. It holds the pickles of the objects that the
+    Connection registered and that changed, the records of its savepoint
+    storage that no registered object replaces, and the new objects that
+    they reach, with provisional oids. It changes no object.
+
+    The count of the records comes before any pickle, and the pickles stop
+    as soon as the overlay alone passes the cap of a call: then it raises
+    `_TooLarge`. So a search does at most the work of one cap. An object
+    that the hook cannot name without a change to it raises `_Unsure`."""
+    changed = {}
+    for obj in list(jar._registered_objects):
+        oid = obj._p_oid
+        # As `Connection._commit`: an object of another jar fails the commit,
+        # and an object that is no longer changed stores nothing.
+        if obj._p_jar is not jar or oid in changed:
+            continue
+        if oid not in jar._added and not obj._p_changed:
+            continue
+        changed[oid] = obj
+    savepoint = getattr(jar, "_savepoint_storage", None)
+    kept = [oid for oid in savepoint.index if oid not in changed] if savepoint else []
+    # The array of the overlay, then three values for each record: its
+    # array, its oid and its pickle.
+    values = _CAP_VALUES - 1 - 3 * (len(changed) + len(kept))
+    size = _CAP_BYTES - 5
+    if values < 0 or size < 0:
+        raise _TooLarge()
+    records = []
+
+    def take(oid, data):
+        nonlocal size
+        size -= 16 + len(data)
+        if size < 0:
+            raise _TooLarge()
+        records.append((oid, data))
+
+    writer = _overlay_writer()(jar)
+    for oid, obj in changed.items():
+        take(bytes(oid), writer.serialize(obj))
+        while writer.pending:
+            values -= 3
+            if values < 0:
+                raise _TooLarge()
+            new, obj = writer.pending.pop()
+            take(new, writer.serialize(obj))
+    for oid in kept:
+        data, _ = savepoint.load(oid)
+        take(bytes(oid), bytes(data))
+    return records
+
+
+@functools.cache
+def _overlay_writer():
+    """The class of the writer of an overlay, made at its first use, so the
+    import of the module imports no ZODB."""
+    from persistent import Persistent
+    from persistent.wref import WeakRef
+    from ZODB.serialize import ObjectWriter, binary
+    from ZODB.utils import p64
+
+    class OverlayWriter(ObjectWriter):
+        """An `ObjectWriter` that names a new object with a provisional oid,
+        and gives it no oid and no jar."""
+
+        def __init__(self, jar):
+            super().__init__()
+            self._jar = jar
+            self.pending = []
+            self._new = {}
+
+        def provisional(self, obj):
+            """The provisional oid of the new object `obj`."""
+            found = self._new.get(id(obj))
+            if found is not None:
+                return found[0]
+            oid = binary(p64(_PROVISIONAL | (len(self._new) + 1)))
+            # The entry keeps the object alive, so no other object takes
+            # its id.
+            self._new[id(obj)] = (oid, obj)
+            self.pending.append((bytes(oid), obj))
+            return oid
+
+        def persistent_id(self, obj):
+            # The stock `persistent_id` gives an oid and a jar to an object
+            # without an oid, and an oid to a weak reference without one.
+            # So it sees only the objects that it does not change.
+            if isinstance(obj, WeakRef):
+                if obj.oid is not None:
+                    return super().persistent_id(obj)
+                target = obj()
+                if target is None:
+                    raise _Unsure()
+                if getattr(target, "_p_oid", None) is None:
+                    return ["w", (self.provisional(target),)]
+                if target._p_jar is self._jar:
+                    return ["w", (binary(target._p_oid),)]
+                raise _Unsure()
+            if isinstance(obj, type):
+                if getattr(obj, "_p_oid", 0) is None:
+                    raise _Unsure()
+                return super().persistent_id(obj)
+            if isinstance(obj, Persistent) and obj._p_oid is None:
+                oid = self.provisional(obj)
+                if hasattr(type(obj), "__getnewargs__"):
+                    return oid
+                return oid, type(obj)
+            return super().persistent_id(obj)
+
+    return OverlayWriter
+
+
+def _size(value):
+    """The msgpack values of `value` and a bound of its bytes."""
+    if value is None or isinstance(value, bool):
+        return 1, 1
+    if isinstance(value, (int, float)):
+        return 1, 9
+    if isinstance(value, str):
+        return 1, 5 + len(value.encode("utf-8", "surrogatepass"))
+    if isinstance(value, bytes):
+        return 1, 5 + len(value)
+    if isinstance(value, dict):
+        values, size = 1, 5
+        for k, v in value.items():
+            for item in (k, v):
+                n, b = _size(item)
+                values, size = values + n, size + b
+        return values, size
+    values, size = 1, 5
+    for item in value:
+        n, b = _size(item)
+        values, size = values + n, size + b
+    return values, size
+
+
+def _too_large(plan, overlay):
+    """Tell if the plan and the overlay pass the cap of a call."""
+    values, size = _size(plan)
+    if overlay:
+        values += 1 + 3 * len(overlay)
+        size += 5 + sum(16 + len(pickle) for _, pickle in overlay)
+    return values > _CAP_VALUES or size > _CAP_BYTES
+
+
+def _start_of(jar):
+    """The start of the snapshot of the Connection `jar`, or None. After a
+    savepoint, `_storage` is the savepoint storage, so the start comes from
+    the storage under it."""
+    storage = getattr(jar, "_normal_storage", None) or getattr(jar, "_storage", None)
+    return getattr(storage, "_start", None)
 
 
 def _savepoint_records(jar):
@@ -423,14 +659,15 @@ def _savepoint_records(jar):
         return True
 
 
-def _result(catalog, reply, jar, start):
-    """The lazy result of a reply, as ZCatalog gives it."""
+def _result(catalog, reply, jar, start, rows=True):
+    """The lazy result of a reply, as ZCatalog gives it. Without `rows`,
+    each brain comes from `Catalog.__getitem__`."""
     from ZTUtils.Lazy import LazyCat, LazyMap
 
     if not reply["r"] and not reply["a"]:
         return LazyCat([])
     return LazyMap(
-        _brains(catalog, reply, jar, start),
+        _brains(catalog, reply, jar, start) if rows else catalog.__getitem__,
         list(reply["r"]),
         reply["n"],
         actual_result_count=reply["a"],
@@ -467,7 +704,7 @@ def _brains(catalog, reply, jar, start):
         return (
             jar._registered_objects
             or _savepoint_records(jar)
-            or getattr(getattr(jar, "_storage", None), "_start", None) != start
+            or _start_of(jar) != start
         )
 
     def brain(rid):

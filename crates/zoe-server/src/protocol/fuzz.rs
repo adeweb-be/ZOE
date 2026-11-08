@@ -1,7 +1,7 @@
 //! The entry of the fuzz targets in `fuzz/`: the frame decoder and the
-//! message decoder of `zoe serve`, and the decoders of the plan of a
-//! catalog query, of its text clause and of the arguments of `text_query`,
-//! on any bytes.
+//! message decoder of `zoe serve`, and the decoders of the plan, of its
+//! text clause and of the overlay of a catalog query, and of the arguments
+//! of `text_query`, on any bytes.
 //!
 //! This module compiles with the feature `fuzz`, and in the unit tests of
 //! the crate.
@@ -9,7 +9,10 @@
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-use super::{PROTOCOL, catalog, frame, message};
+use zoe_catalog::read::{KEYS, RECORDS, node_with};
+use zoe_catalog::{Wire, overlay};
+
+use super::{PROTOCOL, frame, message};
 
 /// Read `data` as the server reads the bytes of a client: the protocol
 /// `M5`, then frames of at most `max_frame_size` bytes, each one a message.
@@ -34,29 +37,47 @@ pub fn read_messages(data: &[u8], max_frame_size: u32) -> usize {
     messages
 }
 
-/// Read `data` as the server reads the argument `plan` of a
-/// `catalog_query` call: one msgpack value within the bounds of a frame,
-/// then a plan of ADR 0059, section 8, with the kind of each clause, and
-/// its text clause of ADR 0060, section 12. The same value also goes
-/// through the decoders of the arguments `clause` and `filter` of
-/// `text_query`, and of the cap of a call.
+/// Read `data` as the server reads the arguments `plan` and `overlay` of
+/// a `catalog_query` call: the msgpack value of the plan, then, when bytes
+/// remain, the msgpack value of the overlay, both within the bounds of a
+/// frame. The plan reads as a plan of ADR 0059, section 8, with the kind
+/// of each clause and its text clause of ADR 0060, section 12; the overlay
+/// as nil or `[[oid, pickle]...]`, and each of its records as a node of a
+/// tree, with the keys and with the records of `data`, as the mirror reads
+/// it. The value of the plan also goes through the decoders of the
+/// arguments `clause` and `filter` of `text_query`, and of the cap of a
+/// call.
 ///
-/// Return true when the plan reads, false when the call fails or gives the
-/// reason `plan`. The function never panics.
+/// Return true when the plan and the overlay read, false when the call
+/// fails or gives the reason `plan`. The function never panics.
 pub fn read_plan(data: &[u8]) -> bool {
-    let Ok(value) = message::decode_value(data) else {
+    let Ok((value, overlay)) = message::decode_first(data) else {
         return false;
     };
-    let Ok(wire) = catalog::wire_of(&value) else {
+    let Ok(wire) = Wire::from_value(&value) else {
         return false;
     };
     let _ = zoe_catalog::text::clause::decode_clause(&wire, false);
     let _ = zoe_catalog::text::clause::decode_filter(&wire);
     let _ = zoe_catalog::text::clause::too_large(&wire);
-    let Ok((rest, _)) = zoe_catalog::split_text(&wire) else {
+    let read = match zoe_catalog::split_text(&wire) {
+        Ok((rest, _)) => zoe_catalog::decode_typed(&rest).is_ok(),
+        Err(_) => false,
+    };
+    if overlay.is_empty() {
+        return read;
+    }
+    let Ok(records) = message::decode_value(overlay).and_then(|v| overlay::decode(&v)) else {
         return false;
     };
-    zoe_catalog::decode_typed(&rest).is_ok()
+    for (_, pickle) in records.unwrap_or_default() {
+        for reader in [KEYS, RECORDS] {
+            if let Ok(record) = (reader.decode)(&pickle) {
+                let _ = node_with(&record, reader.value);
+            }
+        }
+    }
+    read
 }
 
 /// Read one frame of at most `max` bytes from `reader`. Return `None` at
@@ -228,7 +249,13 @@ mod tests {
         let seeds = corpus("plan");
         assert!(seeds.len() >= 5, "plan: {} seeds", seeds.len());
         for (name, data) in seeds {
-            let refused = ["unknown-kind", "unknown-key", "malformed"].contains(&name.as_str());
+            let refused = [
+                "unknown-kind",
+                "unknown-key",
+                "malformed",
+                "overlay-malformed",
+            ]
+            .contains(&name.as_str());
             assert_eq!(read_plan(&data), !refused, "plan/{name}");
         }
     }

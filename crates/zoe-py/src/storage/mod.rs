@@ -940,38 +940,47 @@ impl Storage {
     /// 8. The reply is a dict: `r`, the rids as a list of ints, `n`, `a`,
     /// `rows` and `paths`; or `f`, the reason of a fallback, and `why`.
     /// `rows` holds the cells of the columns `cols` of the plan for each of
-    /// the first `rn` rids, as Python values, or `None`. A plan of another
-    /// form raises `ValueError`. A key or a kind of clause that the mirror
-    /// does not know gives the reason `plan`. The call releases the GIL.
+    /// the first `rn` rids, as Python values, or `None`. `overlay` is
+    /// `None`, or the transaction overlay: a list of `(oid, pickle)` pairs
+    /// of bytes, the records that the transaction changed, which the mirror
+    /// reads over the version at `tid` for this query only. A plan or an
+    /// overlay of another form raises `ValueError`. A key or a kind of
+    /// clause that the mirror does not know gives the reason `plan`, and a
+    /// record of the overlay that the mirror cannot read the reason
+    /// `overlay`. The call releases the GIL.
+    #[pyo3(signature = (catalog, tid, plan, overlay = None))]
     fn catalog_query<'py>(
         &self,
         py: Python<'py>,
         catalog: &[u8],
         tid: &[u8],
         plan: &Bound<'py, PyAny>,
+        overlay: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let oid = catalog::p64("catalog", catalog)?;
         let before = catalog::p64("tid", tid)?;
         let plan = catalog::wire(plan)?;
+        let records = catalog::overlay(overlay)?;
         self.check_open(py)?;
         let Some(mirrors) = self.mirrors() else {
-            let fallback = zoe_catalog::Fallback::new(
-                zoe_catalog::Reason::NotRegistered,
-                "the store has no registration key",
-            );
             // The plan comes first, as on the path of the mirrors: a
             // malformed plan raises, an unknown key gives `plan`.
-            return match zoe_catalog::decode_plan(&plan) {
-                Err(zoe_catalog::PlanError::Malformed(why)) => Err(PyValueError::new_err(why)),
-                Err(zoe_catalog::PlanError::Unknown(why)) => {
-                    let unknown = zoe_catalog::Fallback::new(zoe_catalog::Reason::Plan, why);
-                    catalog::reply(py, tid, &Err(unknown))
+            let fallback = match zoe_catalog::decode_plan(&plan) {
+                Err(zoe_catalog::PlanError::Malformed(why)) => {
+                    return Err(PyValueError::new_err(why));
                 }
-                Ok(_) => catalog::reply(py, tid, &Err(fallback)),
+                Err(zoe_catalog::PlanError::Unknown(why)) => {
+                    zoe_catalog::Fallback::new(zoe_catalog::Reason::Plan, why)
+                }
+                Ok(_) => zoe_catalog::Fallback::new(
+                    zoe_catalog::Reason::NotRegistered,
+                    "the store has no registration key",
+                ),
             };
+            return catalog::reply(py, tid, &Err(fallback));
         };
         let (answer, events) = py.detach(|| {
-            let answer = mirrors.query_wire(oid, before, &plan);
+            let answer = mirrors.query_wire_overlay(oid, before, &plan, records.as_deref());
             (answer, mirrors.take_events())
         });
         catalog::log(py, events);

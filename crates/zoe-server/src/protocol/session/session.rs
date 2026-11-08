@@ -359,12 +359,16 @@ impl Session {
     /// of the `Catalog` object and `tid` the exclusive tid of the snapshot,
     /// each 8 bytes. The call runs outside the transaction of the
     /// connection. A wait for the mirror holds its thread of the read
-    /// pool, at most `catalog-wait`. A plan that does not have the form of
-    /// section 8 fails with `ValueError`, and the connection stays open.
+    /// pool, at most `catalog-wait`. `overlay` is nil or the records of the
+    /// transaction of the client. A plan or an overlay that does not have
+    /// the form of section 8 fails with `ValueError`, and the connection
+    /// stays open.
     fn catalog_query(&self, args: Args<'_>) -> Result<Value, Fault> {
         let [catalog, tid, plan, overlay] = args.exactly::<4>()?;
         let (catalog, tid) = (u64_of(catalog)?, u64_of(tid)?);
-        crate::protocol::catalog::query(&self.storage.invalidations, catalog, tid, plan, overlay)
+        self.storage
+            .catalog
+            .query(&self.storage.invalidations, catalog, tid, plan, overlay)
             .map_err(Fault::value_error)
     }
 
