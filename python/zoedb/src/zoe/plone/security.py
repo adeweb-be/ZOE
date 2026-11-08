@@ -721,7 +721,9 @@ _stock = {}
 # The stock methods of CMFCore, kept after `uninstall()`: a request that
 # runs a replaced method while `uninstall()` runs calls them.
 _originals = {}
-# The lock of `install()` and `uninstall()`.
+# The lock of `install()` and `uninstall()`. A call holds it to its end,
+# its transactions and `_join()` included. Only these two functions take
+# it: no request waits for it. A call of one inside the other deadlocks.
 _install_lock = threading.Lock()
 
 
@@ -841,7 +843,8 @@ def install():
     """Replace `reindexObjectSecurity` and `deleteLocalRoles` of CMFCore
     in the process, and put a `ZoeSecurityIndex` into each catalog of the
     databases that the process has open, in a thread. A second call does
-    nothing."""
+    nothing. A call waits for the end of an `install()` or an
+    `uninstall()` in progress."""
     from AccessControl.requestmethod import postonly
     from Products.CMFCore.CMFCatalogAware import CatalogAware
     from Products.CMFCore.MembershipTool import MembershipTool
@@ -862,17 +865,19 @@ def install():
         registry = getGlobalSiteManager()
         for handler, required in _handlers():
             registry.registerHandler(handler, required)
-    db = _root_db()
-    if db is not None:
-        _start(db)
+        db = _root_db()
+        if db is not None:
+            _start(db)
 
 
 def uninstall():
     """Give CMFCore its own methods back in the process, then put the stock
     `KeywordIndex` back into each catalog of the databases that the process
     has open, each in a transaction of its own. A second call does
-    nothing. A request that runs a replaced method meanwhile ends with
-    the stock method."""
+    nothing. A call waits for the end of an `install()` or an
+    `uninstall()` in progress, and for the threads that put the index in.
+    A request that runs a replaced method meanwhile ends with the stock
+    method."""
     from Products.CMFCore.CMFCatalogAware import CatalogAware
     from Products.CMFCore.MembershipTool import MembershipTool
     from zope.component import getGlobalSiteManager
@@ -887,12 +892,12 @@ def uninstall():
         MembershipTool.deleteLocalRoles = _stock["deleteLocalRoles"]
         # `_originals` keeps the stock methods for the calls in flight.
         _stock.clear()
-    _join()
-    db = _root_db()
-    if db is None:
-        return
-    for path in _sites(db):
-        _swap(db, path, restore_index)
+        _join()
+        db = _root_db()
+        if db is None:
+            return
+        for path in _sites(db):
+            _swap(db, path, restore_index)
 
 
 def _root_db():
@@ -922,9 +927,10 @@ def _start(db):
         name="zoe.plone.security install",
         daemon=True,
     )
+    # `_join()` sees only a thread that started.
     with _threads_lock:
+        thread.start()
         _threads.append(thread)
-    thread.start()
 
 
 def _join(timeout=None):

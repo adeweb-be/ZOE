@@ -166,7 +166,10 @@ _installed = {}
 # kept after `uninstall()`: `_unchecked` reads them, also in a search that
 # runs while `uninstall()` runs.
 _originals = {}
-# The lock of `install()` and `uninstall()`.
+
+# The lock of `install()` and `uninstall()`. A call holds it to its end,
+# its transactions included. Only these two functions take it: no search
+# and no request waits for it. A call of one inside the other deadlocks.
 _install_lock = threading.Lock()
 
 # The root database of the process, from `IDatabaseOpenedWithRoot`.
@@ -236,7 +239,8 @@ def mode():
 def install():
     """Hook `Catalog.search`, in the mode of `ZOE_PLONE_CATALOG_MODE`, and
     write the registration keys of the databases that the process has open.
-    A second call does nothing."""
+    A second call does nothing. A call waits for the end of an `install()`
+    or an `uninstall()` in progress."""
     from Products.ZCatalog.Catalog import Catalog
 
     with _install_lock:
@@ -250,9 +254,9 @@ def install():
         if path and not _counts_file:
             _counts_file["path"] = path
             atexit.register(_write_counts, path)
-    db = _root.get("db")
-    if db is not None:
-        register(db)
+        db = _root.get("db")
+        if db is not None:
+            register(db)
 
 
 # The methods of `Catalog` that the stock search and the hook call.
@@ -303,7 +307,8 @@ def _unchecked(catalog):
 def uninstall():
     """Give the stock search back, then remove, in a transaction of its own,
     the registration keys of each database that the process has open. A
-    second call does nothing. A search that runs meanwhile ends with the
+    second call does nothing. A call waits for the end of an `install()` or
+    an `uninstall()` in progress. A search that runs meanwhile ends with the
     stock search."""
     from Products.ZCatalog.Catalog import Catalog
 
@@ -313,11 +318,11 @@ def uninstall():
         Catalog.search = _installed["stock"]
         # `_originals` keeps the methods for the searches in flight.
         _installed.clear()
-    db = _root.get("db")
-    if db is None:
-        return
-    for each in _databases(db):
-        _write_keys(each, set())
+        db = _root.get("db")
+        if db is None:
+            return
+        for each in _databases(db):
+            _write_keys(each, set())
 
 
 def database_opened(event):
