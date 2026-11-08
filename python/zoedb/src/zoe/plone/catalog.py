@@ -164,6 +164,12 @@ _SORTS = {
 
 # The stock `Catalog.search` and the mode, while the backend is installed.
 _installed = {}
+# The methods of `_SEARCH_METHODS` at the last `install()`, under `code`,
+# kept after `uninstall()`: `_unchecked` reads them, also in a search that
+# runs while `uninstall()` runs.
+_originals = {}
+# The lock of `install()` and `uninstall()`.
+_install_lock = threading.Lock()
 
 # The root database of the process, from `IDatabaseOpenedWithRoot`.
 _root = {}
@@ -237,27 +243,30 @@ def install():
     """Hook `Catalog.search`, in the mode of `ZOE_PLONE_CATALOG_MODE`, and
     write the registration keys of the databases that the process has open.
     A second call does nothing."""
-    if _installed:
-        return
     from Products.ZCatalog.Catalog import Catalog
 
-    current = mode()
-    _installed.update(
-        stock=Catalog.search,
-        mode=current,
-        code=_code(Catalog),
-        addIndex=Catalog.addIndex,
-        delIndex=Catalog.delIndex,
-    )
-    # The stock methods stay here after `uninstall()`, for a call in flight.
-    _stock_methods.update(addIndex=Catalog.addIndex, delIndex=Catalog.delIndex)
-    Catalog.search = _search
-    Catalog.addIndex = _add_index
-    Catalog.delIndex = _del_index
-    path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
-    if path and not _counts_file:
-        _counts_file["path"] = path
-        atexit.register(_write_counts, path)
+    with _install_lock:
+        if _installed:
+            return
+        current = mode()
+        _originals["code"] = _code(Catalog)
+        _installed.update(
+            stock=Catalog.search,
+            mode=current,
+            code=_originals["code"],
+            addIndex=Catalog.addIndex,
+            delIndex=Catalog.delIndex,
+        )
+        # The stock methods stay here after `uninstall()`, for a call in
+        # flight.
+        _stock_methods.update(addIndex=Catalog.addIndex, delIndex=Catalog.delIndex)
+        Catalog.search = _search
+        Catalog.addIndex = _add_index
+        Catalog.delIndex = _del_index
+        path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
+        if path and not _counts_file:
+            _counts_file["path"] = path
+            atexit.register(_write_counts, path)
     db = _root.get("db")
     if db is not None:
         register(db)
@@ -299,7 +308,7 @@ def _unchecked(catalog):
     from Acquisition import aq_base
     from Products.ZCatalog.Catalog import Catalog
 
-    if _code(Catalog) != _installed["code"]:
+    if _code(Catalog) != _originals["code"]:
         return "patched"
     mro = type(aq_base(catalog)).__mro__
     below = mro[: mro.index(Catalog)] if Catalog in mro else mro
@@ -311,25 +320,28 @@ def _unchecked(catalog):
 def uninstall():
     """Give the stock search back, then remove, in a transaction of its own,
     the registration keys of each database that the process has open. A
-    second call does nothing. While a catalog of the databases that the
-    process has open holds a `ZoeTextIndex`, raise `Unsupported` and change
-    nothing: the profile step `zoe.plone:text-uninstall` puts ZCTextIndex
-    back first."""
-    if not _installed:
-        return
+    second call does nothing. A search that runs meanwhile ends with the
+    stock search. While a catalog of the databases that the process has
+    open holds a `ZoeTextIndex`, raise `Unsupported` and change nothing:
+    the profile step `zoe.plone:text-uninstall` puts ZCTextIndex back
+    first."""
     from Products.ZCatalog.Catalog import Catalog
     from ZODB.POSException import Unsupported
 
-    held = _text_index_held()
-    if held:
-        raise Unsupported(
-            f"the catalog of {held} holds a ZoeTextIndex: import the profile"
-            " zoe.plone:text-uninstall before the uninstall of the backend"
-        )
-    Catalog.search = _installed["stock"]
-    Catalog.addIndex = _installed["addIndex"]
-    Catalog.delIndex = _installed["delIndex"]
-    _installed.clear()
+    with _install_lock:
+        if not _installed:
+            return
+        held = _text_index_held()
+        if held:
+            raise Unsupported(
+                f"the catalog of {held} holds a ZoeTextIndex: import the profile"
+                " zoe.plone:text-uninstall before the uninstall of the backend"
+            )
+        Catalog.search = _installed["stock"]
+        Catalog.addIndex = _installed["addIndex"]
+        Catalog.delIndex = _installed["delIndex"]
+        # `_originals` keeps the methods for the searches in flight.
+        _installed.clear()
     db = _root.get("db")
     if db is None:
         return
@@ -611,8 +623,11 @@ def _write_counts(path):
 
 
 def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True):
-    """`Catalog.search` with the mirror."""
-    stock = _installed.get("stock")
+    """`Catalog.search` with the mirror. The search reads the state of the
+    backend once, so a search that runs while `uninstall()` runs ends in
+    the mode that it started in."""
+    state = _installed.copy()
+    stock = state.get("stock")
     if stock is None:
         from Products.ZCatalog.Catalog import Catalog
 
@@ -628,7 +643,7 @@ def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True)
     else:
         _count("queries", "native")
         _last.outcome = "native"
-    if _installed.get("mode") == "compare":
+    if state.get("mode") == "compare":
         try:
             result = stock(self, query, sort_index, reverse, limit, merge)
         except Exception:

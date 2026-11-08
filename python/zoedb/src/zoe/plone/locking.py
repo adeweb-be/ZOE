@@ -50,6 +50,7 @@ of a connection, and undo gives back no lock.
 
 import math
 import pickle
+import threading
 import time
 import weakref
 from collections.abc import MutableMapping
@@ -68,6 +69,8 @@ MAX_TTL = zoe.kv.MAX_TTL
 
 # The stock methods while the backend is installed.
 _stock = {}
+# The lock of `install()`.
+_install_lock = threading.Lock()
 
 # The rows that the current transaction of each connection decoded:
 # connection -> _Rows.
@@ -82,13 +85,8 @@ def installed():
 def install():
     """Keep the locks of plone.locking in the ephemeral namespace of the
     store. A second call does nothing."""
-    if _stock:
-        return
     from OFS.Lockable import LockableItem
     from plone.locking.lockable import TTWLockable
-
-    _stock["wl_lockmapping"] = LockableItem.wl_lockmapping
-    _stock["_locks"] = TTWLockable._locks
 
     def wl_lockmapping(self, killinvalids=0, create=0):
         row = _row_of(self)
@@ -108,9 +106,14 @@ def install():
             return _stock["_locks"](self, create)
         return _Mapping(row, "types")
 
-    wl_lockmapping.__doc__ = _stock["wl_lockmapping"].__doc__
-    LockableItem.wl_lockmapping = wl_lockmapping
-    TTWLockable._locks = _locks
+    with _install_lock:
+        if _stock:
+            return
+        _stock["wl_lockmapping"] = LockableItem.wl_lockmapping
+        _stock["_locks"] = TTWLockable._locks
+        wl_lockmapping.__doc__ = _stock["wl_lockmapping"].__doc__
+        LockableItem.wl_lockmapping = wl_lockmapping
+        TTWLockable._locks = _locks
 
 
 def _row_of(obj):
