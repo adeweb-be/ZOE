@@ -1293,6 +1293,18 @@ impl Index {
         })
     }
 
+    /// Tells if `self` and `other` are one structure, shared.
+    pub fn shares(&self, other: &Index) -> bool {
+        match (self, other) {
+            (Index::Field(a), Index::Field(b)) => Arc::ptr_eq(a, b),
+            (Index::Keyword(a), Index::Keyword(b)) => Arc::ptr_eq(a, b),
+            (Index::DateRange(a), Index::DateRange(b)) => Arc::ptr_eq(a, b),
+            (Index::Path(a), Index::Path(b)) => Arc::ptr_eq(a, b),
+            (Index::Security(a), Index::Security(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     /// The bytes that the structure takes.
     pub fn heap_bytes(&self) -> usize {
         match self {

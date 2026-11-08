@@ -54,6 +54,36 @@ pub enum Owner {
     IndexObject(usize),
     /// The catalog object.
     Catalog,
+    /// A record that the build of the index at this place refused, or the
+    /// index object of that index: a new record of it can make the index
+    /// available.
+    Unavailable(usize),
+}
+
+/// What a commit changed that the change sets do not follow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unfollowed {
+    /// The catalog object: its new pickle, `None` for a deletion.
+    Catalog(Option<Vec<u8>>),
+    /// The index at this place: the new pickle of its index object, when
+    /// the commit wrote one.
+    Index(usize, Option<Vec<u8>>),
+    /// A tree other than the `_unindex` of an index.
+    Tree(Slot),
+}
+
+impl Unfollowed {
+    /// What a record of `who` that the mirror cannot follow changed.
+    fn of(who: Owner) -> Unfollowed {
+        match who {
+            Owner::Catalog => Unfollowed::Catalog(None),
+            Owner::IndexObject(i) | Owner::Length(i) | Owner::Unavailable(i) => {
+                Unfollowed::Index(i, None)
+            }
+            Owner::Node(Slot::Index(i)) => Unfollowed::Index(i, None),
+            Owner::Node(slot) => Unfollowed::Tree(slot),
+        }
+    }
 }
 
 /// The shapes of the mirrored trees: the owner of each oid, the children
@@ -313,6 +343,17 @@ pub struct Read {
     pub records: usize,
     /// Why the mirror cannot follow the commit, if it cannot.
     pub stale: Option<String>,
+    /// What the commit changed that the change sets do not follow. A
+    /// record of an unavailable index is here, without `stale`.
+    pub unfollowed: Vec<Unfollowed>,
+}
+
+impl Read {
+    /// Records that the mirror cannot follow a record of `who`.
+    fn lose(&mut self, who: Owner, why: String) {
+        self.stale = Some(why);
+        self.unfollowed.push(Unfollowed::of(who));
+    }
 }
 
 /// Reads the records of a commit against the version of `base` with
@@ -367,18 +408,28 @@ pub fn read_records<D: AsRef<[u8]>>(
                 continue;
             };
             out.records += 1;
+            if let Owner::Unavailable(i) = who {
+                out.unfollowed.push(Unfollowed::Index(i, None));
+                continue;
+            }
             let Some(data) = data.as_ref().map(AsRef::as_ref) else {
-                out.stale = Some(format!("the commit deletes the object {oid:#x}"));
+                out.lose(who, format!("the commit deletes the object {oid:#x}"));
                 continue;
             };
             if matches!(who, Owner::Catalog | Owner::IndexObject(_)) {
                 if objects.get(oid).map(Vec::as_slice) != Some(data) {
-                    out.stale = Some(match who {
-                        Owner::IndexObject(i) => {
-                            format!("the commit changes the index {}", base.indexes[i].name)
-                        }
-                        _ => "the commit changes the catalog object".into(),
-                    });
+                    let (why, what) = match who {
+                        Owner::IndexObject(i) => (
+                            format!("the commit changes the index {}", base.indexes[i].name),
+                            Unfollowed::Index(i, Some(data.to_vec())),
+                        ),
+                        _ => (
+                            "the commit changes the catalog object".into(),
+                            Unfollowed::Catalog(Some(data.to_vec())),
+                        ),
+                    };
+                    out.stale = Some(why);
+                    out.unfollowed.push(what);
                 }
                 continue;
             }
@@ -390,12 +441,12 @@ pub fn read_records<D: AsRef<[u8]>>(
             let record = match (reader.decode)(data) {
                 Ok(r) => r,
                 Err(e) => {
-                    out.stale = Some(format!("oid {oid:#x}: {}", e.0));
+                    out.lose(who, format!("oid {oid:#x}: {}", e.0));
                     continue;
                 }
             };
             match who {
-                Owner::Catalog | Owner::IndexObject(_) => {}
+                Owner::Catalog | Owner::IndexObject(_) | Owner::Unavailable(_) => {}
                 Owner::Length(i) => match record.int_state() {
                     Some(n) => {
                         let old = overrides
@@ -407,7 +458,7 @@ pub fn read_records<D: AsRef<[u8]>>(
                             out.lengths.push((i, old, n));
                         }
                     }
-                    None => out.stale = Some(format!("the _length {oid:#x} is not an int")),
+                    None => out.lose(who, format!("the _length {oid:#x} is not an int")),
                 },
                 Owner::Node(slot) => {
                     let old_range = edits
@@ -416,7 +467,7 @@ pub fn read_records<D: AsRef<[u8]>>(
                         .copied()
                         .unwrap_or_else(|| shapes.buckets.get(oid).copied());
                     match node_with(&record, reader.value) {
-                        Err(e) => out.stale = Some(format!("oid {oid:#x}: {}", e.0)),
+                        Err(e) => out.lose(who, format!("oid {oid:#x}: {}", e.0)),
                         Ok(Node::Inner(children)) => {
                             let old = edits
                                 .inner
@@ -461,7 +512,7 @@ pub fn read_records<D: AsRef<[u8]>>(
                                 let rid = match rid_of(&key) {
                                     Ok(rid) => rid,
                                     Err(e) => {
-                                        out.stale = Some(e);
+                                        out.lose(who, e);
                                         break;
                                     }
                                 };
@@ -472,7 +523,7 @@ pub fn read_records<D: AsRef<[u8]>>(
                                         match base.indexes[i].index.normalize(value) {
                                             Ok(value) => value,
                                             Err(e) => {
-                                                out.stale = Some(e);
+                                                out.lose(who, e);
                                                 break;
                                             }
                                         }
@@ -502,10 +553,16 @@ pub fn read_records<D: AsRef<[u8]>>(
             continue;
         }
         if shapes.inner.contains_key(&child) || edits.inner.contains_key(&child) {
-            out.stale = Some(format!("the inner node {child:#x} left its tree"));
+            out.lose(
+                Owner::Node(slot),
+                format!("the inner node {child:#x} left its tree"),
+            );
         } else if let Some(range) = shapes.buckets.get(&child) {
             if edits.buckets.get(&child).is_some_and(Option::is_some) {
-                out.stale = Some(format!("the bucket {child:#x} left its tree and changed"));
+                out.lose(
+                    Owner::Node(slot),
+                    format!("the bucket {child:#x} left its tree and changed"),
+                );
                 continue;
             }
             old_ranges.entry(slot).or_default().push(*range);
