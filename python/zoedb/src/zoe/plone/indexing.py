@@ -632,8 +632,13 @@ class Indexer:
 
     def _apply(self, app, site, entries):
         """Apply the entries to the catalog: the removals first, then the
-        index or the reindex of each path that has an object."""
+        index or the reindex of each path that has an object. With a
+        `ZoeSecurityIndex`, the paths go in path order: an entry reads the
+        entries of its containers, so each container comes first."""
+        from zoe.plone.security import security_index
+
         catalog = site.portal_catalog
+        ordered = security_index(catalog) is not None
         self._expand_security(catalog, entries)
         inner = catalog._catalog
         uids = inner.uids
@@ -669,6 +674,8 @@ class Indexer:
                         if found is None or _uid(found) != uid:
                             removals.append(stale)
             updates.append((path, obj, entry))
+        if ordered:
+            updates.sort(key=lambda update: update[0])
         done = set()
         for path in removals:
             if path not in done and uids.get(path) is not None:

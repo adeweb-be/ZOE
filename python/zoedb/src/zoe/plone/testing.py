@@ -22,8 +22,10 @@ With `security`, the site of the fixture of plone.app.testing gets the
 `ZoeSecurityIndex` in the transaction that creates it (ADR 0061); without
 it, the suites keep the stock index and run the stock methods of CMFCore.
 `just plone zoe backends` keeps `locking`, so only the tests of
-`zoe.plone.tests.test_security_index` run with the index: they install the
-backend and put the index into their own sites.
+`zoe.plone.tests.test_security_index` and `test_security_backend` run with
+the index: they install the backend and put the index into their own
+sites. `ZOE_PLONE_BACKENDS=security just plone zoe suites -s zoe.plone -t
+TestTheFixtureOfTheSuites` checks that the site of the fixture holds it.
 
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of

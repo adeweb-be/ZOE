@@ -31,7 +31,6 @@ A catalog without a `ZoeSecurityIndex` runs the stock methods.
 Only the functions that Plone calls import Plone.
 """
 
-import collections
 import logging
 import os
 import threading
@@ -44,6 +43,7 @@ from BTrees.IOBTree import IOBTree
 from BTrees.Length import Length
 from BTrees.OOBTree import OOBTree
 from Products.PluginIndexes.KeywordIndex.KeywordIndex import KeywordIndex
+from Products.ZCatalog.Catalog import Catalog
 from ZODB.POSException import ConflictError
 
 import zoe.kv
@@ -82,7 +82,7 @@ def _default_adapter():
     return DefaultLocalRoleAdapter
 
 
-def node_inputs(obj):
+def _node_inputs(obj):
     """Return the inputs that `obj` holds itself, as the tuple `(kind,
     roles, local, block)`, or None when the index does not read them.
 
@@ -204,19 +204,31 @@ def _apply(node, roles, local):
     return roles, local
 
 
+class _Values(dict):
+    """The values of the entries of one snapshot: a dict of rid to value.
+
+    `distinct` maps each distinct value to the one frozenset that the
+    entries with that value share."""
+
+    __slots__ = ("distinct",)
+
+    def __init__(self):
+        super().__init__()
+        self.distinct = {}
+
+
 class Resolver:
     """Resolve the values of the entries of one index, with a memo.
 
-    `values` is a dict of the values that the resolver gives and that it
-    reads first: the cache of a snapshot, or a new dict."""
+    `values` is a `_Values` of the values that the resolver gives and that
+    it reads first: the cache of a snapshot, or a new one."""
 
     def __init__(self, inputs, paths, uids, values=None):
         self._inputs = inputs
         self._paths = paths
         self._uids = uids
         self._states = {}
-        self._tokens = {}
-        self.values = {} if values is None else values
+        self.values = _Values() if values is None else values
 
     def _entry(self, path):
         """Return the rid and the inputs of the entry at `path`, or None
@@ -284,6 +296,7 @@ class Resolver:
             path = self._paths.get(rid)
             state = _CLOSED if path is None else self._state(rid, inputs, path)
             found = frozenset() if state is _CLOSED else self._value(*state)
+        found = values.distinct.setdefault(found, found)
         values[rid] = found
         return found
 
@@ -304,8 +317,9 @@ class Resolver:
 
 
 # The values of the snapshots that the process resolved: the key of a
-# snapshot to a dict of rid to value. Only the newest snapshots stay.
-_cache = collections.OrderedDict()
+# snapshot to its `_Values`. Only the newest snapshots stay, by the tid of
+# their start.
+_cache = {}
 _cache_lock = threading.Lock()
 _CACHE_SNAPSHOTS = 2
 
@@ -321,9 +335,10 @@ def _savepoint_records(jar):
 
 
 def _snapshot_values(index):
-    """Return the dict of the values of the snapshot of the connection of
-    `index`, or None when the values cannot come from a cache: the
-    connection holds a change of its transaction, or has no snapshot."""
+    """Return the `_Values` of the snapshot of the connection of `index`,
+    or None when the values cannot come from the cache: the connection
+    holds a change of its transaction, has no snapshot, or has a snapshot
+    older than those that the cache keeps."""
     jar = getattr(aq_base(index), "_p_jar", None)
     oid = getattr(aq_base(index), "_p_oid", None)
     if jar is None or oid is None:
@@ -336,12 +351,13 @@ def _snapshot_values(index):
     key = (jar.db(), oid, start)
     with _cache_lock:
         values = _cache.get(key)
-        if values is None:
-            values = _cache[key] = {}
-            while len(_cache) > _CACHE_SNAPSHOTS:
-                _cache.popitem(last=False)
-        else:
-            _cache.move_to_end(key)
+        if values is not None:
+            return values
+        if len(_cache) >= _CACHE_SNAPSHOTS and start < min(k[2] for k in _cache):
+            return None
+        values = _cache[key] = _Values()
+        while len(_cache) > _CACHE_SNAPSHOTS:
+            del _cache[min(_cache, key=lambda k: k[2])]
     return values
 
 
@@ -367,7 +383,16 @@ class ZoeSecurityIndex(KeywordIndex):
             self._increment_counter()
 
     def _catalog(self):
-        return aq_parent(aq_inner(self))
+        """Return the `Catalog` that holds this index, wrapped in its tool.
+        The ZMI wraps the index in the `Indexes` of the tool, not in the
+        `Catalog`."""
+        parent = aq_parent(aq_inner(self))
+        while parent is not None and not isinstance(aq_base(parent), Catalog):
+            inner = getattr(aq_base(parent), "_catalog", None)
+            if isinstance(inner, Catalog):
+                return inner.__of__(parent)
+            parent = aq_parent(aq_inner(parent))
+        return parent
 
     def _tool(self):
         return aq_parent(aq_inner(self._catalog()))
@@ -390,7 +415,7 @@ class ZoeSecurityIndex(KeywordIndex):
             path = _path(current)
             if uids.get(path) is not None:
                 break
-            found = node_inputs(current)
+            found = _node_inputs(current)
             if found is None:
                 return None
             chain.append((path, *found))
@@ -419,7 +444,7 @@ class ZoeSecurityIndex(KeywordIndex):
             target = unwrap()
         inputs = None
         if _stock_entry(obj, self._tool()) and not self._below_opaque(_path(target)):
-            own = node_inputs(target)
+            own = _node_inputs(target)
             if own is not None:
                 chain = self._chain(target, self._catalog().uids)
                 if chain is not None:
@@ -579,7 +604,7 @@ def replace_index(catalog):
     return True
 
 
-def restore_index(catalog):
+def _restore_index(catalog):
     """Put the stock `KeywordIndex` back in the place of the
     `ZoeSecurityIndex` of the catalog tool `catalog`, and index every
     entry. Return False when the catalog holds no `ZoeSecurityIndex`."""
@@ -594,6 +619,11 @@ def restore_index(catalog):
 
 # The stock methods of CMFCore while the backend is installed.
 _stock = {}
+# The stock methods of CMFCore, kept after `uninstall()`: a request that
+# runs a replaced method while `uninstall()` runs calls them.
+_originals = {}
+# The lock of `install()` and `uninstall()`.
+_install_lock = threading.Lock()
 
 
 def _uses_index(obj, catalog):
@@ -624,7 +654,7 @@ def reindexObjectSecurity(self, skip_self=False):
     index = _uses_index(self, catalog)
     path = _path(self)
     if index is None or catalog._catalog.uids.get(path) is None:
-        return _stock["reindexObjectSecurity"](self, skip_self)
+        return _originals["reindexObjectSecurity"](self, skip_self)
     if not skip_self:
         self.reindexObject(idxs=[INDEX], update_metadata=0)
     every = index.opaque(self)
@@ -662,7 +692,7 @@ def deleteLocalRoles(self, obj, member_ids, reindex=1, recursive=0, REQUEST=None
     """
     from Products.CMFCore.utils import getToolByName
 
-    stock = _stock["deleteLocalRoles"]
+    stock = _originals["deleteLocalRoles"]
     catalog = getToolByName(obj, "portal_catalog", None)
     if catalog is None or security_index(catalog) is None:
         return stock(self, obj, member_ids, reindex, recursive, REQUEST)
@@ -700,8 +730,7 @@ def install():
     in the process, and put a `ZoeSecurityIndex` into each catalog of the
     databases that the process has open, in a thread. A second call does
     nothing."""
-    if _stock:
-        return
+    from AccessControl.requestmethod import postonly
     from Products.CMFCore.CMFCatalogAware import CatalogAware
     from Products.CMFCore.interfaces import ISiteRoot
     from Products.CMFCore.MembershipTool import MembershipTool
@@ -709,18 +738,21 @@ def install():
     from zope.lifecycleevent.interfaces import IObjectAddedEvent
     from zope.processlifetime import IDatabaseOpenedWithRoot
 
-    _stock.update(
-        reindexObjectSecurity=CatalogAware.reindexObjectSecurity,
-        deleteLocalRoles=MembershipTool.deleteLocalRoles,
-    )
-    from AccessControl.requestmethod import postonly
-
-    CatalogAware.reindexObjectSecurity = reindexObjectSecurity
-    # The stock method takes POST only, through the web.
-    MembershipTool.deleteLocalRoles = postonly(deleteLocalRoles)
-    registry = getGlobalSiteManager()
-    registry.registerHandler(database_opened, (IDatabaseOpenedWithRoot,))
-    registry.registerHandler(site_added, (ISiteRoot, IObjectAddedEvent))
+    with _install_lock:
+        if _stock:
+            return
+        stock = {
+            "reindexObjectSecurity": CatalogAware.reindexObjectSecurity,
+            "deleteLocalRoles": MembershipTool.deleteLocalRoles,
+        }
+        _originals.update(stock)
+        _stock.update(stock)
+        CatalogAware.reindexObjectSecurity = reindexObjectSecurity
+        # The stock method takes POST only, through the web.
+        MembershipTool.deleteLocalRoles = postonly(deleteLocalRoles)
+        registry = getGlobalSiteManager()
+        registry.registerHandler(database_opened, (IDatabaseOpenedWithRoot,))
+        registry.registerHandler(site_added, (ISiteRoot, IObjectAddedEvent))
     db = _root_db()
     if db is not None:
         _start(db)
@@ -730,9 +762,8 @@ def uninstall():
     """Give CMFCore its own methods back in the process, then put the stock
     `KeywordIndex` back into each catalog of the databases that the process
     has open, each in a transaction of its own. A second call does
-    nothing."""
-    if not _stock:
-        return
+    nothing. A request that runs a replaced method meanwhile ends with
+    the stock method."""
     from Products.CMFCore.CMFCatalogAware import CatalogAware
     from Products.CMFCore.interfaces import ISiteRoot
     from Products.CMFCore.MembershipTool import MembershipTool
@@ -740,18 +771,22 @@ def uninstall():
     from zope.lifecycleevent.interfaces import IObjectAddedEvent
     from zope.processlifetime import IDatabaseOpenedWithRoot
 
-    registry = getGlobalSiteManager()
-    registry.unregisterHandler(database_opened, (IDatabaseOpenedWithRoot,))
-    registry.unregisterHandler(site_added, (ISiteRoot, IObjectAddedEvent))
-    CatalogAware.reindexObjectSecurity = _stock["reindexObjectSecurity"]
-    MembershipTool.deleteLocalRoles = _stock["deleteLocalRoles"]
-    _stock.clear()
+    with _install_lock:
+        if not _stock:
+            return
+        registry = getGlobalSiteManager()
+        registry.unregisterHandler(database_opened, (IDatabaseOpenedWithRoot,))
+        registry.unregisterHandler(site_added, (ISiteRoot, IObjectAddedEvent))
+        CatalogAware.reindexObjectSecurity = _stock["reindexObjectSecurity"]
+        MembershipTool.deleteLocalRoles = _stock["deleteLocalRoles"]
+        # `_originals` keeps the stock methods for the calls in flight.
+        _stock.clear()
     _join()
     db = _root_db()
     if db is None:
         return
     for path in _sites(db):
-        _swap(db, path, restore_index)
+        _swap(db, path, _restore_index)
 
 
 def _root_db():
@@ -926,9 +961,10 @@ class _Lease:
 
 
 def _swap(db, path, change):
-    """Run `change` (`replace_index` or `restore_index`) on the catalog of
+    """Run `change` (`replace_index` or `_restore_index`) on the catalog of
     the site at `path` of the root database `db`, in a transaction of its
-    own, under the lease of the site. Retry it after a conflict."""
+    own, under the lease of the site. Retry it after a conflict. Take no
+    lease when the catalog needs no change."""
     from zoe.plone.indexing import _Context
 
     manager = transaction.TransactionManager()
@@ -942,6 +978,10 @@ def _swap(db, path, change):
         tool = aq_base(site.portal_catalog)
         jar = tool._p_jar
         if not _writable(jar):
+            return
+        holds = security_index(site.portal_catalog) is not None
+        if holds == (change is replace_index):
+            # The catalog holds the index that `change` gives it already.
             return
         lease = _Lease(jar.db(), tool._p_oid)
         if not lease.take():
