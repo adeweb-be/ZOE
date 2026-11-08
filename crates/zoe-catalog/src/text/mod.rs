@@ -13,6 +13,8 @@
 //! - `overlay`: the text overlay, which scores the replaced documents.
 //! - `texts`: the text indexes of a store and their thread.
 //! - `engine`: the answer of a text clause and of `text_info`.
+//! - `rebuild`: the rebuild of `zoe catalog rebuild-text`, in
+//!   `text/<oid>.new`, and its two renames.
 //!
 //! The index is a cache: the deltas of the store are the source of truth,
 //! and a rebuild from them loses nothing. The crate starts the thread of the
@@ -24,6 +26,7 @@ pub mod clause;
 pub mod engine;
 pub mod index;
 pub mod overlay;
+pub mod rebuild;
 pub mod search;
 pub mod settings;
 pub mod texts;
