@@ -8,10 +8,13 @@
   installation: indexing, the guard of a stock registry, the catalog
   backend, locking and the patch of the mutable property sheet.
 
-A test of two installs holds the first `install()` after its check, until
-the second `install()` ends or a time runs out. Without a lock, the second
-`install()` installs, then the first installs again over it, and keeps the
-replacement of the second as the stock method.
+A test of two installs holds the first `install()` after its check. The
+second thread meets the first one there at a barrier, then calls
+`install()`. The first `install()` goes on when the second one ends, or
+when `WAIT` runs out. Without a lock, the second `install()` installs,
+then the first installs again over it, and keeps the replacement of the
+second as the stock method. With a lock, the second `install()` waits for
+the first one, so the first one goes on after `WAIT`.
 
 They need the interpreter of a Plone instance: `just plone zoe backends`
 runs them. They need no layer.
@@ -36,51 +39,59 @@ from zoe.plone import (
 )
 from zoe.plone.tests.helpers import new_directory
 
-# The longest wait of the first `install()` for the second one, in seconds.
-WAIT = 1.0
+# The longest wait of the first `install()` for the end of the second one,
+# from the barrier, in seconds.
+WAIT = 2.0
+# The longest wait at the barrier, in seconds.
+START = 30.0
 
 
 class Late(dict):
-    """A dict whose first truth test reads its length, then waits until
-    `go` is set or `WAIT` runs out, and gives the length that it read."""
+    """A dict whose first truth test reads its length, meets the second
+    thread at `start`, then waits until `done` is set or `WAIT` runs out,
+    and gives the length that it read."""
 
     def __init__(self):
         super().__init__()
-        self.entered = threading.Event()
-        self.go = threading.Event()
+        self.start = threading.Barrier(2, timeout=START)
+        self.done = threading.Event()
         self._first = True
 
     def __len__(self):
         length = super().__len__()
         if self._first:
             self._first = False
-            self.entered.set()
-            self.go.wait(WAIT)
+            self.start.wait()
+            self.done.wait(WAIT)
         return length
 
 
 def race(install, late):
-    """Run `install` in two threads. The second thread starts while the
-    first holds the answer of its check of `late`. Raise the first error
-    of a thread."""
+    """Run `install` in two threads. The second thread calls it after the
+    first one made its check of `late`, and the first one goes on when the
+    second one ends. Raise the first error of a thread."""
     errors = []
 
-    def run():
+    def first():
         try:
             install()
         except BaseException as error:
             errors.append(error)
 
-    first = threading.Thread(target=run)
-    second = threading.Thread(target=run)
-    first.start()
-    if not late.entered.wait(10 * WAIT):
-        raise AssertionError("the first install() made no check")
-    second.start()
-    second.join(WAIT / 2)
-    late.go.set()
-    first.join()
-    second.join()
+    def second():
+        try:
+            late.start.wait()
+            install()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            late.done.set()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     if errors:
         raise errors[0]
 
@@ -222,10 +233,28 @@ class TestCatalog(unittest.TestCase):
             self.skipTest("the catalog backend is installed")
         self.Catalog = Catalog
         self.addCleanup(setattr, Catalog, "search", Catalog.__dict__["search"])
-        for each in (catalog._root, catalog._originals, catalog._counts):
+        for each in (
+            catalog._root,
+            catalog._originals,
+            catalog._counts,
+            catalog._counts_file,
+        ):
             patch = mock.patch.dict(each, clear=each is catalog._root)
             patch.start()
             self.addCleanup(patch.stop)
+        # Without the variable, `install()` registers no writer of counts.
+        environ = mock.patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
+        os.environ.pop("ZOE_PLONE_CATALOG_COUNTS", None)
+
+    def install_compare(self, stock):
+        """Make `stock` the stock search, and install the backend in the
+        mode `compare` until the end of the test."""
+        self.Catalog.search = stock
+        with mock.patch.dict(os.environ, {"ZOE_PLONE_CATALOG_MODE": "compare"}):
+            catalog.install()
+        self.addCleanup(catalog.uninstall)
 
     def test_a_search_in_progress_during_uninstall_ends_with_the_stock_result(self):
         result = object()
@@ -234,14 +263,33 @@ class TestCatalog(unittest.TestCase):
             catalog.uninstall()
             return result
 
-        self.Catalog.search = stock
-        with mock.patch.dict(os.environ, {"ZOE_PLONE_CATALOG_MODE": "compare"}):
-            catalog.install()
-        self.addCleanup(catalog.uninstall)
+        self.install_compare(stock)
         native = mock.patch.object(
             catalog, "_native", return_value=(object(), None, {})
         )
         with native, mock.patch.object(catalog, "_compare") as compare:
+            found = self.Catalog().search({"portal_type": "Document"})
+        self.assertIs(found, result)
+        self.assertEqual(compare.call_count, 1)
+        self.assertIs(self.Catalog.search, stock)
+
+    def test_a_native_query_in_progress_during_uninstall_ends_with_the_stock_result(
+        self,
+    ):
+        result = object()
+
+        def stock(self, query, sort_index=None, reverse=False, limit=None, merge=True):
+            return result
+
+        def native(catalog_, query, sort_index, reverse, limit, merge):
+            catalog.uninstall()
+            return object(), None, {}
+
+        self.install_compare(stock)
+        with (
+            mock.patch.object(catalog, "_native", native),
+            mock.patch.object(catalog, "_compare") as compare,
+        ):
             found = self.Catalog().search({"portal_type": "Document"})
         self.assertIs(found, result)
         self.assertEqual(compare.call_count, 1)

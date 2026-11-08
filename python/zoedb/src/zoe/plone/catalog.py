@@ -162,9 +162,9 @@ _SORTS = {
 
 # The stock `Catalog.search` and the mode, while the backend is installed.
 _installed = {}
-# The stock `Catalog.search` and the methods of `_SEARCH_METHODS` at the
-# last `install()`, kept after `uninstall()`: a search that runs while
-# `uninstall()` runs reads them.
+# The methods of `_SEARCH_METHODS` at the last `install()`, under `code`,
+# kept after `uninstall()`: `_unchecked` reads them, also in a search that
+# runs while `uninstall()` runs.
 _originals = {}
 # The lock of `install()` and `uninstall()`.
 _install_lock = threading.Lock()
@@ -243,9 +243,8 @@ def install():
         if _installed:
             return
         current = mode()
-        stock = {"stock": Catalog.search, "code": _code(Catalog)}
-        _originals.update(stock)
-        _installed.update(stock, mode=current)
+        _originals["code"] = _code(Catalog)
+        _installed.update(stock=Catalog.search, mode=current, code=_originals["code"])
         Catalog.search = _search
         path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
         if path and not _counts_file:
@@ -312,7 +311,7 @@ def uninstall():
         if not _installed:
             return
         Catalog.search = _installed["stock"]
-        # `_originals` keeps the stock search for the searches in flight.
+        # `_originals` keeps the methods for the searches in flight.
         _installed.clear()
     db = _root.get("db")
     if db is None:
@@ -550,8 +549,11 @@ def _write_counts(path):
 
 
 def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True):
-    """`Catalog.search` with the mirror."""
-    stock = _installed.get("stock")
+    """`Catalog.search` with the mirror. The search reads the state of the
+    backend once, so a search that runs while `uninstall()` runs ends in
+    the mode that it started in."""
+    state = _installed.copy()
+    stock = state.get("stock")
     if stock is None:
         from Products.ZCatalog.Catalog import Catalog
 
@@ -567,7 +569,7 @@ def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True)
     else:
         _count("queries", "native")
         _last.outcome = "native"
-    if _installed.get("mode") == "compare":
+    if state.get("mode") == "compare":
         try:
             result = stock(self, query, sort_index, reverse, limit, merge)
         except Exception:
