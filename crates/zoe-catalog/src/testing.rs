@@ -16,7 +16,8 @@
 //!   `Catalog.catalogObject` and `uncatalogObject` change them, and gives
 //!   the records that changed since the last call. Its indexes are
 //!   FieldIndexes, KeywordIndexes, DateIndexes, UUIDIndexes, BooleanIndexes,
-//!   DateRangeIndexes and ExtendedPathIndexes, each with its own trees. Its trees split a
+//!   DateRangeIndexes, ExtendedPathIndexes and the `ZoeSecurityIndex` of
+//!   `zoe.plone`, each with its own trees. Its trees split a
 //!   bucket at half of its items, past the largest bucket of the family,
 //!   and an inner node at half of its children, past the largest inner
 //!   node of the family or the fan-out of `with_fanout`; the root splits as
@@ -616,6 +617,31 @@ fn index_object(class: (&str, &str), id: &str, attrs: &[(&str, Attr<'_>)]) -> Ve
     p.record(class.0, class.1, state)
 }
 
+/// The record of a `ZoeSecurityIndex` of `zoe.plone`, with the oids of its
+/// `_length`, its `_index`, its `_inputs` and its `_counter`.
+pub fn security_index_record(
+    id: &str,
+    length: u64,
+    index: u64,
+    inputs: u64,
+    counter: u64,
+) -> Vec<u8> {
+    index_object(
+        crate::security::SECURITY_INDEX,
+        id,
+        &[
+            ("id", Attr::Id),
+            ("ignore_ex", Attr::None),
+            ("call_methods", Attr::None),
+            ("indexed_attrs", Attr::IdList),
+            ("_length", Attr::Length(length)),
+            ("_index", Attr::Tree(index, OO)),
+            ("_inputs", Attr::Tree(inputs, IO)),
+            ("_counter", Attr::Length(counter)),
+        ],
+    )
+}
+
 /// The record of a `DateIndex`, with the oids of its `_index`, its
 /// `_unindex`, its `_length` and its `_counter`.
 pub fn date_index_record(id: &str, index: u64, unindex: u64, length: u64, counter: u64) -> Vec<u8> {
@@ -1125,6 +1151,9 @@ pub enum IndexKind {
     /// An ExtendedPathIndex: the value of a row is its path, a str. A row
     /// without a value in `catalog` takes the path of the entry.
     Path,
+    /// The `ZoeSecurityIndex` of `zoe.plone`: the value of a row is its
+    /// inputs, which `_inputs` keeps as they are. Its `_index` stays empty.
+    Security,
     /// An index of another class, `module.name`, whose trees stay empty.
     Other(&'static str, &'static str),
 }
@@ -1134,9 +1163,11 @@ impl IndexKind {
     /// DateRangeIndex is its `_always`.
     fn families(self) -> (Family, Family) {
         match self {
-            IndexKind::Field | IndexKind::Keyword | IndexKind::Path | IndexKind::Other(..) => {
-                (OO, IO)
-            }
+            IndexKind::Field
+            | IndexKind::Keyword
+            | IndexKind::Path
+            | IndexKind::Security
+            | IndexKind::Other(..) => (OO, IO),
             IndexKind::Date => (IO, II),
             IndexKind::Uuid => (OI, IO),
             IndexKind::Boolean => (II_SET, II),
@@ -1249,6 +1280,7 @@ impl IndexModel {
             IndexKind::Boolean => crate::base::BOOLEAN_INDEX,
             IndexKind::DateRange(..) => crate::base::DATE_RANGE_INDEX,
             IndexKind::Path => crate::base::EXTENDED_PATH_INDEX,
+            IndexKind::Security => crate::security::SECURITY_INDEX,
             IndexKind::Other(module, name) => (module, name),
         }
     }
@@ -1260,6 +1292,13 @@ impl IndexModel {
             IndexKind::Field | IndexKind::Keyword | IndexKind::Other(..) => index_record(
                 module,
                 name,
+                &self.id,
+                self.length.0,
+                self.index.root,
+                self.unindex.root,
+                self.counter.0,
+            ),
+            IndexKind::Security => security_index_record(
                 &self.id,
                 self.length.0,
                 self.index.root,
@@ -1341,6 +1380,18 @@ impl IndexModel {
         let old = self.old(&doc);
         match self.kind {
             IndexKind::Other(..) => false,
+            IndexKind::Security => {
+                if old == datum {
+                    return false;
+                }
+                match datum {
+                    Some(datum) => self.unindex.set(doc, Item::Val(datum), new_oid),
+                    None => {
+                        self.unindex.remove(&doc);
+                    }
+                }
+                true
+            }
             IndexKind::Path => {
                 let Some(Val::Str(path)) = datum else {
                     return false;
@@ -1478,6 +1529,7 @@ impl IndexModel {
         };
         match self.kind {
             IndexKind::Other(..) => return false,
+            IndexKind::Security => {}
             IndexKind::Path => {
                 if let Val::Str(path) = &old {
                     self.path_unindex(rid, path);

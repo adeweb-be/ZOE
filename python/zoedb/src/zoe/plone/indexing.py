@@ -632,14 +632,24 @@ class Indexer:
 
     def _apply(self, app, site, entries):
         """Apply the entries to the catalog: the removals first, then the
-        index or the reindex of each path that has an object."""
+        index or the reindex of each path that has an object. With a
+        `ZoeSecurityIndex`, the paths go in path order: an entry reads the
+        entries of its containers, so each container comes first. The
+        entries below a path without an object go too, and the inputs of
+        the removed entries go into the chains of the entries below them
+        that stay, at the end."""
+        from zoe.plone.security import _deferred, security_index
+
         catalog = site.portal_catalog
+        index = security_index(catalog)
         self._expand_security(catalog, entries)
         inner = catalog._catalog
         uids = inner.uids
         uid_index = inner.indexes.get("UID")
         removals = []
         updates = []
+        # The paths of the batch that traversal does not find.
+        gone = []
         for path, entry in entries.items():
             if not entry.keys and path in self._broken:
                 continue
@@ -648,6 +658,8 @@ class Indexer:
             if obj is None:
                 if rid is not None:
                     removals.append(path)
+                if self._guarded(path, _missing, app, path):
+                    gone.append(path)
                 continue
             uid = _uid(obj)
             if uid is not None and uid_index is not None:
@@ -669,6 +681,54 @@ class Indexer:
                         if found is None or _uid(found) != uid:
                             removals.append(stale)
             updates.append((path, obj, entry))
+        if index is None:
+            self._update(catalog, uids, removals, updates)
+            return
+        updates.sort(key=lambda update: update[0])
+        # A path without an object has no object below it either. The
+        # entries below the highest such container go in this batch, so no
+        # chain below it is written for a removal that a later batch
+        # applies.
+        for top in highest(self._gone_tops(app, site, uids, gone)):
+            for below in uids.keys(top + "/", top + "0", excludemax=True):
+                if below not in self._broken:
+                    removals.append(below)
+        with _deferred(index) as (removed, fresh):
+            self._update(catalog, uids, removals, updates)
+        if removed:
+            # The entries below a removed entry that stay in the catalog
+            # get its inputs in their chains, once for the batch.
+            self._guarded(removed[0][1], index._write_chains, removed, fresh)
+
+    def _gone_tops(self, app, site, uids, gone):
+        """Return, for each path of `gone`, its highest container below the
+        site that traversal does not find either, through the paths that
+        the batch lists as gone and the catalog entries. The climb stops
+        at the first container that exists, or that is neither."""
+        root = "/".join(site.getPhysicalPath())
+        listed = set(gone)
+        found = {}
+
+        def missing(path):
+            if path in listed:
+                return True
+            if uids.get(path) is None:
+                return False
+            if path not in found:
+                found[path] = self._guarded(path, _missing, app, path)
+            return found[path]
+
+        tops = []
+        for path in gone:
+            top = path
+            above = path.rpartition("/")[0]
+            while above.startswith(root + "/") and missing(above):
+                top = above
+                above = above.rpartition("/")[0]
+            tops.append(top)
+        return tops
+
+    def _update(self, catalog, uids, removals, updates):
         done = set()
         for path in removals:
             if path not in done and uids.get(path) is not None:
@@ -692,7 +752,13 @@ class Indexer:
         whose operations reindex only the security indexes, with those
         indexes. Search only below the highest such paths. A search that
         fails is a failure of its highest path, so the keys of that path
-        stay in the queue and count the failure."""
+        stay in the queue and count the failure. A catalog with a
+        `ZoeSecurityIndex` needs no subtree: its entries resolve through
+        the entries of their containers (ADR 0061)."""
+        from zoe.plone.security import security_index
+
+        if security_index(catalog) is not None:
+            return
         tops = highest(path for path, entry in entries.items() if entry.security)
         for top in tops:
             idxs = set(entries[top].idxs & SECURITY) or set(SECURITY)
@@ -828,6 +894,44 @@ def _resolve(app, path):
     if getattr(aq_base(obj), "reindexObject", None) is None:
         return None
     return obj
+
+
+def _missing(app, path):
+    """Tell if traversal finds no object at `path`: a missing name, or an
+    object of another path that traversal reached by acquisition. An
+    object that its container holds under the last id of `path` is not
+    missing, whatever its physical path, and neither is an object that
+    the catalog cannot index, as a conversation of plone.app.discussion. A
+    read error of the store stays an error."""
+    from Acquisition import aq_base
+    from zExceptions import NotFound
+    from ZODB.POSException import POSKeyError
+
+    def traverse(where):
+        try:
+            return app.unrestrictedTraverse(where)
+        except (TransientError, POSKeyError):
+            raise
+        except (KeyError, AttributeError, NotFound):
+            return None
+
+    obj = traverse(path)
+    if obj is None:
+        return True
+    try:
+        if "/".join(obj.getPhysicalPath()) == path:
+            return False
+    except AttributeError:
+        return False
+    parent, _, name = path.rpartition("/")
+    container = traverse(parent)
+    if container is None:
+        return True
+    base = aq_base(container)
+    has = getattr(base, "hasObject", None)
+    if callable(has):
+        return not has(name)
+    return name not in getattr(base, "__dict__", {})
 
 
 def _uid(obj):

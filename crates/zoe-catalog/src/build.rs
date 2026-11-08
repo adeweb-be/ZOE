@@ -1,8 +1,8 @@
 //! The build of the base of one catalog from its committed trees.
 //!
 //! The build reads as of one tid: `paths`, `uids`, `data`, and the record
-//! of each index with its `_unindex` and its `_length`. It reads no
-//! `_index` tree.
+//! of each index with its `_unindex` and its `_length`; a `ZoeSecurityIndex`
+//! gives `_inputs` in the place of `_unindex`. It reads no `_index` tree.
 //! It decodes each value of a tree straight into the structure of its
 //! index: the keys go into arenas, which the build frees whole when the
 //! structure is built. The structure of a tree builds in a thread of its
@@ -21,6 +21,7 @@ use crate::base::{
 };
 use crate::change::{Owner, Shapes, Slot};
 use crate::read::{RECORDS, Reads, Record, TreeShape, oid_of, walk_tree, walk_tree_with};
+use crate::security::SecurityIndex;
 use crate::table::{Table, TablePart};
 use crate::value::{StrArena, Val};
 
@@ -54,6 +55,8 @@ enum Part {
     /// The path of each row of an ExtendedPathIndex: the paths, and the row
     /// and the place of each.
     Paths(StrArena, Vec<(u32, u32)>),
+    /// The inputs of each row of a `ZoeSecurityIndex`.
+    Inputs(Vec<(u32, Val)>),
 }
 
 impl Part {
@@ -62,6 +65,7 @@ impl Part {
             Part::Pairs(p) => p.heap_bytes(),
             Part::Ranges(v) => v.capacity() * 24,
             Part::Paths(texts, v) => texts.heap_bytes() + v.capacity() * 8,
+            Part::Inputs(v) => v.iter().map(|(_, value)| value.heap_bytes() + 8).sum(),
         }
     }
 
@@ -74,6 +78,7 @@ impl Part {
                 texts.extend(&other);
                 a.extend(b.into_iter().map(|(r, p)| (r, p + offset)));
             }
+            (Part::Inputs(a), Part::Inputs(b)) => a.extend(b),
             _ => {}
         }
     }
@@ -86,6 +91,7 @@ impl Part {
                     .ok_or_else(|| format!("a value of a DateRangeIndex: {value:?}"))?;
                 v.push((row, since, until));
             }
+            (Part::Inputs(v), _) => v.push((row, value)),
             (Part::Paths(texts, v), _) => match value {
                 Val::Str(path) => v.push((row, texts.push(&path))),
                 other => return Err(format!("a path that is not a str: {other:?}")),
@@ -348,9 +354,12 @@ pub fn build(
                 let make = || match kind {
                     Kind::DateRange => Part::Ranges(Vec::new()),
                     Kind::Path => Part::Paths(StrArena::default(), Vec::new()),
+                    Kind::Security => Part::Inputs(Vec::new()),
                     _ => Part::Pairs(Pairs::Empty),
                 };
-                let tree = index_record.attr_oid("_unindex").ok_or("no _unindex")?;
+                let tree = index_record
+                    .attr_oid(kind.tree())
+                    .ok_or_else(|| format!("no {}", kind.tree()))?;
                 let length_oid = index_record.attr_oid("_length").ok_or("no _length")?;
                 entry.tree = Some(tree);
                 entry.length_oid = Some(length_oid);
@@ -434,6 +443,8 @@ pub fn build(
                             (_, Part::Paths(texts, items)) => Ok(Index::Path(Arc::new(
                                 PathIndex::build(texts, items, count, depth, multi_valued),
                             ))),
+                            (_, Part::Inputs(items)) => SecurityIndex::build(items, rows_ref)
+                                .map(|i| Index::Security(Arc::new(i))),
                             (_, Part::Pairs(pairs)) => {
                                 FieldIndex::build(pairs, count).map(|i| Index::Field(Arc::new(i)))
                             }
