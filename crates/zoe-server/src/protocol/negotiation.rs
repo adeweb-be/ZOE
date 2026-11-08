@@ -13,7 +13,9 @@
 //! the connection stays open.
 
 use rmpv::Value;
-use zoe_wire::extension::{KV, LOCK_INTENT, SEQUENCES, SERVER_WRITES, TRACE_CONTEXT};
+use zoe_wire::extension::{
+    CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, SERVER_WRITES, TRACE_CONTEXT,
+};
 
 use super::method::Method;
 
@@ -32,7 +34,16 @@ use super::method::Method;
 /// did not store, it ends the current entry of that oid in its cache, and
 /// gives every Connection of its process one invalidation with every oid
 /// of the commit before it publishes the tid. Neither adds a method.
-pub(crate) const SERVED: &[&str] = &[SEQUENCES, LOCK_INTENT, KV, TRACE_CONTEXT, SERVER_WRITES];
+/// `catalog_query` adds `catalog_query(catalog, tid, plan, overlay)`, a
+/// query of the catalog mirror of the store (ADR 0059).
+pub(crate) const SERVED: &[&str] = &[
+    SEQUENCES,
+    LOCK_INTENT,
+    KV,
+    TRACE_CONTEXT,
+    SERVER_WRITES,
+    CATALOG_QUERY,
+];
 
 /// Return the names of the declaration `value`, the third argument of
 /// `register`. A value that is not a list of strings is an error.

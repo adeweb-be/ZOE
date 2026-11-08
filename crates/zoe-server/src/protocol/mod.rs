@@ -19,6 +19,7 @@
 //! in the order in which they went in.
 
 mod blob;
+pub(crate) mod catalog;
 mod clock;
 mod compress;
 mod extension;
@@ -62,7 +63,7 @@ use outbox::{Closing, Outbox};
 use pipeline::Calls;
 pub(crate) use pipeline::Pool;
 pub(crate) use resolution::ResolutionLog;
-pub(crate) use storage::{NamedStorage, Queues, Storages};
+pub(crate) use storage::{NamedStorage, Queues, Storages, stop_catalogs};
 
 /// The payload that a client sends in place of a protocol to ask for the
 /// status of the server.

@@ -293,6 +293,7 @@ impl Session {
             Op::KvGet => self.kv_get(args),
             Op::KvScan => self.kv_scan(args),
             Op::KvGeneration => self.kv_generation(args),
+            Op::CatalogQuery => self.catalog_query(args),
             // The calls of the transaction run in `Transaction::dispatch`.
             _ => return Outcome::Close(format!("unknown method {}", call.method)),
         };
@@ -349,6 +350,20 @@ impl Session {
             .store
             .kv_generation(str_of(name, "name of a namespace")?)?
             .0))
+    }
+
+    /// Answer a query of the catalog mirror of the store (ADR 0059):
+    /// `catalog_query(catalog, tid, plan, overlay)`. `catalog` is the oid
+    /// of the `Catalog` object and `tid` the exclusive tid of the snapshot,
+    /// each 8 bytes. The call runs outside the transaction of the
+    /// connection. A wait for the mirror holds its thread of the read
+    /// pool, at most `catalog-wait`. A plan that does not have the form of
+    /// section 8 fails with `ValueError`, and the connection stays open.
+    fn catalog_query(&self, args: Args<'_>) -> Result<Value, Fault> {
+        let [catalog, tid, plan, overlay] = args.exactly::<4>()?;
+        let (catalog, tid) = (u64_of(catalog)?, u64_of(tid)?);
+        crate::protocol::catalog::query(&self.storage.invalidations, catalog, tid, plan, overlay)
+            .map_err(Fault::value_error)
     }
 
     /// Return the next value of the sequence `name` of the store (F29),

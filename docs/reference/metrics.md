@@ -57,8 +57,16 @@ Each metric has the label `storage`, the storage name. A duration is a histogram
 | `zoe_clients_connected` | gauge | `storage` | The connections that registered. |
 | `zoe_invalidation_queue_depth` | gauge | `storage` | The messages that wait in the deepest hub queue among the connections of the storage. |
 | `zoe_backlog_bytes` | gauge | `storage` | The backlog of the write-ahead log, in bytes: the commits that the log holds and the tables do not hold yet. |
+| `zoe_catalog_queries_total` | counter | `storage`, `path` | The `catalog_query` calls that the catalog mirrors of the store read (ADR 0059). `path="native"`: the mirror answered. `path="python"`: the reply gave a reason of the server. |
+| `zoe_catalog_query_latency_seconds` | histogram | `storage` | The time of each catalog query in the server, its wait for the mirror included. |
+| `zoe_catalog_fallbacks_total` | counter | `storage`, `reason`, `side` | The catalog queries that took the Python path, by the reason that the server decided; `side` is `server`. A reason has no sample before its first query. |
+| `zoe_catalog_mirror_drops_total` | counter | `storage` | The catalog mirrors that `--catalog-memory` dropped. |
+| `zoe_catalog_mirror_ready` | gauge | `storage`, `catalog` | 1 when the catalog mirror is ready, else 0. `catalog` is the oid of the `Catalog` object in 16 hex digits. A store whose mirrors did not start has no sample. |
+| `zoe_catalog_mirror_build_seconds` | gauge | `storage`, `catalog` | The time of the last build of the catalog mirror, in seconds. |
+| `zoe_catalog_mirror_lag_tids` | gauge | `storage`, `catalog` | The published commits that the catalog mirror did not apply yet. |
+| `zoe_catalog_mirror_bytes` | gauge | `storage`, `catalog` | The memory of the catalog mirror, in bytes. |
 
-The buckets of a histogram in seconds have the upper bounds 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 and `+Inf`. The buckets of `zoe_fsync_batch_size` have the upper bounds 1, 2, 4, 8, 16, 32, 64, 128 and `+Inf`.
+The buckets of a histogram in seconds have the upper bounds 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 and `+Inf`. The buckets of `zoe_fsync_batch_size` have the upper bounds 1, 2, 4, 8, 16, 32, 64, 128 and `+Inf`. The buckets of `zoe_catalog_query_latency_seconds` have the upper bounds 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1 and `+Inf`.
 
 `deploy/grafana/zoe.json` is a Grafana dashboard of these metrics.
 

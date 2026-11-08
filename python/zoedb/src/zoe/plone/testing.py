@@ -31,6 +31,13 @@ is a `zoe.Storage` itself, with no `DemoStorage` on it: a Plone site
 need the catalog mirror of the store use it. Its resources are `zoeDB`,
 the database, and `zoeStorage`, its storage. The module makes the layer at
 its first use, so it imports plone.app.testing only then.
+
+`ZOE_SERVE_SITE` is the same site in a database whose storage is a
+`zoe.zeo.ClientStorage` with the native client inside, of a `zoe serve`
+on a store of its own, with no `DemoStorage` on it: the server holds the
+catalog mirror. Its resources are `zoeDB`, `zoeStorage` and `zoeServer`,
+the `zoe.testing.ZoeServer`. The server is the `zoe` binary that
+`ZOE_BINARY` names.
 """
 
 import shutil
@@ -153,6 +160,12 @@ class ZoeSite(Layer):
     and removes the directory.
     """
 
+    def open(self, directory):
+        """Open the storage of the site in `directory`."""
+        import zoe
+
+        return zoe.Storage(f"{directory}/zoe")
+
     def setUp(self):
         from OFS.Application import Application
         from plone.app.testing import SITE_OWNER_NAME, SITE_OWNER_PASSWORD
@@ -161,10 +174,8 @@ class ZoeSite(Layer):
         from Testing.makerequest import makerequest
         from zope.component.hooks import getSite, setSite
 
-        import zoe
-
         self._directory = tempfile.mkdtemp(prefix="zoe-plone-site-")
-        storage = zoe.Storage(f"{self._directory}/zoe")
+        storage = self.open(self._directory)
         db = DB(storage)
         site = getSite()
         connection = db.open()
@@ -199,16 +210,52 @@ class ZoeSite(Layer):
         shutil.rmtree(self._directory, ignore_errors=True)
 
 
+class ZoeServeSite(ZoeSite):
+    """The Plone site of `ZoeSite` in a database whose storage is a
+    `zoe.zeo.ClientStorage` with the native client inside, of a `zoe serve`
+    on a new store, with no `DemoStorage` on it.
+
+    `setUp` starts the server, then makes the site. `tearDown` closes the
+    database, then stops the server.
+    """
+
+    def open(self, directory):
+        import zoe.zeo
+        from zoe.testing import ZoeServer
+
+        server = ZoeServer(f"{directory}/zoe").start(60)
+        self["zoeServer"] = server
+        return zoe.zeo.ClientStorage(
+            server.address,
+            native=True,
+            blob_dir=f"{directory}/blobs",
+            shared_blob_dir=False,
+            wait_timeout=60,
+        )
+
+    def tearDown(self):
+        self["zoeDB"].close()
+        server = self["zoeServer"]
+        del self["zoeDB"], self["zoeStorage"], self["zoeServer"]
+        server.stop()
+        shutil.rmtree(self._directory, ignore_errors=True)
+
+
 _layers = {}
 
 
 def __getattr__(name):
     # The layer depends on plone.app.testing, which the module imports only
     # when a test asks for it.
-    if name == "ZOE_SITE":
+    made = {
+        "ZOE_SITE": (ZoeSite, "ZoeSite"),
+        "ZOE_SERVE_SITE": (ZoeServeSite, "ZoeServeSite"),
+    }
+    if name in made:
         if name not in _layers:
             from plone.app.testing import PLONE_FIXTURE
 
-            _layers[name] = ZoeSite(bases=(PLONE_FIXTURE,), name="ZoeSite")
+            factory, layer = made[name]
+            _layers[name] = factory(bases=(PLONE_FIXTURE,), name=layer)
         return _layers[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

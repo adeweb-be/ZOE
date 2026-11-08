@@ -45,10 +45,16 @@
 //! `send_to_all` puts a frame that is not a commit, the `info` after a
 //! pack, in the queue of every connection, under the same mutex. So it
 //! takes its place among the frames of the commits. It is one message.
+//!
+//! The catalog mirrors of the store follow the hub (`follow`): after each
+//! publication, outside the mutex, the hub hands them the tid of each
+//! commit that it published. The hand-off only records the tid, so the hub
+//! never waits for the mirrors.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use zoe_catalog::Mirrors;
 use zoe_core::Tid;
 
 use super::outbox::{Frame, Outbox, Parts, Pushed, Room};
@@ -113,6 +119,8 @@ impl Drop for Publication<'_> {
 /// commit order. All the connections of the storage share it.
 pub(crate) struct Invalidations {
     state: Mutex<State>,
+    /// The catalog mirrors of the store, once they start.
+    follower: OnceLock<Arc<Mirrors>>,
 }
 
 /// The state of the hub. Under its mutex, only a `loadBefore` reply takes
@@ -141,7 +149,19 @@ impl Invalidations {
                 clients: BTreeMap::new(),
                 next: 0,
             }),
+            follower: OnceLock::new(),
         }
+    }
+
+    /// Hand the tid of each later publication to `mirrors`. The first
+    /// follower stays.
+    pub(crate) fn follow(&self, mirrors: Arc<Mirrors>) {
+        let _ = self.follower.set(mirrors);
+    }
+
+    /// The catalog mirrors that follow the hub, once they start.
+    pub(crate) fn follower(&self) -> Option<&Arc<Mirrors>> {
+        self.follower.get()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -238,8 +258,12 @@ impl Invalidations {
     /// Publish `commit` after the commit before it, and then each commit
     /// that waits for it.
     pub(crate) fn publish(&self, commit: Commit) {
-        let overflows = {
+        let mut tids = Vec::new();
+        let (follower, overflows) = {
             let mut state = self.lock();
+            // Under the mutex: a follower that comes later reads the last
+            // published tid after this publication.
+            let follower = self.follower.get();
             debug_assert!(commit.previous >= state.published, "a commit came twice");
             state.waiting.insert(commit.previous, commit);
             let mut overflows = 0;
@@ -249,10 +273,19 @@ impl Invalidations {
                     break;
                 };
                 overflows += state.deliver(commit);
+                if follower.is_some() {
+                    tids.push(state.published);
+                }
             }
-            overflows
+            (follower, overflows)
         };
-        // Write the log line after the release of the mutex.
+        // Hand the tids to the mirrors and write the log line after the
+        // release of the mutex.
+        if let Some(mirrors) = follower {
+            for tid in tids {
+                mirrors.committed(tid.0);
+            }
+        }
         log_overflows(overflows);
     }
 

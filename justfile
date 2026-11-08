@@ -122,12 +122,12 @@ tsan crate="zoe-core" filter="":
     echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
 
 # Build the fuzz targets of zoe serve with libFuzzer, then run them one
-# after the other for `seconds` in all. `just fuzz` runs each of the four
-# targets for 15 seconds, and `just fuzz 600 frame` runs only `frame`, for
+# after the other for `seconds` in all. `just fuzz` runs each of the five
+# targets for 12 seconds, and `just fuzz 600 frame` runs only `frame`, for
 # 10 minutes. The targets and their seeds are in crates/zoe-server/fuzz. The
 # build, the inputs that libFuzzer finds and the crash files go to
 # target/fuzz.
-fuzz seconds="60" *targets="frame handshake merge fields":
+fuzz seconds="60" *targets="frame handshake merge fields plan":
     #!/usr/bin/env bash
     set -euo pipefail
     fuzz=crates/zoe-server/fuzz
@@ -170,6 +170,15 @@ fuzz seconds="60" *targets="frame handshake merge fields":
         echo "== $target"
         mkdir -p "$out/corpus/$target" "$out/artifacts/$target"
         options=()
+        asan="$ASAN_OPTIONS"
+        if [ "$target" = plan ]; then
+            # AddressSanitizer keeps the stack of each allocation and never
+            # frees it. The decoder of a plan recurses, so each new input
+            # can give new stacks, and the memory grows with the runs until
+            # libFuzzer stops at its limit. A short stack of 4 frames keeps
+            # that memory small. It is not a leak of the decoder.
+            asan="$asan:malloc_context_size=4"
+        fi
         if [ "$target" = handshake ]; then
             # The server writes a line to stderr for each connection that it
             # closes, so its stderr goes away. The message of a panic goes
@@ -185,7 +194,7 @@ fuzz seconds="60" *targets="frame handshake merge fields":
         fi
         # libFuzzer adds the new inputs to the first directory. The seeds
         # in the repository do not change.
-        TMPDIR="$tmp" "$out/build/$triple/release/$target" \
+        TMPDIR="$tmp" ASAN_OPTIONS="$asan" "$out/build/$triple/release/$target" \
             -max_total_time="$each" -timeout=30 \
             -print_final_stats=1 "${options[@]}" \
             -artifact_prefix="$out/artifacts/$target/" \

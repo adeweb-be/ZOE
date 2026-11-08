@@ -11,6 +11,7 @@ use zoe_core::{Compression, Options, StructuralMerges};
 
 use super::Error;
 use crate::defaults;
+use crate::protocol::catalog::CatalogConfig;
 use crate::protocol::{self, Pool, Queues};
 use crate::tls::TlsOptions;
 
@@ -148,6 +149,7 @@ pub struct ServeOptions {
     pub(super) tls: Option<TlsOptions>,
     pub(super) structural_merges: StructuralMerges,
     pub(super) resolution_log: Option<PathBuf>,
+    pub(super) catalog: CatalogConfig,
 }
 
 impl ServeOptions {
@@ -188,6 +190,7 @@ impl ServeOptions {
             tls: None,
             structural_merges: StructuralMerges::default(),
             resolution_log: None,
+            catalog: CatalogConfig::default(),
         }
     }
 
@@ -395,6 +398,63 @@ impl ServeOptions {
     pub fn resolution_log(mut self, path: impl AsRef<Path>) -> Self {
         self.resolution_log = Some(path.as_ref().to_path_buf());
         self
+    }
+
+    /// Bound the memory of the catalog mirrors of each store with a
+    /// registered catalog to `bytes` (ADR 0059, section 6). A build, a
+    /// rebase or a growth that would pass it drops the mirror that answered
+    /// a query least recently. Without this call, the bound is 2 GiB.
+    #[must_use]
+    pub fn catalog_memory(mut self, bytes: usize) -> Self {
+        self.catalog.0.memory = bytes;
+        self
+    }
+
+    /// Keep the change set of a commit in the mirror window until `tids`
+    /// newer change sets exist. Without this call, 10,000.
+    #[must_use]
+    pub fn catalog_window_tids(mut self, tids: usize) -> Self {
+        self.catalog.0.window_tids = tids;
+        self
+    }
+
+    /// Keep the change set of a commit in the mirror window at most `age`.
+    /// Without this call, 10 minutes.
+    #[must_use]
+    pub fn catalog_window_seconds(mut self, age: Duration) -> Self {
+        self.catalog.0.window = age;
+        self
+    }
+
+    /// Rebase a mirror when the overrides of its last tid hold more than
+    /// `rows` rows. Without this call, 20,000.
+    #[must_use]
+    pub fn catalog_rebase_rows(mut self, rows: usize) -> Self {
+        self.catalog.0.rebase_rows = rows;
+        self
+    }
+
+    /// Let a catalog query wait at most `wait` for the mirror to apply the
+    /// commits of its snapshot. Past it, the reply is the reason `lag`.
+    /// Without this call, 1 second.
+    #[must_use]
+    pub fn catalog_wait(mut self, wait: Duration) -> Self {
+        self.catalog.0.wait = wait;
+        self
+    }
+
+    /// Give the catalog mirrors of each store the hooks `hooks`. Only the
+    /// tests use them.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn catalog_hooks(mut self, hooks: zoe_catalog::Hooks) -> Self {
+        self.catalog.0.hooks = hooks;
+        self
+    }
+
+    /// The settings of the catalog mirrors of each store.
+    pub(super) fn catalog_config(&self) -> zoe_catalog::Config {
+        self.catalog.0.clone()
     }
 
     /// Speak TLS on the ZEO port with the files of `tls`. `Server::start`
