@@ -341,10 +341,15 @@ impl Store {
         batch: usize,
         mut between: impl FnMut(),
     ) -> Result<PackReport> {
-        self.pack_or_stop(at, batch, || {
-            between();
-            false
-        })
+        self.pack_or_stop(
+            at,
+            batch,
+            || {},
+            || {
+                between();
+                false
+            },
+        )
     }
 
     /// Pack the store at `at`, as `pack` does, and stop between two
@@ -358,16 +363,28 @@ impl Store {
     /// batches that did not run, and it opens without repair. A later
     /// pack at the same tid removes what the stopped pack left.
     pub fn pack_until(&self, at: Tid, stop: impl FnMut() -> bool) -> Result<PackReport> {
-        self.pack_or_stop(at, BATCH, stop)
+        self.pack_or_stop(at, BATCH, || {}, stop)
+    }
+
+    /// Pack the store at `at`, as `pack` does, and call `after_caps` once
+    /// the pack read the caps of the store and released the commit
+    /// sequencer, before its mark and its first removal. This is a hook
+    /// of the tests: a cap taken while `after_caps` runs does not hold the
+    /// pack.
+    #[cfg(feature = "testing")]
+    pub fn pack_after_caps(&self, at: Tid, after_caps: impl FnOnce()) -> Result<PackReport> {
+        self.pack_or_stop(at, BATCH, after_caps, || false)
     }
 
     /// Pack the store at `at` in batches of at most `batch` records or text
-    /// deltas, as `pack_in_batches` does. After each batch, stop with
-    /// `Closed` when `stop` returns true.
+    /// deltas, as `pack_in_batches` does. `after_caps` runs once after the
+    /// pack read the caps. After each batch, stop with `Closed` when `stop`
+    /// returns true.
     fn pack_or_stop(
         &self,
         at: Tid,
         batch: usize,
+        after_caps: impl FnOnce(),
         mut stop: impl FnMut() -> bool,
     ) -> Result<PackReport> {
         self.writable()?;
@@ -383,6 +400,7 @@ impl Store {
             *lock(&self.packing.written) = Some(Vec::new());
             (at.min(last), last, watermark)
         };
+        after_caps();
         let _noting = Noting(&self.packing);
         // The tables hold each commit up to the last tid, and the table of
         // the write-ahead log none of them, before the mark: the pack
@@ -1645,10 +1663,15 @@ mod tests {
         let vfs = built.durable_copy();
         let store = Store::open_vfs(vfs.clone()).unwrap();
         let mut batches = 0;
-        let stopped = store.pack_or_stop(last, 2, || {
-            batches += 1;
-            batches == 2
-        });
+        let stopped = store.pack_or_stop(
+            last,
+            2,
+            || {},
+            || {
+                batches += 1;
+                batches == 2
+            },
+        );
         assert!(matches!(stopped, Err(ZoeError::Closed)), "{stopped:?}");
         assert_eq!(batches, 2);
         assert_eq!(store.backend.pack_watermark().unwrap(), last);

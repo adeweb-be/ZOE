@@ -22,8 +22,9 @@ signal-hook.workspace = true
 # The runtime of the native client. Its threads start when the first client
 # opens. ADR 0035 records the decision.
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
-# The catalog mirrors of `zoe.Storage` (ADR 0059).
-zoe-catalog.workspace = true
+# The catalog mirrors of `zoe.Storage` (ADR 0059) and the text index of
+# each catalog (ADR 0060).
+zoe-catalog = { workspace = true, features = ["text"] }
 # The native client of `zoe.zeo.ClientStorage`.
 zoe-client.workspace = true
 zoe-core.workspace = true

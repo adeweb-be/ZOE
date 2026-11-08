@@ -75,7 +75,7 @@ PLANS = [
     ),
     plan([{"k": "b", "i": "is_folderish", "q": True}], cols=["getId"], rn=10),
     # A kind of clause that the mirror does not know: `plan`.
-    plan([{"k": "t", "i": "SearchableText", "q": "word"}]),
+    plan([{"k": "x-unknown", "i": "SearchableText", "q": "word"}]),
     # A kind that does not read the class of its index: `plan`.
     plan([{"k": "b", "i": "portal_type", "q": True}]),
     # An index of the catalog that the mirror does not serve.

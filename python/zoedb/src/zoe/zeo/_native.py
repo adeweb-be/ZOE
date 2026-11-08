@@ -53,15 +53,18 @@ _zeo_logger = logging.getLogger("ZEO.ClientStorage")
 _MB = 1024**2
 
 # The extensions that the native client declares: those of the client of
-# ZEO, `server_writes` (ADR 0049) and `catalog_query` (ADR 0059). With
+# ZEO, `server_writes` (ADR 0049), `catalog_query` (ADR 0059) and `text`
+# (ADR 0060). With
 # `server_writes`, the vote of the server can write a record that the
 # transaction did not store, and the finish gives every Connection of the
 # process every oid of the commit. The asyncio client does not keep that
 # promise, so it does not declare it. Only the native client gives
-# `catalog_query`, so the asyncio client does not declare it either.
+# `catalog_query` and the text calls, so the asyncio client does not declare
+# them either.
 _SERVER_WRITES = "server_writes"
 _CATALOG_QUERY = "catalog_query"
-_NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES, _CATALOG_QUERY)
+_TEXT = "text"
+_NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES, _CATALOG_QUERY, _TEXT)
 
 # The protocols of a server for which a `ClientStorage` without `native`
 # takes the asyncio client of ZEO inside: the pickle protocol of a stock
@@ -570,6 +573,7 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         self._kv_accepted = False
         # The answer of `catalog_supported` from the last server.
         self._catalog_accepted = False
+        self._text_accepted = False
 
         from zoe import _zoe
 
@@ -1331,6 +1335,43 @@ class _NativeClientStorage(zodb._IntentOwners, ClientStorage):
         return self._with_server(
             lambda: self._native.catalog_query(catalog, tid, plan, overlay),
             again=True,
+        )
+
+    # The native text index (ADR 0060).
+
+    def text_supported(self):
+        """Tell if the server accepted `text` on the connection. While the
+        client has no server, give the answer of the last server, as
+        `kv_supported` does."""
+        connected = self._native.is_connected()
+        extensions = self._native.extensions()
+        if extensions or (connected and self._native.is_connected()):
+            self._text_accepted = _TEXT in extensions
+        return self._text_accepted
+
+    def text_set(self, catalog, index, rid, language, text, before, transaction):
+        native = self._check_trans(transaction, "text_set")
+        native.text_set(catalog, index, rid, language, text, before)
+
+    def text_unindex(self, catalog, index, rid, before, transaction):
+        native = self._check_trans(transaction, "text_unindex")
+        native.text_unindex(catalog, index, rid, before)
+
+    def text_clear(self, catalog, index, transaction):
+        self._check_trans(transaction, "text_clear").text_clear(catalog, index)
+
+    def text_query(self, catalog, tid, clause, filter=None):
+        """Answer a text clause on the text index of the server, with the
+        arguments and the reply of `zoe.Storage.text_query`."""
+        return self._with_server(
+            lambda: self._native.text_query(catalog, tid, clause, filter)
+        )
+
+    def text_info(self, catalog, index, tid, rid=None):
+        """Give the counts of a text index of the server, with the
+        arguments and the reply of `zoe.Storage.text_info`."""
+        return self._with_server(
+            lambda: self._native.text_info(catalog, index, tid, rid)
         )
 
     # The owners of the early write-intent locks of `zodb._IntentOwners`

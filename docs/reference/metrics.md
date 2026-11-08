@@ -66,6 +66,7 @@ Each metric has the label `storage`, the storage name. A duration is a histogram
 | `zoe_catalog_mirror_build_seconds` | gauge | `storage`, `catalog` | The time of the last build of the catalog mirror, in seconds. |
 | `zoe_catalog_mirror_lag_tids` | gauge | `storage`, `catalog` | The published commits that the catalog mirror did not apply yet. |
 | `zoe_catalog_mirror_bytes` | gauge | `storage`, `catalog` | The memory of the catalog mirror, in bytes. |
+| `zoe_text_commit_lag_seconds` | gauge | `storage`, `catalog` | The age of the oldest committed text delta that the text index of the catalog does not hold yet, in seconds, and 0 when it holds all (ADR 0060). A store whose mirrors did not start has no sample. |
 
 The buckets of a histogram in seconds have the upper bounds 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 and `+Inf`. The buckets of `zoe_fsync_batch_size` have the upper bounds 1, 2, 4, 8, 16, 32, 64, 128 and `+Inf`. The buckets of `zoe_catalog_query_latency_seconds` have the upper bounds 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1 and `+Inf`.
 

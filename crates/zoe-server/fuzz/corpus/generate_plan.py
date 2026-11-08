@@ -7,12 +7,12 @@ environment of the Python tests:
 
 A seed is the argument `plan` of a `catalog_query` call, one msgpack value
 in the form of ADR 0059, section 8: plans of each kind of clause, with a
-sort, a batch and columns, and plans that the server refuses. A seed whose
-name starts with `overlay` also holds the argument `overlay` after the
-plan: a second msgpack value, `[[oid, pickle]...]`, with records of BTrees
-buckets and of the metadata `data`, one with a provisional oid, written
-as ZODB writes a record (a pickle of the class, then a pickle of the
-state). All data is synthetic.
+sort, a batch and columns, plans with a text clause of ADR 0060, section 12,
+and plans that the server refuses. A seed whose name starts with `overlay`
+also holds the argument `overlay` after the plan: a second msgpack value,
+`[[oid, pickle]...]`, with records of BTrees buckets and of the metadata
+`data`, one with a provisional oid, written as ZODB writes a record (a
+pickle of the class, then a pickle of the state). All data is synthetic.
 """
 
 import io
@@ -61,6 +61,22 @@ def path(index, paths, level=0, depth=-1, navtree=False, start=0):
     }
 
 
+def node(kind, **fields):
+    return {"n": kind, **fields}
+
+
+def text(index, query, languages=None, cleared=(), staged=(), settings=None):
+    return {
+        "k": "t",
+        "i": index,
+        "q": query,
+        "lg": languages,
+        "cl": list(cleared),
+        "st": [list(s) for s in staged],
+        "set": settings,
+    }
+
+
 SEEDS = {
     "field": plan([keys("portal_type", ["Document"])]),
     "field-many": plan([keys("portal_type", ["Document", "News Item"])]),
@@ -90,7 +106,49 @@ SEEDS = {
         cols=["Title", "getId", "modified"],
         rn=3,
     ),
-    "unknown-kind": plan([{"k": "t", "i": "SearchableText", "q": "word"}]),
+    "text": plan(
+        [
+            keys("portal_type", ["Document"]),
+            text(
+                "SearchableText",
+                node(
+                    "and",
+                    items=[
+                        node("atom", w=["alpha"]),
+                        node("phrase", w=["beta", "gamma"]),
+                        node("or", items=[node("glob", p="delt*"), node("atom", w=[])]),
+                    ],
+                    nots=[node("atom", w=["omega"])],
+                ),
+                languages=["en"],
+            ),
+        ],
+        b_size=10,
+    ),
+    "text-sorted": plan(
+        [text("Title", node("atom", w=["alpha"]))],
+        sort=[["sortable_title", False]],
+        limit=5,
+    ),
+    "text-staged": plan(
+        [
+            text(
+                "SearchableText",
+                node("phrase", w=["alpha", "beta", "gamma"]),
+                cleared=["Description"],
+                staged=[
+                    ["SearchableText", 7, "en", "alpha beta gamma"],
+                    ["Title", -3, "", None],
+                ],
+                settings={
+                    "mode": "enhanced",
+                    "language": ["en", "fr"],
+                    "boosts": {"Title": 3.0, "Description": 1.5},
+                },
+            )
+        ]
+    ),
+    "unknown-kind": plan([{"k": "x-unknown", "i": "getObjPositionInParent", "q": [1]}]),
     "unknown-key": {**plan([keys("getId", ["a"])]), "o": [["getId", 1]]},
     "malformed": {"c": "not a list"},
     "empty": plan([]),

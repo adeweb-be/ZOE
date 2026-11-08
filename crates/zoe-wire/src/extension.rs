@@ -23,3 +23,8 @@ pub const SERVER_WRITES: &str = "server_writes";
 /// The catalog queries of the mirror (ADR 0059):
 /// `catalog_query(catalog, tid, plan, overlay)`.
 pub const CATALOG_QUERY: &str = "catalog_query";
+
+/// The native text index (ADR 0060): `text_set`, `text_unindex` and
+/// `text_clear` stage into the transaction of the connection, and
+/// `text_query` and `text_info` read the text index of a catalog.
+pub const TEXT: &str = "text";

@@ -19,8 +19,11 @@
 //! - `mirrors`: the mirrors of a store, their registration, their thread
 //!   and the memory bound.
 //! - `reason` and `counts`: the reasons of a fallback and the counts.
+//! - `text`, with the feature `text`: the native text index of each
+//!   registered catalog, on tantivy (ADR 0060).
 //! - `testing`, with the feature `testing`: the records of a catalog as
-//!   Products.ZCatalog writes them, for tests.
+//!   Products.ZCatalog writes them, and the deltas and the settings of its
+//!   text indexes, for tests.
 //!
 //! The crate is synchronous. It starts its threads when a store with a
 //! registered catalog starts its mirrors, never at the load of a module.
@@ -41,9 +44,13 @@ pub mod security;
 pub mod table;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(feature = "text")]
+pub mod text;
 pub mod value;
 
 pub use mirrors::{Config, Hooks, Mirrors, Opener, Status};
+#[cfg(feature = "text")]
+pub use plan::split_text;
 pub use plan::{
     ClauseKind, PlanError, Wire, decode_plan, decode_request, decode_typed, encode_reply,
 };

@@ -8,7 +8,7 @@ The bytes and the names of the ZEO 6 msgpack protocol that `zoe serve` (`zoe-ser
 - `src/frame.rs`: the frame, a 4-byte big-endian length and the payload: `header`, `encode`, `length`, and `RESERVE`, the largest buffer that a read reserves before the bytes arrive.
 - `src/msgpack.rs`: the head of a bin (written and read), the head of an array (read), and the big-endian read of a length.
 - `src/class.rs`: the class names of the exceptions that the replies of `zoe serve` name.
-- `src/extension.rs`: the names of the ZOE extensions: `sequences`, `kv`, `lock_intent`, `trace_context`, `server_writes` and `catalog_query`.
+- `src/extension.rs`: the names of the ZOE extensions: `sequences`, `kv`, `lock_intent`, `trace_context`, `server_writes`, `catalog_query` and `text`.
 - `src/tls.rs`: `certificates`, the PEM loader; `Validity` and its `check`; `Pinned<P>`, the certificates of a CA file that a peer certificate matches byte for byte, each with what a reader of its DER gave. `src/tls/der.rs`: one TLV reader and one date arithmetic, with two readers: `validity` (the server) and `parts` (the client: the validity period, the common names of the subject, the subjectAltName extension).
 
 ## Invariants

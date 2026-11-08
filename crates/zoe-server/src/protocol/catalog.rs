@@ -17,6 +17,14 @@
 //!
 //! The host keeps the counters of the mirrors from its start, so a query
 //! that the store refuses before the mirrors start counts too.
+//!
+//! The mirrors also host the text index of each registered catalog with
+//! settings in `zoe.text` (ADR 0060), in `text/<oid>/` of the store
+//! directory. A plan can hold a text clause; `text_query(catalog, tid,
+//! clause, filter)` and `text_info(catalog, index, tid, rid)` of the
+//! extension `text` read the text index without the mirror. A store whose
+//! mirrors did not start has no text index: its text queries answer from
+//! the staged texts of an index in `cl`, or give `unavailable`.
 
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -25,9 +33,10 @@ use std::time::Duration;
 
 use rmpv::Value;
 use zoe_catalog::counts::{Counters, LATENCY_BUCKETS};
+use zoe_catalog::text::{CallError, clause, engine};
 use zoe_catalog::{
     Config, Fallback, Mirrors, NAMESPACE, Opener, PlanError, Reads, Reason, Wire, decode_typed,
-    encode_reply, overlay,
+    encode_reply, overlay, split_text,
 };
 use zoe_core::{Flavour, Store};
 
@@ -143,7 +152,11 @@ impl Catalog {
         plan: &Value,
         overlay: &Value,
     ) -> Result<Value, String> {
-        let decoded = decode_typed(&Wire::from_value(plan)?);
+        // The text clause comes apart from the plan.
+        let (rest, text) = split_text(&Wire::from_value(plan)?).map_err(|e| match e {
+            PlanError::Malformed(why) | PlanError::Unknown(why) => why,
+        })?;
+        let decoded = decode_typed(&rest);
         let records = match decoded {
             Err(PlanError::Malformed(why)) => return Err(why),
             _ => overlay::decode(overlay)?,
@@ -166,14 +179,53 @@ impl Catalog {
                 ))
             }
             (Ok((plan, columns, kinds)), Some(mirrors)) => {
-                let answer =
-                    mirrors.query_typed(catalog, tid, &plan, &columns, &kinds, records.as_deref());
+                let answer = mirrors.query_with_text(
+                    catalog,
+                    tid,
+                    &plan,
+                    &columns,
+                    &kinds,
+                    records.as_deref(),
+                    text.as_ref(),
+                );
                 log(mirrors);
                 answer
             }
         };
         Ok(encode_reply(tid, &answer).into_value())
     }
+}
+
+/// Answer `text_query(catalog, tid, clause, filter)` (ADR 0060, section
+/// 12) with the text index of the store.
+pub(crate) fn text_query(
+    hub: &Invalidations,
+    store: &Store,
+    catalog: u64,
+    tid: u64,
+    clause: &Value,
+    filter: &Value,
+) -> Result<Value, CallError> {
+    let clause = Wire::from_value(clause).map_err(CallError::Malformed)?;
+    let filter = Wire::from_value(filter).map_err(CallError::Malformed)?;
+    let texts = hub.follower().and_then(|m| m.texts());
+    let answer = engine::text_query(texts, store, catalog, tid, &clause, &filter)?;
+    Ok(clause::encode_hits(tid, &answer).into_value())
+}
+
+/// Answer `text_info(catalog, index, tid, rid)` with the text index of the
+/// store.
+pub(crate) fn text_info(
+    hub: &Invalidations,
+    store: &Store,
+    catalog: u64,
+    index: &str,
+    tid: u64,
+    rid: Option<i64>,
+) -> Result<Value, CallError> {
+    let texts = hub.follower().and_then(|m| m.texts());
+    let answer = engine::text_info(texts, store, catalog, index, tid, rid)?;
+    Ok(clause::encode_info(tid, &answer).into_value())
 }
 
 /// Tell if a `kv_set` or a `kv_delete` in the namespace `name` of
@@ -311,6 +363,22 @@ pub(crate) fn render(storages: &[Exported]) -> String {
                     value(m)
                 );
             }
+        }
+    }
+    let name = "zoe_text_commit_lag_seconds";
+    head(
+        &mut out,
+        name,
+        "gauge",
+        "The age of the oldest committed text delta that the text index of the catalog does not hold yet, in seconds; 0 when it holds all.",
+    );
+    for (labels, c) in &counts {
+        for t in &c.texts {
+            let _ = writeln!(
+                out,
+                "{name}{{{labels},catalog=\"{:016x}\"}} {}",
+                t.catalog, t.lag_seconds
+            );
         }
     }
     out

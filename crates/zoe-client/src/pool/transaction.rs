@@ -211,6 +211,37 @@ impl PoolTransaction {
         self.txn().kv_delete(flavour, name, key).await
     }
 
+    /// Stage a text delta, as `Transaction::text_set` does.
+    pub async fn text_set(
+        &mut self,
+        catalog: Oid,
+        index: &str,
+        rid: i32,
+        language: &str,
+        text: &str,
+        before: Tid,
+    ) -> Result<(), Error> {
+        self.txn()
+            .text_set(catalog, index, rid, language, text, before)
+            .await
+    }
+
+    /// Stage an unindex, as `Transaction::text_unindex` does.
+    pub async fn text_unindex(
+        &mut self,
+        catalog: Oid,
+        index: &str,
+        rid: i32,
+        before: Tid,
+    ) -> Result<(), Error> {
+        self.txn().text_unindex(catalog, index, rid, before).await
+    }
+
+    /// Stage a clear delta, as `Transaction::text_clear` does.
+    pub async fn text_clear(&mut self, catalog: Oid, index: &str) -> Result<(), Error> {
+        self.txn().text_clear(catalog, index).await
+    }
+
     /// Undo the transaction `trans_id`, as `Transaction::undo` does. The
     /// vote lists the oids of the undo as resolved by the server, and the
     /// turn ends their current entries in the cache of the pool.

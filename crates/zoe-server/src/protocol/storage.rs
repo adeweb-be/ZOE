@@ -168,8 +168,18 @@ impl NamedStorage {
         self
     }
 
-    /// Keep the catalog mirrors of the store with `config`.
-    pub(crate) fn catalog(mut self, config: zoe_catalog::Config) -> Self {
+    /// Keep the catalog mirrors of the store with `config`. The text
+    /// indexes of its catalogs live in `text/` of the store directory; a
+    /// read-only storage writes nothing there (ADR 0060, section 10).
+    pub(crate) fn catalog(mut self, mut config: zoe_catalog::Config) -> Self {
+        config.text = zoe_catalog::text::TextConfig {
+            dir: Some(self.path.clone()),
+            read_only: self.read_only,
+        };
+        #[cfg(feature = "sim")]
+        if self.in_memory {
+            config.text.dir = None;
+        }
         self.catalog = Catalog::new(&self.store, config);
         self
     }

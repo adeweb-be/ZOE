@@ -949,6 +949,32 @@ impl Pool {
         connection.catalog_query(catalog, tid, plan, overlay).await
     }
 
+    /// Answer a text clause, as `Client::text_query` does, on any
+    /// connection of the pool.
+    pub async fn text_query(
+        &self,
+        catalog: Oid,
+        tid: Tid,
+        clause: Value,
+        filter: Value,
+    ) -> Result<Value, Error> {
+        let connection = self.shared.any_connection()?;
+        connection.text_query(catalog, tid, clause, filter).await
+    }
+
+    /// Give the counts of a text index, as `Client::text_info` does, on
+    /// any connection of the pool.
+    pub async fn text_info(
+        &self,
+        catalog: Oid,
+        index: &str,
+        tid: Tid,
+        rid: Option<i32>,
+    ) -> Result<Value, Error> {
+        let connection = self.shared.any_connection()?;
+        connection.text_info(catalog, index, tid, rid).await
+    }
+
     /// Begin a transaction on a free connection, as `Client::begin_with`
     /// does. Open a connection when none is free and the pool has less than
     /// its bound. Else wait for a free one. After the close, or while the

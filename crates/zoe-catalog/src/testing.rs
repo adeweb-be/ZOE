@@ -23,6 +23,8 @@
 //!   node of the family or the fan-out of `with_fanout`; the root splits as
 //!   `BTree_split_root` does. Its tree sets stay one inline bucket.
 //! - `commit` writes records and registration keys to a store.
+//! - With the feature `text`, `commit_text` writes the deltas of the text
+//!   indexes of a catalog and the settings of `zoe.text` (ADR 0060).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -2145,6 +2147,84 @@ pub fn commit(
     }
     for key in unregister {
         txn.kv_delete(Flavour::Durable, NAMESPACE, key)?;
+    }
+    txn.vote()?;
+    Ok(txn.finish()?.0)
+}
+
+/// A delta of a text index, for `commit_text`.
+#[cfg(feature = "text")]
+#[derive(Clone, Debug)]
+pub enum TextOp<'a> {
+    /// The text of `rid` in `index`, in `language`.
+    Set {
+        /// The index id.
+        index: &'a str,
+        /// The rid.
+        rid: i32,
+        /// The language.
+        language: &'a str,
+        /// The text.
+        text: &'a str,
+    },
+    /// The unindex of `rid` in `index`.
+    Unindex {
+        /// The index id.
+        index: &'a str,
+        /// The rid.
+        rid: i32,
+    },
+    /// The clear of `index`.
+    Clear {
+        /// The index id.
+        index: &'a str,
+    },
+}
+
+/// Commits the deltas `ops` of the catalog `catalog` to `store` in one
+/// transaction, with the snapshot of the last tid. `settings` writes the
+/// settings of the text indexes of the catalog in `zoe.text`, and
+/// `register` its registration key in `zoe.catalog`. Returns the tid.
+#[cfg(feature = "text")]
+pub fn commit_text(
+    store: &Store,
+    catalog: u64,
+    ops: &[TextOp<'_>],
+    settings: Option<&crate::text::CatalogSettings>,
+    register: bool,
+) -> Result<u64, ZoeError> {
+    let before = Tid(store.last_transaction().0 + 1);
+    let mut txn = store.tpc_begin(b"", b"", b"")?;
+    let oid = Oid(catalog);
+    for op in ops {
+        match op {
+            TextOp::Set {
+                index,
+                rid,
+                language,
+                text,
+            } => txn.text_set(oid, index, *rid, language, text, before)?,
+            TextOp::Unindex { index, rid } => txn.text_unindex(oid, index, *rid, before)?,
+            TextOp::Clear { index } => txn.text_clear(oid, index)?,
+        }
+    }
+    if let Some(settings) = settings {
+        txn.kv_set(
+            Flavour::Durable,
+            crate::text::settings::NAMESPACE,
+            &catalog.to_be_bytes(),
+            &settings.to_json(),
+            None,
+        )?;
+    }
+    if register {
+        txn.kv_set(
+            Flavour::Durable,
+            NAMESPACE,
+            &catalog.to_be_bytes(),
+            b"",
+            None,
+        )?;
     }
     txn.vote()?;
     Ok(txn.finish()?.0)

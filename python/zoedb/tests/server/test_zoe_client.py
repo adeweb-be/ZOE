@@ -759,6 +759,7 @@ def test_the_native_client_declares_the_extensions_of_the_client_of_zeo():
         *zoe.zeo.EXTENSIONS,
         "server_writes",
         "catalog_query",
+        "text",
     )
     traces = "trace_context" in zoe.zeo._NATIVE_EXTENSIONS
     assert traces == (zoe.zeo._PROPAGATOR is not None)

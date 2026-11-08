@@ -21,7 +21,7 @@ use std::time::Duration;
 use rmpv::Value;
 use tokio::sync::{broadcast, mpsc};
 use zoe_core::{Flavour, Oid, Tid};
-use zoe_wire::extension::{CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, TRACE_CONTEXT};
+use zoe_wire::extension::{CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, TEXT, TRACE_CONTEXT};
 use zoe_wire::{PROTOCOL, p64, u64_of};
 
 use crate::endpoint::{Address, Endpoint};
@@ -654,6 +654,47 @@ impl Client {
         }
     }
 
+    /// Answer a text clause on the text index of a catalog (ADR 0060,
+    /// section 12): `text_query(catalog, tid, clause, filter)`. `clause` is
+    /// the text clause without `k`, `filter` nil or the rids as bin. Return
+    /// the reply map as the server gives it. It needs the extension `text`:
+    /// without it, it fails with `Error::Unsupported` and sends nothing.
+    pub async fn text_query(
+        &self,
+        catalog: Oid,
+        tid: Tid,
+        clause: Value,
+        filter: Value,
+    ) -> Result<Value, Error> {
+        self.check_extension(TEXT)?;
+        let args = vec![p64(catalog.0), p64(tid.0), clause, filter];
+        let reply = self.inner.call("text_query", args).await?;
+        match reply {
+            Value::Map(_) => Ok(reply),
+            other => Err(bad("text_query", &other)),
+        }
+    }
+
+    /// Give the counts of the text index `index` of a catalog and the live
+    /// text of `rid`: `text_info(catalog, index, tid, rid)`, with the rules
+    /// of `text_query`.
+    pub async fn text_info(
+        &self,
+        catalog: Oid,
+        index: &str,
+        tid: Tid,
+        rid: Option<i32>,
+    ) -> Result<Value, Error> {
+        self.check_extension(TEXT)?;
+        let rid = rid.map_or(Value::Nil, Value::from);
+        let args = vec![p64(catalog.0), index.into(), p64(tid.0), rid];
+        let reply = self.inner.call("text_info", args).await?;
+        match reply {
+            Value::Map(_) => Ok(reply),
+            other => Err(bad("text_info", &other)),
+        }
+    }
+
     /// Take the early write-intent lock of each oid of `oids`, in ascending
     /// order, for the next transaction of this connection (ADR 0045).
     /// Return the current serial of each oid, in the same order, when the
@@ -793,7 +834,8 @@ impl Client {
             )
             .await?;
         let kv = self.check_extension(KV).is_ok();
-        Ok(Transaction::new(self.inner.clone(), id, guard, kv))
+        let text = self.check_extension(TEXT).is_ok();
+        Ok(Transaction::new(self.inner.clone(), id, guard, kv, text))
     }
 
     /// Return a receiver of the invalidations that the server sends from
