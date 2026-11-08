@@ -50,6 +50,12 @@ pub trait Reads: Send + Sync {
     /// The generation of the durable namespace `zoe.catalog`: the tid of
     /// the last commit that wrote it.
     fn registration_generation(&self) -> Result<u64, String>;
+
+    /// The store itself, for the reads of the text indexes: its deltas,
+    /// its namespaces and its pack. `None` for reads that hold no store.
+    fn store(&self) -> Option<&Store> {
+        None
+    }
 }
 
 impl Reads for Store {
@@ -113,6 +119,10 @@ impl Reads for Store {
         self.kv_generation(NAMESPACE)
             .map(|tid| tid.0)
             .map_err(|e| format!("the generation of {NAMESPACE}: {e}"))
+    }
+
+    fn store(&self) -> Option<&Store> {
+        Some(self)
     }
 }
 

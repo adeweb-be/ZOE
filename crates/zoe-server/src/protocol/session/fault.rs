@@ -14,6 +14,9 @@ use zoe_wire::p64;
 
 use crate::protocol::iteration::{self, Refused};
 
+/// The class of `ZODB.POSException.Unsupported`.
+const UNSUPPORTED: &str = "ZODB.POSException.Unsupported";
+
 /// The text of a conflict error of ZODB.
 pub(super) const CONFLICT: &str = "database conflict error";
 
@@ -37,6 +40,16 @@ impl Fault {
 
     pub(super) fn value_error(text: impl Into<String>) -> Self {
         Self::new(VALUE_ERROR, text)
+    }
+
+    /// The exception of a text call that fails as a call: `ValueError`
+    /// for arguments of another form, `Unsupported` for the compatibility
+    /// mode.
+    pub(super) fn of_text(error: zoe_catalog::text::CallError) -> Self {
+        match error {
+            zoe_catalog::text::CallError::Malformed(why) => Self::value_error(why),
+            zoe_catalog::text::CallError::Unsupported(why) => Self::new(UNSUPPORTED, why),
+        }
     }
 
     pub(super) fn type_error(text: impl Into<String>) -> Self {
@@ -206,13 +219,17 @@ impl Fault {
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } | ZoeError::WrongThread => {
                 Self::transaction(text)
             }
-            ZoeError::InvalidKv(_) => Self::value_error(text),
+            ZoeError::TextConflict { catalog } => {
+                Self::conflict(CONFLICT_ERROR, CONFLICT, catalog, None, None)
+            }
+            ZoeError::InvalidKv(_) | ZoeError::InvalidText(_) => Self::value_error(text),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptBlob { .. }
             | ZoeError::CorruptTxn { .. }
             | ZoeError::CorruptSequence { .. }
             | ZoeError::CorruptKv { .. }
+            | ZoeError::CorruptText { .. }
             | ZoeError::Backend(_) => Self::new(STORAGE_SYSTEM_ERROR, text),
             _ => Self::new(STORAGE_ERROR, text),
         }

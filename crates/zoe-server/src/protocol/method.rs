@@ -6,7 +6,7 @@
 //! is one row here and one arm in `Session::dispatch` or
 //! `Transaction::dispatch`. The server keeps no other list of method names.
 
-use zoe_wire::extension::{CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES};
+use zoe_wire::extension::{CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, TEXT};
 
 /// Where the call of a method runs, once the connection is registered.
 /// Before `register`, each call runs alone on the read pool.
@@ -72,6 +72,8 @@ pub(crate) enum Op {
     KvScan,
     KvGeneration,
     CatalogQuery,
+    TextQuery,
+    TextInfo,
     LockIntent,
     UnlockIntent,
     TpcBegin,
@@ -81,6 +83,9 @@ pub(crate) enum Op {
     DeleteObject,
     KvSet,
     KvDelete,
+    TextSet,
+    TextUnindex,
+    TextClear,
     Undoa,
     Vote,
     TpcFinish,
@@ -145,6 +150,8 @@ use Lane::{BeforeNext, Own, Read, ReadBeforeNext, Transaction};
 /// on a thread of its own. The extension `sequences` adds `sequence_next`,
 /// `lock_intent` adds `lock_intent` and `unlock_intent` (ADR 0045), and
 /// `kv` adds three reads and two writes in the transaction (ADR 0043).
+/// `text` adds three writes in the transaction and two reads of the text
+/// index (ADR 0060).
 pub(crate) const METHODS: &[Method] = &[
     Method::new("loadBefore", Op::LoadBefore, Read),
     Method::new("register", Op::Register, Read),
@@ -174,6 +181,8 @@ pub(crate) const METHODS: &[Method] = &[
     Method::new("kv_scan", Op::KvScan, Read).of(KV),
     Method::new("kv_generation", Op::KvGeneration, Read).of(KV),
     Method::new("catalog_query", Op::CatalogQuery, Read).of(CATALOG_QUERY),
+    Method::new("text_query", Op::TextQuery, Read).of(TEXT),
+    Method::new("text_info", Op::TextInfo, Read).of(TEXT),
     Method::new("lock_intent", Op::LockIntent, Transaction).of(LOCK_INTENT),
     Method::new("unlock_intent", Op::UnlockIntent, Transaction).of(LOCK_INTENT),
     Method::new("tpc_begin", Op::TpcBegin, Transaction).no_reply(),
@@ -192,6 +201,15 @@ pub(crate) const METHODS: &[Method] = &[
     Method::new("kv_delete", Op::KvDelete, Transaction)
         .no_reply()
         .of(KV),
+    Method::new("text_set", Op::TextSet, Transaction)
+        .no_reply()
+        .of(TEXT),
+    Method::new("text_unindex", Op::TextUnindex, Transaction)
+        .no_reply()
+        .of(TEXT),
+    Method::new("text_clear", Op::TextClear, Transaction)
+        .no_reply()
+        .of(TEXT),
     Method::new("undoa", Op::Undoa, Transaction).no_reply(),
     Method::new("vote", Op::Vote, Transaction),
     Method::new("tpc_finish", Op::TpcFinish, Transaction),
@@ -264,6 +282,9 @@ mod tests {
                 "deleteObject",
                 "kv_set",
                 "kv_delete",
+                "text_set",
+                "text_unindex",
+                "text_clear",
                 "undoa",
                 "storeBlobStart",
                 "storeBlobChunk",

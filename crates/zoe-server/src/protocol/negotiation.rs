@@ -14,7 +14,7 @@
 
 use rmpv::Value;
 use zoe_wire::extension::{
-    CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, SERVER_WRITES, TRACE_CONTEXT,
+    CATALOG_QUERY, KV, LOCK_INTENT, SEQUENCES, SERVER_WRITES, TEXT, TRACE_CONTEXT,
 };
 
 use super::method::Method;
@@ -35,7 +35,10 @@ use super::method::Method;
 /// gives every Connection of its process one invalidation with every oid
 /// of the commit before it publishes the tid. Neither adds a method.
 /// `catalog_query` adds `catalog_query(catalog, tid, plan, overlay)`, a
-/// query of the catalog mirror of the store (ADR 0059).
+/// query of the catalog mirror of the store (ADR 0059). `text` adds the
+/// calls of the native text index (ADR 0060): `text_set`, `text_unindex`
+/// and `text_clear` in the transaction, `text_query` and `text_info` on the
+/// read pool.
 pub(crate) const SERVED: &[&str] = &[
     SEQUENCES,
     LOCK_INTENT,
@@ -43,6 +46,7 @@ pub(crate) const SERVED: &[&str] = &[
     TRACE_CONTEXT,
     SERVER_WRITES,
     CATALOG_QUERY,
+    TEXT,
 ];
 
 /// Return the names of the declaration `value`, the third argument of

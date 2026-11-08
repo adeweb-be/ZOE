@@ -19,10 +19,19 @@
 //!           "and": bool, "d": depth, "nt": bool, "ns": navtree_start,
 //!           "ip": [component...]}
 //! value  = nil | bool | int | float | str | [value...] (a tuple)
-//! reply  = {"tid": tid, "r": rids, "n": len, "a": actual_result_count,
+//! reply  = {"tid": tid, "r": rids, "sc": scores | nil, "n": len,
+//!           "a": actual_result_count,
 //!           "rows": [[cell...] | nil...] | nil, "paths": [path | nil...] | nil}
 //!        | {"tid": tid, "f": reason, "why": text}
+//!        | {"tid": tid, "e": error, "why": text}
 //! ```
+//!
+//! With the feature `text`, `split_text` takes the text clause of ADR 0060,
+//! section 12 (`"k": "t"`, `text::clause`) out of a plan: at most one, kept
+//! apart from the other clauses. The reply then gets `sc`, the score of each rid as a
+//! signed 32-bit big-endian int, when the plan has no sort, and the error
+//! form `e` when the text clause fails. Without the feature, a text clause
+//! is an unknown kind.
 //!
 //! `rows` and `paths` come when the plan names `cols`: one item for each of
 //! the first `rn` rids of `r`. A cell is a msgpack value of `cell`. A row
@@ -555,13 +564,66 @@ pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), Pla
     Ok((plan, columns, kinds))
 }
 
-/// The reply to a query at `tid`, as section 8 gives it on the wire.
+/// Tells if `wire` is a text clause: a map whose `k` is `t`.
+#[cfg(feature = "text")]
+fn is_text(wire: &Wire) -> bool {
+    matches!(wire, Wire::Map(items) if items.iter().any(|(k, v)| {
+        matches!(k, Wire::Str(k) if k == "k") && matches!(v, Wire::Str(v) if v == "t")
+    }))
+}
+
+/// Takes the text clause out of the plan `wire` (ADR 0060, section 12):
+/// the plan without it, and the clause. A plan holds at most one text
+/// clause. A text clause of another form is `Malformed`. A plan of another
+/// form comes back as it is, for `decode_typed` to refuse.
+#[cfg(feature = "text")]
+pub fn split_text(wire: &Wire) -> Result<(Wire, Option<crate::text::TextClause>), PlanError> {
+    let Wire::Map(items) = wire else {
+        return Ok((wire.clone(), None));
+    };
+    let mut text = None;
+    let mut out = Vec::with_capacity(items.len());
+    for (k, v) in items {
+        match (k, v) {
+            (Wire::Str(name), Wire::Array(clauses)) if name == "c" => {
+                let mut kept = Vec::with_capacity(clauses.len());
+                for c in clauses {
+                    if is_text(c) {
+                        if text.is_some() {
+                            return malformed("a plan with two text clauses");
+                        }
+                        text = Some(
+                            crate::text::clause::decode_clause(c, true)
+                                .map_err(PlanError::Malformed)?,
+                        );
+                    } else {
+                        kept.push(c.clone());
+                    }
+                }
+                out.push((k.clone(), Wire::Array(kept)));
+            }
+            _ => out.push((k.clone(), v.clone())),
+        }
+    }
+    Ok((Wire::Map(out), text))
+}
+
+/// The reply to a query at `tid`, as section 8 gives it on the wire, with
+/// the scores `sc` and the error form `e` of ADR 0060, section 12.
 pub fn encode_reply(tid: u64, answer: &Result<Reply, Fallback>) -> Wire {
     let tid = (
         Wire::Str("tid".into()),
         Wire::Bin(tid.to_be_bytes().to_vec()),
     );
     match answer {
+        #[cfg(feature = "text")]
+        Ok(Reply {
+            error: Some(error), ..
+        }) => Wire::Map(vec![
+            tid,
+            (Wire::Str("e".into()), Wire::Str(error.kind.name().into())),
+            (Wire::Str("why".into()), Wire::Str(error.why.clone())),
+        ]),
         Ok(reply) => {
             let mut items = vec![
                 tid,
@@ -569,9 +631,15 @@ pub fn encode_reply(tid: u64, answer: &Result<Reply, Fallback>) -> Wire {
                     Wire::Str("r".into()),
                     Wire::Bin(reply.rids.iter().flat_map(|r| r.to_be_bytes()).collect()),
                 ),
-                (Wire::Str("n".into()), Wire::Int(reply.len)),
-                (Wire::Str("a".into()), Wire::Int(reply.actual)),
             ];
+            if let Some(scores) = &reply.scores {
+                items.push((
+                    Wire::Str("sc".into()),
+                    Wire::Bin(scores.iter().flat_map(|s| s.to_be_bytes()).collect()),
+                ));
+            }
+            items.push((Wire::Str("n".into()), Wire::Int(reply.len)));
+            items.push((Wire::Str("a".into()), Wire::Int(reply.actual)));
             if let (Some(rows), Some(paths)) = (&reply.rows, &reply.paths) {
                 let rows = rows
                     .iter()

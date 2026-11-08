@@ -95,6 +95,13 @@ pub struct Reply {
     pub rows: Option<Vec<Option<Vec<u8>>>>,
     /// The path of each rid of `rows`.
     pub paths: Option<Vec<Option<String>>>,
+    /// The integer score of each rid, for a plan with a text clause and no
+    /// sort.
+    pub scores: Option<Vec<i32>>,
+    /// The error of the text clause, which the reply gives in place of the
+    /// answer.
+    #[cfg(feature = "text")]
+    pub error: Option<crate::text::TextError>,
 }
 
 /// How the range clauses of a query ran.
@@ -359,6 +366,28 @@ impl<'a> View<'a> {
     /// Answers `plan`.
     pub fn query(&self, plan: &Plan) -> Result<Reply, Fallback> {
         let mut trace = Trace::default();
+        let rs = match self.result_set(plan, &mut trace)? {
+            Some(rs) if !rs.is_empty() => rs,
+            // An empty result, or a query that no index uses.
+            _ => {
+                return Ok(Reply {
+                    trace,
+                    ..Reply::default()
+                });
+            }
+        };
+        let mut reply = self.sort(plan, rs)?;
+        reply.trace = trace;
+        Ok(reply)
+    }
+
+    /// The rows of the clauses of `plan`, before the sort: `None` for a
+    /// plan with no clause.
+    fn result_set(
+        &self,
+        plan: &Plan,
+        trace: &mut Trace,
+    ) -> Result<Option<RoaringBitmap>, Fallback> {
         // The clauses on a DateRangeIndex apply last, so they see the
         // result of the others: ZCatalog's answer for a row without an
         // entry depends on the order of its plan.
@@ -388,7 +417,7 @@ impl<'a> View<'a> {
         order.sort_by_key(|c| c.range.is_some());
         let mut rs: Option<RoaringBitmap> = None;
         for clause in order {
-            let set = self.clause(clause, rs.as_ref(), &mut trace)?;
+            let set = self.clause(clause, rs.as_ref(), trace)?;
             rs = Some(match rs {
                 None => set,
                 Some(mut r) => {
@@ -403,18 +432,148 @@ impl<'a> View<'a> {
         if !ranges.is_empty() && !rs.as_ref().is_some_and(RoaringBitmap::is_empty) {
             rs = Some(self.date_ranges(&ranges, rs, plan.clauses.len() == 1)?);
         }
-        let rs = match rs {
-            Some(rs) if !rs.is_empty() => rs,
-            // An empty result, or a query that no index uses.
-            _ => {
-                return Ok(Reply {
-                    trace,
+        Ok(rs)
+    }
+
+    /// The row of `rid`, when the version has one.
+    #[cfg(feature = "text")]
+    fn row_if(&self, rid: i32) -> Option<u32> {
+        match self.base.rows.row(rid) {
+            Some(row) => Some(row),
+            None => self
+                .extra
+                .binary_search(&rid)
+                .ok()
+                .map(|i| (self.base.rows.len() + i) as u32),
+        }
+    }
+
+    /// Answers `plan` with a text clause, and the rows of `columns` (ADR
+    /// 0060, section 12). The clauses of `plan` run first; `text` answers
+    /// the text clause inside the rids of their result.
+    ///
+    /// With no sort, the result is the count of the hits in the filter and
+    /// the first `b_start + b_size` hits by score, then rid descending, with
+    /// their scores; each other clause adds 1 to the score, as
+    /// `weightedIntersection` does. With a sort, the hits are a set with no
+    /// score, in the order of the sort. An error of the text clause gives
+    /// the reply its error; the compatibility mode gives `unsupported`.
+    #[cfg(feature = "text")]
+    pub fn query_text(
+        &self,
+        plan: &Plan,
+        columns: &Columns,
+        text: &mut crate::text::TextSearch<'_>,
+    ) -> Result<Reply, Fallback> {
+        use crate::text::{Failure, TextError, TextErrorKind, Want};
+        let mut trace = Trace::default();
+        let rows = match self.result_set(plan, &mut trace)? {
+            Some(rs) => rs,
+            None => self.all_rows(),
+        };
+        let empty = |scored: bool| Reply {
+            trace,
+            scores: scored.then(Vec::new),
+            ..Reply::default()
+        };
+        if rows.is_empty() {
+            return Ok(empty(plan.sort.is_empty()));
+        }
+        let mut rids: Vec<i32> = rows.iter().map(|r| self.rid_of(r)).collect();
+        rids.sort_unstable();
+        let failed = |f: Failure| -> Result<Reply, Fallback> {
+            match f {
+                Failure::Text(e) => Ok(Reply {
+                    error: Some(e),
                     ..Reply::default()
-                });
+                }),
+                Failure::Unsupported(why) => fallback(Reason::Unsupported, why),
             }
         };
-        let mut reply = self.sort(plan, rs)?;
+        let mut reply = if plan.sort.is_empty() {
+            // `_sort_limit_arguments`, then `_limit_sequence` of the hits
+            // in the order of the scores.
+            let b_start = plan.b_start.max(0) as usize;
+            let mut b_size = plan.b_size;
+            if b_size.is_none() && plan.limit.is_some_and(|l| l != 0) {
+                b_size = plan.limit;
+            }
+            let limit = b_size.map(|size| b_start + size.max(0) as usize);
+            let found = match text(&rids, Want::Top(limit)) {
+                Ok(found) => found,
+                Err(f) => return failed(f),
+            };
+            let count = found.count as i64;
+            let page: Vec<(i64, i32)> = match b_size {
+                Some(size) => found
+                    .hits
+                    .into_iter()
+                    .skip(b_start)
+                    .take(size.max(0) as usize)
+                    .collect(),
+                None => found.hits,
+            };
+            let sets = plan.clauses.len() as i64;
+            let len = if b_size.is_some() {
+                page.len() as i64
+            } else {
+                count
+            };
+            Reply {
+                rids: page.iter().map(|h| h.1).collect(),
+                scores: Some(
+                    page.iter()
+                        .map(|h| {
+                            (h.0 + sets).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                        })
+                        .collect(),
+                ),
+                len,
+                actual: count,
+                ..Reply::default()
+            }
+        } else {
+            let found = match text(&rids, Want::Set) {
+                Ok(found) => found,
+                Err(f) => return failed(f),
+            };
+            let mut hits = RoaringBitmap::new();
+            for (_, rid) in found.hits {
+                if let Some(row) = self.row_if(rid)
+                    && rows.contains(row)
+                {
+                    hits.insert(row);
+                }
+            }
+            if hits.is_empty() {
+                return Ok(empty(false));
+            }
+            self.sort(plan, hits)?
+        };
         reply.trace = trace;
+        self.fill_rows(&mut reply, columns);
+        let rows_bytes: usize = reply
+            .rows
+            .iter()
+            .flatten()
+            .map(|r| r.as_ref().map_or(1, Vec::len))
+            .sum();
+        let path_bytes: usize = reply
+            .paths
+            .iter()
+            .flatten()
+            .map(|p| p.as_ref().map_or(1, |p| p.len() + 5))
+            .sum();
+        let bytes = reply.rids.len() * 8 + rows_bytes + path_bytes;
+        if bytes > crate::text::clause::MAX_BYTES {
+            return Ok(Reply {
+                error: Some(TextError::new(
+                    TextErrorKind::TooLarge,
+                    format!("a reply of {bytes} bytes passes the cap of a reply"),
+                )),
+                ..Reply::default()
+            });
+        }
         Ok(reply)
     }
 

@@ -132,6 +132,54 @@ impl NativeTransaction {
         self.run(py, async |txn| txn.kv_delete(flavour, name, key).await)
     }
 
+    /// Stage a text delta (ADR 0060, section 8): the arguments of
+    /// `zoe.Storage.text_set` without the transaction. The server reports
+    /// an error of the delta at the vote. A rid outside the signed 32-bit
+    /// range raises `ValueError`. Raise `Unsupported` when the server did
+    /// not accept `text`.
+    #[allow(clippy::too_many_arguments)]
+    fn text_set(
+        &self,
+        py: Python<'_>,
+        catalog: &[u8],
+        index: &str,
+        rid: &Bound<'_, PyAny>,
+        language: &str,
+        text: &str,
+        before: &[u8],
+    ) -> PyResult<()> {
+        let catalog = Oid(crate::catalog::p64("catalog", catalog)?);
+        let rid = crate::text::rid(rid)?;
+        let before = Tid(crate::catalog::p64("before", before)?);
+        self.run(py, async |txn| {
+            txn.text_set(catalog, index, rid, language, text, before)
+                .await
+        })
+    }
+
+    /// Stage an unindex, with the rules of `text_set`.
+    fn text_unindex(
+        &self,
+        py: Python<'_>,
+        catalog: &[u8],
+        index: &str,
+        rid: &Bound<'_, PyAny>,
+        before: &[u8],
+    ) -> PyResult<()> {
+        let catalog = Oid(crate::catalog::p64("catalog", catalog)?);
+        let rid = crate::text::rid(rid)?;
+        let before = Tid(crate::catalog::p64("before", before)?);
+        self.run(py, async |txn| {
+            txn.text_unindex(catalog, index, rid, before).await
+        })
+    }
+
+    /// Stage a clear delta, with the rules of `text_set`.
+    fn text_clear(&self, py: Python<'_>, catalog: &[u8], index: &str) -> PyResult<()> {
+        let catalog = Oid(crate::catalog::p64("catalog", catalog)?);
+        self.run(py, async |txn| txn.text_clear(catalog, index).await)
+    }
+
     /// Delete `oid`. `serial` is the serial that the transaction read: the
     /// vote checks it as for a store.
     fn delete_object(

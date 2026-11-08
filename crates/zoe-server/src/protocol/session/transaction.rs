@@ -311,6 +311,9 @@ impl Transaction {
             Some(Op::DeleteObject) => self.delete_object(args),
             Some(Op::KvSet) => self.kv_set(args),
             Some(Op::KvDelete) => self.kv_delete(args),
+            Some(Op::TextSet) => self.text_set(args),
+            Some(Op::TextUnindex) => self.text_unindex(args),
+            Some(Op::TextClear) => self.text_clear(args),
             Some(Op::Undoa) => self.undoa(args),
             Some(Op::Vote) => self.vote(args),
             Some(Op::TpcFinish) => return self.tpc_finish(&*call),
@@ -613,6 +616,49 @@ impl Transaction {
         Ok(Value::Nil)
     }
 
+    /// Stage a text delta in the open transaction (ADR 0060, section 8):
+    /// `text_set(catalog, index, rid, language, text, before)`. `catalog`
+    /// and `before` are 8 bytes, `rid` an int, the others str. The call has
+    /// no reply: an error fails the vote, as an error of `kv_set` does.
+    fn text_set(&mut self, args: Args<'_>) -> Result<Value, Fault> {
+        let [catalog, index, rid, language, text, before] = args.exactly::<6>()?;
+        self.opened(args.method)?.stage(|txn| {
+            let (catalog, rid) = (Oid(u64_of(catalog)?), rid_of(rid)?);
+            let index = str_of(index, "index id")?;
+            let language = str_of(language, "language")?;
+            let text = str_of(text, "text")?;
+            let before = Tid(u64_of(before)?);
+            Ok(txn.text_set(catalog, index, rid, language, text, before)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage an unindex in the open transaction:
+    /// `text_unindex(catalog, index, rid, before)`, with the rules of
+    /// `text_set`.
+    fn text_unindex(&mut self, args: Args<'_>) -> Result<Value, Fault> {
+        let [catalog, index, rid, before] = args.exactly::<4>()?;
+        self.opened(args.method)?.stage(|txn| {
+            let (catalog, rid) = (Oid(u64_of(catalog)?), rid_of(rid)?);
+            let index = str_of(index, "index id")?;
+            let before = Tid(u64_of(before)?);
+            Ok(txn.text_unindex(catalog, index, rid, before)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage a clear delta in the open transaction:
+    /// `text_clear(catalog, index)`, with the rules of `text_set`.
+    fn text_clear(&mut self, args: Args<'_>) -> Result<Value, Fault> {
+        let [catalog, index] = args.exactly::<2>()?;
+        self.opened(args.method)?.stage(|txn| {
+            let catalog = Oid(u64_of(catalog)?);
+            let index = str_of(index, "index id")?;
+            Ok(txn.text_clear(catalog, index)?)
+        });
+        Ok(Value::Nil)
+    }
+
     /// Queue the undo of the transaction of the undo id `trans_id` into the
     /// open transaction `id`. `undoa` has no reply: the first vote stages
     /// the undo, as ZEO's server does, and an error there fails the vote.
@@ -799,4 +845,13 @@ impl Drop for Transaction {
             Stats::add(&stats.aborts);
         }
     }
+}
+
+/// The rid `value`: an int in the signed 32-bit range of the rids of
+/// ZCatalog. Another int is `InvalidText`, which raises `ValueError`.
+fn rid_of(value: &Value) -> Result<i32, Fault> {
+    let rid = value
+        .as_i64()
+        .ok_or_else(|| Fault::type_error("a rid is not an int"))?;
+    Ok(zoe_core::check_rid(rid)?)
 }

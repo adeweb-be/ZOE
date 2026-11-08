@@ -81,6 +81,7 @@ impl Counters {
             drops: load(&self.drops),
             overlay_records: load(&self.overlay_records),
             mirrors: Vec::new(),
+            texts: Vec::new(),
         }
     }
 }
@@ -107,6 +108,8 @@ pub struct Counts {
     pub overlay_records: u64,
     /// The state of each mirror.
     pub mirrors: Vec<MirrorCounts>,
+    /// The state of the text index of each catalog (ADR 0060).
+    pub texts: Vec<TextCounts>,
 }
 
 /// The counts of one mirror.
@@ -123,4 +126,20 @@ pub struct MirrorCounts {
     pub lag_tids: u64,
     /// `zoe_catalog_mirror_bytes`.
     pub bytes: u64,
+}
+
+/// The counts of the text index of one catalog (ADR 0060).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextCounts {
+    /// The oid of the catalog.
+    pub catalog: u64,
+    /// True when the index answers queries.
+    pub ready: bool,
+    /// `zoe_text_commit_lag_seconds`: the age of the oldest committed
+    /// delta that the index does not hold yet, and 0 when it holds all.
+    pub lag_seconds: f64,
+    /// The live documents of the index.
+    pub docs: u64,
+    /// The tid up to which the index holds the deltas.
+    pub tid: u64,
 }

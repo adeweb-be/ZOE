@@ -294,6 +294,8 @@ impl Session {
             Op::KvScan => self.kv_scan(args),
             Op::KvGeneration => self.kv_generation(args),
             Op::CatalogQuery => self.catalog_query(args),
+            Op::TextQuery => self.text_query(args),
+            Op::TextInfo => self.text_info(args),
             // The calls of the transaction run in `Transaction::dispatch`.
             _ => return Outcome::Close(format!("unknown method {}", call.method)),
         };
@@ -368,6 +370,51 @@ impl Session {
             .catalog
             .query(&self.storage.invalidations, catalog, tid, plan, overlay)
             .map_err(Fault::value_error)
+    }
+
+    /// Answer a text clause on the text index of a catalog (ADR 0060,
+    /// section 12): `text_query(catalog, tid, clause, filter)`. `catalog`
+    /// and `tid` are 8 bytes; `filter` is nil or the rids as signed 32-bit
+    /// big-endian ints. The call runs on the read pool, outside the
+    /// transaction. A clause of another form fails with `ValueError`, and
+    /// the compatibility mode with `Unsupported`.
+    fn text_query(&self, args: Args<'_>) -> Result<Value, Fault> {
+        let [catalog, tid, clause, filter] = args.exactly::<4>()?;
+        let (catalog, tid) = (u64_of(catalog)?, u64_of(tid)?);
+        crate::protocol::catalog::text_query(
+            &self.storage.invalidations,
+            &self.store,
+            catalog,
+            tid,
+            clause,
+            filter,
+        )
+        .map_err(Fault::of_text)
+    }
+
+    /// Give the counts of a text index and the live text of a document:
+    /// `text_info(catalog, index, tid, rid)`. `rid` is an int or nil.
+    fn text_info(&self, args: Args<'_>) -> Result<Value, Fault> {
+        let [catalog, index, tid, rid] = args.exactly::<4>()?;
+        let (catalog, tid) = (u64_of(catalog)?, u64_of(tid)?);
+        let index = str_of(index, "index id")?;
+        let rid = match rid {
+            Value::Nil => None,
+            other => Some(
+                other
+                    .as_i64()
+                    .ok_or_else(|| Fault::type_error("a rid is not an int"))?,
+            ),
+        };
+        crate::protocol::catalog::text_info(
+            &self.storage.invalidations,
+            &self.store,
+            catalog,
+            index,
+            tid,
+            rid,
+        )
+        .map_err(Fault::of_text)
     }
 
     /// Return the next value of the sequence `name` of the store (F29),

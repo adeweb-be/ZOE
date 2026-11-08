@@ -13,6 +13,12 @@ publish.workspace = true
 # for the server and the native client.
 rmpv.workspace = true
 roaring.workspace = true
+# The settings of the namespace `zoe.text` (feature `text`).
+serde_json = { workspace = true, optional = true }
+# The text index (feature `text`).
+tantivy = { workspace = true, optional = true }
+# The log of a damaged delta (feature `text`).
+tracing = { workspace = true, optional = true }
 zoe-core.workspace = true
 zoe-pickle.workspace = true
 
@@ -21,12 +27,17 @@ zoe-pickle.workspace = true
 # of this crate and of the crates that serve the mirror. Only
 # dev-dependencies turn it on.
 testing = ["zoe-pickle/testing"]
+# The native text index of each registered catalog, on tantivy (ADR 0060).
+# A build without it has no text index and links no tantivy.
+text = ["dep:tantivy", "dep:serde_json", "dep:tracing"]
 
 [dev-dependencies]
 serde_json.workspace = true
+# The hooks that damage a delta on purpose.
+zoe-core = { workspace = true, features = ["testing"] }
 # This crate with the module `testing`. Cargo builds dev-dependencies only
 # for tests, examples and benchmarks.
-zoe-catalog = { path = ".", features = ["testing"] }
+zoe-catalog = { path = ".", features = ["testing", "text"] }
 
 [lints]
 workspace = true

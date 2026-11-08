@@ -29,6 +29,7 @@ serve = [
     "dep:tracing-opentelemetry",
     "dep:zoe-wire",
     "dep:zoe-catalog",
+    "zoe-catalog/text",
 ]
 # The module `fuzz`: the entry of the fuzz targets in `fuzz/`.
 fuzz = ["serve"]
