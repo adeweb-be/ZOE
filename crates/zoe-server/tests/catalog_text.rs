@@ -240,7 +240,10 @@ fn deltas_commit_with_their_transaction_and_abort_with_it() {
     let mut conn = client(server.addr(), DECLARED);
     let catalog = model.oid();
     let q = clause("Title", atom(&["ruso"]));
-    assert_eq!(ints(get(&answered(&mut conn, catalog, tid + 1, &q), "r")), Vec::<i32>::new());
+    assert_eq!(
+        ints(get(&answered(&mut conn, catalog, tid + 1, &q), "r")),
+        Vec::<i32>::new()
+    );
     let before = last_tid(&mut conn) + 1;
     let committed = commit_texts(&mut conn, vec![text_set(catalog, 1001, "ruso", before)]);
     let reply = answered(&mut conn, catalog, committed + 1, &q);
@@ -250,7 +253,10 @@ fn deltas_commit_with_their_transaction_and_abort_with_it() {
     conn.send_async("text_set", text_set(catalog, 1002, "ruso", committed + 1).1);
     conn.call("tpc_abort", vec![Value::from(2)]).unwrap();
     let now = last_tid(&mut conn) + 1;
-    assert_eq!(ints(get(&answered(&mut conn, catalog, now, &q), "r")), vec![1001]);
+    assert_eq!(
+        ints(get(&answered(&mut conn, catalog, now, &q), "r")),
+        vec![1001]
+    );
     // An unindex and a clear in a transaction.
     let tid = commit_texts(
         &mut conn,
@@ -259,13 +265,19 @@ fn deltas_commit_with_their_transaction_and_abort_with_it() {
             vec![p64(catalog), s("Title"), Value::from(1001), p64(now)],
         )],
     );
-    assert_eq!(ints(get(&answered(&mut conn, catalog, tid + 1, &q), "r")), Vec::<i32>::new());
+    assert_eq!(
+        ints(get(&answered(&mut conn, catalog, tid + 1, &q), "r")),
+        Vec::<i32>::new()
+    );
     let tid = commit_texts(
         &mut conn,
         vec![("text_clear", vec![p64(catalog), s("Title")])],
     );
     let all = clause("Title", atom(&["kalo"]));
-    assert_eq!(ints(get(&answered(&mut conn, catalog, tid + 1, &all), "r")), Vec::<i32>::new());
+    assert_eq!(
+        ints(get(&answered(&mut conn, catalog, tid + 1, &all), "r")),
+        Vec::<i32>::new()
+    );
     server.stop();
 }
 
@@ -314,7 +326,12 @@ fn a_connection_that_did_not_declare_text_gets_value_error() {
     let calls: Vec<(&str, Vec<Value>)> = vec![
         (
             "text_query",
-            vec![p64(catalog), p64(tid + 1), clause("Title", atom(&["kalo"])), Value::Nil],
+            vec![
+                p64(catalog),
+                p64(tid + 1),
+                clause("Title", atom(&["kalo"])),
+                Value::Nil,
+            ],
         ),
         (
             "text_info",
@@ -387,7 +404,12 @@ fn wire_of(value: &Value) -> Wire {
         Value::String(s) => Wire::Str(s.as_str().unwrap().to_owned()),
         Value::Binary(b) => Wire::Bin(b.clone()),
         Value::Array(items) => Wire::Array(items.iter().map(wire_of).collect()),
-        Value::Map(items) => Wire::Map(items.iter().map(|(k, v)| (wire_of(k), wire_of(v))).collect()),
+        Value::Map(items) => Wire::Map(
+            items
+                .iter()
+                .map(|(k, v)| (wire_of(k), wire_of(v)))
+                .collect(),
+        ),
         Value::Ext(kind, data) => Wire::Ext(*kind, data.clone()),
     }
 }
@@ -399,8 +421,16 @@ fn zoe_serve_gives_the_replies_of_the_index_in_the_process() {
     let (model, tid) = prepare(&path, 30, 4, true);
     let catalog = model.oid();
     let queries = [
-        plan(vec![of_type("Document"), plan_clause("Title", atom(&["mite"]))], None, 0),
-        plan(vec![plan_clause("Title", atom(&["kalo"]))], Some(&["getId"]), 5),
+        plan(
+            vec![of_type("Document"), plan_clause("Title", atom(&["mite"]))],
+            None,
+            0,
+        ),
+        plan(
+            vec![plan_clause("Title", atom(&["kalo"]))],
+            Some(&["getId"]),
+            5,
+        ),
     ];
     let text = clause("Title", atom(&["mite"]));
     let server = Server::start(options(&path)).unwrap();
@@ -411,7 +441,10 @@ fn zoe_serve_gives_the_replies_of_the_index_in_the_process() {
     for q in &queries {
         let reply = loop {
             let reply = conn
-                .call("catalog_query", vec![p64(catalog), p64(tid + 1), q.clone(), Value::Nil])
+                .call(
+                    "catalog_query",
+                    vec![p64(catalog), p64(tid + 1), q.clone(), Value::Nil],
+                )
                 .unwrap();
             let pending = get(&reply, "f")
                 .and_then(Value::as_str)
@@ -500,7 +533,10 @@ fn while_the_directory_builds_a_text_clause_is_unavailable_and_a_plan_without_on
     let deadline = Instant::now() + WAIT;
     loop {
         let reply = conn
-            .call("catalog_query", vec![p64(catalog), p64(tid + 1), plain.clone(), Value::Nil])
+            .call(
+                "catalog_query",
+                vec![p64(catalog), p64(tid + 1), plain.clone(), Value::Nil],
+            )
             .unwrap();
         if get(&reply, "r").is_some() {
             assert_eq!(ints(get(&reply, "r")).len(), 5);
@@ -509,17 +545,40 @@ fn while_the_directory_builds_a_text_clause_is_unavailable_and_a_plan_without_on
         assert!(Instant::now() < deadline, "{reply:?}");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let with_text = plan(vec![of_type("Document"), plan_clause("Title", atom(&["kalo"]))], None, 0);
+    let with_text = plan(
+        vec![of_type("Document"), plan_clause("Title", atom(&["kalo"]))],
+        None,
+        0,
+    );
     let started = Instant::now();
     let reply = conn
-        .call("catalog_query", vec![p64(catalog), p64(tid + 1), with_text, Value::Nil])
+        .call(
+            "catalog_query",
+            vec![p64(catalog), p64(tid + 1), with_text, Value::Nil],
+        )
         .unwrap();
-    assert_eq!(get(&reply, "e").and_then(Value::as_str), Some("unavailable"));
+    assert_eq!(
+        get(&reply, "e").and_then(Value::as_str),
+        Some("unavailable")
+    );
     assert!(started.elapsed() >= wait);
-    let reply = text_query(&mut conn, catalog, tid + 1, &clause("Title", atom(&["kalo"])));
-    assert_eq!(get(&reply, "e").and_then(Value::as_str), Some("unavailable"));
+    let reply = text_query(
+        &mut conn,
+        catalog,
+        tid + 1,
+        &clause("Title", atom(&["kalo"])),
+    );
+    assert_eq!(
+        get(&reply, "e").and_then(Value::as_str),
+        Some("unavailable")
+    );
     hold.release();
-    let reply = answered(&mut conn, catalog, tid + 1, &clause("Title", atom(&["kalo"])));
+    let reply = answered(
+        &mut conn,
+        catalog,
+        tid + 1,
+        &clause("Title", atom(&["kalo"])),
+    );
     assert_eq!(ints(get(&reply, "r")).len(), 10);
     server.stop();
 }
@@ -533,13 +592,29 @@ fn a_reply_over_16_mib_gets_too_large() {
     let catalog = model.oid();
     let server = Server::start(options(&path)).unwrap();
     let mut conn = client(server.addr(), DECLARED);
-    answered(&mut conn, catalog, tid + 1, &clause("Title", atom(&["kalo"])));
-    let q = plan(vec![plan_clause("Title", atom(&["kalo"]))], Some(&["getId"]), 180);
-    let small = plan(vec![plan_clause("Title", atom(&["kalo"]))], Some(&["getId"]), 10);
+    answered(
+        &mut conn,
+        catalog,
+        tid + 1,
+        &clause("Title", atom(&["kalo"])),
+    );
+    let q = plan(
+        vec![plan_clause("Title", atom(&["kalo"]))],
+        Some(&["getId"]),
+        180,
+    );
+    let small = plan(
+        vec![plan_clause("Title", atom(&["kalo"]))],
+        Some(&["getId"]),
+        10,
+    );
     let deadline = Instant::now() + WAIT;
     loop {
         let reply = conn
-            .call("catalog_query", vec![p64(catalog), p64(tid + 1), small.clone(), Value::Nil])
+            .call(
+                "catalog_query",
+                vec![p64(catalog), p64(tid + 1), small.clone(), Value::Nil],
+            )
             .unwrap();
         if get(&reply, "r").is_some() {
             break;
@@ -548,7 +623,10 @@ fn a_reply_over_16_mib_gets_too_large() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let reply = conn
-        .call("catalog_query", vec![p64(catalog), p64(tid + 1), q, Value::Nil])
+        .call(
+            "catalog_query",
+            vec![p64(catalog), p64(tid + 1), q, Value::Nil],
+        )
         .unwrap();
     assert_eq!(get(&reply, "e").and_then(Value::as_str), Some("too_large"));
     server.stop();
@@ -573,14 +651,28 @@ fn metrics_give_zoe_text_commit_lag_seconds() {
     let catalog = model.oid();
     let server = Server::start(options(&path)).unwrap();
     let mut conn = client(server.addr(), DECLARED);
-    answered(&mut conn, catalog, tid + 1, &clause("Title", atom(&["kalo"])));
+    answered(
+        &mut conn,
+        catalog,
+        tid + 1,
+        &clause("Title", atom(&["kalo"])),
+    );
     let line = format!("zoe_text_commit_lag_seconds{{storage=\"1\",catalog=\"{catalog:016x}\"}} 0");
     let deadline = Instant::now() + WAIT;
-    while !metrics(server.admin_addr().unwrap()).lines().any(|l| l == line) {
-        assert!(Instant::now() < deadline, "{}", metrics(server.admin_addr().unwrap()));
+    while !metrics(server.admin_addr().unwrap())
+        .lines()
+        .any(|l| l == line)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            metrics(server.admin_addr().unwrap())
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(metrics(server.admin_addr().unwrap()).contains("# TYPE zoe_text_commit_lag_seconds gauge"));
+    assert!(
+        metrics(server.admin_addr().unwrap()).contains("# TYPE zoe_text_commit_lag_seconds gauge")
+    );
     server.stop();
 }
 
@@ -609,7 +701,12 @@ fn tantivy_threads_child() {
     let server = Server::start(options(&path)).unwrap();
     let mut conn = client(server.addr(), DECLARED);
     if registered {
-        let reply = answered(&mut conn, model.oid(), tid + 1, &clause("Title", atom(&["kalo"])));
+        let reply = answered(
+            &mut conn,
+            model.oid(),
+            tid + 1,
+            &clause("Title", atom(&["kalo"])),
+        );
         assert_eq!(ints(get(&reply, "r")).len(), 4);
     } else {
         std::thread::sleep(Duration::from_millis(500));
@@ -629,7 +726,12 @@ fn tantivy_threads_child() {
 fn the_threads_of_tantivy_start_with_a_registered_catalog() {
     for mode in ["registered", "none"] {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tantivy_threads_child", "--include-ignored", "--nocapture"])
+            .args([
+                "--exact",
+                "tantivy_threads_child",
+                "--include-ignored",
+                "--nocapture",
+            ])
             .env("ZOE_TEXT_THREADS", mode)
             .status()
             .unwrap();
