@@ -9,6 +9,7 @@
   during the replay and with low `catalog-rebase-rows` and mirror window,
   in-process and through `zoe serve`, gives no mismatch, the counts by path
   and by reason, a rebase and a query outside the window.
+- A fault of the hook fails the replay: the command exits with 1.
 - A line of another version of the format is refused.
 - The report holds no value of a query: a marker value in a query of the
   log is in no output of the replay.
@@ -219,7 +220,10 @@ def test_the_probe_writes_one_line_for_each_search(site):
 def test_the_replay_with_commits_finds_no_mismatch(replayed, leg):
     report, _ = replayed
     found = report["legs"][leg]
-    assert found["errors"] == {}
+    assert found["hook_errors"] == {}
+    assert found["stock_errors"] == {}
+    assert found["unchecked"] == {}
+    assert replay.problems(found) == []
     assert found["mismatches"] == 0, found["mismatched"]
     assert found["replayed"] == found["searches"]
     assert found["queries"]["native"] > 0
@@ -234,6 +238,19 @@ def test_the_replay_with_commits_finds_no_mismatch(replayed, leg):
         assert found["rebases"] >= 1
     else:
         assert found["rebases"] is None
+
+
+def test_a_fault_of_the_hook_fails_the_replay(site, monkeypatch, capsys):
+    from plonebench.catalog.__main__ import main
+
+    store, out, _ = site
+    monkeypatch.setenv("PLONEBENCH_REPLAY_FAULT", "1")
+    code = main(["replay", str(out), str(store), "--legs", "inprocess", "--no-flip"])
+    text = capsys.readouterr().out
+    assert code == 1
+    assert "error of the hook builtins.ValueError" in text
+    assert "FAILS" in text
+    assert MARKER not in text
 
 
 def test_a_line_of_another_version_is_refused(site, tmp_path):

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -77,6 +78,9 @@ class Settings:
     flip: bool = True
     seed: int = 292
     ready_timeout: int = 600
+    # A fault of the hook in each third plan, for the test that the replay
+    # fails on it. `PLONEBENCH_REPLAY_FAULT=1` sets it from the command line.
+    fault: bool = False
 
 
 def log_files(paths) -> list[Path]:
@@ -218,6 +222,8 @@ def replay(
     leg of `settings`. Return the report: the legs, by name. A line of
     another version of the format raises `LogError` before any copy."""
     settings = settings or Settings()
+    if os.environ.get("PLONEBENCH_REPLAY_FAULT") == "1":
+        settings = dataclasses.replace(settings, fault=True)
     files = log_files(logs)
     if not files:
         raise querylog.LogError("no file of a query log")
@@ -244,9 +250,28 @@ def replay(
     return report
 
 
+def problems(leg: dict) -> list[str]:
+    """Why a leg fails: a mismatch, an error of the hook, or a native answer
+    that the mode `compare` did not compare (unchecked), but for the native
+    answers whose stock search raised: such a line does not apply to the
+    store."""
+    out = []
+    if leg["mismatches"]:
+        out.append(f"{leg['mismatches']} mismatches")
+    if leg["hook_errors"]:
+        out.append(f"{sum(leg['hook_errors'].values())} errors of the hook")
+    native = leg["queries"].get("native", 0)
+    if leg["compared"] < native - leg["native_stock_errors"]:
+        out.append(
+            f"{native - leg['native_stock_errors'] - leg['compared']} native"
+            " answers not compared"
+        )
+    return out
+
+
 def failed(report: dict) -> bool:
-    """Tell if a leg of the report found a mismatch."""
-    return any(leg["mismatches"] for leg in report["legs"].values())
+    """Tell if a leg of the report fails."""
+    return any(problems(leg) for leg in report["legs"].values())
 
 
 def format_report(report: dict) -> str:
@@ -260,16 +285,44 @@ def format_report(report: dict) -> str:
             f" transaction that changed the catalog, in {leg['seconds']} s"
         )
         searches = max(1, sum(leg["queries"].values()))
+        native = leg["queries"].get("native", 0)
+        unchecked = sum(leg["unchecked"].values())
+        # The coverage first: the share of the searches that the mode
+        # compare compared, and the share that the mirror answered.
+        out.append(
+            f"replay {name}: compared {leg['compared']} of {searches}"
+            f" ({100 * leg['compared'] / searches:.1f} %), native {native}"
+            f" ({100 * native / searches:.1f} %), unchecked {unchecked}"
+        )
         for path, n in sorted(leg["queries"].items()):
             out.append(f"replay {name}: path {path}: {n} ({100 * n / searches:.1f} %)")
         for reason, side, n in sorted(leg["fallbacks"], key=lambda row: -row[2]):
             out.append(f"replay {name}: reason {reason} ({side}): {n}")
+        out.append(f"replay {name}: overlay past the bound: {leg['overlay_bound']}")
+        for why, n in sorted(leg["unchecked"].items()):
+            out.append(f"replay {name}: unchecked ({why}): {n}")
+        for outcome, n in sorted(leg["pinned_outcomes"].items()):
+            out.append(f"replay {name}: pinned search: {outcome}: {n}")
         for key in ("compared", "cache_differences", "mismatches"):
             out.append(f"replay {name}: {key}: {leg[key]}")
         for shape in leg["mismatched"]:
             out.append(f"replay {name}: mismatch: {shape}")
-        for error, n in sorted(leg["errors"].items()):
-            out.append(f"replay {name}: error {error}: {n}")
+        for found in leg["mismatch_lines"]:
+            out.append(
+                f"replay {name}: mismatch at line {found['line']} of the log,"
+                f" round {found['round']}, before the tid {found['before']}"
+            )
+        for error, n in sorted(leg["hook_errors"].items()):
+            out.append(f"replay {name}: error of the hook {error}: {n}")
+        for error, n in sorted(leg["stock_errors"].items()):
+            out.append(f"replay {name}: error of the stock search {error}: {n}")
+        if leg["native_stock_errors"]:
+            out.append(
+                f"replay {name}: native answers whose stock search raised:"
+                f" {leg['native_stock_errors']}"
+            )
+        for problem in problems(leg):
+            out.append(f"replay {name}: FAILS: {problem}")
         writer = leg["writer"]
         out.append(
             f"replay {name}: writer: {writer['commits']} commits ({writer['edits']}"

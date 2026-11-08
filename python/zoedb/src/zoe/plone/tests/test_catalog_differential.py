@@ -21,6 +21,8 @@ tests, and `just plone zoe backends` runs it.
 
 import contextlib
 import logging
+import pathlib
+import tempfile
 import threading
 import time
 import unittest
@@ -138,6 +140,11 @@ def queries(site):
         "kw-not-only-alone": {"Subject": {"not": "zeta"}},
         "kw-not-only-absent": {"Subject": {"not": "nothing"}},
         "kw-none-not": {"Subject": {"query": [None], "not": "alpha"}},
+        "fi-none-not": {"portal_type": {"query": [None], "not": "Document"}},
+        "kw-none-key-not": {"Subject": {"query": [None, "alpha"], "not": "beta"}},
+        "kw-none-range-not": {
+            "Subject": {"query": [None], "range": "min", "not": "beta"}
+        },
         "kw-range": {"Subject": {"query": ["beta", "eps"], "range": "min:max"}},
         "kw-range-min": {"Subject": {"query": "delta", "range": "min"}},
         "kw-range-not": {
@@ -250,7 +257,10 @@ def queries(site):
 # The searches of the fixed set that take the Python path, with their
 # reason. Keys that are all None with `not`: ZCatalog gives no row, and the
 # plan would read as a query of `not` alone.
-EXPECTED = {"kw-none-not": ("option", "client")}
+EXPECTED = {
+    "kw-none-not": ("option", "client"),
+    "fi-none-not": ("option", "client"),
+}
 
 
 @contextlib.contextmanager
@@ -471,9 +481,48 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
         ):
             site.portal_catalog.unrestrictedSearchResults(portal_type="Document")
         now = counts()
-        self.assertEqual(now["unchecked"], 1)
+        self.assertEqual(now["unchecked"], {"patched": 1})
         self.assertEqual(now["compared"], 0)
         self.assertEqual(now["mismatches"], 0)
+
+    def test_a_brain_that_differs_is_a_mismatch(self):
+        def plant(result):
+            def other(rid):
+                brain = result._func(rid)
+                brain.__dict__["getPath"] = lambda: "/elsewhere"
+                return brain
+
+            return LazyMap(other, list(result._seq), len(result))
+
+        query = {"portal_type": list(TYPES), "sort_on": "getId", "sort_limit": 5}
+        with (
+            test_storage(self.storage) as db,
+            opened(db) as site,
+            mock.patch.object(catalog, "_plant", plant),
+            self.assertLogs("zoe.plone.catalog", logging.ERROR) as logs,
+        ):
+            site.portal_catalog.unrestrictedSearchResults(**query)
+        self.assertEqual(counts()["mismatches"], 1)
+        self.assertIn("a mismatch of rows", "\n".join(logs.output))
+        self.assertNotIn("/elsewhere", "\n".join(logs.output))
+
+    def test_only_a_method_that_a_search_calls_makes_it_unchecked(self):
+        from Products.ZCatalog.Catalog import Catalog
+
+        class Plain(Catalog):
+            pass
+
+        class Override(Catalog):
+            def _search_index(self, *args):
+                return super()._search_index(*args)
+
+        self.assertIsNone(catalog._unchecked(Catalog()))
+        self.assertIsNone(catalog._unchecked(Plain()))
+        self.assertEqual(catalog._unchecked(Override()), "subclass")
+        with mock.patch.object(Catalog, "addColumn", lambda *a: None):
+            self.assertIsNone(catalog._unchecked(Catalog()))
+        with mock.patch.object(Catalog, "sortResults", lambda *a: None):
+            self.assertEqual(catalog._unchecked(Catalog()), "patched")
 
     def test_in_mode_on_a_test_storage_takes_unsupported(self):
         catalog._installed["mode"] = "on"
@@ -596,3 +645,64 @@ class TestThePathsOfTheOverlay(unittest.TestCase):
         # One line for the error of the lock, one for the RuntimeError.
         self.assertEqual(len(pickled), 2, logs.output)
         self.assertEqual(len([line for line in pickled if "RuntimeError" in line]), 1)
+
+
+class TestThePlansOfTheMirrorData(unittest.TestCase):
+    """The hook and `crates/zoe-catalog/tests/data/indexes.py`, which writes
+    the plans of the tests of the mirror, give each query of that script
+    the same plan."""
+
+    layer = SITE
+
+    def setUp(self):
+        switch_on(self, "compare")
+
+    def script(self):
+        here = pathlib.Path(__file__).resolve()
+        for parent in here.parents:
+            found = parent / "crates" / "zoe-catalog" / "tests" / "data" / "indexes.py"
+            if found.exists():
+                return found
+        self.skipTest("the tree of the repository is not above this module")
+
+    def test_the_hook_and_the_data_script_give_the_same_plans(self):
+        import runpy
+        import sys
+
+        import Products.ZCatalog.Catalog as catalog_module
+        from Products.ZCatalog.Catalog import Catalog
+        from ZTUtils.Lazy import LazyCat
+
+        script = self.script()
+        kept = (Catalog.instantiate, catalog_module.randint, sys.argv)
+        transaction.abort()
+        with tempfile.TemporaryDirectory() as directory:
+            sys.argv = [str(script), f"{directory}/indexes.json"]
+            try:
+                names = runpy.run_path(str(script), run_name="indexes")
+            finally:
+                Catalog.instantiate, catalog_module.randint, sys.argv = kept
+                transaction.abort()
+        cat = names["cat"]
+        compared = 0
+        for name, query in names["QUERIES"].items():
+            seen = []
+
+            def capture(self, *args, _seen=seen, **kw):
+                _seen.append((args, kw))
+                return LazyCat([])
+
+            with mock.patch.object(Catalog, "search", capture):
+                cat.searchResults(dict(query))
+            args, kw = seen[0]
+            plan, _ = catalog.plan_of(cat, *args, **kw)
+            theirs = names["plan_of"](query)
+            if plan is None or theirs is None:
+                self.assertEqual(plan, theirs, name)
+                continue
+            mine = {key: plan[key] for key in ("s", "l", "bs", "bz")}
+            mine["c"] = sorted(plan["c"], key=lambda c: c["i"])
+            theirs = dict(theirs, c=sorted(theirs["c"], key=lambda c: c["i"]))
+            self.assertEqual(mine, theirs, name)
+            compared += 1
+        self.assertEqual(compared, len(names["QUERIES"]))

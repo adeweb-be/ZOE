@@ -74,10 +74,15 @@ interim sets of an index in a cache of the request, and a hit of that cache
 can give another answer than a miss. So a difference runs the stock search
 again with an empty cache for the catalog: when that answer equals the
 native answer, the difference comes from the cache of ZCatalog. It logs at
-WARNING and counts apart, and it is no mismatch. A test can replace a
-method of `Catalog` with a mock, so the stock search gives no reference: a
-search while a method of `Catalog` differs from the method at `install()`
-is not compared, and counts as unchecked.
+WARNING and counts apart, and it is no mismatch. The comparison also
+takes the brains of the first rids that the reply gives rows for: each
+brain of the mirror must hold the values of the stock brain in each column
+and give its path. A test can replace a method of `Catalog` with a mock, so
+the stock search gives no reference: a search while a method of `Catalog`
+that a search calls (`_SEARCH_METHODS`) differs from the method at
+`install()` is not compared, and counts as unchecked (`patched`); so is a
+search of an instance of a subclass that overrides one of these methods
+(`subclass`).
 
 The throwaway mirror (ADR 0059, section 9). A test storage, a `DemoStorage`
 whose chain of bases ends at a ZOE storage, has no mirror. In the mode
@@ -161,7 +166,10 @@ _root = {}
 # The counts of this process: `("queries", path)`, `("fallbacks", reason)`
 # for the reasons that the hook decides, `("refusals", reason)` for the
 # reasons of a reply, `("compared",)`, `("throwaways",)`, `("mismatches",)`,
-# `("cache_differences",)` and `("unchecked",)`.
+# `("cache_differences",)`, `("unchecked", why)`, `("stock_errors",)` for
+# a native answer whose stock search raised, `("overlay_bound",)` for
+# an overlay that does not fit `catalog-memory`, and `("refused", why)` for
+# the text of each refusal of a throwaway build.
 _counts = collections.Counter()
 _counts_lock = threading.Lock()
 
@@ -172,6 +180,11 @@ _KEPT = 1000
 
 # The file of `ZOE_PLONE_CATALOG_COUNTS`, once its write is registered.
 _counts_file = {}
+
+# The last search of the thread: `outcome` is "native", or the reason of the
+# Python path with its side, or None; `mismatch` is the shape of its
+# mismatch, or None. The replay reads it.
+_last = threading.local()
 
 # A function that the tests give to change a native result before the
 # comparison of the mode `compare`. None outside the tests.
@@ -231,13 +244,49 @@ def install():
         register(db)
 
 
+# The methods of `Catalog` that the stock search and the hook call.
+_SEARCH_METHODS = (
+    "__getitem__",
+    "__len__",
+    "_get_index_query_names",
+    "_limit_sequence",
+    "_maintain_zodb_cache",
+    "_search_index",
+    "_sort_iterate_index",
+    "_sort_iterate_resultset",
+    "_sort_limit_arguments",
+    "_sort_nbest",
+    "_sort_nbest_reverse",
+    "_sorted_search_indexes",
+    "getCatalogPlan",
+    "getIndex",
+    "instantiate",
+    "make_query",
+    "sortResults",
+)
+
+
 def _code(cls):
-    """The methods of the class `Catalog` but `search`, by name."""
-    return {
-        name: value
-        for name, value in vars(cls).items()
-        if name != "search" and callable(value)
-    }
+    """The methods of `_SEARCH_METHODS` that the class `cls` defines, by
+    name."""
+    found = vars(cls)
+    return {name: found[name] for name in _SEARCH_METHODS if name in found}
+
+
+def _unchecked(catalog):
+    """Why the stock search of `catalog` gives no reference, or None: a
+    method that a search calls differs from the method at `install()`
+    (`patched`), or the class of `catalog` overrides one (`subclass`)."""
+    from Acquisition import aq_base
+    from Products.ZCatalog.Catalog import Catalog
+
+    if _code(Catalog) != _installed["code"]:
+        return "patched"
+    mro = type(aq_base(catalog)).__mro__
+    below = mro[: mro.index(Catalog)] if Catalog in mro else mro
+    if any(_code(cls) for cls in below):
+        return "subclass"
+    return None
 
 
 def uninstall():
@@ -435,11 +484,18 @@ def _counts_now():
         "throwaways": counts.get(("throwaways",), 0),
         "mismatches": counts.get(("mismatches",), 0),
         "cache_differences": counts.get(("cache_differences",), 0),
-        "unchecked": counts.get(("unchecked",), 0),
+        "unchecked": {},
+        "overlay_bound": counts.get(("overlay_bound",), 0),
+        "stock_errors": counts.get(("stock_errors",), 0),
+        "refused": {},
     }
     for key, n in counts.items():
         if key[0] == "queries":
             out["queries"][key[1]] = n
+        elif key[0] == "unchecked":
+            out["unchecked"][key[1]] = n
+        elif key[0] == "refused":
+            out["refused"][key[1]] = n
         elif key[0] == "fallbacks":
             out["fallbacks"][(key[1], "client")] = n
         elif key[0] == "refusals":
@@ -466,6 +522,9 @@ def _write_counts(path):
         "mismatches": counts["mismatches"],
         "cache_differences": counts["cache_differences"],
         "unchecked": counts["unchecked"],
+        "overlay_bound": counts["overlay_bound"],
+        "stock_errors": counts["stock_errors"],
+        "refused": counts["refused"],
         "mismatched": mismatched,
     }
     try:
@@ -482,20 +541,29 @@ def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True)
         from Products.ZCatalog.Catalog import Catalog
 
         return Catalog.search(self, query, sort_index, reverse, limit, merge)
-    from Acquisition import aq_base
-
+    _last.outcome = None
+    _last.mismatch = None
     native, reason, plan = _native(self, query, sort_index, reverse, limit, merge)
     if native is None:
         _count("queries", "python")
         if reason is not None:
             _count("fallbacks", reason)
+            _last.outcome = (reason, "client")
     else:
         _count("queries", "native")
+        _last.outcome = "native"
     if _installed.get("mode") == "compare":
-        result = stock(self, query, sort_index, reverse, limit, merge)
-        if native is not None and _code(type(aq_base(self))) != _installed["code"]:
-            # A mock of a method of `Catalog` gives the stock result.
-            _count("unchecked")
+        try:
+            result = stock(self, query, sort_index, reverse, limit, merge)
+        except Exception:
+            # The stock search raises for this query: there is nothing to
+            # compare the native answer with.
+            if native is not None:
+                _count("stock_errors")
+            raise
+        why = _unchecked(self) if native is not None else None
+        if why is not None:
+            _count("unchecked", why)
         elif native is not None:
             _count("compared")
             if _plant is not None:
@@ -575,6 +643,13 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
             return None, "unsupported", plan
     if "f" in reply:
         _count("refusals", reply["f"])
+        _last.outcome = (reply["f"], "server")
+        why = str(reply.get("why", ""))
+        if reply["f"] == "overlay" and why.startswith("the overlay passes"):
+            _count("overlay_bound")
+        if throwaway and reply["f"] == "refused":
+            # The text names oids and records, never a value of a query.
+            _count("refused", why[:200])
         return None, None, plan
     return _result(catalog, reply, jar, start, overlay is None), None, plan
 
@@ -1103,9 +1178,10 @@ def _path_clause(index, name, rec):
     }, None
 
 
-def _differences(native, stock):
+def _differences(native, stock, rows=0):
     """The names of the parts of the answer where the native and the stock
-    result of a search differ."""
+    result of a search differ: the rids, `len()`, `actual_result_count`,
+    and the brains of the first `rows` rids."""
     differences = []
     if list(native._seq if hasattr(native, "_seq") else []) != _rids(stock):
         differences.append("rids")
@@ -1114,7 +1190,33 @@ def _differences(native, stock):
     actual = getattr(stock, "actual_result_count", len(stock))
     if getattr(native, "actual_result_count", len(native)) != actual:
         differences.append("actual_result_count")
+    if not differences and rows and not _same_brains(native, stock, rows):
+        differences.append("rows")
     return differences
+
+
+def _same_brains(native, stock, rows):
+    """Tell if the first `rows` brains of the native result hold the values
+    of the stock brains in each column, and give their paths."""
+    seq = getattr(native, "_seq", None) or []
+    func = getattr(native, "_func", None)
+    if func is None:
+        return True
+    stock_func = getattr(stock, "_func", None)
+    stock_seq = getattr(stock, "_seq", None)
+    for k in range(min(rows, len(seq))):
+        try:
+            mine = func(seq[k])
+            theirs = (
+                stock_func(stock_seq[k])
+                if stock_func is not None and stock_seq is not None
+                else stock[k]
+            )
+            if tuple(mine) != tuple(theirs) or mine.getPath() != theirs.getPath():
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _uncached(catalog, run):
@@ -1146,11 +1248,12 @@ def _compare(plan, native, stock, uncached=None):
     value. `uncached()` gives the stock result with an empty cache of the
     request, or None when the search had no such cache: a difference that
     it does not show comes from the cache of ZCatalog."""
-    differences = _differences(native, stock)
+    rows = plan["rn"] if plan.get("cols") else 0
+    differences = _differences(native, stock, rows)
     if not differences:
         return
     again = uncached() if uncached is not None else None
-    cache = again is not None and not _differences(native, again)
+    cache = again is not None and not _differences(native, again, rows)
     clauses = []
     for clause in plan["c"]:
         options = [
@@ -1182,6 +1285,7 @@ def _compare(plan, native, stock, uncached=None):
         )
         return
     _count("mismatches")
+    _last.mismatch = shape
     with _counts_lock:
         if len(_mismatched) < _KEPT:
             _mismatched.append(shape)

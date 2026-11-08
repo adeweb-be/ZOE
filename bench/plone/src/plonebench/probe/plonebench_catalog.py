@@ -26,6 +26,10 @@ Each line is a JSON object of the version `VERSION` of the format:
 - `replayable`: false when the query holds a value of a type that the
   format does not carry (`{"$": "other"}`).
 
+A call that the probe cannot record (its encode fails) gets no line. At
+the exit of the process, the probe adds one line `{"v": 1, "kind":
+"unrecorded", "n": N, "pid": PID}` with their count, when N is more than 0.
+
 The typed form: None, a bool, an int, a float, a str and a list stay as
 they are; a tuple is `{"$": "tuple", "v": [...]}`, a set `{"$": "set",
 "v": [...]}`, a mapping `{"$": "dict", "v": [[key, value]...]}`, a
@@ -39,6 +43,7 @@ runner of its site. It needs only the standard library at import.
 
 from __future__ import annotations
 
+import atexit
 import datetime
 import json
 import os
@@ -191,6 +196,17 @@ def _record(catalog, query, sort_index, reverse, limit, merge, result):
             out.write(text + "\n")
 
 
+def _write_unrecorded():
+    """Add a line with the count of the calls that the log could not
+    record, when there is one."""
+    with _lock:
+        out, n = _state["out"], _state["errors"]
+        if out is None or not n:
+            return
+        line = {"v": VERSION, "kind": "unrecorded", "n": n, "pid": os.getpid()}
+        out.write(json.dumps(line, sort_keys=True) + "\n")
+
+
 def install(path):
     """Write the query log of this process to the end of the file `path`.
     A second call does nothing."""
@@ -203,6 +219,7 @@ def install(path):
         if directory:
             os.makedirs(directory, exist_ok=True)
         _state["out"] = open(path, "a", buffering=1)
+    atexit.register(_write_unrecorded)
     inner = Catalog.search
 
     def search(self, query, sort_index=None, reverse=False, limit=None, merge=True):

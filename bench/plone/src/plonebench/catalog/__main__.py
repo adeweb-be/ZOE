@@ -73,7 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "inventory":
         from plonebench.catalog import log
 
-        found = log.inventory(log.read_all(replay.log_files(args.logs)))
+        totals = {}
+        lines = log.read_all(replay.log_files(args.logs), totals)
+        found = log.inventory(lines, totals.get("unrecorded", 0))
         print(log.format_inventory(found, args.title))
         if args.json:
             with open(args.json, "w") as out:

@@ -27,9 +27,15 @@ after that commit until it answers, and measures the seconds from the
 commit to that answer. The saves search the catalog too, in a transaction
 that changed it, and these searches count with the others.
 
+A search that raises runs again with the stock search: when that raises
+too, the line does not apply to the store (a stock error); else it is an
+error of the hook. Each mismatch keeps its line of the log and the tid
+that its snapshot ends before, and each pinned search its outcome.
+
 OUT receives a JSON report: the counts by path, by reason and side of the
-Python path, of the comparisons, of the mismatches with the indexes and
-the options of each, of the differences of the cache of the request, of
+Python path, of the comparisons, of the unchecked answers, of the overlays
+past the bound, of the mismatches with the indexes and the options of
+each, of the differences of the cache of the request, of the errors, of
 the writer, the rebases, and the flip. It holds no value of a query.
 """
 
@@ -249,6 +255,35 @@ class Writer(threading.Thread):
         self.flip.update(committed=True, missing=True)
 
 
+def start_of(connection):
+    """The start of the snapshot of `connection`, as an int."""
+    storage_ = getattr(connection, "_normal_storage", None)
+    if storage_ is None:
+        storage_ = connection._storage
+    return u64(storage_._start)
+
+
+def run_stock(tool, line):
+    """Replay one line with the stock search of ZCatalog."""
+    catalog = tool._catalog
+    return len(backend._installed["stock"](catalog, *arguments(catalog, line)))
+
+
+def install_fault():
+    """Make the plan of each third search raise `ValueError`: a fault of the
+    hook, for the test that the replay fails on it."""
+    plan_of = backend.plan_of
+    calls = [0]
+
+    def faulty(*args, **kw):
+        calls[0] += 1
+        if calls[0] % 3 == 0:
+            raise ValueError("a fault of the hook")
+        return plan_of(*args, **kw)
+
+    backend.plan_of = faulty
+
+
 def arguments(catalog, line):
     """The arguments of `Catalog.search` of one line, on `catalog`."""
     query = querylog.decode(line["query"])
@@ -306,7 +341,13 @@ def main():
         plan = plan[: settings["limit"]]
     flip_at = len(plan) // 2 if settings.get("flip", True) else None
     counts = {"replayed": 0, "skipped": 0, "pinned": 0, "changed": 0}
-    errors = {}
+    hook_errors = {}
+    stock_errors = {}
+    change_errors = 0
+    pinned_outcomes = {}
+    mismatches = []
+    if settings.get("fault"):
+        install_fault()
     # A build after a stale commit starts the count of the rebases of the
     # mirror again, so the reader adds up what it sees.
     rebases = {"seen": before["rebases"] if before else 0, "total": 0}
@@ -352,23 +393,55 @@ def main():
         else:
             fresh_tm.begin()
             connection = fresh
-        try:
-            tool = tool_of(connection)
-            if line.get("changed") and documents:
+        tool = tool_of(connection)
+        if line.get("changed") and documents:
+            try:
                 obj = connection.root()["Application"].unrestrictedTraverse(
                     rnd.choice(documents)
                 )
                 obj.setTitle("Replay change")
                 obj.reindexObject()
                 counts["changed"] += 1
+            except Exception:
+                change_errors += 1
+        before_search = start_of(connection)
+        backend._last.outcome = None
+        backend._last.mismatch = None
+        try:
             run_search(tool, line)
             counts["replayed"] += 1
         except Exception as error:
             name = f"{type(error).__module__}.{type(error).__qualname__}"
-            errors[name] = errors.get(name, 0) + 1
+            # The stock search on the same arguments tells a line that does
+            # not apply to this store from a fault of the hook.
+            try:
+                run_stock(tool, line)
+            except Exception:
+                stock_errors[name] = stock_errors.get(name, 0) + 1
+            else:
+                hook_errors[name] = hook_errors.get(name, 0) + 1
         finally:
             if connection is fresh:
                 fresh_tm.abort()
+        if backend._last.mismatch is not None:
+            mismatches.append(
+                {
+                    "line": i % len(lines) + 1,
+                    "round": i // len(lines) + 1,
+                    "before": f"{before_search:016x}",
+                    "shape": backend._last.mismatch,
+                }
+            )
+        if connection is pinned:
+            outcome = backend._last.outcome
+            key = (
+                "native"
+                if outcome == "native"
+                else f"{outcome[0]} ({outcome[1]})"
+                if outcome
+                else "error"
+            )
+            pinned_outcomes[key] = pinned_outcomes.get(key, 0) + 1
         count_rebases()
     seconds = time.monotonic() - started
     writer.stop.set()
@@ -386,16 +459,23 @@ def main():
         "ready_seconds": round(ready, 3),
         "seconds": round(seconds, 3),
         **counts,
-        "errors": errors,
+        "hook_errors": hook_errors,
+        "stock_errors": stock_errors,
+        "change_errors": change_errors,
+        "pinned_outcomes": pinned_outcomes,
         "queries": found["queries"],
         "fallbacks": [
             [reason, side, n]
             for (reason, side), n in sorted(found["fallbacks"].items())
         ],
         "compared": found["compared"],
+        "unchecked": found["unchecked"],
+        "native_stock_errors": found["stock_errors"],
+        "overlay_bound": found["overlay_bound"],
         "mismatches": found["mismatches"],
         "cache_differences": found["cache_differences"],
         "mismatched": list(backend._mismatched),
+        "mismatch_lines": mismatches[:1000],
         "writer": writer.counts,
         "rebases": rebases["total"] if after is not None else None,
         "mirror": (

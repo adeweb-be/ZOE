@@ -151,7 +151,8 @@ _CLASSES = {
 
 
 def plan_of(query):
-    """The plan of `query`, as zoe.plone.catalog builds it."""
+    """The plan of `query`, as zoe.plone.catalog builds it, or None when
+    the query takes the Python path."""
     merged = cat.merge_query_args(query)
     made = cat.make_query(merged)
     clauses = []
@@ -185,9 +186,13 @@ def plan_of(query):
         else:
             clause["q"] = [index._convert(k) for k in rec.keys if k is not None]
             clause["r"] = None
+        # Keys that are all None give no row, whatever `not` holds: the
+        # query takes the Python path, so it has no plan.
+        if rec.keys and not clause["q"] and not rng and nots:
+            return None
         # ZCatalog converts the keys of `not` for a query of `not` alone.
-        # With keys, it looks them up as they are.
-        has_keys = bool(clause["q"]) or rng
+        # With keys, None among them, it looks them up as they are.
+        has_keys = bool(rec.keys)
         clause["not"] = nots if has_keys else [index._convert(k) for k in nots]
         clauses.append(clause)
     sort = []

@@ -9,8 +9,14 @@ query again, in the interpreter of a Plone instance. The inventory counts
 the index types, the options, the sorts and their shares, and the share of
 the searches in a transaction that changed the catalog, as the finding of
 the catalog mirror gives them for the Plone suites. It holds no value of a
-query: only the names of the indexes, of their options and of the sort
-indexes, and the numbers of `depth`, `level` and `navtree_start`.
+query: only the names of the index types and of the sort indexes, the
+names of the options of `OPTIONS`, the keys of `KEYS`, and the counts. So
+an inventory can leave the runner of a production site.
+
+A line with `"kind": "unrecorded"` is no search: the probe writes it at
+the exit of a process that could not record some calls, with their count
+`n`. `read` keeps such lines out of its result and adds their counts to
+`totals`.
 
 The module needs only the standard library.
 """
@@ -24,19 +30,46 @@ from pathlib import Path
 #: The version of the format that this module reads.
 VERSION = 1
 
-# The options of a record of a query whose value the inventory keeps: a
-# small int of the path index, never a value of the content.
-NUMBERS = ("depth", "level", "navtree", "navtree_start")
+# The options of a record of a query that the inventory names. Another
+# option is `other`.
+OPTIONS = (
+    "query",
+    "operator",
+    "range",
+    "not",
+    "usage",
+    "depth",
+    "level",
+    "navtree",
+    "navtree_start",
+)
+# The keys of a query that name no index and that the inventory names: the
+# keys of ZCatalog and of Plone. Another key, such as the name of a field
+# of a form, is `other`.
+KEYS = (
+    "sort_on",
+    "sort_order",
+    "sort_limit",
+    "b_start",
+    "b_size",
+    "Language",
+    "show_inactive",
+    "show_all",
+    "metadata_fields",
+    "use_site_search_settings",
+    "fullobjects",
+)
 
 
 class LogError(ValueError):
     """A line of the log that this version does not read."""
 
 
-def read(path: Path | str) -> list[dict]:
-    """Return the lines of the log at `path`. A line that is not a JSON
-    object, or a line of another version, raises `LogError` with its
-    number, and no value of the line."""
+def read(path: Path | str, totals: dict | None = None) -> list[dict]:
+    """Return the lines of the searches of the log at `path`. A line that is
+    not a JSON object, or a line of another version, raises `LogError` with
+    its number, and no value of the line. The count of each line of the kind
+    `unrecorded` goes to `totals["unrecorded"]`."""
     lines = []
     with open(path) as f:
         for number, text in enumerate(f, 1):
@@ -53,15 +86,21 @@ def read(path: Path | str) -> list[dict]:
                     f"line {number} of the log has the version {line.get('v')!r}:"
                     f" this replay reads the version {VERSION}"
                 )
+            if line.get("kind") == "unrecorded":
+                if totals is not None:
+                    totals["unrecorded"] = totals.get("unrecorded", 0) + int(
+                        line.get("n", 0)
+                    )
+                continue
             lines.append(line)
     return lines
 
 
-def read_all(paths) -> list[dict]:
-    """The lines of each log of `paths`, in order."""
+def read_all(paths, totals: dict | None = None) -> list[dict]:
+    """The lines of the searches of each log of `paths`, in order."""
     lines = []
     for path in paths:
-        lines.extend(read(path))
+        lines.extend(read(path, totals))
     return lines
 
 
@@ -106,22 +145,13 @@ def _items(encoded) -> list:
 
 def _options(value) -> tuple[str, ...]:
     """The names of the options of the value of an index in a query, with
-    the numbers of `NUMBERS`: `query` for a plain value."""
+    no value: `query` for a plain value, `other` for a name out of
+    `OPTIONS`."""
     pairs = _items(value)
     if not pairs:
         return ("query",)
-    out = []
-    for key, item in sorted(pairs, key=lambda pair: str(pair[0])):
-        key = str(key)
-        if key in NUMBERS and isinstance(item, int) and not isinstance(item, bool):
-            out.append(f"{key} {item}")
-        elif key == "operator" and item in ("and", "or"):
-            out.append(f"operator {item}")
-        elif key == "range" and isinstance(item, str):
-            out.append(f"range {item}")
-        else:
-            out.append(key)
-    return tuple(out)
+    names = {str(key) if str(key) in OPTIONS else "other" for key, _ in pairs}
+    return tuple(sorted(names))
 
 
 def _order(value) -> str:
@@ -130,7 +160,7 @@ def _order(value) -> str:
     return ",".join("descending" if v else "ascending" for v in values)
 
 
-def inventory(lines: list[dict]) -> dict:
+def inventory(lines: list[dict], unrecorded: int = 0) -> dict:
     """The inventory of the searches of `lines`: by index type, by index
     type and options, by sort, the keys of the queries that name no index,
     such as `sort_limit`, `b_start` and `b_size`, and the shares of the
@@ -151,7 +181,7 @@ def inventory(lines: list[dict]) -> dict:
         for name, value in pairs.items():
             kind = classes.get(name)
             if kind is None:
-                keys[name] += 1
+                keys[name if name in KEYS else "other"] += 1
                 continue
             seen.add(kind)
             shapes.add((kind, ", ".join(_options(value))))
@@ -193,6 +223,7 @@ def inventory(lines: list[dict]) -> dict:
         ],
         "changed": {"calls": changed, "share": share(changed)},
         "not_replayable": {"calls": other, "share": share(other)},
+        "unrecorded": unrecorded,
     }
 
 
@@ -226,5 +257,7 @@ def format_inventory(found: dict, title: str = "") -> str:
         f"Not replayable (a value of another type): "
         f"{found['not_replayable']['calls']:,} calls"
         f" ({found['not_replayable']['share']:.2f} %).",
+        f"Not recorded (the probe could not encode the call):"
+        f" {found.get('unrecorded', 0):,} calls.",
     ]
     return "\n".join(out)
