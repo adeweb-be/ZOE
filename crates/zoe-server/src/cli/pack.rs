@@ -109,6 +109,8 @@ fn write_report(out: &mut dyn Write, title: &str, report: &PackReport) -> io::Re
     writeln!(out, "  objects  {}", report.objects)?;
     let (blobs, blob_bytes) = (report.blobs, report.blob_bytes);
     writeln!(out, "  blobs    {blobs} ({blob_bytes} bytes)")?;
+    let (texts, clears) = (report.text_deltas, report.clear_deltas);
+    writeln!(out, "  deltas   {texts} text deltas, {clears} clear deltas")?;
     if report.by_class.is_empty() {
         return Ok(());
     }

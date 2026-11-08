@@ -48,6 +48,20 @@ pub struct TextChange {
     pub rid: Option<i32>,
 }
 
+/// One delta, as `Store::text_deltas_at` gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextDelta {
+    /// The oid of the catalog.
+    pub catalog: Oid,
+    /// The index id.
+    pub index: String,
+    /// The rid of a text delta. A clear delta has none.
+    pub rid: Option<i32>,
+    /// The language and the text of a text delta. An unindex and a clear
+    /// delta have none.
+    pub text: Option<LiveText>,
+}
+
 /// A problem that `Store::verify_text` found. It names the catalog, the
 /// index, the rid and the tid of the delta, never the text.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,6 +363,83 @@ impl Store {
         }
     }
 
+    /// Return the deltas of the transaction `tid`, in the key order of
+    /// `text_deltas`: the clear deltas of a catalog before its text
+    /// deltas. A transaction without a delta gives none. Each frame passes
+    /// its checksum, or the read is `CorruptText`. A key of `text_txn`
+    /// without its delta is `CorruptText` too.
+    ///
+    /// The call holds the deltas of the transaction in memory at once, as
+    /// the transaction iterator holds its records.
+    pub fn text_deltas_at(&self, tid: Tid) -> Result<Vec<TextDelta>> {
+        let Some(after) = tid.0.checked_sub(1).map(Tid) else {
+            return Ok(Vec::new());
+        };
+        let mut deltas = Vec::new();
+        for change in self.text_changed(after, tid)? {
+            let prefix = match change.rid {
+                Some(rid) => text::text_prefix(change.catalog, &change.index, rid),
+                None => text::clear_prefix(change.catalog, &change.index),
+            };
+            let key = text::delta_key(&prefix, tid);
+            let at = Included(key.as_slice());
+            let Some((_, frame)) = self.backend.text_rows(at, at, 1)?.pop() else {
+                return Err(corrupt(&prefix, &key));
+            };
+            let (_, payload) = decode(&prefix, &key, &frame)?;
+            let text = match (change.rid, text::decode_payload(&payload)) {
+                (None, _) if !payload.is_empty() => return Err(corrupt(&prefix, &key)),
+                (_, Err(())) => return Err(corrupt(&prefix, &key)),
+                (Some(_), Ok(Some((language, text)))) => Some(LiveText {
+                    language: language.to_owned(),
+                    text: text.to_owned(),
+                }),
+                _ => None,
+            };
+            deltas.push(TextDelta {
+                catalog: change.catalog,
+                index: change.index,
+                rid: change.rid,
+                text,
+            });
+        }
+        Ok(deltas)
+    }
+
+    /// Return the key of each delta after the delta `after`, or from the
+    /// first one for `None`, at most `limit` of them, in the key order of
+    /// `text_deltas`: by catalog, the clear deltas of a catalog before its
+    /// text deltas, by index id and rid, and the deltas of one key from the
+    /// oldest. The deltas of the backlog of the write-ahead log are in it.
+    /// The scan checks no frame. A key that does not read is
+    /// `CorruptText`.
+    pub fn text_keys(&self, after: Option<&TextChange>, limit: usize) -> Result<Vec<TextChange>> {
+        let from = after.map(|after| {
+            let prefix = match after.rid {
+                Some(rid) => text::text_prefix(after.catalog, &after.index, rid),
+                None => text::clear_prefix(after.catalog, &after.index),
+            };
+            text::delta_key(&prefix, after.tid)
+        });
+        let low = match &from {
+            Some(key) => Excluded(key.as_slice()),
+            None => Unbounded,
+        };
+        self.backend
+            .text_rows(low, Unbounded, limit)?
+            .iter()
+            .map(|(key, _)| {
+                let (parts, _, tid) = text::split_key(key).ok_or_else(|| corrupt_key(key))?;
+                Ok(TextChange {
+                    tid,
+                    catalog: parts.catalog,
+                    index: parts.index.to_owned(),
+                    rid: parts.rid,
+                })
+            })
+            .collect()
+    }
+
     /// Return the snapshot of a read of the deltas before `tid`: `tid`,
     /// or the tid after the last tid when `tid` is after it.
     pub(crate) fn text_snapshot(&self, tid: Tid) -> Tid {
@@ -419,8 +510,8 @@ impl Store {
     pub(crate) fn text_previous(&self, prefix: &[u8]) -> Result<Tid> {
         Ok(self
             .backend
-            .text_newest(prefix, Tid::MAX)?
-            .and_then(|(key, _)| text::key_tid(&key))
+            .text_newest_key(prefix, Tid::MAX)?
+            .and_then(|key| text::key_tid(&key))
             .unwrap_or(Tid::ZERO))
     }
 

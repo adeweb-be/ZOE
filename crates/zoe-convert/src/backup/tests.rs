@@ -308,11 +308,11 @@ fn a_restore_refuses_a_dump_of_version_1() {
     let store = sample(&source);
     let full = backup(&store, &dumps).unwrap();
     drop(store);
-    // A dump of version 1 gets the refusal of an unknown version, 3.
+    // A dump of version 1 gets the refusal of an unknown version, 4.
     let path = full.dump.unwrap();
     let good = fs::read(&path).unwrap();
     let mut refusals = Vec::new();
-    for version in [1, 3] {
+    for version in [1, 4] {
         let mut bytes = good.clone();
         bytes[7] = version;
         let end = bytes.len() - HASH;

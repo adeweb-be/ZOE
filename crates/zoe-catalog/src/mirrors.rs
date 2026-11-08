@@ -22,6 +22,14 @@
 //! rebase or a growth that would pass the bound drops the mirror that
 //! answered a query least recently.
 //!
+//! A query can carry a transaction overlay (`overlay`): the mirror reads it
+//! over the version of the query, with the shapes of the trees that the
+//! thread keeps, for that query only. The bound counts the overlays of the
+//! queries that run: an overlay that does not fit beside the mirrors and
+//! the other overlays takes the Python path (`overlay`). An overlay never
+//! makes the bound drop a mirror, and a build, a rebase or a growth does
+//! not count the overlays.
+//!
 //! The thread holds a share of the store only while it works, so the store
 //! can close between two passes, and a build takes a share for each read.
 //! `stop` stops the thread and the builds, and waits for them.
@@ -29,7 +37,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -38,6 +48,7 @@ use crate::build::{BuildError, Built, build};
 use crate::change::{ChangeSet, Shapes, read_records};
 use crate::counts::{Counters, Counts, MirrorCounts};
 use crate::mirror::{Versions, rebase};
+use crate::overlay;
 use crate::plan::{ClauseKind, PlanError, Wire, decode_typed};
 use crate::query::{Columns, Plan, Reply, View};
 use crate::read::{Commit, Reads};
@@ -104,6 +115,9 @@ pub struct Hooks {
     pub before_apply: Option<Hook>,
     /// Before a rebase lays its new base, with the oid of the catalog.
     pub before_swap: Option<Hook>,
+    /// Before a query reads its overlay, after it took its version, with
+    /// the oid of the catalog.
+    pub before_overlay: Option<Hook>,
 }
 
 /// The state of one mirror, as `status` gives it.
@@ -140,6 +154,8 @@ enum State {
 
 struct Entry {
     state: State,
+    /// The shapes and the objects of a ready mirror.
+    maint: Option<Arc<RwLock<Maint>>>,
     stale_at: Option<u64>,
     /// The order of the last answer of the mirror; 0 for none.
     last_answer: u64,
@@ -157,6 +173,7 @@ impl Entry {
     fn new() -> Entry {
         Entry {
             state: State::Pending,
+            maint: None,
             stale_at: None,
             last_answer: 0,
             build_seconds: 0.0,
@@ -185,6 +202,8 @@ struct Inner {
     rebased: Vec<(u64, Result<Base, String>)>,
     building: bool,
     answers: u64,
+    /// The bytes of the transaction overlays of the queries that run.
+    overlays: usize,
 }
 
 struct Shared {
@@ -192,14 +211,56 @@ struct Shared {
     changed: Condvar,
     config: Config,
     open: Opener,
-    counters: Counters,
+    counters: Arc<Counters>,
     cancel: AtomicBool,
 }
 
-/// The state that the thread keeps for the maintenance of a mirror.
+/// The state that the thread keeps for the maintenance of a mirror. A query
+/// with an overlay reads it.
 struct Maint {
     shapes: Shapes,
     objects: HashMap<u64, Vec<u8>>,
+    /// The tid of the last commit that changed the shape of each node,
+    /// after the base of the build. A node at or before the floor of the
+    /// versions leaves it.
+    moved: HashMap<u64, u64>,
+    /// The floor of the versions at the last prune of `moved`.
+    pruned: u64,
+}
+
+impl Maint {
+    fn heap_bytes(&self) -> usize {
+        self.shapes.heap_bytes() + self.moved.capacity() * 16
+    }
+}
+
+fn read(maint: &RwLock<Maint>) -> RwLockReadGuard<'_, Maint> {
+    maint.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write(maint: &RwLock<Maint>) -> RwLockWriteGuard<'_, Maint> {
+    maint.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The bytes of the maintenance of a mirror.
+fn maint_bytes(e: &Entry) -> usize {
+    e.maint.as_ref().map_or(0, |m| read(m).heap_bytes())
+}
+
+/// The overlay bytes that a query holds in the bound; the drop gives them
+/// back.
+struct Held<'a> {
+    shared: &'a Shared,
+    bytes: usize,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let mut inner = self.shared.lock();
+            inner.overlays = inner.overlays.saturating_sub(self.bytes);
+        }
+    }
 }
 
 /// The mirrors of one store.
@@ -212,6 +273,18 @@ impl Mirrors {
     /// Starts the thread of the mirrors of the store that `open` gives. The
     /// store has published each commit up to `published`.
     pub fn start(open: Opener, published: u64, config: Config) -> Mirrors {
+        Mirrors::start_counting(open, published, config, Arc::default())
+    }
+
+    /// Starts the thread as `start` does, with the counters `counters`. The
+    /// host of the mirrors counts on them the queries that it refuses
+    /// before the mirrors start.
+    pub fn start_counting(
+        open: Opener,
+        published: u64,
+        config: Config,
+        counters: Arc<Counters>,
+    ) -> Mirrors {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 entries: BTreeMap::new(),
@@ -225,11 +298,12 @@ impl Mirrors {
                 rebased: Vec::new(),
                 building: false,
                 answers: 0,
+                overlays: 0,
             }),
             changed: Condvar::new(),
             config,
             open,
-            counters: Counters::default(),
+            counters,
             cancel: AtomicBool::new(false),
         });
         let worker = Arc::clone(&shared);
@@ -277,21 +351,43 @@ impl Mirrors {
         plan: &Plan,
         columns: &Columns,
     ) -> Result<Reply, Fallback> {
-        self.query_kinds(catalog, tid, plan, columns, &[])
+        self.query_typed(catalog, tid, plan, columns, &[], None)
     }
 
-    /// Answers `plan` as `query_rows` does, after a check of the kind of
-    /// each clause (`kinds`) against the class of its index.
-    fn query_kinds(
+    /// Answers `plan` as `query_rows` does, over the transaction overlay
+    /// `records`: the version at `tid` with the records, for this query
+    /// only. A record that does not read gives the reason `overlay`.
+    pub fn query_overlay(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Plan,
+        columns: &Columns,
+        records: &[(u64, Vec<u8>)],
+    ) -> Result<Reply, Fallback> {
+        self.query_typed(catalog, tid, plan, columns, &[], Some(records))
+    }
+
+    /// Answers a plan that `decode_typed` read, as `query_overlay` does,
+    /// after a check of the kind of each clause (`kinds`) against the class
+    /// of its index. A clause whose kind does not read the class of its
+    /// index gives the reason `plan`. Without `overlay`, the query reads
+    /// the version at `tid` alone.
+    pub fn query_typed(
         &self,
         catalog: u64,
         tid: u64,
         plan: &Plan,
         columns: &Columns,
         kinds: &[ClauseKind],
+        overlay: Option<&[(u64, Vec<u8>)]>,
     ) -> Result<Reply, Fallback> {
         let started = Instant::now();
-        let answer = self.answer(catalog, tid, plan, columns, kinds);
+        if let Some(records) = overlay {
+            self.shared.counters.overlay(records.len());
+        }
+        let overlay = overlay.filter(|records| !records.is_empty());
+        let answer = self.answer(catalog, tid, plan, columns, kinds, overlay);
         match &answer {
             Ok(_) => self.shared.counters.native(started.elapsed()),
             Err(f) => self.shared.counters.python(f.reason, started.elapsed()),
@@ -310,9 +406,21 @@ impl Mirrors {
         tid: u64,
         plan: &Wire,
     ) -> Result<Result<Reply, Fallback>, String> {
+        self.query_wire_overlay(catalog, tid, plan, None)
+    }
+
+    /// Answers the plan `plan` as `query_wire` does, over the transaction
+    /// overlay `overlay` when it is given.
+    pub fn query_wire_overlay(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Wire,
+        overlay: Option<&[(u64, Vec<u8>)]>,
+    ) -> Result<Result<Reply, Fallback>, String> {
         match decode_typed(plan) {
             Ok((plan, columns, kinds)) => {
-                Ok(self.query_kinds(catalog, tid, &plan, &columns, &kinds))
+                Ok(self.query_typed(catalog, tid, &plan, &columns, &kinds, overlay))
             }
             Err(PlanError::Malformed(why)) => Err(why),
             Err(PlanError::Unknown(why)) => {
@@ -329,6 +437,7 @@ impl Mirrors {
         plan: &Plan,
         columns: &Columns,
         kinds: &[ClauseKind],
+        overlay: Option<&[(u64, Vec<u8>)]>,
     ) -> Result<Reply, Fallback> {
         let shared = &self.shared;
         let v = tid.saturating_sub(1);
@@ -338,7 +447,8 @@ impl Mirrors {
         let needed = v.min(store.last_tid());
         drop(store);
         let deadline = Instant::now() + shared.config.wait;
-        let snapshot = {
+        let mut held = Held { shared, bytes: 0 };
+        let (snapshot, maint, at) = {
             let mut inner = shared.lock();
             loop {
                 let answers = inner.answers + 1;
@@ -372,9 +482,12 @@ impl Mirrors {
                                 "a commit after the tid has no change set in the mirror",
                             ));
                         };
+                        // The version holds each commit up to `at`.
+                        let at = v.min(versions.applied);
+                        let maint = entry.maint.clone();
                         entry.last_answer = answers;
                         inner.answers = answers;
-                        break snapshot;
+                        break (snapshot, maint, at);
                     }
                     State::Ready(_) => {}
                 }
@@ -394,10 +507,52 @@ impl Mirrors {
         };
         let answer = catch_unwind(AssertUnwindSafe(|| {
             let (base, over) = snapshot.resolve();
-            let view = View::new(&base, &over);
-            view.check_kinds(plan, kinds)?;
-            view.query_rows(plan, columns)
+            View::new(&base, &over).check_kinds(plan, kinds)?;
+            let over = match (overlay, &maint) {
+                (None, _) => over,
+                (Some(records), Some(maint)) => {
+                    // The bound counts the records and the copy of the
+                    // overrides that the overlay makes. An overlay that does
+                    // not fit drops no mirror.
+                    let bytes = overlay::heap_bytes(records) + over.heap_bytes();
+                    {
+                        let mut inner = shared.lock();
+                        if !shared.fits(&inner, bytes) {
+                            return Err(Fallback::new(
+                                Reason::Overlay,
+                                "the overlay passes catalog-memory",
+                            ));
+                        }
+                        inner.overlays += bytes;
+                        held.bytes = bytes;
+                    }
+                    if let Some(hook) = &shared.config.hooks.before_overlay {
+                        hook(catalog);
+                    }
+                    let m = read(maint);
+                    // The thread forgot the shape changes at or before the
+                    // floor that it pruned at.
+                    if at < m.pruned {
+                        return Err(Fallback::new(
+                            Reason::Overlay,
+                            "the mirror forgot the shape changes after the tid",
+                        ));
+                    }
+                    let with =
+                        overlay::read(&base, &over, &m.shapes, &m.objects, &m.moved, at, records);
+                    drop(m);
+                    Arc::new(with?)
+                }
+                (Some(_), None) => {
+                    return Err(Fallback::new(
+                        Reason::Overlay,
+                        "the mirror keeps no shapes of its trees",
+                    ));
+                }
+            };
+            View::new(&base, &over).query_rows(plan, columns)
         }));
+        drop(held);
         answer.unwrap_or_else(|_| Err(Fallback::new(Reason::Refused, "the query panicked")))
     }
 
@@ -550,6 +705,14 @@ impl Shared {
         }
     }
 
+    /// Tells if the bound has room for an overlay of `bytes` beside the
+    /// mirrors and the overlays of the running queries. It never drops a
+    /// mirror.
+    fn fits(&self, inner: &Inner, bytes: usize) -> bool {
+        let used: usize = inner.entries.values().map(|e| e.bytes).sum();
+        used + inner.overlays + bytes <= self.config.memory
+    }
+
     /// Tells if the bound has room for `extra` more bytes, after it dropped
     /// the mirrors that answered least recently. `keep` is a mirror that
     /// the bound does not drop.
@@ -577,6 +740,7 @@ impl Shared {
             e.last_bytes = e.bytes;
             e.bytes = 0;
             e.state = State::Dropped;
+            e.maint = None;
             e.rebasing = false;
             self.counters.drop_mirror();
             let text = format!(
@@ -630,7 +794,6 @@ impl Reads for Weakly<'_> {
 
 /// The thread of the mirrors.
 fn run(shared: &Arc<Shared>) {
-    let mut maint: HashMap<u64, Maint> = HashMap::new();
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     loop {
         {
@@ -648,16 +811,16 @@ fn run(shared: &Arc<Shared>) {
             break;
         };
         let pass = catch_unwind(AssertUnwindSafe(|| {
-            pass(shared, &*store, &mut maint, &mut workers);
+            pass(shared, &*store, &mut workers);
         }));
         drop(store);
         if pass.is_err() {
             let mut inner = shared.lock();
             for e in inner.entries.values_mut() {
                 e.state = State::Refused("the thread of the mirror panicked".into());
+                e.maint = None;
                 e.bytes = 0;
             }
-            maint.clear();
             let text =
                 "the thread of the catalog mirrors panicked: each query takes the Python path"
                     .to_owned();
@@ -675,26 +838,28 @@ fn run(shared: &Arc<Shared>) {
 
 /// One pass of the thread: the registration, the builds, the commits, the
 /// rebases and the window.
-fn pass(
-    shared: &Arc<Shared>,
-    store: &dyn Reads,
-    maint: &mut HashMap<u64, Maint>,
-    workers: &mut Vec<JoinHandle<()>>,
-) {
+fn pass(shared: &Arc<Shared>, store: &dyn Reads, workers: &mut Vec<JoinHandle<()>>) {
     let config = &shared.config;
-    read_registration(shared, store, maint);
-    install_build(shared, maint);
+    read_registration(shared, store);
+    install_build(shared);
     start_build(shared, workers);
-    apply_commits(shared, store, maint);
+    apply_commits(shared, store);
     install_rebases(shared);
     // The change sets leave the window as time passes.
     let mut inner = shared.lock();
     let mut due = Vec::new();
+    let mut floors = Vec::new();
     for (catalog, e) in inner.entries.iter_mut() {
+        if !matches!(e.state, State::Ready(_)) {
+            e.maint = None;
+        }
         if let State::Ready(versions) = &mut e.state {
             versions.prune(config.window_tids, config.window);
-            e.bytes =
-                versions.heap_bytes() + maint.get(catalog).map_or(0, |m| m.shapes.heap_bytes());
+            if let Some(m) = &e.maint {
+                floors.push((Arc::clone(m), versions.floor));
+            }
+            let maint = e.maint.as_ref().map_or(0, |m| read(m).heap_bytes());
+            e.bytes = versions.heap_bytes() + maint;
             let retry = e.rebase_failed.is_none_or(|t| t.elapsed() > REBASE_RETRY);
             if !e.rebasing
                 && retry
@@ -710,13 +875,16 @@ fn pass(
             }
         }
     }
-    maint.retain(|c, _| {
-        matches!(
-            inner.entries.get(c).map(|e| &e.state),
-            Some(State::Ready(_))
-        )
-    });
     drop(inner);
+    // A node whose shape changed at or before the floor of the versions
+    // leaves `moved`: no query reads a version before the floor.
+    for (maint, floor) in floors {
+        if read(&maint).pruned < floor {
+            let mut m = write(&maint);
+            m.moved.retain(|_, tid| *tid > floor);
+            m.pruned = floor;
+        }
+    }
     for (catalog, base, head, tid) in due {
         let worker = Arc::clone(shared);
         let spawned = thread::Builder::new()
@@ -753,7 +921,7 @@ fn pass(
 }
 
 /// Reads the namespace when a commit wrote it since the last read.
-fn read_registration(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMap<u64, Maint>) {
+fn read_registration(shared: &Arc<Shared>, store: &dyn Reads) {
     let generation = match store.registration_generation() {
         Ok(g) => g,
         Err(e) => {
@@ -797,7 +965,6 @@ fn read_registration(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMa
         if let Some(e) = inner.entries.remove(&catalog) {
             freed |= e.bytes > 0;
         }
-        maint.remove(&catalog);
     }
     for catalog in listed {
         inner.entries.entry(catalog).or_insert_with(Entry::new);
@@ -818,7 +985,7 @@ fn read_registration(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMa
 }
 
 /// Lays the base of a build that ended.
-fn install_build(shared: &Arc<Shared>, maint: &mut HashMap<u64, Maint>) {
+fn install_build(shared: &Arc<Shared>) {
     let mut inner = shared.lock();
     let Some((catalog, result)) = inner.built.take() else {
         return;
@@ -837,13 +1004,12 @@ fn install_build(shared: &Arc<Shared>, maint: &mut HashMap<u64, Maint>) {
             e.stale_at = None;
             e.build_seconds = built.seconds;
             e.bytes = bytes;
-            maint.insert(
-                catalog,
-                Maint {
-                    shapes: built.shapes,
-                    objects: built.objects,
-                },
-            );
+            e.maint = Some(Arc::new(RwLock::new(Maint {
+                shapes: built.shapes,
+                objects: built.objects,
+                moved: HashMap::new(),
+                pruned: 0,
+            })));
         }
         Err(BuildError::Refused(why)) => {
             e.state = State::Refused(why.clone());
@@ -938,7 +1104,7 @@ fn start_build(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
 }
 
 /// Applies the commits up to the last hand-off to each ready mirror.
-fn apply_commits(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMap<u64, Maint>) {
+fn apply_commits(shared: &Arc<Shared>, store: &dyn Reads) {
     let (target, ready) = {
         let inner = shared.lock();
         let ready: Vec<(u64, u64)> = inner
@@ -963,14 +1129,14 @@ fn apply_commits(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMap<u6
             hook(commit.tid);
         }
         for catalog in &catalogs {
-            apply(shared, maint, *catalog, &commit);
+            apply(shared, *catalog, &commit);
         }
         true
     };
     if let Err(e) = store.commits(from, target, &mut each) {
         let mut inner = shared.lock();
         for catalog in &catalogs {
-            make_stale(shared, &mut inner, maint, *catalog, from, &e);
+            make_stale(shared, &mut inner, *catalog, from, &e);
         }
         drop(inner);
         shared.changed.notify_all();
@@ -991,10 +1157,13 @@ fn apply_commits(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMap<u6
     // A growth that passes the bound drops the mirror that answered least
     // recently, this one too.
     for catalog in &catalogs {
-        let bytes = match inner.entries.get(catalog).map(|e| &e.state) {
-            Some(State::Ready(v)) => {
-                v.heap_bytes() + maint.get(catalog).map_or(0, |m| m.shapes.heap_bytes())
-            }
+        let bytes = match inner.entries.get(catalog) {
+            Some(
+                e @ Entry {
+                    state: State::Ready(v),
+                    ..
+                },
+            ) => v.heap_bytes() + maint_bytes(e),
             _ => continue,
         };
         if let Some(e) = inner.entries.get_mut(catalog) {
@@ -1018,36 +1187,52 @@ fn apply_commits(shared: &Arc<Shared>, store: &dyn Reads, maint: &mut HashMap<u6
     shared.changed.notify_all();
 }
 
-/// Applies one commit to the mirror of `catalog`.
-fn apply(shared: &Arc<Shared>, maint: &mut HashMap<u64, Maint>, catalog: u64, commit: &Commit) {
-    let (base, head) = {
+/// Applies one commit to the mirror of `catalog`. The shapes take the
+/// edits of the commit before the versions take its change set, so a query
+/// never reads a version with older shapes than its own.
+fn apply(shared: &Arc<Shared>, catalog: u64, commit: &Commit) {
+    let (base, head, maint) = {
         let inner = shared.lock();
-        match inner.entries.get(&catalog).map(|e| &e.state) {
-            Some(State::Ready(v)) if v.applied < commit.tid => {
-                (Arc::clone(&v.base), Arc::clone(&v.head))
+        match inner.entries.get(&catalog) {
+            Some(Entry {
+                state: State::Ready(v),
+                maint: Some(maint),
+                ..
+            }) if v.applied < commit.tid => {
+                (Arc::clone(&v.base), Arc::clone(&v.head), Arc::clone(maint))
             }
             _ => return,
         }
     };
-    let Some(m) = maint.get(&catalog) else {
-        return;
+    let got = {
+        let m = read(&maint);
+        read_records(&base, &head, &m.shapes, &m.objects, &commit.records)
     };
-    let read = read_records(&base, &head, &m.shapes, &m.objects, &commit.records);
     drop((base, head));
+    let crate::change::Read {
+        changes,
+        lengths,
+        edits,
+        stale,
+        ..
+    } = got;
+    if stale.is_none() {
+        let mut m = write(&maint);
+        for oid in m.shapes.take(edits) {
+            m.moved.insert(oid, commit.tid);
+        }
+    }
     let mut inner = shared.lock();
-    if let Some(why) = read.stale {
-        make_stale(shared, &mut inner, maint, catalog, commit.tid, &why);
+    if let Some(why) = stale {
+        make_stale(shared, &mut inner, catalog, commit.tid, &why);
     } else if let Some(e) = inner.entries.get_mut(&catalog)
         && let State::Ready(v) = &mut e.state
     {
-        if let Some(m) = maint.get_mut(&catalog) {
-            m.shapes.take(read.edits);
-        }
         v.push(ChangeSet {
             tid: commit.tid,
             at: Instant::now(),
-            changes: read.changes,
-            lengths: read.lengths,
+            changes,
+            lengths,
         });
     }
     drop(inner);
@@ -1056,14 +1241,7 @@ fn apply(shared: &Arc<Shared>, maint: &mut HashMap<u64, Maint>, catalog: u64, co
 
 /// Makes the mirror of `catalog` stale at `tid`: it drops its base and
 /// builds again.
-fn make_stale(
-    shared: &Shared,
-    inner: &mut Inner,
-    maint: &mut HashMap<u64, Maint>,
-    catalog: u64,
-    tid: u64,
-    why: &str,
-) {
+fn make_stale(shared: &Shared, inner: &mut Inner, catalog: u64, tid: u64, why: &str) {
     let Some(e) = inner.entries.get_mut(&catalog) else {
         return;
     };
@@ -1071,10 +1249,10 @@ fn make_stale(
         return;
     }
     e.state = State::Pending;
+    e.maint = None;
     e.stale_at = Some(tid);
     e.bytes = 0;
     e.rebasing = false;
-    maint.remove(&catalog);
     inner.dirty = true;
     let text =
         format!("the catalog mirror of {catalog:#x} is stale at {tid:#x} and builds again: {why}");

@@ -7,10 +7,16 @@ environment of the Python tests:
 
 A seed is the argument `plan` of a `catalog_query` call, one msgpack value
 in the form of ADR 0059, section 8: plans of each kind of clause, with a
-sort, a batch and columns, and plans that the server refuses. All data is
-synthetic.
+sort, a batch and columns, and plans that the server refuses. A seed whose
+name starts with `overlay` also holds the argument `overlay` after the
+plan: a second msgpack value, `[[oid, pickle]...]`, with records of BTrees
+buckets and of the metadata `data`, one with a provisional oid, written
+as ZODB writes a record (a pickle of the class, then a pickle of the
+state). All data is synthetic.
 """
 
+import io
+import pickle
 from pathlib import Path
 
 import msgpack
@@ -91,10 +97,62 @@ SEEDS = {
 }
 
 
+# The high bit of a provisional oid.
+PROVISIONAL = 1 << 63
+
+
+def oid(n):
+    return n.to_bytes(8, "big")
+
+
+def record(module, name, state, refs=()):
+    """A record as ZODB writes it: the class as a GLOBAL, then the state.
+    Each item of `refs` stands for a persistent reference to that oid."""
+    klass = b"\x80\x03c" + f"{module}\n{name}\n".encode() + b"q\x00."
+    out = io.BytesIO()
+
+    class Ref:
+        def __init__(self, n):
+            self.n = n
+
+    pickler = pickle.Pickler(out, protocol=3)
+    pickler.persistent_id = lambda o: oid(o.n) if isinstance(o, Ref) else None
+    pickler.dump(state(*[Ref(n) for n in refs]))
+    return klass + out.getvalue()
+
+
+BUCKET = record(
+    "BTrees.IOBTree", "IOBucket", lambda: ((1000, "Document", 1002, "Folder"),)
+)
+DATA = record("BTrees.IOBTree", "IOBucket", lambda: ((1000, ("item-0", "Item 0")),))
+TREE = record(
+    "BTrees.IOBTree",
+    "IOBTree",
+    lambda a, b: ((a, 1002, b), a),
+    refs=(12, PROVISIONAL | 1),
+)
+OVERLAYS = {
+    "overlay": [[oid(12), BUCKET], [oid(14), DATA]],
+    "overlay-provisional": [
+        [oid(11), TREE],
+        [oid(12), BUCKET],
+        [oid(PROVISIONAL | 1), BUCKET],
+    ],
+    "overlay-nil": None,
+    "overlay-empty": [],
+}
+MALFORMED_OVERLAY = [[oid(12)], [b"short", BUCKET]]
+
+
 def main():
     HERE.mkdir(exist_ok=True)
     for name, value in SEEDS.items():
         (HERE / name).write_bytes(msgpack.packb(value, use_bin_type=True))
+    query = msgpack.packb(SEEDS["field"], use_bin_type=True)
+    for name, value in OVERLAYS.items():
+        (HERE / name).write_bytes(query + msgpack.packb(value, use_bin_type=True))
+    malformed = msgpack.packb(MALFORMED_OVERLAY, use_bin_type=True)
+    (HERE / "overlay-malformed").write_bytes(query + malformed)
 
 
 if __name__ == "__main__":

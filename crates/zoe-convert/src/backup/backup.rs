@@ -38,6 +38,8 @@ pub struct Backup {
     /// The durable rows of the KV namespaces of the dump, the generation
     /// rows included.
     pub durable_rows: u64,
+    /// The text deltas, the unindexes and the clear deltas of the dump.
+    pub deltas: u64,
 }
 
 /// Write a dump of `store` into the backup directory `dir`, and return
@@ -79,6 +81,7 @@ pub fn backup(store: &Store, dir: &Path) -> Result<Backup, Error> {
         blob_bytes: 0,
         sequences: 0,
         durable_rows: 0,
+        deltas: 0,
     };
     if !dumps.is_empty() {
         if last == after {

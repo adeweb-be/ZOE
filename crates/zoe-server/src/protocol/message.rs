@@ -120,14 +120,21 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
 /// values and its depth. The bounds hold before rmpv builds a value.
 /// Return a text that says why the bytes are not one value.
 pub(crate) fn decode_value(frame: &[u8]) -> Result<Value, String> {
-    check_values(frame, MAX_VALUES)?;
-    let mut bytes = frame;
-    let value = rmpv::decode::read_value_with_max_depth(&mut bytes, MAX_DEPTH)
-        .map_err(|e| e.to_string())?;
-    if !bytes.is_empty() {
+    let (value, rest) = decode_first(frame)?;
+    if !rest.is_empty() {
         return Err("bytes after the message".into());
     }
     Ok(value)
+}
+
+/// Decode the first msgpack value of `bytes` within the bounds of a frame,
+/// as `decode_value` does. Return it and the bytes after it.
+pub(crate) fn decode_first(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
+    check_values(bytes, MAX_VALUES)?;
+    let mut rest = bytes;
+    let value =
+        rmpv::decode::read_value_with_max_depth(&mut rest, MAX_DEPTH).map_err(|e| e.to_string())?;
+    Ok((value, rest))
 }
 
 /// Encode the reply to the call `id` with `result`.

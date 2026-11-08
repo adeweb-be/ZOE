@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use zoe_core::{Store, Tid};
+use zoe_core::{Store, TextDelta, Tid, Txn};
 
 use super::chain::{DumpFile, chain};
 use super::dump::{DumpReader, Entry, Head, check_hash};
@@ -36,6 +36,8 @@ pub struct Restored {
     /// The durable rows of the KV namespaces of the last dump, the
     /// generation rows included.
     pub durable_rows: u64,
+    /// The text deltas, the unindexes and the clear deltas.
+    pub deltas: u64,
     /// The last tid of the last dump.
     pub last_tid: Tid,
 }
@@ -110,6 +112,7 @@ fn build(dumps: &[DumpFile], work: &Path) -> Result<Restored, Error> {
         blobs: 0,
         sequences: 0,
         durable_rows: 0,
+        deltas: 0,
         last_tid: Tid::ZERO,
     };
     let mut names = BTreeSet::new();
@@ -118,6 +121,8 @@ fn build(dumps: &[DumpFile], work: &Path) -> Result<Restored, Error> {
     for dump in dumps {
         let mut reader = DumpReader::open(dump)?;
         rows.clear();
+        // The restore transaction whose deltas the reader can still give.
+        let mut open: Option<Txn<&Store>> = None;
         loop {
             match reader.next()? {
                 Entry::Sequence { name, end } => {
@@ -125,11 +130,26 @@ fn build(dumps: &[DumpFile], work: &Path) -> Result<Restored, Error> {
                     names.insert(name);
                 }
                 Entry::Durable(row) => rows.push(row),
-                Entry::Transaction(head) => restore_txn(&store, &mut reader, &head, &mut report)?,
+                Entry::Transaction(head) => {
+                    commit(open.take(), &mut report)?;
+                    open = Some(restore_txn(&store, &mut reader, &head, &mut report)?);
+                }
+                Entry::Delta(delta) => match open.as_mut() {
+                    Some(txn) => {
+                        restore_delta(txn, &delta)?;
+                        report.deltas += 1;
+                    }
+                    None => {
+                        return Err(reader.damaged("a delta outside a transaction".to_owned()));
+                    }
+                },
                 Entry::Record { .. } => {
                     return Err(reader.damaged("a record outside a transaction".to_owned()));
                 }
-                Entry::End => break,
+                Entry::End => {
+                    commit(open.take(), &mut report)?;
+                    break;
+                }
             }
         }
         report.dumps += 1;
@@ -142,13 +162,15 @@ fn build(dumps: &[DumpFile], work: &Path) -> Result<Restored, Error> {
     Ok(report)
 }
 
-/// Restore the transaction `head` and its records from `reader`.
-fn restore_txn(
-    store: &Store,
+/// Begin the restore of the transaction `head`, and restore its records
+/// from `reader`. Its deltas follow in the dump: the caller stages them,
+/// then commits the transaction with `commit`.
+fn restore_txn<'s>(
+    store: &'s Store,
     reader: &mut DumpReader,
     head: &Head,
     report: &mut Restored,
-) -> Result<(), Error> {
+) -> Result<Txn<&'s Store>, Error> {
     let mut txn =
         store.tpc_begin_restore(head.tid, &head.user, &head.description, &head.extension)?;
     for _ in 0..head.records {
@@ -167,6 +189,30 @@ fn restore_txn(
         }
         report.records += 1;
     }
+    Ok(txn)
+}
+
+/// Stage `delta` in the restore transaction `txn`, at its tid.
+fn restore_delta(txn: &mut Txn<&Store>, delta: &TextDelta) -> Result<(), Error> {
+    match (delta.rid, &delta.text) {
+        (None, _) => txn.restore_clear(delta.catalog, &delta.index)?,
+        (Some(rid), Some(text)) => txn.restore_text(
+            delta.catalog,
+            &delta.index,
+            rid,
+            &text.language,
+            Some(&text.text),
+        )?,
+        (Some(rid), None) => txn.restore_text(delta.catalog, &delta.index, rid, "", None)?,
+    }
+    Ok(())
+}
+
+/// Commit the restore transaction `txn`, if any.
+fn commit(txn: Option<Txn<&Store>>, report: &mut Restored) -> Result<(), Error> {
+    let Some(mut txn) = txn else {
+        return Ok(());
+    };
     txn.vote()?;
     txn.finish()?;
     report.transactions += 1;

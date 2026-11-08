@@ -30,6 +30,10 @@ pub struct Report {
     /// conversion into a `Data.fs` left out: a `Data.fs` holds no
     /// namespace (ADR 0043). A conversion from a `Data.fs` has none.
     pub durable_keys: u64,
+    /// The text deltas, the unindexes and the clear deltas of a store that
+    /// the conversion into a `Data.fs` left out: a `Data.fs` holds no delta
+    /// (ADR 0060, section 6). A conversion from a `Data.fs` has none.
+    pub deltas: u64,
     /// What the verification found, one problem per line. The lines about
     /// the whole source or the whole file come first: where a read of a
     /// `Data.fs` stopped before the end of the file, and the blob records
@@ -52,6 +56,7 @@ impl Report {
             blobs: 0,
             last_tid: Tid::ZERO,
             durable_keys: 0,
+            deltas: 0,
             problems: Vec::new(),
             counts: BTreeMap::new(),
         }

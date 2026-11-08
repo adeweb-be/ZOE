@@ -21,9 +21,10 @@ it, each raises `ZODB.POSException.Unsupported`. `zoe.kv.Namespace` gives a
 namespace to a connection of a database.
 
 With the native client inside, a connection also declares `catalog_query`,
-and `catalog_query(catalog, tid, plan)` answers a catalog query from the
-catalog mirror of the server, as `zoe.Storage` does from the mirror of the
-process (ADR 0059). `catalog_supported()` tells if the server accepted it.
+and `catalog_query(catalog, tid, plan, overlay=None)` answers a catalog
+query from the catalog mirror of the server, over the transaction overlay
+when it is given, as `zoe.Storage` does from the mirror of the process (ADR
+0059). `catalog_supported()` tells if the server accepted it.
 The asyncio mode has neither call.
 
 When the package `opentelemetry` is installed, each connection also declares

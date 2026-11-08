@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The plan, the reply and the overlay of `catalog_query` as msgpack values,
+# for the server and the native client.
+rmpv.workspace = true
 roaring.workspace = true
 zoe-core.workspace = true
 zoe-pickle.workspace = true

@@ -421,6 +421,13 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    /// Return the key of the newest delta of `prefix` whose tid is before
+    /// `before`, as `text_newest` gives it, without its frame. The default
+    /// reads it through `text_newest`.
+    fn text_newest_key(&self, prefix: &[u8], before: Tid) -> Result<Option<Bytes>> {
+        Ok(self.text_newest(prefix, before)?.map(|(key, _)| key))
+    }
+
     /// Return the rows of `text_deltas` from `from` to `to`, in key order,
     /// at most `limit` of them: the key and the frame of each, as stored.
     /// One snapshot gives the list. A key outside the bounds, or a key that
@@ -658,6 +665,14 @@ pub trait WriteTxn {
     /// its key in `text_txn`. The backend encodes the payload with its own
     /// compression. The default fails: the backend keeps no delta.
     fn put_text(&mut self, _key: &[u8], _prev: Tid, _payload: &[u8]) -> Result<()> {
+        Err(ZoeError::Backend("no text deltas in this backend".into()))
+    }
+
+    /// Stage the removal of the delta `key`, a key of `text_deltas`, and of
+    /// its key in `text_txn`. Pack uses this. A missing row or index key
+    /// is `CorruptText`, so the write does not erase the evidence of a
+    /// damaged store. The default fails: the backend keeps no delta.
+    fn remove_text(&mut self, _key: &[u8]) -> Result<()> {
         Err(ZoeError::Backend("no text deltas in this backend".into()))
     }
 

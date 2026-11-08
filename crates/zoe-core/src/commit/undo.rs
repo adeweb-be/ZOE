@@ -4,10 +4,14 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use std::ops::Bound::{Excluded, Included};
+
 use crate::backend::Record;
 use crate::error::{Result, ZoeError};
+use crate::format::text as keys;
 use crate::merge::{self, Outcome, Resolution, Resolved};
 use crate::store::Store;
+use crate::text::TextChange;
 use crate::types::{Oid, Tid};
 use crate::undo::{self, UndoConflict, Undone};
 
@@ -44,6 +48,16 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///   `tid`, also when the pickles are the same, as the pickles of the
     ///   revisions of one blob are. So the undo never drops a later
     ///   revision of a blob, where FileStorage gives the earlier blob back.
+    /// - For each text delta of `tid`, the call reads the live text of its
+    ///   key as this transaction sees it: the delta that it staged, else
+    ///   the newest committed one. When that text is the text of `tid`, it
+    ///   stages the live text before `tid`, or an unindex when there is
+    ///   none, with the snapshot of its read as `before`. No live text
+    ///   equals an unindex. Else it fails with `Undo`: text has no merge.
+    ///   A clear delta of the index after `tid`, or staged in this
+    ///   transaction, fails the call with `Undo`, also for an unindex. A
+    ///   transaction `tid` that holds a clear delta fails the call with
+    ///   `Undo` before it stages anything.
     ///
     /// A transaction at or before the last pack, one that the store does
     /// not have, or one whose state before is gone by a pack, fails the
@@ -87,13 +101,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .map_err(|error| self.packed_since(tid, error))
     }
 
-    /// Stage the undo of each record of the transaction `tid`.
+    /// Stage the undo of each record and of each text delta of the
+    /// transaction `tid`.
     fn undo_records(&mut self, tid: Tid) -> Result<Undone> {
         let records = match self.store.backend.txn_records(tid)? {
             Some((row, records)) if row.oid_count == records.len() as u64 => records,
             Some(_) => return Err(ZoeError::CorruptTxn { tid }),
             None => return Err(refused(None, undo::NO_TRANSACTION)),
         };
+        let texts = self.store.text_changed(Tid(tid.0 - 1), tid)?;
+        if let Some(clear) = texts.iter().find(|change| change.rid.is_none()) {
+            return Err(refused(Some(clear.catalog), undo::CLEARS_INDEX));
+        }
         let mut undone = Undone::default();
         for (oid, data) in records {
             undone.oids.push(oid);
@@ -101,7 +120,61 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 undone.conflicts.push(conflict);
             }
         }
+        for change in &texts {
+            self.undo_text(tid, change)?;
+        }
         Ok(undone)
+    }
+
+    /// Stage the undo of the text delta `change` of the transaction `tid`.
+    fn undo_text(&mut self, tid: Tid, change: &TextChange) -> Result<()> {
+        let store: &Store = &self.store;
+        let (catalog, index) = (change.catalog, change.index.as_str());
+        let rid = change.rid.expect("a text delta has a rid");
+        let prefix = keys::text_prefix(catalog, index, rid);
+        // A clear delta of the index after `tid`, committed or staged here,
+        // empties the index. The undo never puts the document back.
+        let clear = keys::clear_prefix(catalog, index);
+        let from = keys::delta_key(&clear, tid);
+        let to = keys::delta_key(&clear, Tid::MAX);
+        let cleared = !store
+            .backend
+            .text_rows(Excluded(from.as_slice()), Included(to.as_slice()), 1)?
+            .is_empty();
+        if cleared || self.staged.text(&clear).is_some() {
+            return Err(refused(Some(catalog), undo::CLEARED_LATER));
+        }
+        // The text of the delta of `tid`, or `None` for an unindex.
+        let key = keys::delta_key(&prefix, tid);
+        let at = Included(key.as_slice());
+        let Some((_, frame)) = store.backend.text_rows(at, at, 1)?.pop() else {
+            return Err(ZoeError::CorruptTxn { tid });
+        };
+        let (_, undone) = crate::text::decode(&prefix, &key, &frame)?;
+        if keys::decode_payload(&undone).is_err() {
+            return Err(crate::text::corrupt(&prefix, &key));
+        }
+        let undone = (!undone.is_empty()).then_some(undone);
+        // The live text now, as this transaction sees it, and the snapshot
+        // of that read.
+        let (current, before) = match self.staged.text(&prefix) {
+            Some(staged) => {
+                let payload = self.staged.text_payload(staged)?;
+                (payload.map(|payload| payload.into_owned()), staged.before)
+            }
+            None => {
+                let snapshot = store.text_snapshot(Tid::MAX);
+                let live = store.live_payload(catalog, index, rid, snapshot)?;
+                (live, snapshot)
+            }
+        };
+        if current != undone {
+            return Err(refused(Some(catalog), undo::CHANGED_LATER));
+        }
+        let previous = store.live_payload(catalog, index, rid, tid)?;
+        let size = previous.as_ref().map_or(0, Vec::len);
+        let stored_bytes = self.check_text_size(&prefix, size, 0)?;
+        self.stage_text(prefix, previous.as_deref(), before, false, stored_bytes)
     }
 
     /// Return the error of an undo of `tid` whose reads failed with `error`.

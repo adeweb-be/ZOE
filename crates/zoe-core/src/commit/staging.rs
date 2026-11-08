@@ -408,6 +408,19 @@ impl Staging {
         self.texts.get(key)
     }
 
+    /// Return the bytes that the keys and the payloads of the deltas whose
+    /// keys start with `prefix` count toward the transaction size.
+    pub(crate) fn texts_bytes(&self, prefix: &[u8]) -> u64 {
+        self.texts
+            .range::<[u8], _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, staged)| (key.len() + staged.payload_len()) as u64)
+            .sum()
+    }
+
     /// Take the deltas whose keys start with `prefix` out of the staging.
     /// Return the bytes that their keys and payloads counted toward the
     /// transaction size.

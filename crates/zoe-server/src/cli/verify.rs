@@ -180,6 +180,7 @@ fn backup_to_json(check: &BackupCheck) -> Value {
         "blobs": restored.blobs,
         "sequences": restored.sequences,
         "durable_rows": restored.durable_rows,
+        "deltas": restored.deltas,
         "differences": check.differences,
     })
 }
@@ -215,6 +216,7 @@ fn write_backup_text(
             ("blobs", &restored.blobs),
             ("sequences", &restored.sequences),
             ("durable rows", &restored.durable_rows),
+            ("deltas", &restored.deltas),
         ],
     )?;
     writeln!(out, "Differences: {}", check.differences.len())?;
@@ -494,6 +496,7 @@ mod tests {
                 blobs: 2,
                 sequences: 1,
                 durable_rows: 0,
+                deltas: 0,
                 last_tid: Tid(0x10),
             },
             differences: vec!["the store lacks transaction 0x0000000000000010".to_owned()],

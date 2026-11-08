@@ -35,6 +35,11 @@
 //!    an oid count of 0 and keys in the transaction index is `CorruptTxn`,
 //!    and the pack stops before it removes it.
 //!
+//! A pack holds in memory the reachable oids of the mark, one batch of
+//! selected records or text deltas, the clear deltas that it removes, and
+//! `kept_tids`: one tid for each transaction at or before T that keeps a
+//! delta. For a large catalog that set can hold millions of tids.
+//!
 //! A finish during the pack writes records after T only, so the records
 //! that the mark reads do not change. Before each batch, under the commit
 //! sequencer, the pack reads the records that the finishes noted and marks
@@ -64,6 +69,25 @@
 //! It writes nothing. With no commit between them, the report of the dry
 //! run equals the report of the pack.
 //!
+//! The text deltas (ADR 0060, section 4) go in batches of their own,
+//! before the batches of the records. Pack keeps every delta after T. A
+//! text delta at or before T that is dead at T goes: it is before the
+//! newest clear delta of its index at or before T. Every clear delta of
+//! the index at or before T goes too. Of the other text deltas at or
+//! before T of one key, pack keeps the newest and removes the others, and
+//! it removes that newest one too when it is an unindex. With garbage
+//! collection, the deltas at or before T of a catalog that the mark does
+//! not reach go too. The batches remove the text deltas in key order, and
+//! the clear deltas in the last batch of the deltas, so a stop or a crash
+//! between two batches never brings a dead text delta back. Pack notes the
+//! tids of the deltas at or before T that it keeps, and a transaction row
+//! stays while it keeps a record or a delta. A delta whose frame fails
+//! stops the pack with `CorruptText`.
+//!
+//! The text indexes of the process hold a `PackCap` each. A pack packs at
+//! the lowest tid of the caps at most, so it never removes an unindex that
+//! a live text index has not applied.
+//!
 //! A store with `Options::pack_gc` false packs without garbage collection,
 //! as the `pack-gc` of FileStorage does. Such a pack has no mark and reads
 //! no reference. It keeps every record after T. Of each object, it keeps
@@ -74,24 +98,31 @@
 //! files of the blob files and the stop between batches stay the same. A
 //! dry run of such a store reports what such a pack removes.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Mutex, MutexGuard};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Bound::{Excluded, Unbounded};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
 
 use crate::backend::TxnMeta;
 use crate::error::{Result, ZoeError};
+use crate::format::text as keys;
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
 /// The oid of the root object.
 const ROOT: Oid = Oid(0);
 
-/// The number of records that `Store::pack` removes in one batch.
+/// The number of records, or of text deltas, that `Store::pack` removes
+/// in one batch.
 const BATCH: usize = 1000;
 
 /// The number of record keys that one read of the key scan asks for.
 const KEY_CHUNK: usize = 4096;
+
+/// The number of rows of `text_deltas` that one read of the scan of the
+/// deltas asks for.
+const DELTA_CHUNK: usize = 1024;
 
 /// What a pack removed. A dry run gives the same report for what a pack
 /// would remove.
@@ -112,6 +143,11 @@ pub struct PackReport {
     /// entry for each class, so it grows with the number of classes, not
     /// with the number of records.
     pub by_class: BTreeMap<String, ClassTotals>,
+    /// The number of text deltas that the pack removed, unindexes
+    /// included.
+    pub text_deltas: u64,
+    /// The number of clear deltas that the pack removed.
+    pub clear_deltas: u64,
 }
 
 impl PackReport {
@@ -143,6 +179,72 @@ pub(crate) struct PackState {
     /// The tid and the oids of each finish since the pack started. It is
     /// `None` when no pack runs.
     written: Mutex<Option<Noted>>,
+    /// The tid of each `PackCap` that a holder holds.
+    caps: Arc<Mutex<Caps>>,
+}
+
+/// The tids of the caps of the packs of one store, by id of the cap. The
+/// mutex of the caps is held with no other lock taken under it.
+#[derive(Debug, Default)]
+struct Caps {
+    next: u64,
+    tids: HashMap<u64, Tid>,
+}
+
+/// A cap of the packs of a store: while a holder holds it, a pack of the
+/// store packs at the tid of the cap at most. The holder moves the cap
+/// forward with `advance`, and the drop releases it.
+///
+/// A text index holds one (ADR 0060, section 4): a live index at the tid
+/// up to which it holds the deltas, a rebuild at the tid from which it
+/// reads them. So a pack never removes an unindex that the index has not
+/// applied.
+///
+/// A pack reads the caps when it starts, so a cap holds only the packs
+/// that start after it. A cap taken while a pack runs does not hold that
+/// pack: the pack can remove an unindex after the tid of the cap. The
+/// pack writes `pack_watermark` with or before its first removal. So the
+/// holder reads `Store::pack_watermark` again after it catches up, and
+/// rebuilds its index when the watermark is above the tid of its cap.
+#[derive(Debug)]
+pub struct PackCap {
+    caps: Arc<Mutex<Caps>>,
+    id: u64,
+}
+
+impl PackCap {
+    /// Move the cap forward to `tid`. A tid before the tid of the cap
+    /// changes nothing.
+    pub fn advance(&self, tid: Tid) {
+        if let Some(cap) = lock(&self.caps).tids.get_mut(&self.id) {
+            *cap = (*cap).max(tid);
+        }
+    }
+
+    /// Return the tid of the cap.
+    pub fn tid(&self) -> Tid {
+        lock(&self.caps)
+            .tids
+            .get(&self.id)
+            .copied()
+            .unwrap_or(Tid::ZERO)
+    }
+}
+
+impl Drop for PackCap {
+    fn drop(&mut self) {
+        lock(&self.caps).tids.remove(&self.id);
+    }
+}
+
+impl PackState {
+    /// Return the lower of `at` and the tid of each cap.
+    fn capped(&self, at: Tid) -> Tid {
+        lock(&self.caps)
+            .tids
+            .values()
+            .fold(at, |at, &cap| at.min(cap))
+    }
 }
 
 impl PackState {
@@ -164,9 +266,10 @@ impl PackState {
     }
 }
 
-/// Return the span of one batch of a pack that removes `records` records.
-fn batch_span(records: usize) -> tracing::Span {
-    tracing::info_span!("pack_batch", records)
+/// Return the span of one batch of a pack that removes `records` records
+/// and `deltas` deltas.
+fn batch_span(records: usize, deltas: usize) -> tracing::Span {
+    tracing::info_span!("pack_batch", records, deltas)
 }
 
 /// Lock `mutex`. A panic of another thread does not hide the state.
@@ -184,6 +287,23 @@ impl Drop for Noting<'_> {
 }
 
 impl Store {
+    /// Cap the packs of the store at `tid`: while the returned cap lives, a
+    /// pack that starts packs at the tid of the cap at most. The holder
+    /// moves the cap forward with `PackCap::advance` and releases it with
+    /// a drop. The cap does not hold a pack that runs already: `PackCap`
+    /// gives the duty of the holder.
+    pub fn pack_cap(&self, tid: Tid) -> PackCap {
+        let caps = Arc::clone(&self.packing.caps);
+        let id = {
+            let mut inner = lock(&caps);
+            let id = inner.next;
+            inner.next += 1;
+            inner.tids.insert(id, tid);
+            id
+        };
+        PackCap { caps, id }
+    }
+
     /// Pack the store at `at`: remove the records that no reader at or
     /// after `at` needs, and the objects that such a reader cannot reach.
     /// Return what the pack removed.
@@ -192,14 +312,16 @@ impl Store {
     /// reader can reach. It removes only the old revisions, and the
     /// objects whose newest record at or before `at` is a deletion.
     ///
-    /// This is `pack_in_batches` with batches of 1,000 records and
-    /// nothing between them.
+    /// This is `pack_in_batches` with batches of 1,000 records or text
+    /// deltas and nothing between them.
     pub fn pack(&self, at: Tid) -> Result<PackReport> {
         self.pack_in_batches(at, BATCH, || {})
     }
 
     /// Pack the store at `at`, as `pack` does, in batches of at most
-    /// `batch` records. `between` runs after each batch. It runs without
+    /// `batch` records or text deltas, and one last batch of the deltas
+    /// with every clear delta that it removes. `between` runs after each
+    /// batch. It runs without
     /// the commit sequencer and without a backend transaction, so reads
     /// and commits can run then. Only a second pack or a dry run waits.
     /// Readers and commits continue during the whole pack.
@@ -239,8 +361,9 @@ impl Store {
         self.pack_or_stop(at, BATCH, stop)
     }
 
-    /// Pack the store at `at` in batches of at most `batch` records. After
-    /// each batch, stop with `Closed` when `stop` returns true.
+    /// Pack the store at `at` in batches of at most `batch` records or text
+    /// deltas, as `pack_in_batches` does. After each batch, stop with
+    /// `Closed` when `stop` returns true.
     fn pack_or_stop(
         &self,
         at: Tid,
@@ -253,6 +376,7 @@ impl Store {
             let sequencer = self.lock_sequencer();
             let last = (*sequencer).ok_or(ZoeError::Halted)?;
             let watermark = self.backend.pack_watermark()?;
+            let at = self.packing.capped(at);
             if at < watermark {
                 return Ok(PackReport::default());
             }
@@ -266,15 +390,37 @@ impl Store {
         self.backend.fold(last)?;
         let mut pack = Pack::new(self, tid, (tid > watermark).then_some(tid));
         pack.mark_roots(last)?;
+        // The deltas first, the text deltas in key order, then the clear
+        // deltas in the last batch of the deltas.
+        loop {
+            let removals = pack.plan_deltas(batch.max(1))?;
+            if removals.is_empty() {
+                break;
+            }
+            batch_span(0, removals.len()).in_scope(|| pack.remove_deltas(removals))?;
+            if stop() {
+                return Err(ZoeError::Closed);
+            }
+        }
+        // The clear deltas need no bound: a clear empties a whole index,
+        // so a store has few of them, and the store keeps them in memory.
+        // One batch removes every clear only after every dead text.
+        let clears = std::mem::take(&mut pack.deltas.clears);
+        if !clears.is_empty() {
+            batch_span(0, clears.len()).in_scope(|| pack.remove_deltas(clears))?;
+            if stop() {
+                return Err(ZoeError::Closed);
+            }
+        }
         loop {
             let removals = pack.plan(batch.max(1))?;
             if removals.is_empty() {
                 if pack.watermark.is_some() {
-                    batch_span(0).in_scope(|| pack.remove(Vec::new()))?;
+                    batch_span(0, 0).in_scope(|| pack.remove(Vec::new()))?;
                 }
                 break;
             }
-            batch_span(removals.len()).in_scope(|| pack.remove(removals))?;
+            batch_span(removals.len(), 0).in_scope(|| pack.remove(removals))?;
             if stop() {
                 return Err(ZoeError::Closed);
             }
@@ -303,8 +449,9 @@ impl Store {
     /// lock, so one waits for the other.
     ///
     /// The dry run holds the reachable oids of the mark, as a pack does,
-    /// one batch of selected records and the report. The report has one
-    /// entry for each class.
+    /// one batch of selected records or text deltas, the tids of the kept
+    /// deltas, the clear deltas that it selects, and the report. The
+    /// report has one entry for each class.
     ///
     /// A record that the mark reads and that does not decode fails the dry
     /// run with `Format`. A record that fails its checksum fails it with
@@ -312,11 +459,22 @@ impl Store {
     pub fn pack_dry_run(&self, at: Tid) -> Result<PackReport> {
         let _running = lock(&self.packing.running);
         let last = (*self.lock_sequencer()).ok_or(ZoeError::Halted)?;
+        let at = self.packing.capped(at);
         if at < self.backend.pack_watermark()? {
             return Ok(PackReport::default());
         }
         let mut pack = Pack::new(self, at.min(last), None);
         pack.mark_roots(last)?;
+        loop {
+            let planned = pack.plan_deltas(BATCH)?;
+            if planned.is_empty() {
+                break;
+            }
+            let removed = pack.confirm_deltas(planned);
+            pack.account_deltas(&removed);
+        }
+        let clears = std::mem::take(&mut pack.deltas.clears);
+        pack.account_deltas(&clears);
         loop {
             let planned = pack.plan(BATCH)?;
             if planned.is_empty() {
@@ -366,7 +524,55 @@ struct Pack<'s> {
     cursor: Option<(Oid, Tid)>,
     /// The watermark that the next batch writes, if it must write one.
     watermark: Option<Tid>,
+    /// The scan of the deltas.
+    deltas: DeltaScan,
+    /// The tids of the deltas at or before T that the pack keeps. A row of
+    /// these tids stays, also when it keeps no record.
+    kept_tids: HashSet<Tid>,
     report: PackReport,
+}
+
+/// One delta that a batch removes, or that a dry run reports.
+struct DeltaRemoval {
+    /// The key of the delta in `text_deltas`.
+    key: Vec<u8>,
+    /// The catalog of the delta.
+    catalog: Oid,
+    tid: Tid,
+    /// True for a clear delta.
+    clear: bool,
+    /// True when the rules of the deltas remove it whatever the mark. When
+    /// false, the delta goes only because the mark does not reach its
+    /// catalog, and it stays when a finish links the catalog again.
+    by_rules: bool,
+}
+
+/// The key without its tid of the text deltas that the scan reads, and
+/// their rows at or before T, from the oldest: the tid, and true for an
+/// unindex.
+type Group = (Vec<u8>, Vec<(Tid, bool)>);
+
+/// The scan of the deltas of a pack, in key order of `text_deltas`.
+#[derive(Default)]
+struct DeltaScan {
+    /// The key of the last row that the scan read, or `None` before the
+    /// first read.
+    from: Option<Vec<u8>>,
+    /// True when the scan read the last row.
+    done: bool,
+    /// The catalog of the rows that the scan reads.
+    catalog: Option<Oid>,
+    /// The tid of the newest clear delta at or before T of each index of
+    /// that catalog, by index id. The clear deltas of a catalog sort before
+    /// its text deltas, so the scan reads them first.
+    newest_clears: HashMap<Vec<u8>, Tid>,
+    /// The text deltas of one key that the scan reads.
+    group: Option<Group>,
+    /// The text deltas that the scan selected and that no batch took yet,
+    /// in key order.
+    pending: VecDeque<DeltaRemoval>,
+    /// The clear deltas that the last batch of the deltas removes.
+    clears: Vec<DeltaRemoval>,
 }
 
 impl<'s> Pack<'s> {
@@ -381,6 +587,8 @@ impl<'s> Pack<'s> {
             written: HashSet::new(),
             cursor: Some((Oid(0), Tid::ZERO)),
             watermark,
+            deltas: DeltaScan::default(),
+            kept_tids: HashSet::new(),
             report: PackReport::default(),
         }
     }
@@ -646,8 +854,9 @@ impl<'s> Pack<'s> {
             }
             for (row, left) in rows {
                 // The row at T stays: a later backup and the clients name
-                // the last tid of a pack at the last tid.
-                if left == 0 && row.tid != self.tid {
+                // the last tid of a pack at the last tid. A row that keeps
+                // a delta stays too.
+                if left == 0 && row.tid != self.tid && !self.kept_tids.contains(&row.tid) {
                     write.remove_txn(row.tid)?;
                 } else {
                     write.replace_txn(&TxnMeta {
@@ -670,9 +879,10 @@ impl<'s> Pack<'s> {
     }
 
     /// Remove the transaction rows from `from` to the tid before T whose
-    /// oid count is 0, at most `batch` of them, in one backend write under
-    /// the commit sequencer. The row at T stays. Return the tid from which
-    /// the next call goes on, or `None` when no such row is left.
+    /// oid count is 0 and that keep no delta, at most `batch` of them, in
+    /// one backend write under the commit sequencer. The row at T stays.
+    /// Return the tid from which the next call goes on, or `None` when no
+    /// such row is left.
     ///
     /// Only this pack changes the rows at or before T, so a read outside
     /// the write gives the current rows. A row that does not read stops
@@ -688,7 +898,7 @@ impl<'s> Pack<'s> {
         let mut next = None;
         for row in backend.iter_txns(from, before) {
             let row = row?;
-            if row.oid_count == 0 {
+            if row.oid_count == 0 && !self.kept_tids.contains(&row.tid) {
                 if !backend.indexed_tids(row.tid, row.tid, 1)?.is_empty() {
                     return Err(ZoeError::CorruptTxn { tid: row.tid });
                 }
@@ -720,6 +930,198 @@ impl<'s> Pack<'s> {
             return Err(error);
         }
         Ok(next)
+    }
+
+    /// Select the next text deltas to remove, at most `batch` of them, in
+    /// key order. Note the clear deltas that the last batch of the deltas
+    /// removes, and the tids of the deltas at or before T that stay.
+    ///
+    /// A delta after T stays. A text delta at or before T before the
+    /// newest clear delta of its index at or before T is dead, and goes.
+    /// Every clear delta at or before T goes. Of the other text deltas at
+    /// or before T of one key, the newest stays, unless it is an unindex,
+    /// and the others go. With garbage collection, each delta at or before
+    /// T of a catalog that the mark does not reach goes.
+    ///
+    /// A key or a frame that fails, at or before T, is `CorruptText`.
+    fn plan_deltas(&mut self, batch: usize) -> Result<Vec<DeltaRemoval>> {
+        let mut removals = Vec::new();
+        loop {
+            while removals.len() < batch {
+                match self.deltas.pending.pop_front() {
+                    Some(removal) => removals.push(removal),
+                    None => break,
+                }
+            }
+            if removals.len() == batch {
+                return Ok(removals);
+            }
+            if self.deltas.done {
+                self.end_group();
+                if self.deltas.pending.is_empty() {
+                    return Ok(removals);
+                }
+                continue;
+            }
+            let from = match &self.deltas.from {
+                Some(key) => Excluded(key.as_slice()),
+                None => Unbounded,
+            };
+            let rows = self.store.backend.text_rows(from, Unbounded, DELTA_CHUNK)?;
+            self.deltas.done = rows.len() < DELTA_CHUNK;
+            for (key, frame) in &rows {
+                self.scan_delta(key, frame)?;
+            }
+            if let Some((last, _)) = rows.into_iter().last() {
+                self.deltas.from = Some(last);
+            }
+        }
+    }
+
+    /// Read the row `key` of `text_deltas`, whose stored frame is `frame`,
+    /// for `plan_deltas`.
+    fn scan_delta(&mut self, key: &[u8], frame: &[u8]) -> Result<()> {
+        let (parts, prefix, tid) =
+            keys::split_key(key).ok_or_else(|| crate::text::corrupt_key(key))?;
+        if self.deltas.catalog != Some(parts.catalog) {
+            self.end_group();
+            self.deltas.catalog = Some(parts.catalog);
+            self.deltas.newest_clears.clear();
+        }
+        let same = matches!(&self.deltas.group, Some((group, _)) if group == prefix);
+        if !same {
+            self.end_group();
+        }
+        if tid > self.tid {
+            return Ok(());
+        }
+        let (_, payload) = crate::text::decode(prefix, key, frame)?;
+        let index = parts.index.as_bytes().to_vec();
+        match parts.rid {
+            None => {
+                if !payload.is_empty() {
+                    return Err(crate::text::corrupt(prefix, key));
+                }
+                self.deltas.newest_clears.insert(index, tid);
+                self.deltas.clears.push(DeltaRemoval {
+                    key: key.to_vec(),
+                    catalog: parts.catalog,
+                    tid,
+                    clear: true,
+                    by_rules: true,
+                });
+            }
+            Some(_) => {
+                if keys::decode_payload(&payload).is_err() {
+                    return Err(crate::text::corrupt(prefix, key));
+                }
+                let (_, rows) = self
+                    .deltas
+                    .group
+                    .get_or_insert_with(|| (prefix.to_vec(), Vec::new()));
+                rows.push((tid, payload.is_empty()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Select what goes of the text deltas of the key that the scan read,
+    /// and note the tid of the delta that stays.
+    fn end_group(&mut self) {
+        let Some((prefix, rows)) = self.deltas.group.take() else {
+            return;
+        };
+        let parts = keys::split_prefix(&prefix).expect("the scan read the key");
+        let catalog = parts.catalog;
+        let clear = self
+            .deltas
+            .newest_clears
+            .get(parts.index.as_bytes())
+            .copied();
+        // The newest text delta that the clear does not hide stays, unless
+        // it is an unindex.
+        let kept = rows
+            .last()
+            .filter(|&&(tid, unindex)| clear.is_none_or(|clear| tid >= clear) && !unindex)
+            .map(|&(tid, _)| tid);
+        let unreached = self.gc && !self.reachable.contains(&catalog);
+        for (tid, _) in rows {
+            let by_rules = kept != Some(tid);
+            if by_rules || unreached {
+                self.deltas.pending.push_back(DeltaRemoval {
+                    key: keys::delta_key(&prefix, tid),
+                    catalog,
+                    tid,
+                    clear: false,
+                    by_rules,
+                });
+            } else {
+                self.kept_tids.insert(tid);
+            }
+        }
+    }
+
+    /// Return the deltas of `planned` that the pack removes. A finish can
+    /// link a catalog again after the plan. The mark then reaches it, and
+    /// its deltas that only the mark removed stay.
+    fn confirm_deltas(&mut self, planned: Vec<DeltaRemoval>) -> Vec<DeltaRemoval> {
+        let mut removed = Vec::with_capacity(planned.len());
+        for removal in planned {
+            if !removal.by_rules && self.reachable.contains(&removal.catalog) {
+                self.kept_tids.insert(removal.tid);
+            } else {
+                removed.push(removal);
+            }
+        }
+        removed
+    }
+
+    /// Remove `removals` in one backend write transaction under the commit
+    /// sequencer, as `remove` removes records.
+    fn remove_deltas(&mut self, removals: Vec<DeltaRemoval>) -> Result<()> {
+        let store = self.store;
+        // Most of the marking happens here, outside the commit sequencer.
+        self.mark_written()?;
+        let removed = {
+            let mut sequencer = store.lock_sequencer();
+            if sequencer.is_none() {
+                return Err(ZoeError::Halted);
+            }
+            // No finish runs from here to the commit below.
+            self.mark_written()?;
+            let removed = self.confirm_deltas(removals);
+            let written = (|| {
+                let mut write = store.backend.begin_write()?;
+                for removal in &removed {
+                    write.remove_text(&removal.key)?;
+                }
+                if let Some(watermark) = self.watermark {
+                    write.put_pack_watermark(watermark)?;
+                }
+                write.commit()
+            })();
+            if let Err(error) = written {
+                // The outcome of the write is unknown, as for a batch of
+                // records.
+                *sequencer = None;
+                return Err(error);
+            }
+            self.watermark = None;
+            removed
+        };
+        self.account_deltas(&removed);
+        Ok(())
+    }
+
+    /// Add the deltas `removed` to the report.
+    fn account_deltas(&mut self, removed: &[DeltaRemoval]) {
+        for removal in removed {
+            if removal.clear {
+                self.report.clear_deltas += 1;
+            } else {
+                self.report.text_deltas += 1;
+            }
+        }
     }
 
     /// Add `removed` to the report.

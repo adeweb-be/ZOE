@@ -228,17 +228,18 @@ class TestTheCatalogMirror(unittest.TestCase):
         self.assertEqual(counts["fallbacks"][("index", "client")], 2)
         self.assertEqual(counts["fallbacks"][("sort", "client")], 1)
 
-    def test_a_search_after_a_change_of_the_catalog_takes_transaction(self):
+    def test_a_search_after_a_change_of_the_catalog_stays_native(self):
         with opened(self.db) as site:
             site["item-0"].setTitle("Changed")
             site["item-0"].reindexObject()
+            native = catalog._counts_now()["queries"].get("native", 0)
             found = site.portal_catalog.unrestrictedSearchResults(
                 sortable_title="changed"
             )
             self.assertEqual(len(found), 1)
-        self.assertEqual(
-            catalog._counts_now()["fallbacks"][("transaction", "client")], 1
-        )
+        counts = catalog._counts_now()
+        self.assertEqual(counts["queries"].get("native", 0), native + 1)
+        self.assertEqual(counts["fallbacks"].get(("transaction", "client"), 0), 0)
 
     def test_compare_finds_no_mismatch_and_logs_a_planted_one(self):
         catalog._installed["mode"] = "compare"
