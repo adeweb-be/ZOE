@@ -317,13 +317,15 @@ pub struct Read {
 
 /// Reads the records of a commit against the version of `base` with
 /// `overrides`. `objects` holds the pickles of the catalog object and of
-/// the mirrored index objects that the build read.
-pub fn read_records(
+/// the mirrored index objects that the build read. Each record is read
+/// once, so the read takes a time in proportion to the records, whatever
+/// their order.
+pub fn read_records<D: AsRef<[u8]>>(
     base: &Base,
     overrides: &Overrides,
     shapes: &Shapes,
     objects: &HashMap<u64, Vec<u8>>,
-    records: &[(u64, Option<Vec<u8>>)],
+    records: &[(u64, Option<D>)],
 ) -> Read {
     let mut out = Read::default();
     let mut edits = ShapeEdits::default();
@@ -340,27 +342,37 @@ pub fn read_records(
     let mut old_ranges: BTreeMap<Slot, Vec<(i64, i64)>> = BTreeMap::new();
     // The children that left a changed inner node.
     let mut gone: Vec<(Slot, u64)> = Vec::new();
-    let mut done = vec![false; records.len()];
-    // A changed inner node names its new buckets, which can come before it
-    // in the commit: read until no record is left to read.
-    loop {
-        let mut progress = false;
-        for (i, (oid, data)) in records.iter().enumerate() {
-            if done[i] {
-                continue;
-            }
+    // The places of the records of each oid.
+    let mut places: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, (oid, _)) in records.iter().enumerate() {
+        places.entry(*oid).or_default().push(i);
+    }
+    // The records to read: first those of the oids that the mirror owns. A
+    // changed inner node names its new buckets, which can come before it
+    // in the commit: their records join the queue when the node is read.
+    let mut queued = vec![false; records.len()];
+    let mut queue: std::collections::VecDeque<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, (oid, _))| shapes.owners.contains_key(oid))
+        .map(|(i, _)| i)
+        .collect();
+    for i in &queue {
+        queued[*i] = true;
+    }
+    {
+        while let Some(i) = queue.pop_front() {
+            let (oid, data) = &records[i];
             let Some(who) = owner(&edits, *oid) else {
                 continue;
             };
-            done[i] = true;
-            progress = true;
             out.records += 1;
-            let Some(data) = data else {
+            let Some(data) = data.as_ref().map(AsRef::as_ref) else {
                 out.stale = Some(format!("the commit deletes the object {oid:#x}"));
                 continue;
             };
             if matches!(who, Owner::Catalog | Owner::IndexObject(_)) {
-                if objects.get(oid) != Some(data) {
+                if objects.get(oid).map(Vec::as_slice) != Some(data) {
                     out.stale = Some(match who {
                         Owner::IndexObject(i) => {
                             format!("the commit changes the index {}", base.indexes[i].name)
@@ -415,6 +427,12 @@ pub fn read_records(
                             for child in &children {
                                 if owner(&edits, *child).is_none() {
                                     edits.owners.insert(*child, Owner::Node(slot));
+                                    for j in places.get(child).into_iter().flatten() {
+                                        if !queued[*j] {
+                                            queued[*j] = true;
+                                            queue.push_back(*j);
+                                        }
+                                    }
                                 }
                             }
                             // A child that left the node may have moved to
@@ -471,9 +489,6 @@ pub fn read_records(
                     }
                 }
             }
-        }
-        if !progress {
-            break;
         }
     }
     // A child that an inner node of the commit names moved, and keeps its

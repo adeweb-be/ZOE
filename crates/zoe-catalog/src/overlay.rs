@@ -18,7 +18,9 @@
 //! applied. A commit after the tid of the query can have changed the shape
 //! of a node of the overlay. The shapes keep the tid of the last change of
 //! each node, so the read refuses such a node (`overlay`): the shape at the
-//! tid of the query is not known.
+//! tid of the query is not known. The thread forgets the changes at or
+//! before the floor of the versions, so a query at a tid before the floor
+//! that it pruned at is refused too.
 //!
 //! On the wire, an overlay is nil or `[[oid, pickle]...]`: each oid is a
 //! bin of 8 bytes, each pickle a bin.
@@ -67,9 +69,11 @@ pub fn decode(value: &Value) -> Result<Option<Records>, String> {
     Ok(Some(out))
 }
 
-/// The bytes that the records of an overlay take, estimated.
+/// The bytes that the host holds for the records of an overlay during its
+/// query, estimated: two copies of each pickle (the value of the call and
+/// the records), and the oid of each.
 pub fn heap_bytes(records: &[(u64, Vec<u8>)]) -> usize {
-    records.iter().map(|(_, p)| p.len() + 32).sum()
+    records.iter().map(|(_, p)| 2 * p.len() + 48).sum()
 }
 
 /// The overrides of the version of `base` with `over` at the tid `v`, with
@@ -100,9 +104,9 @@ pub fn read(
             ));
         }
     }
-    let records: Vec<(u64, Option<Vec<u8>>)> = records
+    let records: Vec<(u64, Option<&[u8]>)> = records
         .iter()
-        .map(|(oid, pickle)| (*oid, Some(pickle.clone())))
+        .map(|(oid, pickle)| (*oid, Some(pickle.as_slice())))
         .collect();
     let read = read_records(base, over, shapes, objects, &records);
     if let Some(why) = read.stale {

@@ -23,11 +23,18 @@ records of its savepoint storage that no registered object replaces, and
 the new objects that they reach. A new object that no savepoint stored has
 no oid, so the hook names it with a provisional oid: the high bit set, then
 a counter of the overlay. The hook pickles copies of the states with
-ZODB's `ObjectWriter` and changes no object: a new object gets no oid and
-no jar. It sends every record, with no filter, and pickles the overlay
-again for each search. A plan and an overlay that pass the cap of a call,
-50,000 msgpack values or 16 MiB, take the Python path (`too_large`). An
-overlay that the hook cannot pickle takes the Python path (`overlay`).
+ZODB's `ObjectWriter` and changes no object: a new object, and a weak
+reference to a new object, get no oid and no jar; the stock writer sees
+only the objects that it does not change. It sends every record, with no
+filter, and pickles the overlay again for each search. A plan and an
+overlay that pass the cap of a call, 50,000 msgpack values or 16 MiB, take
+the Python path (`too_large`): the hook counts the records before any
+pickle, and stops as soon as the overlay passes the cap. An object that the
+hook cannot name without a change to it (a weak reference to an object of
+another database, a persistent class without an oid), and an overlay that
+does not pickle, take the Python path (`overlay`); the second goes to the
+log once for each class. A `ConflictError` and a `POSKeyError` of a pickle
+go on to the caller.
 
 The brains. The plan names the columns of the `schema` of the catalog, in
 the order of their positions (`cols`), and the number of rids that get
@@ -422,22 +429,30 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     plan, reason = plan_of(catalog, query, sort_index, reverse, limit, merge)
     if plan is None:
         return None, reason, None
+    from ZODB.POSException import ConflictError, POSKeyError, StorageError, Unsupported
+
     overlay = None
     if jar._registered_objects or _savepoint_records(jar):
+        # Each brain of a result over an overlay comes from
+        # `Catalog.__getitem__`.
+        cols, rn = plan["cols"], plan["rn"]
+        plan["cols"], plan["rn"] = None, 0
         try:
             overlay = _overlay(jar)
-        except Exception:
-            logger.debug("catalog mirror: the overlay does not pickle", exc_info=True)
+        except _TooLarge:
+            return None, "too_large", plan
+        except _Unsure:
             return None, "overlay", plan
-    if overlay:
-        # Each brain of the result comes from `Catalog.__getitem__`.
-        plan["cols"] = None
-        plan["rn"] = 0
-    else:
-        overlay = None
+        except (ConflictError, POSKeyError):
+            raise
+        except Exception as e:
+            _log_once(e, "the transaction overlay does not pickle")
+            return None, "overlay", plan
+        if not overlay:
+            overlay = None
+            plan["cols"], plan["rn"] = cols, rn
     if _too_large(plan, overlay):
         return None, "too_large", plan
-    from ZODB.POSException import StorageError, Unsupported
 
     try:
         reply = storage.catalog_query(oid, start, plan, overlay)
@@ -446,28 +461,37 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
         # after a failover, or the connection is lost. The stock search
         # answers. A plan of another form raises `ValueError`, a fault of
         # the hook, which goes on.
-        _log_once(e)
+        _log_once(e, "catalog_query failed")
         return None, "unsupported", plan
     if "f" in reply:
         return None, None, plan
     return _result(catalog, reply, jar, start, overlay is None), None, plan
 
 
-def _log_once(error):
-    """Log an error of `catalog_query`, once for each class in the
-    process."""
+def _log_once(error, what):
+    """Log an error that the hook caught, with `what` it was doing, once for
+    each class and each `what` in the process."""
     cls = type(error)
     name = f"{cls.__module__}.{cls.__qualname__}"
     with _counts_lock:
-        if name in _logged:
+        if (what, name) in _logged:
             return
-        _logged.add(name)
+        _logged.add((what, name))
     logger.warning(
-        "catalog mirror: catalog_query failed with %s: %s; the search takes the"
-        " Python path",
+        "catalog mirror: %s with %s: %s; the search takes the Python path",
+        what,
         name,
         error,
     )
+
+
+class _TooLarge(Exception):
+    """The overlay passes the cap of a call."""
+
+
+class _Unsure(Exception):
+    """The overlay holds an object that the hook cannot name without a
+    change to it."""
 
 
 def _overlay(jar):
@@ -475,30 +499,51 @@ def _overlay(jar):
     pickle)` pairs of bytes. It holds the pickles of the objects that the
     Connection registered and that changed, the records of its savepoint
     storage that no registered object replaces, and the new objects that
-    they reach, with provisional oids. It changes no object."""
-    writer = _overlay_writer()(jar)
-    records = []
-    seen = set()
+    they reach, with provisional oids. It changes no object.
+
+    The count of the records comes before any pickle, and the pickles stop
+    as soon as the overlay alone passes the cap of a call: then it raises
+    `_TooLarge`. So a search does at most the work of one cap. An object
+    that the hook cannot name without a change to it raises `_Unsure`."""
+    changed = {}
     for obj in list(jar._registered_objects):
         oid = obj._p_oid
         # As `Connection._commit`: an object of another jar fails the commit,
         # and an object that is no longer changed stores nothing.
-        if obj._p_jar is not jar or oid in seen:
+        if obj._p_jar is not jar or oid in changed:
             continue
         if oid not in jar._added and not obj._p_changed:
             continue
-        seen.add(oid)
-        records.append((bytes(oid), writer.serialize(obj)))
-    while writer.pending:
-        oid, obj = writer.pending.pop()
-        records.append((oid, writer.serialize(obj)))
+        changed[oid] = obj
     savepoint = getattr(jar, "_savepoint_storage", None)
-    if savepoint is not None:
-        for oid in list(savepoint.index):
-            if oid in seen:
-                continue
-            data, _ = savepoint.load(oid)
-            records.append((bytes(oid), bytes(data)))
+    kept = [oid for oid in savepoint.index if oid not in changed] if savepoint else []
+    # The array of the overlay, then three values for each record: its
+    # array, its oid and its pickle.
+    values = _CAP_VALUES - 1 - 3 * (len(changed) + len(kept))
+    size = _CAP_BYTES - 5
+    if values < 0 or size < 0:
+        raise _TooLarge()
+    records = []
+
+    def take(oid, data):
+        nonlocal size
+        size -= 16 + len(data)
+        if size < 0:
+            raise _TooLarge()
+        records.append((oid, data))
+
+    writer = _overlay_writer()(jar)
+    for oid, obj in changed.items():
+        take(bytes(oid), writer.serialize(obj))
+        while writer.pending:
+            values -= 3
+            if values < 0:
+                raise _TooLarge()
+            new, obj = writer.pending.pop()
+            take(new, writer.serialize(obj))
+    for oid in kept:
+        data, _ = savepoint.load(oid)
+        take(bytes(oid), bytes(data))
     return records
 
 
@@ -507,6 +552,7 @@ def _overlay_writer():
     """The class of the writer of an overlay, made at its first use, so the
     import of the module imports no ZODB."""
     from persistent import Persistent
+    from persistent.wref import WeakRef
     from ZODB.serialize import ObjectWriter, binary
     from ZODB.utils import p64
 
@@ -520,17 +566,39 @@ def _overlay_writer():
             self.pending = []
             self._new = {}
 
+        def provisional(self, obj):
+            """The provisional oid of the new object `obj`."""
+            found = self._new.get(id(obj))
+            if found is not None:
+                return found[0]
+            oid = binary(p64(_PROVISIONAL | (len(self._new) + 1)))
+            # The entry keeps the object alive, so no other object takes
+            # its id.
+            self._new[id(obj)] = (oid, obj)
+            self.pending.append((bytes(oid), obj))
+            return oid
+
         def persistent_id(self, obj):
+            # The stock `persistent_id` gives an oid and a jar to an object
+            # without an oid, and an oid to a weak reference without one.
+            # So it sees only the objects that it does not change.
+            if isinstance(obj, WeakRef):
+                if obj.oid is not None:
+                    return super().persistent_id(obj)
+                target = obj()
+                if target is None:
+                    raise _Unsure()
+                if getattr(target, "_p_oid", None) is None:
+                    return ["w", (self.provisional(target),)]
+                if target._p_jar is self._jar:
+                    return ["w", (binary(target._p_oid),)]
+                raise _Unsure()
+            if isinstance(obj, type):
+                if getattr(obj, "_p_oid", 0) is None:
+                    raise _Unsure()
+                return super().persistent_id(obj)
             if isinstance(obj, Persistent) and obj._p_oid is None:
-                found = self._new.get(id(obj))
-                if found is None:
-                    oid = binary(p64(_PROVISIONAL | (len(self._new) + 1)))
-                    # The entry keeps the object alive, so no other object
-                    # takes its id.
-                    self._new[id(obj)] = (oid, obj)
-                    self.pending.append((bytes(oid), obj))
-                else:
-                    oid = found[0]
+                oid = self.provisional(obj)
                 if hasattr(type(obj), "__getnewargs__"):
                     return oid
                 return oid, type(obj)

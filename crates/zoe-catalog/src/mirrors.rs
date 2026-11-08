@@ -25,7 +25,10 @@
 //! A query can carry a transaction overlay (`overlay`): the mirror reads it
 //! over the version of the query, with the shapes of the trees that the
 //! thread keeps, for that query only. The bound counts the overlays of the
-//! queries that run.
+//! queries that run: an overlay that does not fit beside the mirrors and
+//! the other overlays takes the Python path (`overlay`). An overlay never
+//! makes the bound drop a mirror, and a build, a rebase or a growth does
+//! not count the overlays.
 //!
 //! The thread holds a share of the store only while it works, so the store
 //! can close between two passes, and a build takes a share for each read.
@@ -112,6 +115,9 @@ pub struct Hooks {
     pub before_apply: Option<Hook>,
     /// Before a rebase lays its new base, with the oid of the catalog.
     pub before_swap: Option<Hook>,
+    /// Before a query reads its overlay, after it took its version, with
+    /// the oid of the catalog.
+    pub before_overlay: Option<Hook>,
 }
 
 /// The state of one mirror, as `status` gives it.
@@ -444,7 +450,7 @@ impl Mirrors {
         let mut held = Held { shared, bytes: 0 };
         let (snapshot, maint, at) = {
             let mut inner = shared.lock();
-            let found = loop {
+            loop {
                 let answers = inner.answers + 1;
                 let Some(entry) = inner.entries.get_mut(&catalog) else {
                     return Err(Fallback::new(
@@ -497,19 +503,7 @@ impl Mirrors {
                     .wait_timeout(inner, deadline - now)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
-            };
-            if let Some(records) = overlay {
-                let bytes = overlay::heap_bytes(records);
-                if !shared.room(&mut inner, Some(catalog), bytes) {
-                    return Err(Fallback::new(
-                        Reason::Overlay,
-                        "the overlay passes catalog-memory",
-                    ));
-                }
-                inner.overlays += bytes;
-                held.bytes = bytes;
             }
-            found
         };
         let answer = catch_unwind(AssertUnwindSafe(|| {
             let (base, over) = snapshot.resolve();
@@ -517,7 +511,33 @@ impl Mirrors {
             let over = match (overlay, &maint) {
                 (None, _) => over,
                 (Some(records), Some(maint)) => {
+                    // The bound counts the records and the copy of the
+                    // overrides that the overlay makes. An overlay that does
+                    // not fit drops no mirror.
+                    let bytes = overlay::heap_bytes(records) + over.heap_bytes();
+                    {
+                        let mut inner = shared.lock();
+                        if !shared.fits(&inner, bytes) {
+                            return Err(Fallback::new(
+                                Reason::Overlay,
+                                "the overlay passes catalog-memory",
+                            ));
+                        }
+                        inner.overlays += bytes;
+                        held.bytes = bytes;
+                    }
+                    if let Some(hook) = &shared.config.hooks.before_overlay {
+                        hook(catalog);
+                    }
                     let m = read(maint);
+                    // The thread forgot the shape changes at or before the
+                    // floor that it pruned at.
+                    if at < m.pruned {
+                        return Err(Fallback::new(
+                            Reason::Overlay,
+                            "the mirror forgot the shape changes after the tid",
+                        ));
+                    }
                     let with =
                         overlay::read(&base, &over, &m.shapes, &m.objects, &m.moved, at, records);
                     drop(m);
@@ -685,13 +705,20 @@ impl Shared {
         }
     }
 
+    /// Tells if the bound has room for an overlay of `bytes` beside the
+    /// mirrors and the overlays of the running queries. It never drops a
+    /// mirror.
+    fn fits(&self, inner: &Inner, bytes: usize) -> bool {
+        let used: usize = inner.entries.values().map(|e| e.bytes).sum();
+        used + inner.overlays + bytes <= self.config.memory
+    }
+
     /// Tells if the bound has room for `extra` more bytes, after it dropped
     /// the mirrors that answered least recently. `keep` is a mirror that
     /// the bound does not drop.
     fn room(&self, inner: &mut Inner, keep: Option<u64>, extra: usize) -> bool {
         loop {
-            let used: usize =
-                inner.entries.values().map(|e| e.bytes).sum::<usize>() + inner.overlays + extra;
+            let used: usize = inner.entries.values().map(|e| e.bytes).sum::<usize>() + extra;
             if used <= self.config.memory {
                 return true;
             }

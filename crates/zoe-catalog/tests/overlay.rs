@@ -9,14 +9,16 @@
 //! the change sets nor the base, and a query without it gives the answer
 //! without it.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
 use zoe_catalog::build::build;
+use zoe_catalog::mirrors::Hook;
 use zoe_catalog::overlay::{PROVISIONAL, is_provisional};
 use zoe_catalog::query::View;
-use zoe_catalog::testing::{self, CatalogModel, IndexKind};
+use zoe_catalog::testing::{self, CatalogModel, IO, IndexKind, TreeRecord, tree_record};
 use zoe_catalog::value::Val;
 use zoe_catalog::{
     Columns, Config, Mirrors, Opener, Plan, Reads, Reason, Reply, Status, Wire, decode_request,
@@ -364,5 +366,157 @@ fn a_node_whose_shape_a_later_commit_changed_gives_overlay() {
     let (plan, columns) = &plans()[0];
     let found = mirrors.query_overlay(catalog, first + 1, plan, columns, &records);
     assert_eq!(found.map_err(|f| f.reason), Err(Reason::Overlay));
+    mirrors.stop();
+}
+
+fn mirrors_with(store: &Arc<Store>, config: Config) -> Mirrors {
+    let weak = Arc::downgrade(store);
+    let open: Opener = Arc::new(move || weak.upgrade().map(|s| s as Arc<dyn Reads>));
+    Mirrors::start(open, store.last_transaction().0, config)
+}
+
+#[test]
+fn an_overlay_that_does_not_fit_takes_overlay_and_drops_no_mirror() {
+    let store = store();
+    let mut a = CatalogModel::new(10, &KINDS, &COLUMNS);
+    let mut b = CatalogModel::new(100_000, &KINDS, &COLUMNS);
+    for i in 0..300 {
+        add(&mut a, i, 0);
+        add(&mut b, i, 1);
+    }
+    let mut records = a.records();
+    records.extend(b.records());
+    let tid = testing::commit(&store, &records, &[a.key(), b.key()], &[]).expect("a commit");
+    let config = Config {
+        memory: 8 << 20,
+        ..Config::default()
+    };
+    let mirrors = mirrors_with(&store, config);
+    assert!(ready_at(&mirrors, a.oid(), tid));
+    assert!(ready_at(&mirrors, b.oid(), tid));
+    let (plan, columns) = &plans()[0];
+    // A small overlay fits.
+    let small = vec![(1 << 40, vec![0; 100])];
+    let found = mirrors.query_overlay(a.oid(), tid + 1, plan, columns, &small);
+    assert!(found.is_ok(), "{found:?}");
+    // An overlay larger than the bound takes the Python path, and the
+    // mirror of the other catalog stays.
+    let large = vec![(1 << 40, vec![0; 9 << 20])];
+    let found = mirrors.query_overlay(a.oid(), tid + 1, plan, columns, &large);
+    assert_eq!(found.map_err(|f| f.reason), Err(Reason::Overlay));
+    for catalog in [a.oid(), b.oid()] {
+        assert_eq!(mirrors.status(catalog).expect("a mirror").state, "ready");
+    }
+    assert_eq!(mirrors.counts().drops, 0);
+    let found = mirrors.query_overlay(b.oid(), tid + 1, plan, columns, &small);
+    assert!(found.is_ok(), "{found:?}");
+    mirrors.stop();
+}
+
+#[test]
+fn a_query_whose_tid_the_thread_pruned_before_the_overlay_read_takes_overlay() {
+    let store = store();
+    let mut m = CatalogModel::new(10, &KINDS, &COLUMNS);
+    for i in 0..300 {
+        add(&mut m, i, 0);
+    }
+    let first = testing::commit(&store, &m.records(), &[m.key()], &[]).expect("a commit");
+    let catalog = m.oid();
+    // The same catalog, as another client changes it.
+    let mut other = CatalogModel::new(10, &KINDS, &COLUMNS);
+    for i in 0..300 {
+        add(&mut other, i, 0);
+    }
+    other.records();
+    let other = Arc::new(Mutex::new(other));
+    let shared: Arc<OnceLock<Arc<Mirrors>>> = Arc::new(OnceLock::new());
+    let armed = Arc::new(AtomicBool::new(false));
+    // Between the version and the read of the overlay, other commits
+    // change the shape of the first bucket of each tree and move the floor
+    // of the versions past the tid of the query.
+    let hook: Hook = {
+        let (store, other, shared, armed) = (
+            Arc::clone(&store),
+            Arc::clone(&other),
+            Arc::clone(&shared),
+            Arc::clone(&armed),
+        );
+        Arc::new(move |_| {
+            if !armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let mirrors = shared.get().expect("the mirrors");
+            let mut other = other.lock().unwrap();
+            other.catalog(-99_999, "/site/f0/first", &[("getId", s("first"))]);
+            for turn in [3, 8, 13] {
+                if turn > 3 {
+                    add(&mut other, 1, turn);
+                }
+                commit(&store, Some(mirrors), &other.records());
+            }
+            assert!(mirrors.wait_for(catalog, WAIT, |s| {
+                s.is_some_and(|s| s.floor.is_some_and(|f| f > first))
+            }));
+            // The pass that moved the floor prunes the shape changes next.
+            std::thread::sleep(Duration::from_millis(300));
+        })
+    };
+    let config = Config {
+        window_tids: 1,
+        rebase_rows: 0,
+        hooks: zoe_catalog::Hooks {
+            before_overlay: Some(hook),
+            ..zoe_catalog::Hooks::default()
+        },
+        ..Config::default()
+    };
+    let mirrors = Arc::new(mirrors_with(&store, config));
+    shared.set(Arc::clone(&mirrors)).ok();
+    assert!(ready_at(&mirrors, catalog, first));
+    let lowest = (0..300)
+        .min_by_key(|i| (i * 7919 + 13) % 100_000 - 50_000)
+        .unwrap();
+    m.next_oids_from(PROVISIONAL | 1);
+    add(&mut m, lowest, 1);
+    let records = m.records();
+    let (plan, columns) = &plans()[0];
+    armed.store(true, Ordering::SeqCst);
+    let found = mirrors.query_overlay(catalog, first + 1, plan, columns, &records);
+    assert!(!armed.load(Ordering::SeqCst), "the hook ran");
+    assert_eq!(found.map_err(|f| f.reason), Err(Reason::Overlay));
+    mirrors.stop();
+}
+
+#[test]
+fn an_overlay_of_inner_nodes_named_in_reverse_order_reads_in_linear_time() {
+    let (_store, mirrors, m, first) = prepared();
+    let catalog = m.oid();
+    // A chain of inner nodes from a root that the mirror owns, each one
+    // naming the next, sent with the last node first.
+    let n = 20_000u64;
+    let root = m.unindex_root("portal_type");
+    let node = |child: u64| {
+        tree_record(
+            IO,
+            &TreeRecord::Split {
+                children: vec![(child, true)],
+                keys: Vec::new(),
+                first: child,
+            },
+        )
+    };
+    let mut records: Vec<(u64, Vec<u8>)> = (1..=n)
+        .rev()
+        .map(|k| (PROVISIONAL | k, node(PROVISIONAL | (k + 1))))
+        .collect();
+    records.push((root, node(PROVISIONAL | 1)));
+    let (plan, columns) = &plans()[0];
+    let started = Instant::now();
+    let _ = mirrors.query_overlay(catalog, first + 1, plan, columns, &records);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the read took {:?}",
+        started.elapsed()
+    );
     mirrors.stop();
 }

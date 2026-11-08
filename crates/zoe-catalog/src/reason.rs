@@ -19,8 +19,8 @@ pub enum Reason {
     AndRange,
     /// A sort that the mirror does not serve.
     Sort,
-    /// The transaction changed records, and no overlay carries them: the
-    /// rule before the transaction overlay. The hook does not give it.
+    /// The transaction changed records, and the client sends no overlay.
+    /// The hook of `zoe.plone` does not give this reason.
     Transaction,
     /// The plan and the overlay pass the cap of a call.
     TooLarge,
