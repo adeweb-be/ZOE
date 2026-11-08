@@ -36,6 +36,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 
 import transaction
 from Acquisition import aq_base, aq_inner, aq_parent
@@ -317,10 +318,10 @@ class Resolver:
         return frozenset(allowed)
 
 
-# The values of the snapshots that the process resolved: the key of a
-# snapshot to its `_Values`. Only the newest snapshots stay, by the tid of
-# their start.
-_cache = {}
+# The values of the snapshots that the process resolved: for each database,
+# the pair `(oid of the index, start of the snapshot)` to its `_Values`.
+# Only the newest snapshots of each index stay, by the tid of their start.
+_cache = weakref.WeakKeyDictionary()
 _cache_lock = threading.Lock()
 _CACHE_SNAPSHOTS = 2
 
@@ -339,7 +340,7 @@ def _snapshot_values(index):
     """Return the `_Values` of the snapshot of the connection of `index`,
     or None when the values cannot come from the cache: the connection
     holds a change of its transaction, has no snapshot, or has a snapshot
-    older than those that the cache keeps."""
+    older than those that the cache keeps for the index."""
     jar = getattr(aq_base(index), "_p_jar", None)
     oid = getattr(aq_base(index), "_p_oid", None)
     if jar is None or oid is None:
@@ -349,16 +350,17 @@ def _snapshot_values(index):
     start = getattr(getattr(jar, "_storage", None), "_start", None)
     if start is None:
         return None
-    key = (jar.db(), oid, start)
     with _cache_lock:
-        values = _cache.get(key)
+        cache = _cache.setdefault(jar.db(), {})
+        values = cache.get((oid, start))
         if values is not None:
             return values
-        if len(_cache) >= _CACHE_SNAPSHOTS and start < min(k[2] for k in _cache):
+        starts = sorted(k[1] for k in cache if k[0] == oid)
+        if len(starts) >= _CACHE_SNAPSHOTS and start < starts[0]:
             return None
-        values = _cache[key] = _Values()
-        while len(_cache) > _CACHE_SNAPSHOTS:
-            del _cache[min(_cache, key=lambda k: k[2])]
+        values = cache[oid, start] = _Values()
+        for old in starts[: len(starts) + 1 - _CACHE_SNAPSHOTS]:
+            del cache[oid, old]
     return values
 
 

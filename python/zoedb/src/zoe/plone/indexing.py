@@ -635,8 +635,9 @@ class Indexer:
         index or the reindex of each path that has an object. With a
         `ZoeSecurityIndex`, the paths go in path order: an entry reads the
         entries of its containers, so each container comes first. The
-        inputs of the removed entries go into the chains of the entries
-        below them at the end."""
+        entries below a path without an object go too, and the inputs of
+        the removed entries go into the chains of the entries below them
+        that stay, at the end."""
         from zoe.plone.security import _deferred, security_index
 
         catalog = site.portal_catalog
@@ -647,6 +648,8 @@ class Indexer:
         uid_index = inner.indexes.get("UID")
         removals = []
         updates = []
+        # The paths without an object.
+        gone = []
         for path, entry in entries.items():
             if not entry.keys and path in self._broken:
                 continue
@@ -655,6 +658,7 @@ class Indexer:
             if obj is None:
                 if rid is not None:
                     removals.append(path)
+                gone.append(path)
                 continue
             uid = _uid(obj)
             if uid is not None and uid_index is not None:
@@ -680,12 +684,41 @@ class Indexer:
             self._update(catalog, uids, removals, updates)
             return
         updates.sort(key=lambda update: update[0])
+        # A path without an object has no object below it either. The
+        # entries below the highest such container go in this batch, so no
+        # chain below it is written for a removal that a later batch
+        # applies.
+        for top in highest(self._gone_tops(app, site, gone)):
+            for below in uids.keys(top + "/", top + "0", excludemax=True):
+                if below not in self._broken:
+                    removals.append(below)
         with _deferred(index) as (removed, fresh):
             self._update(catalog, uids, removals, updates)
         if removed:
             # The entries below a removed entry that stay in the catalog
             # get its inputs in their chains, once for the batch.
             self._guarded(removed[0][1], index._write_chains, removed, fresh)
+
+    def _gone_tops(self, app, site, gone):
+        """Return, for each path of `gone`, the highest container of it
+        below the site that has no object either, or the path."""
+        root = "/".join(site.getPhysicalPath())
+        found = {}
+
+        def missing(path):
+            if path not in found:
+                found[path] = self._guarded(path, _resolve, app, path) is None
+            return found[path]
+
+        tops = []
+        for path in gone:
+            top = path
+            above = path.rpartition("/")[0]
+            while above.startswith(root + "/") and missing(above):
+                top = above
+                above = above.rpartition("/")[0]
+            tops.append(top)
+        return tops
 
     def _update(self, catalog, uids, removals, updates):
         done = set()

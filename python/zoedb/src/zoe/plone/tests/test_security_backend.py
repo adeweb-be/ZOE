@@ -43,6 +43,8 @@ MEMBER = acceptance.MEMBER
 opened = acceptance.opened
 # The longest wait for a thread of the backend, in seconds.
 JOIN = 20
+# The entries below the folder of the large delete.
+LARGE = 5000
 
 
 def make_site(test):
@@ -263,6 +265,120 @@ class TestAContainerThatLeavesTheCatalog(TokenChecks, unittest.TestCase):
         self.checks("a delete")
 
 
+class TestTheQueueAndALargeDelete(TokenChecks, unittest.TestCase):
+    layer = zoe_testing.ZOE_SITE
+
+    def setUp(self):
+        make_site(self)
+        indexing.install()
+        self.addCleanup(indexing.uninstall)
+
+    def test_a_delete_of_a_large_folder_writes_as_a_delete_in_one_transaction(self):
+        from ZODB.Connection import Connection
+
+        written = []
+        commit = Connection.commit
+
+        def counted(connection, txn):
+            written.append(len(connection._registered_objects))
+            return commit(connection, txn)
+
+        def records(call):
+            """Return the records that the commits of `call` write."""
+            del written[:]
+            with mock.patch.object(Connection, "commit", counted):
+                call()
+            return sum(written)
+
+        with opened(self.db) as site:
+            for name in ("large", "twin"):
+                site.invokeFactory("Folder", name, title=name)
+                folder = site[name]
+                for i in range(LARGE // 50):
+                    folder.invokeFactory("Folder", f"f{i}", title=f"f{i}")
+                    sub = folder[f"f{i}"]
+                    for j in range(49):
+                        sub.invokeFactory("Document", f"d{j}", title=f"d{j}")
+                    transaction.savepoint(optimistic=True)
+            transaction.commit()
+        with opened(self.db) as site:
+            indexing.Indexer(site).run()
+        with opened(self.db) as site:
+            deleted = len(
+                site.portal_catalog.unrestrictedSearchResults(path="/plone/large")
+            )
+        self.assertEqual(deleted, LARGE + 1)
+        # An edit of the folder puts its path first in the queue: the first
+        # batch finds the folder gone before the entries below it.
+        with opened(self.db) as site:
+            site["large"].setTitle("Large")
+            site["large"].reindexObject()
+            transaction.commit()
+
+        # The stock processor deletes the twin in the transaction of the
+        # delete: the records of one transaction.
+        def delete_twin():
+            with opened(self.db) as site:
+                site.manage_delObjects(["twin"])
+                transaction.commit()
+
+        indexing.uninstall()
+        try:
+            stock = records(delete_twin)
+        finally:
+            indexing.install()
+        with opened(self.db) as site:
+            site.manage_delObjects(["large"])
+            transaction.commit()
+
+        def run():
+            with opened(self.db) as site:
+                indexing.Indexer(site, batch_size=100).run()
+
+        queued = records(run)
+        print(
+            f"\na delete of {deleted} entries wrote {queued} records through"
+            f" the queue, and {stock} in one transaction"
+        )
+        self.assertLess(queued, stock * 1.25)
+        with opened(self.db) as site:
+            for name in ("large", "twin"):
+                found = site.portal_catalog.unrestrictedSearchResults(
+                    path=f"/plone/{name}"
+                )
+                self.assertEqual(list(found), [])
+        self.check(self.db, storage=self.storage, what="a large delete")
+
+
+class TestASearchInATransactionThatChangedSecurity(TokenChecks, unittest.TestCase):
+    layer = zoe_testing.ZOE_SITE
+
+    def setUp(self):
+        make_site(self)
+
+    def test_the_search_with_the_overlay_gives_the_stock_result(self):
+        from Products.CMFCore.indexing import processQueue
+
+        token = "user:" + MEMBER
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            acceptance.wait_applied(self.storage, aq_base(pc)._catalog._p_oid)
+            site["public"].manage_setLocalRoles(MEMBER, ["Reader"])
+            site["public"].reindexObjectSecurity()
+            processQueue()
+            self.assertTrue(site._p_jar._registered_objects)
+            # The stock index of the same transaction.
+            pc.reindexIndex(acceptance.STOCK, None)
+            expected = acceptance.stock_search(site, {acceptance.STOCK: [token]})
+            rid = pc._catalog.uids["/plone/public/doc-0"]
+            self.assertIn(rid, expected)
+            catalog._counts.clear()
+            found = pc.unrestrictedSearchResults(**{INDEX: [token]})
+            self.assertEqual(sorted(brain.getRID() for brain in found), expected)
+            counts = catalog._counts_now()["queries"]
+            self.assertEqual(counts, {"native": 1}, catalog._counts_now())
+
+
 class TestTheCacheOfTheSnapshots(unittest.TestCase):
     layer = zoe_testing.ZOE_SITE
 
@@ -316,9 +432,22 @@ class TestTheCacheOfTheSnapshots(unittest.TestCase):
         # The snapshot of the old connection is older than the two of the
         # cache, so it resolves without the cache.
         self.assertIsNone(security._snapshot_values(index))
-        with security._cache_lock:
-            kept = sorted(key[2] for key in security._cache)
-        self.assertEqual(kept, sorted(starts))
+        oid = aq_base(index)._p_oid
+
+        def kept():
+            with security._cache_lock:
+                cache = security._cache[self.db]
+                return sorted(start for each, start in cache if each == oid)
+
+        self.assertEqual(kept(), sorted(starts))
+        # The snapshots of another index have slots of their own. The
+        # catalog tool stands for it: its oid is another key.
+        with opened(self.db) as site:
+            other = site.portal_catalog
+            self.assertIsNotNone(security._snapshot_values(other))
+            # The old connection has a slot for this other key too.
+            self.assertIsNotNone(security._snapshot_values(old.portal_catalog))
+        self.assertEqual(kept(), sorted(starts))
 
 
 class TestInstallOnASiteThatExists(acceptance.Checks, unittest.TestCase):
