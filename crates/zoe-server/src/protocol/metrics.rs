@@ -298,6 +298,9 @@ pub(crate) struct Exported {
     /// The store, for the gauge of its backlog. A weak reference does not
     /// keep the store open.
     pub(crate) store: Weak<Store>,
+    /// The counters of the catalog mirrors of the store, also before the
+    /// mirrors start.
+    pub(crate) catalog: Arc<zoe_catalog::counts::Counters>,
 }
 
 impl Exported {
@@ -542,6 +545,7 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             hub: Arc::new(Invalidations::new(Tid::ZERO)),
             store: Weak::new(),
+            catalog: Arc::default(),
         }
     }
 

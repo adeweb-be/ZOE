@@ -1844,6 +1844,12 @@ impl CatalogModel {
         self.oid
     }
 
+    /// Gives the next new objects of the model the oids from `next`, as a
+    /// transaction names its new objects with provisional oids.
+    pub fn next_oids_from(&mut self, next: u64) {
+        self.next = next;
+    }
+
     /// The registration key of the catalog.
     pub fn key(&self) -> [u8; 8] {
         self.oid.to_be_bytes()

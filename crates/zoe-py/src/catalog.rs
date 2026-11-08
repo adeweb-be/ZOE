@@ -1,6 +1,7 @@
 //! The catalog mirrors of a `zoe.Storage` (ADR 0059): the plan of
-//! `catalog_query` from a Python dict, its reply as a dict with the rows of
-//! the metadata table as Python values, the state and the counts of the
+//! `catalog_query` from a Python dict, its transaction overlay from a list
+//! of `(oid, pickle)` pairs, its reply as a dict with the rows of the
+//! metadata table as Python values, the state and the counts of the
 //! mirrors, and the log of their events.
 //!
 //! The mirrors of a store live in `zoe-catalog`. `storage` starts them at
@@ -16,6 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use zoe_catalog::cell::{self, EXT_DATE_TIME, EXT_MESSAGE, EXT_MISSING};
 use zoe_catalog::counts::{Counts, LATENCY_BUCKETS};
+use zoe_catalog::overlay::Records;
 use zoe_catalog::{Fallback, Reply, Status, Wire};
 
 /// The deepest plan that `wire` reads.
@@ -262,24 +264,61 @@ pub(crate) fn reply<'py>(
     Ok(out)
 }
 
-/// The plan `wire` as a msgpack value of the wire, for the native client.
-pub(crate) fn value_of_wire(wire: Wire) -> rmpv::Value {
+/// The transaction overlay `value`: `None`, or a list or a tuple of
+/// `(oid, pickle)` pairs of bytes, with each oid 8 bytes. Another form
+/// raises `ValueError`.
+pub(crate) fn overlay(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Records>> {
+    let Some(value) = value.filter(|v| !v.is_none()) else {
+        return Ok(None);
+    };
+    let bad = || PyValueError::new_err("the overlay is a list of (oid, pickle) pairs of bytes");
+    let items: Vec<Bound<'_, PyAny>> = if let Ok(list) = value.cast::<PyList>() {
+        list.iter().collect()
+    } else if let Ok(tuple) = value.cast::<PyTuple>() {
+        tuple.iter().collect()
+    } else {
+        return Err(bad());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let pair: Vec<Bound<'_, PyAny>> = if let Ok(t) = item.cast::<PyTuple>() {
+            t.iter().collect()
+        } else if let Ok(l) = item.cast::<PyList>() {
+            l.iter().collect()
+        } else {
+            return Err(bad());
+        };
+        let [oid, pickle] = pair.as_slice() else {
+            return Err(bad());
+        };
+        let (Ok(oid), Ok(pickle)) = (oid.cast::<PyBytes>(), pickle.cast::<PyBytes>()) else {
+            return Err(bad());
+        };
+        out.push((
+            p64("an oid of the overlay", oid.as_bytes())?,
+            pickle.as_bytes().to_vec(),
+        ));
+    }
+    Ok(Some(out))
+}
+
+/// The transaction overlay `records` as the msgpack value of the wire, for
+/// the native client: nil, or `[[oid, pickle]...]`.
+pub(crate) fn value_of_overlay(records: Option<Records>) -> rmpv::Value {
     use rmpv::Value;
-    match wire {
-        Wire::Nil => Value::Nil,
-        Wire::Bool(b) => Value::Boolean(b),
-        Wire::Int(i) => Value::from(i),
-        Wire::Float(f) => Value::F64(f),
-        Wire::Str(s) => Value::from(s),
-        Wire::Bin(b) => Value::Binary(b),
-        Wire::Array(items) => Value::Array(items.into_iter().map(value_of_wire).collect()),
-        Wire::Map(items) => Value::Map(
-            items
+    match records {
+        None => Value::Nil,
+        Some(records) => Value::Array(
+            records
                 .into_iter()
-                .map(|(k, v)| (value_of_wire(k), value_of_wire(v)))
+                .map(|(oid, pickle)| {
+                    Value::Array(vec![
+                        Value::Binary(oid.to_be_bytes().to_vec()),
+                        Value::Binary(pickle),
+                    ])
+                })
                 .collect(),
         ),
-        Wire::Ext(kind, data) => Value::Ext(kind, data),
     }
 }
 
@@ -423,6 +462,7 @@ pub(crate) fn counts<'py>(py: Python<'py>, counts: Option<Counts>) -> PyResult<B
     latency.set_item("sum", counts.latency_seconds)?;
     out.set_item("zoe_catalog_query_latency_seconds", latency)?;
     out.set_item("zoe_catalog_mirror_drops_total", counts.drops)?;
+    out.set_item("zoe_catalog_overlay_records", counts.overlay_records)?;
     let mirrors = PyDict::new(py);
     for m in &counts.mirrors {
         let one = PyDict::new(py);

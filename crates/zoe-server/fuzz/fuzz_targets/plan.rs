@@ -1,9 +1,11 @@
-//! Fuzz the decoder of the plan of a catalog query of `zoe serve` (ADR
-//! 0059, section 8).
+//! Fuzz the decoders of the plan and of the overlay of a catalog query of
+//! `zoe serve` (ADR 0059, section 8).
 //!
-//! An input is the argument `plan` of a `catalog_query` call: one msgpack
-//! value. The decoder reads it within the bounds of a frame, then reads
-//! the plan and the kind of each clause. A panic fails the run.
+//! An input is the argument `plan` of a `catalog_query` call, one msgpack
+//! value, and then, when bytes remain, the argument `overlay`, a second
+//! msgpack value. The decoder reads each within the bounds of a frame, then
+//! reads the plan and the kind of each clause, and the records of the
+//! overlay as the mirror reads them. A panic fails the run.
 
 #![no_main]
 
