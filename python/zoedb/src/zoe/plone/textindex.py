@@ -186,9 +186,11 @@ def _written(lexicon, term, pattern):
     splitter = elements[0] if elements else None
     process = getattr(splitter, "processGlob", None)
     if process is not None:
-        found = [
-            w for w in process([text]) if isinstance(w, str) and ("*" in w or "?" in w)
+        words = [
+            w.decode("utf-8", "replace") if isinstance(w, bytes) else w
+            for w in process([text])
         ]
+        found = [w for w in words if isinstance(w, str) and ("*" in w or "?" in w)]
         if len(found) == 1:
             return found[0]
     return pattern

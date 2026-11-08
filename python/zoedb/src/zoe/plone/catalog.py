@@ -343,10 +343,14 @@ def _text_index_held():
     db = _root.get("db")
     if db is None:
         return None
-    for catalog in _catalogs(db):
-        for index in catalog.indexes.values():
-            if _class_of(index) == _TEXT:
-                return f"the oid {catalog._p_oid.hex()}"
+    try:
+        for catalog in _catalogs(db):
+            for index in catalog.indexes.values():
+                if _class_of(index) == _TEXT:
+                    return f"the oid {catalog._p_oid.hex()}"
+    except Exception:
+        # A database that closed: no catalog of it is open.
+        logger.exception("catalog mirror: the search of the text indexes failed")
     return None
 
 

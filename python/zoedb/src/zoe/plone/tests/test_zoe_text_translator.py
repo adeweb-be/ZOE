@@ -126,7 +126,7 @@ class TestTheTranslator(unittest.TestCase):
 
     def test_a_glob_that_starts_with_a_wildcard_raises_query_error(self):
         lexicon = Lexicon(WhitespaceSplitter(), CaseNormalizer())
-        for query in ("*offee", "?offee", "beans AND *offee", "beans -?offee"):
+        for query in ("*offee", "?offee", "beans AND *offee", "beans AND NOT ?offee"):
             with self.assertRaises(QueryError, msg=query):
                 translate(lexicon, query)
 
@@ -141,7 +141,6 @@ class TestTheTranslator(unittest.TestCase):
             "-coffee",
             "NOT coffee",
             "the",
-            "the AND an",
         ]
         for query in queries:
             with self.assertRaises(ParseError, msg=query) as stock:

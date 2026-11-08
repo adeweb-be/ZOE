@@ -25,6 +25,7 @@ import unittest
 import transaction
 from OFS.Application import Application
 from plone.app.testing import SITE_OWNER_NAME, SITE_OWNER_PASSWORD
+from plone.testing import Layer
 from plone.testing import zope as zope_testing
 from Products.CMFPlone.factory import addPloneSite
 from Testing.makerequest import makerequest
@@ -86,6 +87,12 @@ def titled(site, text):
     return ids(site.portal_catalog.unrestrictedSearchResults(Title=text))
 
 
+def close(db):
+    """Close `db` once."""
+    if getattr(db, "_mvcc_storage", None) is not None:
+        db.close()
+
+
 class Big:
     """An object whose `SearchableText` passes the cap of a call."""
 
@@ -99,7 +106,7 @@ class StackTests:
     def push(self, below):
         storage = DemoStorage(base=below, close_base_on_close=False)
         db = DB(storage)
-        self.addCleanup(db.close)
+        self.addCleanup(close, db)
         return storage, db
 
     def test_a_save_writes_its_deltas_in_the_top_demostorage_only(self):
@@ -129,7 +136,7 @@ class StackTests:
             self.assertEqual(ids(search(site, "hazelnut")), {"n4", "t-new"})
             # The texts of the corpus below the top.
             self.assertEqual(ids(search(site, "stars")), {"n6"})
-            self.assertEqual(ids(search(site, "roast")), {"n5"})
+            self.assertEqual(ids(search(site, "slowly")), {"n5"})
 
     def test_a_delta_above_replaces_the_same_key_below(self):
         middle, db1 = self.push(self.lower)
@@ -146,7 +153,7 @@ class StackTests:
         with opened(db2) as site:
             self.assertEqual(ids(search(site, "walnut")), set())
             self.assertEqual(ids(search(site, "pecan")), {"n5"})
-            self.assertEqual(ids(search(site, "roast")), set())
+            self.assertEqual(ids(search(site, "slowly")), set())
         with opened(db1) as site:
             self.assertEqual(ids(search(site, "walnut")), {"n5"})
 
@@ -161,7 +168,7 @@ class StackTests:
         with opened(db) as site:
             self.assertEqual(titled(site, "coffee"), {"n5"})
             self.assertEqual(titled(site, "night"), set())
-            site.portal_catalog.reindexObject(site["n6"], idxs=["Title"])
+            site.portal_catalog.reindexObject(site["box"]["n6"], idxs=["Title"])
             self.assertEqual(titled(site, "night"), {"n6"})
 
     def test_the_base_holds_no_delta_after_the_test_storage_goes(self):
@@ -172,7 +179,7 @@ class StackTests:
             site["n5"].reindexObject()
             site.portal_catalog.manage_clearIndex(["Title"])
             transaction.commit()
-        db.close()
+        close(db)
         del top, db
         self.assertEqual(self.base.lastTransaction(), last)
         self.check_base()
@@ -190,25 +197,39 @@ class StackTests:
         """Check that the base holds the texts that it held before."""
 
 
+class EmptyStore(Layer):
+    """A `DemoStorage` over an empty `zoe.Storage`, as the Plone suites
+    stack them, with a site and the corpus in the `DemoStorage`. Its
+    resources: `base`, the `zoe.Storage`, and `lower`, the `DemoStorage`."""
+
+    defaultBases = (zoe_testing.ZOE_TEXT_SITE,)
+
+    def setUp(self):
+        self._directory = tempfile.mkdtemp(prefix="zoe-text-demo-")
+        self["base"] = zoe.Storage(f"{self._directory}/zoe")
+        self["lower"] = DemoStorage(base=self["base"], close_base_on_close=False)
+        self._db = DB(self["lower"])
+        make_site(self._db)
+
+    def tearDown(self):
+        self._db.close()
+        self["base"].close()
+        shutil.rmtree(self._directory, ignore_errors=True)
+        del self["base"], self["lower"], self._db
+
+
+EMPTY_STORE = EmptyStore(name="EmptyStore")
+
+
 class TestOverAnEmptyStore(StackTests, unittest.TestCase):
     """A stack over an empty `zoe.Storage`: the site and its corpus are in
     the lower `DemoStorage`, and the base holds no record."""
 
-    layer = zoe_testing.ZOE_TEXT_SITE
+    layer = EMPTY_STORE
 
-    @classmethod
-    def setUpClass(cls):
-        cls.directory = tempfile.mkdtemp(prefix="zoe-text-demo-")
-        cls.base = zoe.Storage(f"{cls.directory}/zoe")
-        cls.lower = DemoStorage(base=cls.base, close_base_on_close=False)
-        cls.lower_db = DB(cls.lower)
-        make_site(cls.lower_db)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.lower_db.close()
-        cls.base.close()
-        shutil.rmtree(cls.directory, ignore_errors=True)
+    def setUp(self):
+        self.base = self.layer["base"]
+        self.lower = self.layer["lower"]
 
     def check_base(self):
         # The base holds no record, so it holds no catalog either.
@@ -239,12 +260,12 @@ class TestOverAStoreWithASite(StackTests, unittest.TestCase):
         wait_text(self.base, self.key)
         self.lower = DemoStorage(base=self.base, close_base_on_close=False)
         self.lower_db = DB(self.lower)
-        self.addCleanup(self.lower_db.close)
+        self.addCleanup(close, self.lower_db)
 
     def check_base(self):
         tid = textindex._next(self.base.lastTransaction())
         info = self.base.text_info(self.key, "SearchableText", tid, self.rid)
-        self.assertIn("roast", info["text"])
+        self.assertIn("slowly", info["text"])
         self.assertNotIn("Walnut", info["text"])
         title = self.base.text_info(self.key, "Title", tid)
         self.assertEqual(title["docs"], self.entries)
