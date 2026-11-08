@@ -52,7 +52,7 @@ import shutil
 import tempfile
 
 import transaction
-from plone.testing import Layer, zodb
+from plone.testing import Layer, zca, zodb
 from plone.testing import zope as zope_layers
 from ZODB.DB import DB
 from ZODB.DemoStorage import DemoStorage
@@ -66,19 +66,39 @@ class BaseStorage(Layer):
     `plone.testing.zodb.stackDemoStorage` without a database stacks a
     `DemoStorage` on this storage. With a database, it does not change.
     `tearDown` closes the storage and removes the directory.
+
+    The layer comes after `LAYER_CLEANUP` of plone.testing, which clears
+    the global registry. So `setUp` registers the handlers of the security
+    backend again when `install` installed it, and `tearDown` removes them.
     """
+
+    defaultBases = (zca.LAYER_CLEANUP,)
 
     def open(self, directory):
         """Open the base storage in `directory`."""
         raise NotImplementedError
 
     def setUp(self):
+        from zope.component import getGlobalSiteManager
+
+        from zoe.plone import security
+
+        self._handlers = security._handlers() if security.installed() else []
+        registry = getGlobalSiteManager()
+        for handler, required in self._handlers:
+            registry.registerHandler(handler, required)
         self._directory = tempfile.mkdtemp(prefix="zoe-plone-")
         self._storage = self.open(self._directory)
         self._stack = zodb.stackDemoStorage
         zodb.stackDemoStorage = self.stackDemoStorage
 
     def tearDown(self):
+        from zope.component import getGlobalSiteManager
+
+        registry = getGlobalSiteManager()
+        for handler, required in self._handlers:
+            registry.unregisterHandler(handler, required)
+        del self._handlers
         zodb.stackDemoStorage = self._stack
         self._storage.close()
         shutil.rmtree(self._directory, ignore_errors=True)

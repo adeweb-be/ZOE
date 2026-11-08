@@ -725,6 +725,19 @@ def installed():
     return bool(_stock)
 
 
+def _handlers():
+    """Return the handlers of the backend, as pairs `(handler, required)`
+    for the global registry."""
+    from Products.CMFCore.interfaces import ISiteRoot
+    from zope.lifecycleevent.interfaces import IObjectAddedEvent
+    from zope.processlifetime import IDatabaseOpenedWithRoot
+
+    return [
+        (database_opened, (IDatabaseOpenedWithRoot,)),
+        (site_added, (ISiteRoot, IObjectAddedEvent)),
+    ]
+
+
 def install():
     """Replace `reindexObjectSecurity` and `deleteLocalRoles` of CMFCore
     in the process, and put a `ZoeSecurityIndex` into each catalog of the
@@ -732,11 +745,8 @@ def install():
     nothing."""
     from AccessControl.requestmethod import postonly
     from Products.CMFCore.CMFCatalogAware import CatalogAware
-    from Products.CMFCore.interfaces import ISiteRoot
     from Products.CMFCore.MembershipTool import MembershipTool
     from zope.component import getGlobalSiteManager
-    from zope.lifecycleevent.interfaces import IObjectAddedEvent
-    from zope.processlifetime import IDatabaseOpenedWithRoot
 
     with _install_lock:
         if _stock:
@@ -751,8 +761,8 @@ def install():
         # The stock method takes POST only, through the web.
         MembershipTool.deleteLocalRoles = postonly(deleteLocalRoles)
         registry = getGlobalSiteManager()
-        registry.registerHandler(database_opened, (IDatabaseOpenedWithRoot,))
-        registry.registerHandler(site_added, (ISiteRoot, IObjectAddedEvent))
+        for handler, required in _handlers():
+            registry.registerHandler(handler, required)
     db = _root_db()
     if db is not None:
         _start(db)
@@ -765,18 +775,15 @@ def uninstall():
     nothing. A request that runs a replaced method meanwhile ends with
     the stock method."""
     from Products.CMFCore.CMFCatalogAware import CatalogAware
-    from Products.CMFCore.interfaces import ISiteRoot
     from Products.CMFCore.MembershipTool import MembershipTool
     from zope.component import getGlobalSiteManager
-    from zope.lifecycleevent.interfaces import IObjectAddedEvent
-    from zope.processlifetime import IDatabaseOpenedWithRoot
 
     with _install_lock:
         if not _stock:
             return
         registry = getGlobalSiteManager()
-        registry.unregisterHandler(database_opened, (IDatabaseOpenedWithRoot,))
-        registry.unregisterHandler(site_added, (ISiteRoot, IObjectAddedEvent))
+        for handler, required in _handlers():
+            registry.unregisterHandler(handler, required)
         CatalogAware.reindexObjectSecurity = _stock["reindexObjectSecurity"]
         MembershipTool.deleteLocalRoles = _stock["deleteLocalRoles"]
         # `_originals` keeps the stock methods for the calls in flight.
