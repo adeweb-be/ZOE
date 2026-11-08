@@ -74,7 +74,10 @@ interim sets of an index in a cache of the request, and a hit of that cache
 can give another answer than a miss. So a difference runs the stock search
 again with an empty cache for the catalog: when that answer equals the
 native answer, the difference comes from the cache of ZCatalog. It logs at
-WARNING and counts apart, and it is no mismatch.
+WARNING and counts apart, and it is no mismatch. A test can replace a
+method of `Catalog` with a mock, so the stock search gives no reference: a
+search while a method of `Catalog` differs from the method at `install()`
+is not compared, and counts as unchecked.
 
 The throwaway mirror (ADR 0059, section 9). A test storage, a `DemoStorage`
 whose chain of bases ends at a ZOE storage, has no mirror. In the mode
@@ -157,8 +160,8 @@ _root = {}
 
 # The counts of this process: `("queries", path)`, `("fallbacks", reason)`
 # for the reasons that the hook decides, `("refusals", reason)` for the
-# reasons of a reply, `("compared",)`, `("throwaways",)`, `("mismatches",)`
-# and `("cache_differences",)`.
+# reasons of a reply, `("compared",)`, `("throwaways",)`, `("mismatches",)`,
+# `("cache_differences",)` and `("unchecked",)`.
 _counts = collections.Counter()
 _counts_lock = threading.Lock()
 
@@ -217,7 +220,7 @@ def install():
     from Products.ZCatalog.Catalog import Catalog
 
     current = mode()
-    _installed.update(stock=Catalog.search, mode=current)
+    _installed.update(stock=Catalog.search, mode=current, code=_code(Catalog))
     Catalog.search = _search
     path = os.environ.get("ZOE_PLONE_CATALOG_COUNTS", "").strip()
     if path and not _counts_file:
@@ -226,6 +229,15 @@ def install():
     db = _root.get("db")
     if db is not None:
         register(db)
+
+
+def _code(cls):
+    """The methods of the class `Catalog` but `search`, by name."""
+    return {
+        name: value
+        for name, value in vars(cls).items()
+        if name != "search" and callable(value)
+    }
 
 
 def uninstall():
@@ -423,6 +435,7 @@ def _counts_now():
         "throwaways": counts.get(("throwaways",), 0),
         "mismatches": counts.get(("mismatches",), 0),
         "cache_differences": counts.get(("cache_differences",), 0),
+        "unchecked": counts.get(("unchecked",), 0),
     }
     for key, n in counts.items():
         if key[0] == "queries":
@@ -452,6 +465,7 @@ def _write_counts(path):
         "throwaways": counts["throwaways"],
         "mismatches": counts["mismatches"],
         "cache_differences": counts["cache_differences"],
+        "unchecked": counts["unchecked"],
         "mismatched": mismatched,
     }
     try:
@@ -468,6 +482,8 @@ def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True)
         from Products.ZCatalog.Catalog import Catalog
 
         return Catalog.search(self, query, sort_index, reverse, limit, merge)
+    from Acquisition import aq_base
+
     native, reason, plan = _native(self, query, sort_index, reverse, limit, merge)
     if native is None:
         _count("queries", "python")
@@ -477,7 +493,10 @@ def _search(self, query, sort_index=None, reverse=False, limit=None, merge=True)
         _count("queries", "native")
     if _installed.get("mode") == "compare":
         result = stock(self, query, sort_index, reverse, limit, merge)
-        if native is not None:
+        if native is not None and _code(type(aq_base(self))) != _installed["code"]:
+            # A mock of a method of `Catalog` gives the stock result.
+            _count("unchecked")
+        elif native is not None:
             _count("compared")
             if _plant is not None:
                 native = _plant(native)

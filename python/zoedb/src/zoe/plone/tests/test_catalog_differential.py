@@ -456,6 +456,25 @@ class TestTheModeCompareOnATestStorage(unittest.TestCase):
         self.assertIn("cache of the request", text)
         self.assertIn("effective", text)
 
+    def test_a_search_under_a_mock_of_the_catalog_is_unchecked(self):
+        from Products.ZCatalog.Catalog import Catalog
+
+        original = Catalog._search_index
+
+        def mocked(catalog, *args):
+            return original(catalog, *args)
+
+        with (
+            test_storage(self.storage) as db,
+            opened(db) as site,
+            mock.patch.object(Catalog, "_search_index", mocked),
+        ):
+            site.portal_catalog.unrestrictedSearchResults(portal_type="Document")
+        now = counts()
+        self.assertEqual(now["unchecked"], 1)
+        self.assertEqual(now["compared"], 0)
+        self.assertEqual(now["mismatches"], 0)
+
     def test_in_mode_on_a_test_storage_takes_unsupported(self):
         catalog._installed["mode"] = "on"
         with test_storage(self.storage) as db, opened(db) as site:

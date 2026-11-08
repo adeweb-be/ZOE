@@ -8,7 +8,8 @@ FILE holds one JSON line for each process of `bin/test`: the counts that
 `ZOE_PLONE_CATALOG_COUNTS` names the file. The script adds them up and
 prints the searches by path, the reasons of the Python path with their
 side, the comparisons, the throwaway mirrors, the differences of the cache
-of the request of ZCatalog, and the mismatches with the indexes and the
+of the request of ZCatalog, the searches that a mock of a method of
+`Catalog` left unchecked, and the mismatches with the indexes and the
 options of each, never a value. It exits with 1 when a mismatch occurred
 or when the file holds no line.
 """
@@ -37,6 +38,7 @@ for line in lines:
         fallbacks[(reason, side)] += n
     for name in ("compared", "throwaways", "mismatches", "cache_differences"):
         total[name] += line[name]
+    total["unchecked"] += line.get("unchecked", 0)
     mismatched.update(line["mismatched"])
 searches = sum(queries.values())
 print(f"catalog: {len(lines)} processes, {searches} searches")
@@ -46,7 +48,7 @@ for (reason, side), n in sorted(fallbacks.items(), key=lambda item: -item[1]):
     print(
         f"catalog: reason {reason} ({side}): {n} ({100 * n / max(1, searches):.1f} %)"
     )
-for name in ("compared", "throwaways", "cache_differences", "mismatches"):
+for name in ("compared", "throwaways", "cache_differences", "unchecked", "mismatches"):
     print(f"catalog: {name}: {total[name]}")
 for shape, n in mismatched.most_common():
     print(f"catalog: mismatch, {n} times: {shape}")
