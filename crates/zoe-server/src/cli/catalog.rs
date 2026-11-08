@@ -83,9 +83,14 @@ fn rebuild_text(args: &RebuildTextArgs, out: &mut dyn Write) -> Result<(), Failu
     for (catalog, settings) in &catalogs {
         let done = rebuild::rebuild(&store, path, *catalog, settings, &|_| {}).map_err(fail)?;
         let seconds = done.time.as_secs_f64();
+        let documents = if done.docs == 1 {
+            "document"
+        } else {
+            "documents"
+        };
         writeln!(
             out,
-            "  catalog {}  rebuilt  {} documents  {seconds:.2} s",
+            "  catalog {}  rebuilt  {} {documents}  {seconds:.2} s",
             Oid(done.catalog).hex(),
             done.docs
         )?;

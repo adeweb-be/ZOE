@@ -3,9 +3,10 @@
 //! at the last tid, in a store folder that no other process holds.
 //!
 //! The rebuild uses the build of the thread of the text indexes, with 4
-//! indexing threads, and writes the new index in `text/<oid>.new`. Then it
-//! renames `text/<oid>` to `text/<oid>.old`, renames `text/<oid>.new` to
-//! `text/<oid>`, syncs `text/` and removes `text/<oid>.old`. rename(2)
+//! indexing threads, and writes and syncs the new index in
+//! `text/<oid>.new`. Then it renames `text/<oid>` to `text/<oid>.old`,
+//! renames `text/<oid>.new` to `text/<oid>`, syncs `text/` and the store
+//! directory, and removes `text/<oid>.old`. rename(2)
 //! does not replace a directory that holds files, so two renames are
 //! necessary. The old index stays until the new one is complete.
 //!
@@ -43,7 +44,7 @@ pub enum Step {
     Retired,
     /// The new index is in `text/<oid>`.
     Placed,
-    /// `text/` is synced.
+    /// `text/` and the store directory are synced.
     Synced,
     /// `.old` is removed.
     Removed,
@@ -153,7 +154,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// The caller holds the lock of the store. `step` gets each step.
 ///
 /// A failure before the first rename removes `.new` and leaves the old
-/// index.
+/// index. A failure of the second rename puts the old index back.
 pub fn rebuild(
     store: &Store,
     dir: &Path,
@@ -170,16 +171,17 @@ pub fn rebuild(
     clean(&path).map_err(|e| failed("the removal of a directory of a rebuild fails", &e))?;
     let layout = texts::layout_of(settings);
     let cancel = AtomicBool::new(false);
-    let built = loop {
-        match texts::build(store, catalog, &layout, &new, THREADS, &cancel, step) {
-            Ok(built) => break Ok(built),
-            // The caller holds the lock of the store, so no other process
-            // packs it; a pack of this process passed the cap.
-            Err(Halt::Packed) => continue,
-            Err(Halt::Cancelled) => break Err(failed("the build", &"cancelled")),
-            Err(Halt::Store(e)) => break Err(failed("a read of the deltas fails", &e)),
-            Err(Halt::Index(why)) => break Err(failed("the build", &why)),
-        }
+    // The store is open read-only, so no pack runs: a pack watermark
+    // past the last tid is a damaged store.
+    let built = match texts::build(store, catalog, &layout, &new, THREADS, &cancel, step) {
+        Ok(built) => Ok(built),
+        Err(Halt::Packed) => Err(failed(
+            "the build",
+            &"the pack watermark is past the last tid",
+        )),
+        Err(Halt::Cancelled) => Err(failed("the build", &"cancelled")),
+        Err(Halt::Store(e)) => Err(failed("a read of the deltas fails", &e)),
+        Err(Halt::Index(why)) => Err(failed("the build", &why)),
     };
     let placed = built.and_then(|built| {
         let (docs, at) = (built.docs, built.at);
@@ -189,16 +191,17 @@ pub fn rebuild(
             .map_err(|e| failed("the merges of the new index fail", &e))?;
         drop(built.index);
         drop(built.cap);
+        // tantivy does not sync the directory after its last write of
+        // `meta.json`.
+        sync_dir(&new).map_err(|e| failed("the sync of the new index fails", &e))?;
         step(Step::Committed);
         match std::fs::rename(&path, &old) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(failed("the rename of the old index fails", &e));
-            }
-            _ => {}
+            Ok(()) => Ok((docs, at, true)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((docs, at, false)),
+            Err(e) => Err(failed("the rename of the old index fails", &e)),
         }
-        Ok((docs, at))
     });
-    let (docs, tid) = match placed {
+    let (docs, tid, retired) = match placed {
         Ok(found) => found,
         Err(why) => {
             let _ = remove(&new);
@@ -206,10 +209,20 @@ pub fn rebuild(
         }
     };
     step(Step::Retired);
-    std::fs::rename(&new, &path).map_err(|e| failed("the rename of the new index fails", &e))?;
+    if let Err(e) = std::fs::rename(&new, &path) {
+        // The old index serves again.
+        if retired {
+            let _ = std::fs::rename(&old, &path);
+        }
+        return Err(failed("the rename of the new index fails", &e));
+    }
     step(Step::Placed);
+    // `index::create` can create `text/`, so the store directory gets a
+    // sync too.
     let text = path.parent().unwrap_or(dir);
-    sync_dir(text).map_err(|e| failed("the sync of text/ fails", &e))?;
+    sync_dir(text)
+        .and_then(|()| sync_dir(dir))
+        .map_err(|e| failed("the sync of text/ fails", &e))?;
     step(Step::Synced);
     remove(&old).map_err(|e| failed("the removal of the old index fails", &e))?;
     step(Step::Removed);

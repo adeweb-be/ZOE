@@ -539,10 +539,14 @@ fn child_rebuilds_until_its_kill() {
         let kill = |at: Step| {
             if at.name() == step {
                 let pid = std::process::id().to_string();
-                let _ = Command::new("kill").args(["-s", "KILL", &pid]).status();
-                loop {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+                let status = Command::new("kill")
+                    .args(["-s", "KILL", &pid])
+                    .status()
+                    .expect("kill runs");
+                assert!(status.success(), "kill fails: {status}");
+                // The signal comes at once: a child that still runs fails.
+                std::thread::sleep(Duration::from_secs(10));
+                panic!("the child lives after its kill at {step}");
             }
         };
         rebuild::rebuild(&store, &dir, *catalog, settings, &kill).unwrap();
@@ -579,15 +583,48 @@ fn a_kill_at_each_step_leaves_the_old_index_or_the_new_one() {
             "the tables changed at {}",
             step.name()
         );
+        // What the kill leaves in `text/` for the first catalog, and what
+        // the open then serves.
+        let name = format!("{FIRST:016x}");
+        let (left, expect_old): (&[&str], bool) = match step {
+            Step::Created | Step::Added | Step::Committed => (&["", ".new"], true),
+            Step::Retired => (&[".new", ".old"], false),
+            Step::Placed | Step::Synced => (&["", ".old"], false),
+            Step::Removed => (&[""], false),
+        };
+        let mut expected: BTreeSet<String> = left.iter().map(|s| format!("{name}{s}")).collect();
+        expected.insert(format!("{SECOND:016x}"));
+        assert_eq!(
+            text_entries(&dir),
+            expected,
+            "text/ after the kill at {}",
+            step.name()
+        );
+        // Until its removal, `.old` holds the whole old index.
+        let retired = dir.join("text").join(format!("{name}.old"));
+        if retired.is_dir() {
+            assert_eq!(
+                segments(&retired),
+                old_first,
+                "the old index at {}",
+                step.name()
+            );
+        }
         let first_left = index_dir(&dir, FIRST).is_dir();
 
         let (found, builds, counts) = reopen(&dir, &[FIRST, SECOND]);
         // The open removes what the kill left in `text/`.
         assert_clean(&dir, &[FIRST, SECOND]);
         let first = segments(&index_dir(&dir, FIRST));
-        let old = first == old_first;
-        let new = first.is_disjoint(&old_first);
-        assert!(old || new, "a mix of indexes at {}", step.name());
+        if expect_old {
+            assert_eq!(first, old_first, "the old index at {}", step.name());
+        } else {
+            assert!(
+                first.is_disjoint(&old_first),
+                "a new index at {}",
+                step.name()
+            );
+        }
         // Only a kill between the two renames leaves no index of the first
         // catalog: then the open rebuilds it.
         assert_eq!(
