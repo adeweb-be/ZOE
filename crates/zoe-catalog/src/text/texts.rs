@@ -823,6 +823,9 @@ fn open_existing(
     if &found != layout {
         return Err("the mode, the language or the indexes changed".into());
     }
+    if index.schema() != index::schema(layout).0 {
+        return Err("its schema is not the schema of this build".into());
+    }
     if tid > store.last_transaction().0 {
         return Err("its tid is after the last tid of the store".into());
     }

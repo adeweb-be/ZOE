@@ -37,9 +37,12 @@ sends `text_query` with the result set of the other indexes as its filter,
 sorted, and makes an `IIBucket` of the reply. A filter that passes the cap
 of a call is not sent: the index intersects the reply itself. The clause
 holds the staged texts of the indexes that the query reads (`st`) and the
-indexes that the transaction cleared (`cl`). Staged texts that pass the cap
-of a call raise `zoe.storage.Unavailable`. `numObjects` gives the distinct
-words of the index, `indexSize` its documents, and `getEntryForObject` the
+indexes that the transaction cleared (`cl`). When the catalog has an index
+`Language`, the clause holds the fields of the languages of the `Language`
+clause of the query (`lg`, see `_languages_of`). Staged texts that pass the
+cap of a call raise `zoe.storage.Unavailable`. `numObjects` gives the
+distinct words of the index, `indexSize` its documents, an empty text
+included, and `getEntryForObject` the
 words of the live text of a rid, split with the pipeline of the lexicon:
 all three read `text_info` and do not count the staged texts.
 
@@ -67,13 +70,17 @@ The profile steps. `zoe.plone:text` replaces the ZCTextIndex indexes
 `SearchableText`, `Title` and `Description` of `portal_catalog` with
 `ZoeTextIndex` indexes of the same ids, in the enhanced mode, with the
 languages of the site and, for `SearchableText`, the boosts `Title^3`,
-`Description^1.5` and `SearchableText^1`. Then it indexes the catalog in
-batches of `BATCH_SIZE` objects, one commit each, which writes the deltas.
-It refuses with `Unsupported`, and changes nothing, an instance without
-the backend `catalog`, a storage without the extension `text`, and the mode
-`compat`. `zoe.plone:text-uninstall` stages a clear delta for each
-`ZoeTextIndex` of the catalog, puts ZCTextIndex indexes with the same
-attributes and lexicons back, and reindexes them in batches.
+`Description^1.5` and `SearchableText^1`. The new indexes are pending
+first, under the key `PENDING` and their id, and no query reads them: the
+step indexes the catalog into them in batches of `BATCH_SIZE` objects, one
+commit each, which writes the deltas, while the old indexes serve. The last
+batch puts them in place, in the commit of the caller. An import after a
+failure halfway finishes the work. It refuses with `Unsupported`, and
+changes nothing, an instance without the backend `catalog`, a storage
+without the extension `text`, and the mode `compat`.
+`zoe.plone:text-uninstall` fills pending ZCTextIndex indexes with the same
+attributes and lexicons in the same way, then stages a clear delta for
+each `ZoeTextIndex` and puts the ZCTextIndex indexes in place.
 """
 
 import json
@@ -108,9 +115,13 @@ __all__ = [
     "BOOSTS",
     "MODES",
     "NAMESPACE",
+    "PENDING",
     "TEXT_INDEXES",
     "ZoeTextIndex",
+    "install_text",
+    "settings_changed",
     "translate",
+    "uninstall_text",
 ]
 
 #: The durable namespace of the settings.
@@ -127,6 +138,10 @@ BOOSTS = {"Title": 3.0, "Description": 1.5, "SearchableText": 1.0}
 
 #: The objects that each commit of a profile step indexes.
 BATCH_SIZE = 1000
+
+#: The prefix of the key of a pending index in a catalog: the index that a
+#: profile step fills while the old index serves.
+PENDING = "zoe-text-pending-"
 
 # The cap of a call (ADR 0059, section 8): msgpack values and bytes.
 _CAP_VALUES = 50_000
@@ -591,13 +606,15 @@ def _catalog_of(index):
     return None
 
 
-def _text_indexes(catalog):
-    """The `ZoeTextIndex` indexes of the `Catalog` object `catalog`, by
-    id."""
+def _text_indexes(catalog, pending=True):
+    """The `ZoeTextIndex` indexes of the `Catalog` object `catalog`, by the
+    id of each index. Without `pending`, leave out the pending indexes of a
+    profile step."""
     return {
-        name: aq_base(index)
-        for name, index in catalog.indexes.items()
+        aq_base(index).id: aq_base(index)
+        for index in catalog.indexes.values()
         if isinstance(aq_base(index), ZoeTextIndex)
+        and (pending or not aq_base(index)._is_pending())
     }
 
 
@@ -609,9 +626,11 @@ _pending = weakref.WeakKeyDictionary()
 def settings_changed(catalog):
     """Write the settings of the `ZoeTextIndex` indexes of the `Catalog`
     object `catalog` in `zoe.text`, before the commit of the current
-    transaction. A catalog without a database gets no write."""
+    transaction of the Connection of the catalog. A catalog without a
+    database gets no write."""
     catalog = aq_base(catalog)
-    txn = transaction.get()
+    jar = catalog._p_jar
+    txn = jar.transaction_manager.get() if jar is not None else transaction.get()
     pending = _pending.setdefault(txn, {})
     if id(catalog) in pending:
         return
@@ -843,8 +862,9 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
         record = IndexQuery(request, self.id, self.query_options)
         if record.keys is None:
             return None
+        catalog = self._catalog()
         return (
-            self.query_index(record, languages=_query_languages(request)),
+            self.query_index(record, languages=self._languages_of(catalog, request)),
             (self.id,),
         )
 
@@ -955,13 +975,35 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
             clause["cl"] = sorted(set(reads))
         return storage, tid, clause
 
-    def _plan_clause(self, query, languages):
-        """The text clause of `query` in a plan of `catalog_query`."""
+    def _plan_clause(self, query, request):
+        """The text clause of `query` in a plan of `catalog_query`, with the
+        languages of the catalog query `request`."""
         catalog = self._catalog()
         jar = self._jar(catalog)
         self._check(jar)
+        languages = self._languages_of(catalog, request)
         _storage, _tid, clause = self._clause(catalog, jar, query, languages)
         return {"k": "t", **clause}
+
+    def _languages_of(self, catalog, request):
+        """The fields that a query reads, as `lg`: None for every field.
+
+        ZCatalog reads the `Language` clause of a query only when the
+        catalog has an index `Language`. Then each language of the clause
+        maps to a field of this index as a delta maps to it: the same tag,
+        else the same primary subtag, else the first language of the
+        settings. So the neutral language `""` maps to the first field. The
+        index `Language` still filters the rows."""
+        if "Language" not in catalog.indexes:
+            return None
+        wanted = _query_languages(request)
+        fields = list(self.language) or [""]
+        if wanted is None or len(fields) == 1:
+            return None
+        mapped = {fields[_field_of(fields, tag)] for tag in wanted}
+        if mapped >= set(fields):
+            return None
+        return [f for f in fields if f in mapped]
 
     # The counts.
 
@@ -1054,8 +1096,16 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
         return list(self._indexed_attrs)
 
     def getIndexQueryNames(self):
-        """The index applies to the queries for its id."""
+        """The index applies to the queries for its id. A pending index of
+        a profile step applies to no query."""
+        if self._is_pending():
+            return ()
         return (self.id,)
+
+    def _is_pending(self):
+        """Tell if a profile step fills this index while the old index of
+        its id serves."""
+        return bool(getattr(aq_base(self), "_pending", False))
 
     def getIndexType(self):
         """Return the type of the index."""
@@ -1063,6 +1113,23 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
 
 
 InitializeClass(ZoeTextIndex)
+
+
+def _field_of(languages, language):
+    """The place of the field of `language` among `languages`, as the text
+    index places a delta: the same tag, else the same primary subtag, else
+    the first."""
+    lower = [tag.lower() for tag in languages]
+    if language.lower() in lower:
+        return lower.index(language.lower())
+
+    def primary(tag):
+        return tag.replace("_", "-").split("-")[0].lower()
+
+    for k, tag in enumerate(languages):
+        if primary(tag) == primary(language):
+            return k
+    return 0
 
 
 def _query_languages(query):
@@ -1124,21 +1191,47 @@ def _check_site(tool):
     _check(jar.db().storage)
 
 
-def _reindex(tool, ids):
-    """Index each catalogued object of `tool` in the indexes `ids`, with a
-    commit after each `BATCH_SIZE` objects."""
+def _reindex(tool, keys):
+    """Index each catalogued object of `tool` in the indexes of the keys
+    `keys`, with a commit after each `BATCH_SIZE` objects. The objects of
+    the last batch wait for the commit of the caller."""
     paths = list(tool._catalog.uids.keys())
     for k, path in enumerate(paths, 1):
         obj = tool.resolve_path(path)
         if obj is not None:
-            tool.catalog_object(obj, path, idxs=list(ids), update_metadata=0)
-        if k % BATCH_SIZE == 0:
+            tool.catalog_object(obj, path, idxs=list(keys), update_metadata=0)
+        if k % BATCH_SIZE == 0 and k < len(paths):
             transaction.commit()
+
+
+def _swap(catalog, names):
+    """Put the pending index of each id of `names` in the place of the old
+    index of the id, in the current transaction. The hook of `delIndex`
+    stages a clear delta of an old `ZoeTextIndex`."""
+    for name in names:
+        if name in catalog.indexes:
+            catalog.delIndex(name)
+        indexes = dict(catalog.indexes)
+        index = aq_base(indexes.pop(PENDING + name))
+        index.id = name
+        if "_pending" in index.__dict__:
+            del index._pending
+        indexes[name] = index
+        catalog.indexes = indexes
+    settings_changed(catalog)
 
 
 def install_text(setup, mode="enhanced"):
     """The profile step `zoe.plone:text`, with the setup tool `setup` of a
-    site."""
+    site.
+
+    For each ZCTextIndex of `TEXT_INDEXES`, the step adds a pending
+    `ZoeTextIndex` of the same id, which no query reads, and indexes the
+    catalog into it in batches while the ZCTextIndex serves. A save during
+    the step stages its texts in the pending index too. The last batch
+    puts each pending index in the place of its ZCTextIndex, in the commit
+    of the caller. An import after a failure finds the pending indexes and
+    indexes the catalog again into them."""
     site = _site_of(setup)
     tool = site.portal_catalog
     if mode != "enhanced":
@@ -1147,13 +1240,17 @@ def install_text(setup, mode="enhanced"):
     from zoe.plone import register_text_index
 
     register_text_index()
+    catalog = tool._catalog
     languages = _site_languages(site)
-    replaced = []
+    names = []
     for name in TEXT_INDEXES:
-        old = tool._catalog.indexes.get(name)
+        if PENDING + name in catalog.indexes:
+            names.append(name)
+            continue
+        old = catalog.indexes.get(name)
         if old is None or getattr(aq_base(old), "meta_type", None) != "ZCTextIndex":
             continue
-        old = tool._catalog.getIndex(name)
+        old = catalog.getIndex(name)
         extra = _Extra()
         extra.indexed_attrs = ",".join(old.getIndexSourceNames())
         extra.lexicon_id = old.lexicon_id
@@ -1161,35 +1258,55 @@ def install_text(setup, mode="enhanced"):
         extra.language = ",".join(languages)
         if name == "SearchableText":
             extra.boosts = BOOSTS
-        tool.delIndex(name)
-        tool.addIndex(name, ZoeTextIndex(name, extra=extra, caller=tool))
-        replaced.append(name)
-    if replaced:
-        _reindex(tool, replaced)
+        index = ZoeTextIndex(name, extra=extra, caller=tool)
+        index._pending = True
+        catalog.addIndex(PENDING + name, index)
+        names.append(name)
+    if names:
+        settings_changed(catalog)
+        _reindex(tool, [PENDING + name for name in names])
+        _swap(catalog, names)
 
 
 def uninstall_text(setup):
     """The profile step `zoe.plone:text-uninstall`, with the setup tool
-    `setup` of a site."""
+    `setup` of a site.
+
+    For each `ZoeTextIndex`, the step adds a pending ZCTextIndex with the
+    same attributes and lexicon under the key `PENDING` and the id, which
+    no query reads, and indexes the catalog into it in batches while the
+    `ZoeTextIndex` serves. The last batch stages a clear delta of each
+    `ZoeTextIndex` and puts each ZCTextIndex in its place, in the commit of
+    the caller. An import after a failure indexes the catalog again into
+    the pending indexes. The ZCTextIndex indexes are of the type `Okapi
+    BM25 Rank`, the type of Plone."""
     from Products.ZCTextIndex.ZCTextIndex import ZCTextIndex
 
     site = _site_of(setup)
     tool = site.portal_catalog
-    catalog = aq_base(tool)._catalog
-    found = _text_indexes(catalog)
-    if not found:
+    catalog = tool._catalog
+    serving = _text_indexes(aq_base(catalog), pending=False)
+    names = sorted(
+        set(serving)
+        | {key[len(PENDING) :] for key in catalog.indexes if key.startswith(PENDING)}
+    )
+    if not names:
         return
     _check_site(tool)
-    jar = catalog._p_jar
-    deltas = _deltas(jar, create=True)
-    for name in sorted(found):
-        index = tool._catalog.getIndex(name)
-        deltas.clear(catalog._p_oid, name)
+    for name in names:
+        if PENDING + name in catalog.indexes:
+            continue
+        index = catalog.getIndex(name)
         extra = _Extra()
         extra.doc_attr = ",".join(index.getIndexSourceNames())
         extra.lexicon_id = index.lexicon_id
         extra.index_type = "Okapi BM25 Rank"
-        tool.delIndex(name)
-        tool.addIndex(name, ZCTextIndex(name, extra=extra, caller=tool))
-    settings_changed(catalog)
-    _reindex(tool, sorted(found))
+        pending = ZCTextIndex(PENDING + name, extra=extra, caller=tool)
+        catalog.addIndex(PENDING + name, pending)
+    _reindex(tool, [PENDING + name for name in names])
+    jar = aq_base(catalog)._p_jar
+    deltas = _deltas(jar, create=True)
+    for name in names:
+        if name in serving:
+            deltas.clear(aq_base(catalog)._p_oid, name)
+    _swap(catalog, names)

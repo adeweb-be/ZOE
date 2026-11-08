@@ -7,7 +7,9 @@
 //! field of the pairs of words in a row beside each. The field of a text is
 //! the field of its language, else the field of the first language of the
 //! index. The fast field `rid` holds the rid, and a delete of the term of
-//! the rid removes the document.
+//! the rid removes the document. The presence field of each text index
+//! holds one token when the document has a text in the index, also an
+//! empty text: an empty text counts as a document, as in ZCTextIndex.
 //!
 //! The payload of each tantivy commit holds the tid up to which the index
 //! holds the deltas, and the layout of the settings that built it.
@@ -55,6 +57,9 @@ pub struct Fields {
     pub rid: Field,
     /// The fields of each text index, by index id.
     pub indexes: HashMap<String, Vec<LangFields>>,
+    /// The presence field of each text index, by index id: its norm is
+    /// above 0 when the document has a text in the index.
+    pub present: HashMap<String, Field>,
 }
 
 impl Fields {
@@ -136,7 +141,27 @@ pub fn schema(layout: &Layout) -> (Schema, Fields) {
             .collect();
         indexes.insert(name.clone(), fields);
     }
-    (b.build(), Fields { rid, indexes })
+    // The presence fields come after the others.
+    let presence = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("raw")
+            .set_index_option(IndexRecordOption::Basic),
+    );
+    let mut present = HashMap::new();
+    for (i, (name, _, _)) in layout.iter().enumerate() {
+        present.insert(
+            name.clone(),
+            b.add_text_field(&format!("h{i}"), presence.clone()),
+        );
+    }
+    (
+        b.build(),
+        Fields {
+            rid,
+            indexes,
+            present,
+        },
+    )
 }
 
 /// The payload of a commit: the tid and the layout.
@@ -229,6 +254,15 @@ pub fn document(
         let Some(langs) = fields.indexes.get(index) else {
             continue;
         };
+        if let Some(present) = fields.present.get(index) {
+            d.add_pre_tokenized_text(
+                *present,
+                PreTokenizedString {
+                    text: String::new(),
+                    tokens: tokens(std::iter::once("1".to_owned())),
+                },
+            );
+        }
         let names: Vec<String> = langs.iter().map(|f| f.language.clone()).collect();
         let f = &langs[field_of(&names, language)];
         let words = analyzers.words(&f.language, text);

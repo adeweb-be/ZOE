@@ -353,16 +353,13 @@ def _text_index_held():
     """The oid of a catalog of a site of the databases that the process has
     open that holds a `ZoeTextIndex`, as a text, or None."""
     db = _root.get("db")
-    if db is None:
+    # A closed database has no storage: no catalog of it is open.
+    if db is None or getattr(db, "_mvcc_storage", None) is None:
         return None
-    try:
-        for catalog in _catalogs(db):
-            for index in catalog.indexes.values():
-                if _class_of(index) == _TEXT:
-                    return f"the oid {catalog._p_oid.hex()}"
-    except Exception:
-        # A database that closed: no catalog of it is open.
-        logger.exception("catalog mirror: the search of the text indexes failed")
+    for catalog in _catalogs(db):
+        for index in catalog.indexes.values():
+            if _class_of(index) == _TEXT:
+                return f"the oid {catalog._p_oid.hex()}"
     return None
 
 
@@ -698,6 +695,7 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     if throwaway and text:
         # A throwaway mirror has no text index.
         return None, "unsupported", plan
+    kept = {name: plan[name] for name in ("bs", "bz", "rn")}
     shift = _shift(plan) if text else 0
     from ZODB.POSException import ConflictError, POSKeyError, StorageError, Unsupported
 
@@ -743,6 +741,9 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
             # of the hook, which goes on.
             _log_once(e, "catalog_query failed")
             return None, "unsupported", plan
+    # The plan gives the options of the query again, for the log of a
+    # mismatch.
+    plan.update(kept)
     if "f" in reply:
         _count("refusals", reply["f"])
         _last.outcome = (reply["f"], "server")
@@ -1178,10 +1179,8 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
             if not text:
                 # `query_index` gives None: the stock search gives no row.
                 return None, "option"
-            from zoe.plone.textindex import _query_languages
-
             try:
-                clauses.append(index._plan_clause(text, _query_languages(made)))
+                clauses.append(index._plan_clause(text, made))
             except Exception:
                 # A query that the parser refuses, a storage without the
                 # extension text, or staged texts past the cap: the stock

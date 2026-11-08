@@ -628,3 +628,219 @@ class TestTheIndex(TextTests):
             with mock.patch.dict(catalog._installed, {}, clear=True):
                 with self.assertRaises(Unsupported):
                     index.index_object(1, types.SimpleNamespace(SearchableText="x"))
+
+
+def scored(result):
+    """The rid, the score and the normalized score of each brain."""
+    return [
+        (b.getRID(), b.data_record_score_, b.data_record_normalized_score_)
+        for b in result
+    ]
+
+
+class TestTheOptions(TextTests):
+    """The options of a query with a text clause, natively and on the
+    Python path, and the other ways to change an index."""
+
+    def same_on_both_paths(self, site, text, **query):
+        before = counts()
+        native = scored(search(site, text, **query))
+        self.assertEqual(counts(), (before[0] + 1, before[1]), query)
+        with python_path():
+            stock = scored(search(site, text, **query))
+        self.assertEqual(native, stock, query)
+        return native
+
+    def test_b_start_sort_limit_sort_on_and_normalized_scores(self):
+        with opened(self.db) as site:
+            whole = self.same_on_both_paths(site, "coffee OR stars")
+            self.assertEqual(len(whole), 4)
+            self.assertEqual(whole[0][2], 100)
+            self.assertTrue(all(0 < norm <= 100 for _r, _s, norm in whole))
+            page = self.same_on_both_paths(site, "coffee OR stars", b_start=1, b_size=2)
+            # A page after the first keeps the scores of the whole result.
+            self.assertEqual(page, whole[1:3])
+            self.same_on_both_paths(site, "coffee OR stars", b_start=2)
+            self.assertEqual(
+                self.same_on_both_paths(site, "coffee OR stars", sort_limit=2),
+                whole[:2],
+            )
+            self.same_on_both_paths(site, "coffee OR stars", sort_on="sortable_title")
+            self.same_on_both_paths(
+                site, "coffee OR stars", sort_on="sortable_title", sort_limit=2
+            )
+            self.same_on_both_paths(
+                site,
+                "coffee OR stars",
+                sort_on="sortable_title",
+                sort_order="reverse",
+                b_start=1,
+                b_size=2,
+            )
+
+    def test_a_language_clause_without_a_language_index(self):
+        with opened(self.db) as site:
+            self.assertNotIn("Language", site.portal_catalog._catalog.indexes)
+            for language in ("fr", "en-us", ["en", ""]):
+                found = self.same_on_both_paths(site, "coffee", Language=language)
+                self.assertEqual(len(found), 3, language)
+
+    def test_a_language_clause_with_a_language_index(self):
+        def ids_of(site, language):
+            native = [b.getId for b in search(site, "coffee", Language=language)]
+            with python_path():
+                stock = [b.getId for b in search(site, "coffee", Language=language)]
+            self.assertEqual(native, stock, language)
+            return set(native)
+
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            pc.addIndex("Language", "FieldIndex")
+            for name in textindex.TEXT_INDEXES:
+                self.index(site, name).setSettings(language=["en", "fr"])
+            site["n5"].language = "fr"
+            pc.reindexIndex("Language", None)
+            site["n5"].reindexObject()
+            transaction.commit()
+        try:
+            wait_text(self.storage, self.key)
+            with opened(self.db) as site:
+                index = self.index(site)
+                cat = site.portal_catalog._catalog
+                fields = {
+                    "fr": ["fr"],
+                    "fr-ca": ["fr"],
+                    "": ["en"],
+                    "de": ["en"],
+                    ("fr", ""): None,
+                }
+                for language, field in fields.items():
+                    query = {
+                        "Language": list(language)
+                        if isinstance(language, tuple)
+                        else language
+                    }
+                    self.assertEqual(index._languages_of(cat, query), field, language)
+                self.assertEqual(ids_of(site, "fr"), {"n5"})
+                self.assertEqual(ids_of(site, "fr-ca"), set())
+                # The neutral items are in the field of the first language.
+                self.assertEqual(ids_of(site, ["fr", ""]), {"n4", "n5", "n7"})
+                self.assertEqual(ids_of(site, ""), {"n4", "n7"})
+        finally:
+            with opened(self.db) as site:
+                site.portal_catalog.delIndex("Language")
+                for name in textindex.TEXT_INDEXES:
+                    self.index(site, name).setSettings(language=["en"])
+                site["n5"].language = ""
+                site["n5"].reindexObject()
+                transaction.commit()
+            wait_text(self.storage, self.key)
+
+    def test_an_empty_text_counts_as_a_document(self):
+        with opened(self.db) as site:
+            before = self.index(site, "Title").indexSize()
+            site["n3"].setTitle("")
+            site["n3"].reindexObject()
+            transaction.commit()
+        try:
+            wait_text(self.storage, self.key)
+            with opened(self.db) as site:
+                index = self.index(site, "Title")
+                self.assertEqual(index.indexSize(), before)
+                rid = site.portal_catalog.getrid("/plone/n3")
+                self.assertEqual(index.getEntryForObject(rid), [])
+        finally:
+            with opened(self.db) as site:
+                site["n3"].setTitle(CORPUS["n3"][2])
+                site["n3"].reindexObject()
+                transaction.commit()
+
+    def test_the_meta_type_adds_the_index(self):
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            extra = types.SimpleNamespace(
+                indexed_attrs="Title", lexicon_id="plone_lexicon", language="en"
+            )
+            pc.addIndex("zoe_probe", "ZoeTextIndex", extra)
+            index = pc._catalog.getIndex("zoe_probe")
+            self.assertIsInstance(index.aq_base, textindex.ZoeTextIndex)
+            self.assertEqual(index.getSettings()["indexed_attrs"], ["Title"])
+            self.assertEqual(index.getSettings()["language"], ["en"])
+
+    def test_the_settings_follow_the_transaction_of_the_connection(self):
+        manager = transaction.TransactionManager()
+        connection = self.db.open(transaction_manager=manager)
+        try:
+            from Testing.makerequest import makerequest
+
+            site = makerequest(connection.root()["Application"]).plone
+            index = site.portal_catalog._catalog.getIndex("Description")
+            index.setSettings(boosts={"Title": 2.0})
+            manager.commit()
+            value = self.storage.kv_get("durable", textindex.NAMESPACE, self.key)
+            import json
+
+            boosts = json.loads(value)["indexes"]["Description"]["boosts"]
+            self.assertEqual(boosts, {"Title": 2.0})
+            index.setSettings(boosts={})
+            manager.commit()
+        finally:
+            manager.abort()
+            connection.close()
+
+
+class TestAStepThatFailsHalfway(TextTests):
+    """A profile step that fails after some batches: the old index serves,
+    and a second import finishes the work and loses no document."""
+
+    def import_failing(self, profile, after):
+        from Products.CMFPlone.CatalogTool import CatalogTool
+
+        calls = []
+        stock = CatalogTool.catalog_object
+
+        def failing(tool, *args, **kwargs):
+            calls.append(1)
+            if len(calls) == after:
+                raise ConflictError("a conflict of the test")
+            return stock(tool, *args, **kwargs)
+
+        with (
+            mock.patch.object(textindex, "BATCH_SIZE", 2),
+            mock.patch.object(CatalogTool, "catalog_object", failing),
+            opened(self.db) as site,
+        ):
+            with self.assertRaises(ConflictError):
+                site.portal_setup.runAllImportStepsFromProfile(profile)
+            transaction.abort()
+
+    def import_again(self, profile):
+        with mock.patch.object(textindex, "BATCH_SIZE", 2), opened(self.db) as site:
+            site.portal_setup.runAllImportStepsFromProfile(profile)
+            transaction.commit()
+
+    def check(self, kind):
+        with opened(self.db) as site:
+            pc = site.portal_catalog
+            entries = len(pc._catalog.uids)
+            self.assertFalse(
+                [k for k in pc._catalog.indexes if k.startswith(textindex.PENDING)]
+            )
+            for name in textindex.TEXT_INDEXES:
+                index = pc._catalog.getIndex(name)
+                self.assertIsInstance(index.aq_base, kind, name)
+                self.assertEqual(index.getId(), name)
+                self.assertEqual(index.indexSize(), entries, name)
+            self.assertEqual({b.getId for b in search(site, "stars")}, {"n6"})
+
+    def test_both_steps_resume_after_a_failure(self):
+        self.import_failing("profile-zoe.plone:text-uninstall", after=5)
+        # The text index still serves, and the backend still refuses.
+        self.check(textindex.ZoeTextIndex)
+        self.import_again("profile-zoe.plone:text-uninstall")
+        self.check(ZCTextIndex)
+        self.import_failing("profile-zoe.plone:text", after=5)
+        self.check(ZCTextIndex)
+        self.import_again("profile-zoe.plone:text")
+        wait_text(self.storage, self.key)
+        self.check(textindex.ZoeTextIndex)
