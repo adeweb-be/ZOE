@@ -270,10 +270,8 @@ def queries(index):
             "group",
             f"({_pick(rng, common)} OR {_pick(rng, vocab)}) AND {_pick(rng, common)}",
         )
-        add(
-            "group-not",
-            f"{_pick(rng, common)} AND NOT ({_pick(rng, common)} OR {_pick(rng, vocab)})",
-        )
+        first, second, third = _pick(rng, common), _pick(rng, common), _pick(rng, vocab)
+        add("group-not", f"{first} AND NOT ({second} OR {third})")
     for t in _sample(rng, texts, 24):
         ws = t.split()
         if len(ws) >= 3:

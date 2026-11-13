@@ -15,6 +15,12 @@ index that the transaction staged before it.
 The settings: `indexed_attrs`, `mode` (`enhanced` or `compat`),
 `language` (the languages of the fields, the default first) and `boosts`
 (the indexes that a query on the index also reads, with their weights).
+The mode `compat` gives the results of ZCTextIndex with the lexicon
+`plone_lexicon` of Plone 6.1: its rids, its order, its counts and its
+scores, at each snapshot that the text clause serves (ADR 0060, section
+11). The store splits the texts as the pipeline of that lexicon does, so
+the index needs a lexicon with that pipeline. A query in this mode reads
+the index alone: `language` and `boosts` do not apply to it.
 The index writes the settings of each `ZoeTextIndex` of a catalog in the
 durable namespace `zoe.text`, under the 8 bytes of the oid of the catalog,
 in the transaction that adds the index, removes it, or calls
@@ -70,14 +76,15 @@ The profile steps. `zoe.plone:text` replaces the ZCTextIndex indexes
 `SearchableText`, `Title` and `Description` of `portal_catalog` with
 `ZoeTextIndex` indexes of the same ids, in the enhanced mode, with the
 languages of the site and, for `SearchableText`, the boosts `Title^3`,
-`Description^1.5` and `SearchableText^1`. The new indexes are pending
-first, under the key `PENDING` and their id, and no query reads them: the
-step indexes the catalog into them in batches of `BATCH_SIZE` objects, one
-commit each, which writes the deltas, while the old indexes serve. The last
-batch puts them in place, in the commit of the caller. An import after a
-failure halfway finishes the work. It refuses with `Unsupported`, and
-changes nothing, an instance without the backend `catalog`, a storage
-without the extension `text`, and the mode `compat`.
+`Description^1.5` and `SearchableText^1`. `install_text(setup,
+mode="compat")` makes them in the mode `compat`, with no boost. The new
+indexes are pending first, under the key `PENDING` and their id, and no
+query reads them: the step indexes the catalog into them in batches of
+`BATCH_SIZE` objects, one commit each, which writes the deltas, while the
+old indexes serve. The last batch puts them in place, in the commit of the
+caller. An import after a failure halfway finishes the work. It refuses
+with `Unsupported`, and changes nothing, an instance without the backend
+`catalog` and a storage without the extension `text`.
 `zoe.plone:text-uninstall` fills pending ZCTextIndex indexes with the same
 attributes and lexicons in the same way, then stages a clear delta for
 each `ZoeTextIndex` and puts the ZCTextIndex indexes in place.
@@ -811,8 +818,10 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
 
     def _reads(self):
         """The indexes that a query on this index reads: the index, then
-        the indexes of its boosts."""
+        the indexes of its boosts. In the mode `compat`, the index alone."""
         out = [self.id]
+        if self.mode == "compat":
+            return out
         out.extend(name for name in self.boosts if name not in out)
         return out
 
@@ -993,8 +1002,9 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
         maps to a field of this index as a delta maps to it: the same tag,
         else the same primary subtag, else the first language of the
         settings. So the neutral language `""` maps to the first field. The
-        index `Language` still filters the rows."""
-        if "Language" not in catalog.indexes:
+        index `Language` still filters the rows. An index in the mode
+        `compat` has one field."""
+        if "Language" not in catalog.indexes or self.mode == "compat":
             return None
         wanted = _query_languages(request)
         fields = list(self.language) or [""]
@@ -1245,7 +1255,7 @@ def _swap(catalog, names):
 
 def install_text(setup, mode="enhanced"):
     """The profile step `zoe.plone:text`, with the setup tool `setup` of a
-    site.
+    site, in the mode `mode`: `enhanced`, or `compat` with no boost.
 
     For each ZCTextIndex of `TEXT_INDEXES`, the step adds a pending
     `ZoeTextIndex` of the same id, which no query reads, and indexes the
@@ -1257,8 +1267,7 @@ def install_text(setup, mode="enhanced"):
     a step back that failed go first."""
     site = _site_of(setup)
     tool = site.portal_catalog
-    if mode != "enhanced":
-        raise Unsupported(f"the mode {mode!r} is not served")
+    mode = _mode(mode)
     _check_site(tool)
     from zoe.plone import register_text_index
 
@@ -1282,7 +1291,7 @@ def install_text(setup, mode="enhanced"):
         extra.lexicon_id = old.lexicon_id
         extra.mode = mode
         extra.language = ",".join(languages)
-        if name == "SearchableText":
+        if name == "SearchableText" and mode == "enhanced":
             extra.boosts = BOOSTS
         index = ZoeTextIndex(name, extra=extra, caller=tool)
         index._pending = True
