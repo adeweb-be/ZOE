@@ -1,6 +1,6 @@
 # 0054. One published format for every benchmark: one layout, the index of version 2, the B5 summary and `just bench publish`
 
-Status: accepted. It changes no on-disk format, no wire protocol and no public Python API. It changes the output of `just bench plone report --json` and the layout of the results repository.
+Status: accepted. It changes no on-disk format, no wire protocol and no public Python API. It changes the output of `just bench plone report --json` and the layout of the results repository. The amendment at the end, the family `catalog`, is proposed.
 
 ## Context
 
@@ -99,3 +99,34 @@ Each scenario of a cell of a native result holds `ratio`, `low`, `high` and `ver
 - **Accept a document with no record of its tree.** A dirty run passes for a clean one.
 - **Refuse a native run without the 30 cells of the gate set.** A document shows what it holds.
 - **No commit check; the human checks before the push.** A commit off main passes when the human misses it.
+
+## Amendment: the family `catalog`
+
+Status: proposed. Card ZOE-300, decision Q14 of the plan of phase 6 (#597). It adds a fifth family for the results of `zoe-bench catalog` (ZOE-299). It changes no on-disk format, no wire protocol and no public Python API. The four families of sections 1 to 8 do not change.
+
+1. **The family and its key** (section 1). The family `catalog` has one document for each run of `just bench catalog`, valid against `bench/schema/catalog.schema.json`. Its key is `catalog`: the fixture of the run, with its `name`, its `preset` (the preset whose spec equals the spec of the fixture, else `custom`) and its counts. No other family uses this key, and a catalog document holds none of the keys of the other families. In `plone` the fixture is the key `fixture`. A catalog document cannot use that key, because `fixture` names `plone`.
+2. **The layout** (section 2). `results/catalog/<machine>/<fixture>/<started>-<commit>.json`. `<machine>` is `machine.name`, and `<fixture>` is `catalog.name`. `run.started` is in UTC to the second, so `<started>` is `YYYYMMDDTHHMMSSZ`. The path has no `<python>` part, where the four families have one. No Python runs on the measured path: the client is `zoe-bench`, the server is `zoe serve`. A Zope process makes the plans once and stores them with the fixture, so its Python build belongs to the fixture, not to the run. A `<python>` part would split the runs of one machine by a build that does not change their numbers. `catalog` joins the family names that a machine cannot take; no machine of the results repository has it.
+3. **The entry in `index.json`** (section 3). `family` is `catalog`; `path`; `machine`; `python` is null, for the reason of point 2; `stacks` is `["zoe"]`; `fixture` is `catalog.name`; `scenarios` are the names of the scenarios, in the order of the document; `started` and `commit` come from `run`. So `fixture` is null except for `plone` and `catalog`. `stacks` lists the stacks that ran, as in every family. One stack runs, `zoe serve` with its mirror, and the document holds no list of stacks, so the entry gives the name `zoe`. `index_version` stays 2: an entry keeps its keys, and `family` gets one more value.
+4. **What is publishable** (section 4). Rules 1, 3, 4 and 6 apply as they are: valid against the schema, a commit on REF, `run.dirty` false, a free path. Rule 2 is for `shootout` and rule 5 for `plone`. A catalog document has one more rule: it is a full run. `catalog.preset` is `catalog-1m`, and the document holds each scenario of the default set: `intersect`, `text`, `mix` and `cold`. So `publish` refuses a run of one scenario, such as `just bench catalog text`, and a run on `catalog-mini`, with the reason. This departs from section 7, point 2, where a part of the native gate is publishable. G2, G3 and G4 read one run of the whole set on `catalog-1m`, and the dashboard shows the latest document of a machine, so a part of a run would hide the scenarios that it does not hold.
+5. **`text-rebuild`.** The rebuild of the text index with one thread is not in the default set, so a full run stays near 30 minutes. A document of the default set can also hold it. A document of `text-rebuild` alone is a part of a run, and `publish` refuses it.
+6. **Refusals and errors.** The counts of the replies `f` and `e` are numbers of the run. They do not make its document unpublishable. The differential suite (G1) judges correctness, and a reply `not_ready` during `cold` is expected.
+7. **No private data** (section 6). The document holds no host name, user name, path, address or password, as the B5 summary. So the paths of the fixture and of the store, and the address of `zoe serve`, are not in it.
+8. **`publish`, `index` and the dashboard** (section 5). `just bench publish` and `just bench index` take a catalog document as they take the others. For each machine and fixture, the dashboard shows the latest catalog document as plain tables, with the earlier ones a selector away. It computes no number that the document does not hold.
+
+### Consequences of the amendment
+
+- `bench/README.md` ("The results repository"), `bench/dashboard/README.md` and "Regression tracking" of the specification name the fifth family.
+- The acceptance tests: `bench/shootout/tests/test_publish_catalog.py`, the catalog cases of `bench/shootout/tests/test_dashboard.py`, and `crates/zoe-bench/tests/catalog_document.rs`.
+- A checkout without a catalog document gets the same index as before.
+
+### Alternatives of the amendment
+
+- **The key `fixture`, as in `plone`.** One key would name two families.
+- **A `<python>` part, with the build of the plans.** It names the build of a step of the fixture, not of the run.
+- **A part of the set is publishable, as for the native gate.** The latest document of a machine would hide the scenarios that it does not hold.
+- **`index_version` 3.** No key of an entry changes.
+
+### Points for the human
+
+1. **`python` of the entry.** Proposed: null. The other choice is the build of the plans.
+2. **`text-rebuild` alone.** Proposed: refused. ZOE-299 runs `text-rebuild` alone, so its numbers publish only when `just bench catalog` can run it with the default set in one run. The other choice: `text-rebuild` alone on `catalog-1m` is a full run of its own set, and the dashboard shows the latest document of each set.
