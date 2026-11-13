@@ -50,9 +50,9 @@
 //!
 //! `decode_ordered` also reads the order clause of the amendment of
 //! ADR 0059 (`order`): the key `o`, whose sort `s` is `[[i, reverse]]` with
-//! a bool. `decode_typed` gives `Unknown` for a plan with `o`, so a caller
-//! that cannot serve it gives the reason `plan`. `decode_request` and
-//! `decode_plan` read the form of `o` and drop it.
+//! a bool. `decode_typed`, `decode_request` and `decode_plan` give
+//! `Unknown` for a plan with the key `o`, whatever its form, so a caller
+//! that cannot serve it gives the reason `plan`.
 
 use crate::base::Kind;
 use crate::cell;
@@ -487,24 +487,21 @@ fn path_clause(items: &[(&str, &Wire)]) -> Result<Clause, PlanError> {
     Ok(clause)
 }
 
-/// Reads a plan, without its rows and without its order clause.
+/// Reads a plan, without its rows. A plan with the key `o` is `Unknown`.
 pub fn decode_plan(wire: &Wire) -> Result<Plan, PlanError> {
     decode_request(wire).map(|(plan, _)| plan)
 }
 
 /// Reads a plan and the rows that its reply gives: `cols` and `rn`. A
-/// negative `rn` gives no row. The order clause is read and dropped.
+/// negative `rn` gives no row. A plan with the key `o` is `Unknown`.
 pub fn decode_request(wire: &Wire) -> Result<(Plan, Columns), PlanError> {
-    decode_ordered(wire).map(|(plan, columns, _, _)| (plan, columns))
+    decode_typed(wire).map(|(plan, columns, _)| (plan, columns))
 }
 
 /// Reads a plan as `decode_request` does, and gives the kind of each of
-/// its clauses, in their order. A plan with an order clause is `Unknown`.
+/// its clauses, in their order. A plan with the key `o` is `Unknown`.
 pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), PlanError> {
-    match decode_ordered(wire)? {
-        (_, _, _, Some(_)) => Err(PlanError::Unknown("a plan key \"o\"".into())),
-        (plan, columns, kinds, None) => Ok((plan, columns, kinds)),
-    }
+    decode(wire, false).map(|(plan, columns, kinds, _)| (plan, columns, kinds))
 }
 
 /// Reads the order clause `o` of a plan whose sort is `sort`.
@@ -540,6 +537,15 @@ fn order(wire: &Wire, sort: &[(String, Option<bool>)]) -> Result<Option<Order>, 
 /// Reads a plan as `decode_typed` does, with its order clause.
 pub fn decode_ordered(
     wire: &Wire,
+) -> Result<(Plan, Columns, Vec<ClauseKind>, Option<Order>), PlanError> {
+    decode(wire, true)
+}
+
+/// Reads a plan with its order clause when `with_order` is true. Else the key
+/// `o` is a key that this version does not know.
+fn decode(
+    wire: &Wire,
+    with_order: bool,
 ) -> Result<(Plan, Columns, Vec<ClauseKind>, Option<Order>), PlanError> {
     let mut plan = Plan::default();
     let mut columns = Columns::default();
@@ -598,7 +604,7 @@ pub fn decode_ordered(
                     ),
                 }
             }
-            "o" => ordered = Some(v),
+            "o" if with_order => ordered = Some(v),
             other => {
                 unknown.get_or_insert_with(|| format!("a plan key {other:?}"));
             }
