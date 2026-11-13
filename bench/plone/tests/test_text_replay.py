@@ -54,17 +54,19 @@ SITE_SCRIPT = textwrap.dedent(
     import transaction
     from AccessControl.SecurityManagement import newSecurityManager
     from AccessControl.SpecialUsers import system
-    from Products.CMFPlone.factory import addPloneSite
+    from Products.CMFPlone import factory
     from zope.component.hooks import setSite
 
     probe, directory, marker = sys.argv[1:]
     sys.path.insert(0, probe)
     from zoe.plone import testing
 
+    # The patch of `replace_text_indexes` replaces `factory.addPloneSite`,
+    # so the script reads it from the module after the patch.
     testing.replace_text_indexes("compat")
     testing.record_texts(directory)
     newSecurityManager(None, system)
-    addPloneSite(
+    factory.addPloneSite(
         app,
         "Plone",
         setup_content=False,

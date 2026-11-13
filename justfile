@@ -288,7 +288,7 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
 # indexes of each site replaced by `ZoeTextIndex` indexes in the mode
 # compat (ZOE_PLONE_TEXT of zoe.plone.testing), and writes the texts of the
 # suites and their query log in target/plone/zoe/var/catalog-text, which
-# `just bench catalog replay-text` replays.
+# `just bench catalog replay --text` replays.
 # `just plone zoe backends` runs the suite of plone.locking
 # on the locking backend of zoe.plone, with the tests of zoe.plone; it
 # builds the `zoe` binary first, for the tests that start `zoe serve`.
