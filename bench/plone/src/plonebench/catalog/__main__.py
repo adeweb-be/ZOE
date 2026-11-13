@@ -5,6 +5,7 @@
     python -m plonebench.catalog fixtures
     python -m plonebench.catalog inventory LOG... [--json FILE]
     python -m plonebench.catalog replay LOG... STORE [--legs inprocess,serve]
+    python -m plonebench.catalog replay --text DIR... [--legs inprocess,serve]
 
 `just bench catalog ...` runs it in the environment of bench/plone.
 """
@@ -60,6 +61,12 @@ def main(argv: list[str] | None = None) -> int:
         "--writer-interval", type=float, default=defaults.writer_interval
     )
     replaying.add_argument("--no-flip", action="store_true")
+    replaying.add_argument(
+        "--text",
+        action="store_true",
+        help="replay the text queries of the directories of"
+        " `just plone zoe catalog text`, against ZCTextIndex",
+    )
     replaying.add_argument("--json", help="also write the report to this file")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if args.command == "prepare":
@@ -81,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
             with open(args.json, "w") as out:
                 json.dump(found, out, indent=1)
         return 0
+    if args.command == "replay" and args.text:
+        return _replay_text(args)
     if args.command == "replay":
         return _replay(args)
     for line in fixture.fixtures():
@@ -119,6 +128,35 @@ def _replay(args) -> int:
         with open(args.json, "w") as out:
             json.dump(report, out, indent=1, sort_keys=True)
     return 1 if replay.failed(report) else 0
+
+
+def _replay_text(args) -> int:
+    from plonebench.catalog import log, text_replay
+
+    defaults = text_replay.Settings()
+    settings = text_replay.Settings(
+        legs=tuple(filter(None, args.legs.split(","))),
+        window_tids=args.window_tids,
+        window_seconds=args.window_seconds,
+        writer_interval=args.writer_interval,
+        pinned_every=args.pinned_every,
+        pinned_sync=args.pinned_sync,
+        staged_every=defaults.staged_every,
+        rounds=args.rounds,
+        limit=args.limit,
+        seed=args.seed,
+    )
+    try:
+        report = text_replay.replay_text(args.paths, settings)
+    except log.LogError as error:
+        print(f"plonebench.catalog replay: {error}", file=sys.stderr)
+        return 2
+    print(text_replay.format_report(report))
+    print(f"replay text: the report is in {report['directory']}/report.json")
+    if args.json:
+        with open(args.json, "w") as out:
+            json.dump(report, out, indent=1, sort_keys=True)
+    return 1 if text_replay.failed(report) else 0
 
 
 if __name__ == "__main__":
