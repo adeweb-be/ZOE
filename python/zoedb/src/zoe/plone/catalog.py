@@ -61,7 +61,24 @@ of ExtendedPathIndex (`"k": "p"`, each path with
 its level, the options of `ExtendedPathIndex.query_index` and the
 physical path of the index), and a sort on FieldIndexes, DateIndexes and
 UUIDIndexes. A sort on an ExtendedPathIndex takes the Python path
-(`sort`). The hook decides the reasons `unsupported`, `index`, `option`,
+(`sort`).
+
+The order clause (ADR 0059, the amendment of ZOE-302). A sort on the
+`GopipIndex` of plone.folder, alone, over one folder, sends the oid of the
+order of the folder with the plan (`"o"`), and the mirror sorts the rows as
+`documentToKeyMap` does. The plan must have one path clause, with one
+path, the level 0, `depth` 1 and no `navtree`. The hook finds the folder
+of that path as `documentToKeyMap` finds it, from `getPhysicalRoot()` of
+the `ISiteRoot` utility. Its ordering must be a `DefaultOrdering`, and the
+order that `_order()` gives a `PersistentList` with an oid, in the
+Connection of the catalog. Else the search takes the Python path
+(`sort`): a sort on several indexes, several folders (several paths,
+another level or depth, `navtree`, no path clause), a folder that does not
+traverse or has another ordering, an order of another class, an order that
+is new in the transaction, or an order in another database. A
+`ConflictError` of these steps goes to the caller.
+
+The hook decides the reasons `unsupported`, `index`, `option`,
 `and_range`, `sort`, `too_large` and the `overlay` that it cannot pickle;
 the store decides the others. An error of `catalog_query` that the hook
 catches (`Unsupported`, `StorageError`) goes to the log once for each
@@ -161,6 +178,9 @@ _SORTS = {
     f"{_PLUGIN_INDEXES}.DateIndex.DateIndex.DateIndex",
     f"{_PLUGIN_INDEXES}.UUIDIndex.UUIDIndex.UUIDIndex",
 }
+# The sort index of an order clause: the position of an object in its
+# folder.
+_GOPIP = "plone.folder.nogopip.GopipIndex"
 
 # The stock `Catalog.search` and the mode, while the backend is installed.
 _installed = {}
@@ -1227,11 +1247,14 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
             return None, reason
         clauses.append(clause)
     sort = []
+    gopip = None
     if sort_index is not None:
         indexes = sort_index if isinstance(sort_index, list) else [sort_index]
         orders = reverse if isinstance(reverse, list) else [bool(reverse)]
         for i, each in enumerate(indexes):
-            if _class_of(each) not in _SORTS:
+            if _class_of(each) == _GOPIP and len(indexes) == 1:
+                gopip = each.getId()
+            elif _class_of(each) not in _SORTS:
                 return None, "sort"
             if len(orders) == 1:
                 order = orders[0]
@@ -1248,13 +1271,18 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
         b_size = int(b_size) if b_size is not None else None
     except (TypeError, ValueError):
         return None, "option"
+    order = None
+    if gopip is not None:
+        order = _order_clause(catalog, clauses, gopip)
+        if order is None:
+            return None, "sort"
     cols = _columns(catalog)
     if cols is None:
         rn = 0
     else:
         page = max(1, _CELLS // max(1, len(cols)))
         rn = page if b_size is None else max(0, min(b_size, page))
-    return {
+    plan = {
         "c": clauses,
         "s": sort,
         "l": limit,
@@ -1262,7 +1290,63 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
         "bz": b_size,
         "cols": cols,
         "rn": rn,
-    }, None
+    }
+    if order is not None:
+        plan["o"] = order
+    return plan, None
+
+
+def _order_clause(catalog, clauses, name):
+    """The order clause of a sort on the GopipIndex `name` (ADR 0059, the
+    amendment of ZOE-302): the oid of the order of the one folder that the
+    path clause of `clauses` names, and the path of the folder. None when
+    the search does not have one folder of `DefaultOrdering`."""
+    from ZODB.POSException import ConflictError
+
+    paths = [c for c in clauses if c["k"] == "p"]
+    if len(paths) != 1:
+        return None
+    clause = paths[0]
+    if len(clause["q"]) != 1 or clause["lv"] != 0 or clause["d"] != 1 or clause["nt"]:
+        return None
+    path, level = clause["q"][0]
+    if level not in (None, 0):
+        return None
+    path = "/" + "/".join(p for p in path.split("/") if p)
+    try:
+        order = _order_of(path)
+    except ConflictError:
+        raise
+    except Exception:
+        return None
+    if order is None or order._p_oid is None or order._p_jar is not catalog._p_jar:
+        return None
+    return {"i": name, "oid": bytes(order._p_oid), "p": path}
+
+
+def _order_of(path):
+    """The order of the folder at `path`, found as `documentToKeyMap` of
+    plone.folder finds it: the `PersistentList` that `_order()` of its
+    `DefaultOrdering` gives. None for another folder or another order."""
+    from Acquisition import aq_base
+    from persistent.list import PersistentList
+    from plone.folder.default import DefaultOrdering
+    from plone.folder.nogopip import traverse
+    from Products.CMFCore.interfaces import ISiteRoot
+    from zope.component import getUtility
+
+    root = getUtility(ISiteRoot).getPhysicalRoot()
+    folder = traverse(root, path)
+    if folder is None or getattr(aq_base(folder), "getOrdering", None) is None:
+        return None
+    ordering = folder.getOrdering()
+    if type(ordering) is not DefaultOrdering:
+        return None
+    # `idsInOrder()` copies this list.
+    order = ordering._order()
+    if type(order) is not PersistentList:
+        return None
+    return order
 
 
 def _class_of(index):

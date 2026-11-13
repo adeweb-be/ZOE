@@ -102,7 +102,7 @@ N6 bounds the resident memory of a server by its configuration. The mirrors add 
 
 ### 7. What the mirror serves, and the reasons of a fallback
 
-Served: the clauses of FieldIndex, DateIndex, UUIDIndex and KeywordIndex (`query`, `range`, `operator`, `not`), BooleanIndex (`query`), DateRangeIndex (`query`) and ExtendedPathIndex (`query`, `level`, `operator`, `depth`, `navtree`, `navtree_start`); a sort on one or several FieldIndex, DateIndex or UUIDIndex, with `sort_order`, `sort_limit`, `b_start` and `b_size`; a query without sort. Each answer gives the rids in the order of ZCatalog, the length of its lazy result and `actual_result_count`.
+Served: the clauses of FieldIndex, DateIndex, UUIDIndex and KeywordIndex (`query`, `range`, `operator`, `not`), BooleanIndex (`query`), DateRangeIndex (`query`) and ExtendedPathIndex (`query`, `level`, `operator`, `depth`, `navtree`, `navtree_start`); a sort on one or several FieldIndex, DateIndex or UUIDIndex, with `sort_order`, `sort_limit`, `b_start` and `b_size`; a sort on one GopipIndex with an order clause (the amendment of ZOE-302); a query without sort. Each answer gives the rids in the order of ZCatalog, the length of its lazy result and `actual_result_count`.
 
 A query takes the Python path, whole, with one of these reasons:
 
@@ -114,7 +114,7 @@ A query takes the Python path, whole, with one of these reasons:
 | `index` | an index of the query is of another class: ZCTextIndex, DateRecurringIndex, any add-on index |
 | `option` | an option that the plan does not carry, such as `usage` |
 | `and_range` | a range with the operator `and` |
-| `sort` | a sort on another index (GopipIndex until ZOE-302, ExtendedPathIndex), `merge=False`, a `sort_limit` of 0, or several sort indexes on the path of ZCatalog that iterates the index |
+| `sort` | a sort on another index (ExtendedPathIndex, a GopipIndex that the order clause of ZOE-302 does not serve), `merge=False`, a `sort_limit` of 0, or several sort indexes on the path of ZCatalog that iterates the index |
 | `transaction` | the transaction changed records before ZOE-291 merged: the interim rule of ZOE-286 (section 8) |
 | `too_large` | the plan and the transaction overlay pass the cap of a call (section 8) |
 | `plan` | the server does not know a key or a kind of clause of the plan: a client newer than the server (the order clause of ZOE-302, the text clause of ADR 0060) |
@@ -154,6 +154,7 @@ overlay = nil | [[oid, pickle]...]
 - `rows` and `paths` cover the first `rn` rids of `r`, with the cells of the columns `cols`. The client gives `b_size` as `rn`, or a page of its own when the query has no `b_size`. A `LazyMap` makes a brain past these rows with the stock `Catalog.__getitem__`, which loads the bucket of `data`.
 - A cell is msgpack: nil, bool, an int of 64 bits, float, str, bin, an array for a tuple, a map for a dict, and three ext types: `Missing.Value` (ext 1, empty), `DateTime` (ext 2: `_micros` as int64, the naive flag, the name of `_tz`), `Message` (ext 3: the msgpack array of the arguments of its `__reduce__`). A row with a cell of another type (a list, a `datetime`, a `set`, an instance, a larger int) comes as nil, and the client makes its brain with the stock `__getitem__`.
 - The reply has no scores. ADR 0060 adds them, with the text clause.
+- Amendment (ZOE-302): the key `o` of a plan is the order clause of a sort on a GopipIndex: the amendment at the end of this record.
 - Amendment (ADR 0060, section 12): a plan holds at most one text clause, `{"k": "t", "i": index, "q": node, "lg": [language...] | nil, "cl": [index...], "st": [staged...], "set": settings | nil}`. The mirror runs the other clauses first and gives the rids of their result to the text index of the catalog. The reply gets `sc`, the integer score of each rid of `r` as a signed 32-bit big-endian int in one bin, when the plan has a text clause and no sort; with a sort, the hits of the text clause are a set in the order of the sort. A failure of the text clause gives the error form `{"tid": tid, "e": error, "why": text}`, with `unavailable`, `packed`, `cleared`, `corrupt` and `too_large`. A text clause of another form makes the plan malformed: `ValueError`.
 
 The transaction overlay (Q6) is the records that the transaction changed in the database of the catalog:
