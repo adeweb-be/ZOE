@@ -1,5 +1,5 @@
-//! The order clause of a plan (ADR 0059, the amendment of ZOE-302): a
-//! sort on the `GopipIndex` of plone.folder for the rows of one container.
+//! The order clause of a plan (ADR 0059, its amendment): a sort on the
+//! `GopipIndex` of plone.folder for the rows of one container.
 //!
 //! `GopipIndex` stores nothing. For a result whose rows have one parent,
 //! its `documentToKeyMap` gives each row the place of its id in

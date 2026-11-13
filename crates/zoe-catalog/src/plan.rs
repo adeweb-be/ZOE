@@ -49,7 +49,7 @@
 //! gives the reason `plan`.
 //!
 //! `decode_ordered` also reads the order clause of the amendment of
-//! ZOE-302 (`order`): the key `o`, whose sort `s` is `[[i, reverse]]` with
+//! ADR 0059 (`order`): the key `o`, whose sort `s` is `[[i, reverse]]` with
 //! a bool. `decode_typed` gives `Unknown` for a plan with `o`, so a caller
 //! that cannot serve it gives the reason `plan`. `decode_request` and
 //! `decode_plan` read the form of `o` and drop it.

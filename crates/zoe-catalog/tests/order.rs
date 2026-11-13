@@ -1,5 +1,5 @@
-//! The acceptance test of the order clause (ADR 0059, the amendment of
-//! ZOE-302): a listing of one folder of plone.folder, sorted on its
+//! The acceptance test of the order clause (ADR 0059, its amendment): a
+//! listing of one folder of plone.folder, sorted on its
 //! `GopipIndex`, answered by the mirror in the order of `documentToKeyMap`.
 //!
 //! `tests/data/order.json` holds the folders of plone.folder and the

@@ -1,6 +1,6 @@
 """Acceptance tests of the order clause of the catalog backend of
-`zoe.plone` (ADR 0059, the amendment of ZOE-302): the listings of a folder
-of 300 items sorted on `getObjPositionInParent`, the `GopipIndex` of
+`zoe.plone` (ADR 0059, its amendment): the listings of a folder of 300
+items sorted on `getObjPositionInParent`, the `GopipIndex` of
 plone.folder, answered by the catalog mirror in the order of the Python
 path.
 

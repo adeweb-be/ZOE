@@ -63,7 +63,7 @@ physical path of the index), and a sort on FieldIndexes, DateIndexes and
 UUIDIndexes. A sort on an ExtendedPathIndex takes the Python path
 (`sort`).
 
-The order clause (ADR 0059, the amendment of ZOE-302). A sort on the
+The order clause (ADR 0059, its amendment). A sort on the
 `GopipIndex` of plone.folder, alone, over one folder, sends the oid of the
 order of the folder with the plan (`"o"`), and the mirror sorts the rows as
 `documentToKeyMap` does. The plan must have one path clause, with one
@@ -1297,8 +1297,8 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
 
 
 def _order_clause(catalog, clauses, name):
-    """The order clause of a sort on the GopipIndex `name` (ADR 0059, the
-    amendment of ZOE-302): the oid of the order of the one folder that the
+    """The order clause of a sort on the GopipIndex `name` (ADR 0059, its
+    amendment): the oid of the order of the one folder that the
     path clause of `clauses` names, and the path of the folder. None when
     the search does not have one folder of `DefaultOrdering`."""
     from ZODB.POSException import ConflictError
