@@ -54,8 +54,7 @@ import transaction
 from Acquisition import Implicit
 from OFS.SimpleItem import SimpleItem
 from plone.folder.default import DefaultOrdering
-from plone.folder.interfaces import IOrderableFolder
-from plone.folder.interfaces import IOrdering
+from plone.folder.interfaces import IOrderableFolder, IOrdering
 from plone.folder.nogopip import GopipIndex
 from plone.folder.ordered import OrderedBTreeFolderBase
 from Products.CMFCore.interfaces import ISiteRoot
@@ -65,8 +64,7 @@ from Products.ZCatalog.Catalog import Catalog
 from ZODB import DB
 from ZODB.MappingStorage import MappingStorage
 from zope.annotation.attribute import AttributeAnnotations
-from zope.component import provideAdapter
-from zope.component import provideUtility
+from zope.component import provideAdapter, provideUtility
 
 out = sys.argv[1]
 rnd = random.Random(302)
