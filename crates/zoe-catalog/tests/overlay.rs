@@ -403,7 +403,15 @@ fn an_overlay_that_does_not_fit_takes_overlay_and_drops_no_mirror() {
     // mirror of the other catalog stays.
     let large = vec![(1 << 40, vec![0; 9 << 20])];
     let found = mirrors.query_overlay(a.oid(), tid + 1, plan, columns, &large);
-    assert_eq!(found.map_err(|f| f.reason), Err(Reason::Overlay));
+    let refused = found.expect_err("a refusal");
+    assert_eq!(refused.reason, Reason::Overlay);
+    // The hook of `zoe.plone.catalog` counts a refusal with this text as an
+    // overlay past the bound (`overlay_bound`).
+    assert!(
+        refused.why.starts_with("the overlay passes"),
+        "{}",
+        refused.why
+    );
     for catalog in [a.oid(), b.oid()] {
         assert_eq!(mirrors.status(catalog).expect("a mirror").state, "ready");
     }
