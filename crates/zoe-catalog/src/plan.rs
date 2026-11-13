@@ -504,10 +504,13 @@ pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), Pla
     decode(wire, false).map(|(plan, columns, kinds, _)| (plan, columns, kinds))
 }
 
-/// Reads the order clause `o` of a plan whose sort is `sort`.
+/// Reads the order clause `o` of a plan whose sort is `sort`. An `o` that
+/// is not a map is a form that this version does not know: `Unknown`.
 fn order(wire: &Wire, sort: &[(String, Option<bool>)]) -> Result<Option<Order>, PlanError> {
-    if *wire == Wire::Nil {
-        return Ok(None);
+    match wire {
+        Wire::Nil => return Ok(None),
+        Wire::Map(_) => {}
+        _ => return Err(PlanError::Unknown("o of another form".into())),
     }
     let (mut index, mut oid, mut path) = (None, None, None);
     for (key, v) in items(wire, "o")? {
