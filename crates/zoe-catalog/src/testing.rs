@@ -22,6 +22,9 @@
 //!   and an inner node at half of its children, past the largest inner
 //!   node of the family or the fan-out of `with_fanout`; the root splits as
 //!   `BTree_split_root` does. Its tree sets stay one inline bucket.
+//! - `order_record`, `positions_record` and `annotations_record` give the
+//!   records of the order of a folder of plone.folder, as `DefaultOrdering`
+//!   writes them in the annotations of the folder.
 //! - `commit` writes records and registration keys to a store.
 //! - With the feature `text`, `commit_text` writes the deltas of the text
 //!   indexes of a catalog and the settings of `zoe.text` (ADR 0060).
@@ -482,6 +485,52 @@ pub fn bucket_record(family: Family, items: &[(Val, Item)], next: Option<u64>) -
 /// The record of a `BTrees.Length.Length` of `n`.
 pub fn length_record(n: i64) -> Vec<u8> {
     Pickle::default().record("BTrees.Length", "Length", Py::Int(n))
+}
+
+/// The key of the order in the annotations of a folder of plone.folder.
+pub const ORDER_KEY: &str = "plone.folder.ordered.order";
+
+/// The key of the positions in the annotations of a folder of plone.folder.
+pub const POS_KEY: &str = "plone.folder.ordered.pos";
+
+/// The record of the order of a folder of plone.folder: the
+/// `persistent.list.PersistentList` of the ids, with the state
+/// `{'data': [id...]}`.
+pub fn order_record(ids: &[&str]) -> Vec<u8> {
+    let mut p = Pickle::default();
+    let items = ids.iter().map(|id| p.str(id)).collect();
+    let list = p.list(items);
+    let key = p.str("data");
+    let state = p.dict(vec![(key, list)]);
+    p.record("persistent.list", "PersistentList", state)
+}
+
+/// The record of the positions of a folder of plone.folder: an `OIBTree`
+/// of `{id: index}` with one inline bucket. `items` are in the order of the
+/// ids.
+pub fn positions_record(items: &[(&str, i64)]) -> Vec<u8> {
+    let items = items
+        .iter()
+        .map(|(id, place)| (Val::Str((*id).into()), Item::Val(Val::Int(*place))))
+        .collect();
+    tree_record(OI, &TreeRecord::Inline(items))
+}
+
+/// The record of the annotations of a folder of plone.folder that hold only
+/// its order at `order` and its positions at `positions`: an `OOBTree` with
+/// one inline bucket.
+pub fn annotations_record(order: u64, positions: u64) -> Vec<u8> {
+    let items = vec![
+        (
+            Val::Str(ORDER_KEY.into()),
+            Item::Ref(order, "persistent.list", "PersistentList"),
+        ),
+        (
+            Val::Str(POS_KEY.into()),
+            Item::Ref(positions, "BTrees.OIBTree", "OIBTree"),
+        ),
+    ];
+    tree_record(OO, &TreeRecord::Inline(items))
 }
 
 /// The record of a `Catalog` with the columns `columns`, the indexes
