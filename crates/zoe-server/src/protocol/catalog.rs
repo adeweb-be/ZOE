@@ -35,7 +35,7 @@ use rmpv::Value;
 use zoe_catalog::counts::{Counters, LATENCY_BUCKETS};
 use zoe_catalog::text::{CallError, clause, engine};
 use zoe_catalog::{
-    Config, Fallback, Mirrors, NAMESPACE, Opener, PlanError, Reads, Reason, Wire, decode_typed,
+    Config, Fallback, Mirrors, NAMESPACE, Opener, PlanError, Reads, Reason, Wire, decode_ordered,
     encode_reply, overlay, split_text,
 };
 use zoe_core::{Flavour, Store};
@@ -156,7 +156,7 @@ impl Catalog {
         let (rest, text) = split_text(&Wire::from_value(plan)?).map_err(|e| match e {
             PlanError::Malformed(why) | PlanError::Unknown(why) => why,
         })?;
-        let decoded = decode_typed(&rest);
+        let decoded = decode_ordered(&rest);
         let records = match decoded {
             Err(PlanError::Malformed(why)) => return Err(why),
             _ => overlay::decode(overlay)?,
@@ -178,7 +178,7 @@ impl Catalog {
                     "the store has no registration key",
                 ))
             }
-            (Ok((plan, columns, kinds)), Some(mirrors)) => {
+            (Ok((plan, columns, kinds, order)), Some(mirrors)) => {
                 let answer = mirrors.query_with_text(
                     catalog,
                     tid,
@@ -187,6 +187,7 @@ impl Catalog {
                     &kinds,
                     records.as_deref(),
                     text.as_ref(),
+                    order.as_ref(),
                 );
                 log(mirrors);
                 answer

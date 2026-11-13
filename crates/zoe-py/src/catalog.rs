@@ -601,13 +601,13 @@ pub(crate) fn _catalog_throwaway<'py>(
     use zoe_catalog::build::{BuildError, build};
     use zoe_catalog::change::Overrides;
     use zoe_catalog::query::View;
-    use zoe_catalog::{PlanError, Reason, decode_typed};
+    use zoe_catalog::{PlanError, Reason, decode_ordered};
 
     let oid = p64("catalog", catalog)?;
     let before = p64("tid", tid)?;
     let wire = wire(plan)?;
     let records = self::overlay(overlay)?;
-    let (plan, columns, kinds) = match decode_typed(&wire) {
+    let (plan, columns, kinds, order) = match decode_ordered(&wire) {
         Ok(decoded) => decoded,
         Err(PlanError::Malformed(why)) => return Err(PyValueError::new_err(why)),
         Err(PlanError::Unknown(why)) => {
@@ -644,7 +644,21 @@ pub(crate) fn _catalog_throwaway<'py>(
                     records,
                 )?,
             };
-            View::new(&built.base, &over).query_rows(&plan, &columns)
+            // The order of an order clause, through `load` as the trees.
+            let list = match &order {
+                Some(order) => Some(zoe_catalog::order::read(
+                    &reads,
+                    order,
+                    before,
+                    records.as_deref(),
+                )?),
+                None => None,
+            };
+            let mut view = View::new(&built.base, &over);
+            if let Some(list) = &list {
+                view = view.ordered(list);
+            }
+            view.query_rows(&plan, &columns)
         }))
         .unwrap_or_else(|_| Err(Fallback::new(Reason::Refused, "the query panicked")))
     });

@@ -30,6 +30,9 @@
 //! commit that changes the rows, and a shadow rebuild that fails, drop the
 //! base: the mirror builds again from nothing.
 //!
+//! A query with an order clause reads the order of its container as of its
+//! tid, or from its transaction overlay, at each query (`order`).
+//!
 //! A query can carry a transaction overlay (`overlay`): the mirror reads it
 //! over the version of the query, with the shapes of the trees that the
 //! thread keeps, for that query only. The bound counts the overlays of the
@@ -56,8 +59,9 @@ use crate::build::{BuildError, Built, build};
 use crate::change::{ChangeSet, Shapes, Unfollowed, read_records};
 use crate::counts::{Counters, Counts, MirrorCounts};
 use crate::mirror::{Versions, rebase};
+use crate::order::{self as order_clause, Order};
 use crate::overlay;
-use crate::plan::{ClauseKind, PlanError, Wire, decode_typed};
+use crate::plan::{ClauseKind, PlanError, Wire, decode_ordered};
 use crate::query::{Columns, Plan, Reply, View};
 use crate::read::{Commit, Reads};
 use crate::reason::{Fallback, Reason};
@@ -513,11 +517,27 @@ impl Mirrors {
         kinds: &[ClauseKind],
         overlay: Option<&[(u64, Vec<u8>)]>,
     ) -> Result<Reply, Fallback> {
-        self.query_full(catalog, tid, plan, columns, kinds, overlay, None)
+        self.query_full(catalog, tid, plan, columns, kinds, overlay, None, None)
     }
 
-    /// Answers a plan as `query_typed` does, with the text clause `text` of
-    /// ADR 0060, section 12, which `split_text` took out of the plan.
+    /// Answers a plan as `query_typed` does, with the order clause `order`
+    /// that `decode_ordered` read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_ordered(
+        &self,
+        catalog: u64,
+        tid: u64,
+        plan: &Plan,
+        columns: &Columns,
+        kinds: &[ClauseKind],
+        overlay: Option<&[(u64, Vec<u8>)]>,
+        order: Option<&Order>,
+    ) -> Result<Reply, Fallback> {
+        self.query_full(catalog, tid, plan, columns, kinds, overlay, None, order)
+    }
+
+    /// Answers a plan as `query_ordered` does, with the text clause `text`
+    /// of ADR 0060, section 12, which `split_text` took out of the plan.
     #[cfg(feature = "text")]
     #[allow(clippy::too_many_arguments)]
     pub fn query_with_text(
@@ -529,11 +549,13 @@ impl Mirrors {
         kinds: &[ClauseKind],
         overlay: Option<&[(u64, Vec<u8>)]>,
         text: Option<&crate::text::TextClause>,
+        order: Option<&Order>,
     ) -> Result<Reply, Fallback> {
-        self.query_full(catalog, tid, plan, columns, kinds, overlay, text)
+        self.query_full(catalog, tid, plan, columns, kinds, overlay, text, order)
     }
 
-    /// Answers a plan as `query_typed` does, with its text clause `text`.
+    /// Answers a plan as `query_typed` does, with its text clause `text`
+    /// and its order clause `order`.
     #[allow(clippy::too_many_arguments)]
     fn query_full(
         &self,
@@ -544,13 +566,14 @@ impl Mirrors {
         kinds: &[ClauseKind],
         overlay: Option<&[(u64, Vec<u8>)]>,
         text: Option<&TextPart>,
+        order: Option<&Order>,
     ) -> Result<Reply, Fallback> {
         let started = Instant::now();
         if let Some(records) = overlay {
             self.shared.counters.overlay(records.len());
         }
         let overlay = overlay.filter(|records| !records.is_empty());
-        let answer = self.answer(catalog, tid, plan, columns, kinds, overlay, text);
+        let answer = self.answer(catalog, tid, plan, columns, kinds, overlay, text, order);
         match &answer {
             Ok(_) => self.shared.counters.native(started.elapsed()),
             Err(f) => self.shared.counters.python(f.reason, started.elapsed()),
@@ -590,8 +613,8 @@ impl Mirrors {
         let plan = &rest;
         #[cfg(not(feature = "text"))]
         let text: Option<TextPart> = None;
-        match decode_typed(plan) {
-            Ok((plan, columns, kinds)) => Ok(self.query_full(
+        match decode_ordered(plan) {
+            Ok((plan, columns, kinds, order)) => Ok(self.query_full(
                 catalog,
                 tid,
                 &plan,
@@ -599,6 +622,7 @@ impl Mirrors {
                 &kinds,
                 overlay,
                 text.as_ref(),
+                order.as_ref(),
             )),
             Err(PlanError::Malformed(why)) => Err(why),
             Err(PlanError::Unknown(why)) => {
@@ -618,6 +642,7 @@ impl Mirrors {
         kinds: &[ClauseKind],
         overlay: Option<&[(u64, Vec<u8>)]>,
         text: Option<&TextPart>,
+        order: Option<&Order>,
     ) -> Result<Reply, Fallback> {
         #[cfg(not(feature = "text"))]
         let _ = text;
@@ -754,7 +779,20 @@ impl Mirrors {
                     ));
                 }
             };
-            let view = View::new(&base, &over);
+            // The order of an order clause, read at each query.
+            let list = match order {
+                Some(order) => {
+                    let Some(reads) = (shared.open)() else {
+                        return Err(Fallback::new(Reason::NotReady, "the store is closed"));
+                    };
+                    Some(order_clause::read(&*reads, order, tid, overlay)?)
+                }
+                None => None,
+            };
+            let mut view = View::new(&base, &over);
+            if let Some(list) = &list {
+                view = view.ordered(list);
+            }
             #[cfg(feature = "text")]
             if let Some(clause) = text {
                 return self.answer_text(&view, catalog, tid, plan, clause, columns);

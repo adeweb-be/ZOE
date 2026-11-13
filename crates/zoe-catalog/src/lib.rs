@@ -14,6 +14,8 @@
 //! - `security`: the `ZoeSecurityIndex` of `zoe.plone`, resolved from the
 //!   inherited inputs of each entry.
 //! - `plan`: the codec of a plan and of a reply.
+//! - `order`: the order clause of a plan, a sort on the `GopipIndex` of
+//!   plone.folder over one container, and the read of its order.
 //! - `overlay`: the transaction overlay of a query, read over the version
 //!   of the query for that query only.
 //! - `mirrors`: the mirrors of a store, their registration, their thread
@@ -37,6 +39,7 @@ pub mod change;
 pub mod counts;
 pub mod mirror;
 pub mod mirrors;
+pub mod order;
 pub mod overlay;
 pub mod plan;
 pub mod query;
@@ -52,10 +55,12 @@ pub mod text;
 pub mod value;
 
 pub use mirrors::{Config, Hooks, Mirrors, Opener, Status};
+pub use order::{Order, OrderList};
 #[cfg(feature = "text")]
 pub use plan::split_text;
 pub use plan::{
-    ClauseKind, PlanError, Wire, decode_plan, decode_request, decode_typed, encode_reply,
+    ClauseKind, PlanError, Wire, decode_ordered, decode_plan, decode_request, decode_typed,
+    encode_reply,
 };
 pub use query::{Clause, Columns, Plan, Reply};
 pub use read::{NAMESPACE, Reads};
