@@ -91,7 +91,7 @@ pub struct Rebuilt {
 
 /// The catalogs whose text index a rebuild writes, with their settings, in
 /// the order of their oids: each registered catalog whose settings in
-/// `zoe.text` name a text index in the enhanced mode. With `only`, that
+/// `zoe.text` name a text index. With `only`, that
 /// catalog alone.
 ///
 /// Settings that do not read fail the call, as does an `only` that names
@@ -115,7 +115,7 @@ pub fn catalogs(store: &Store, only: Option<u64>) -> Result<Vec<(u64, CatalogSet
         && out.is_empty()
     {
         return Err(format!(
-            "the catalog {catalog:#018x} is not registered, or has no text index in the enhanced mode"
+            "the catalog {catalog:#018x} is not registered, or has no text index"
         ));
     }
     Ok(out)

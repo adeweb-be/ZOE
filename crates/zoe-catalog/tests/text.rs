@@ -1394,7 +1394,8 @@ fn a_clause_of_another_form_is_malformed() {
         ("rn", Wire::Int(0)),
     ]);
     assert!(site.mirrors.query_wire(site.catalog, now, &plan).is_err());
-    // The compatibility mode is not served.
+    // The compatibility mode is served: an index in `cl` with no staged
+    // text has no hit.
     let compat = map(vec![
         ("mode", s("compat")),
         ("language", strs(&["en"])),
@@ -1409,7 +1410,7 @@ fn a_clause_of_another_form_is_malformed() {
         &q,
         &Wire::Nil,
     );
-    assert!(matches!(found, Err(CallError::Unsupported(_))));
+    assert!(matches!(found, Ok(Ok(hits)) if hits.rids.is_empty()));
 }
 
 #[test]

@@ -6,11 +6,16 @@
 //! - `clause`: the text clause, its codec, and the replies of `text_query`
 //!   and `text_info`.
 //! - `analysis`: the analyzer of the enhanced mode.
+//! - `lexicon`: the words of the lexicon `plone_lexicon` of Plone 6.1, of
+//!   the compatibility mode, with its tables in `plone_table.rs`, which
+//!   `plone_table.py` generates.
 //! - `index`: the tantivy index of a catalog, its directory and its maps.
 //! - `translate`: the parse tree as a tantivy query, and the bound of its
 //!   hits.
 //! - `search`: the search inside a filter, and the integer scores.
 //! - `overlay`: the text overlay, which scores the replaced documents.
+//! - `compat`: the search of the compatibility mode: the score of
+//!   `OkapiIndex` over the index and the text overlay.
 //! - `texts`: the text indexes of a store and their thread.
 //! - `engine`: the answer of a text clause and of `text_info`.
 //! - `rebuild`: the rebuild of `zoe catalog rebuild-text`, in
@@ -23,9 +28,12 @@
 
 pub mod analysis;
 pub mod clause;
+pub mod compat;
 pub mod engine;
 pub mod index;
+pub mod lexicon;
 pub mod overlay;
+mod plone_table;
 pub mod rebuild;
 pub mod search;
 pub mod settings;

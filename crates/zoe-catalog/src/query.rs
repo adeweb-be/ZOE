@@ -457,7 +457,7 @@ impl<'a> View<'a> {
     /// their scores; each other clause adds 1 to the score, as
     /// `weightedIntersection` does. With a sort, the hits are a set with no
     /// score, in the order of the sort. An error of the text clause gives
-    /// the reply its error; the compatibility mode gives `unsupported`.
+    /// the reply its error.
     #[cfg(feature = "text")]
     pub fn query_text(
         &self,

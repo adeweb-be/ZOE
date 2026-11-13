@@ -1,8 +1,7 @@
 //! The text indexes of a store, and their thread (ADR 0060, section 10).
 //!
 //! One tantivy index serves each registered catalog whose settings in
-//! `zoe.text` name a text index in the enhanced mode, in `text/<oid>/` of
-//! the store directory. Only the process that holds the lock of the store
+//! `zoe.text` name a text index, in `text/<oid>/` of the store directory. Only the process that holds the lock of the store
 //! opens a writer: a read-only open writes nothing in `text/`.
 //!
 //! The thread reads the registration keys and the settings at its start,
@@ -41,7 +40,7 @@ use crate::read::NAMESPACE as CATALOGS;
 use super::clause::{TextError, TextErrorKind};
 use super::index::{self, Analyzers, Fields, Maps, SegmentRids};
 use super::rebuild::Step;
-use super::settings::{CatalogSettings, Layout, Mode, NAMESPACE};
+use super::settings::{CatalogSettings, Layout, NAMESPACE};
 
 /// The longest time that the writer holds a delta before a commit.
 const COMMIT_EVERY: Duration = Duration::from_millis(500);
@@ -110,8 +109,7 @@ struct Entry {
     /// When the open or the rebuild began.
     since: Instant,
     /// True when no index serves the catalog: its settings name no text
-    /// index in the enhanced mode, or do not parse. Such an entry has no
-    /// lag.
+    /// index, or do not parse. Such an entry has no lag.
     indexless: bool,
 }
 
@@ -568,12 +566,10 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
     for (catalog, settings) in wanted {
         let settings = match settings {
             Ok(s) if layout_of(&s).is_empty() => {
-                // No text index in the enhanced mode: the queries see the
-                // settings, and no index serves them.
+                // No text index: the queries see the settings, and no index
+                // serves them.
                 let entry = Entry {
-                    state: TextState::Unavailable(
-                        "the catalog has no text index in the enhanced mode".into(),
-                    ),
+                    state: TextState::Unavailable("the catalog has no text index".into()),
                     snap: None,
                     settings: s,
                     held: None,
@@ -674,14 +670,10 @@ pub(super) fn registered(
     Ok(wanted)
 }
 
-/// The layout of the index of `settings`: its text indexes in the enhanced
+/// The layout of the index of `settings`: its text indexes, each with its
 /// mode.
 pub(super) fn layout_of(settings: &CatalogSettings) -> Layout {
-    settings
-        .layout()
-        .into_iter()
-        .filter(|(_, mode, _)| *mode == Mode::Enhanced)
-        .collect()
+    settings.layout()
 }
 
 fn set_state(shared: &Shared, catalog: u64, state: TextState) {
@@ -1121,7 +1113,7 @@ fn publish(
         return Err(());
     }
     let searcher = live.reader.searcher();
-    let maps = match Maps::build(&searcher, &mut live.segments) {
+    let maps = match Maps::build(&searcher, &live.fields, &mut live.segments) {
         Ok(m) => m,
         Err(e) => {
             set_state(shared, catalog, TextState::Unavailable(e.to_string()));

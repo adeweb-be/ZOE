@@ -9,8 +9,11 @@
 //! - The transaction. The staged texts of the clause replace the documents
 //!   of their keys, after the snapshot. When the clause lists an index that
 //!   the query reads in `cl`, the answer comes from the staged texts alone.
-//! - The statistics are those of the current index, or those of the
-//!   staged texts when no index holds a document.
+//! - The statistics. In the enhanced mode, they are those of the current
+//!   index, or those of the staged texts when no index holds a document.
+//!   In the compatibility mode, they are those of the index less the
+//!   replaced documents, plus the documents of the overlay: those of the
+//!   snapshot with the staged texts (`compat`).
 //! - The refusals: a snapshot at or before the pack watermark is `packed`;
 //!   a snapshot before a clear delta that the index holds is `cleared`. A
 //!   clear delta before the snapshot that the index does not hold yet means
@@ -25,7 +28,9 @@ use tantivy::query::Bm25StatisticsProvider;
 use zoe_core::{Oid, Store, Tid};
 
 use super::clause::{MAX_BYTES, TextClause, TextErrorKind, TextInfo};
+use super::compat;
 use super::index::{self, Fields};
+use super::lexicon;
 use super::overlay::{Doc, OwnStats, Scorer};
 use super::search::{self, Found, Scope, Strategy, Want, to_int};
 use super::settings::{IndexSettings, Mode};
@@ -82,7 +87,7 @@ fn check_packed(store: &Store, tid: u64) -> Result<u64, Failure> {
 }
 
 /// The settings of the index of `clause`: those of the clause, else those
-/// of `zoe.text`. The compatibility mode is `Unsupported`.
+/// of `zoe.text`.
 fn settings_of(clause: &TextClause, snap: Option<&Snap>) -> Result<IndexSettings, Failure> {
     let settings = match (&clause.settings, snap) {
         (Some(s), _) => s.clone(),
@@ -98,11 +103,6 @@ fn settings_of(clause: &TextClause, snap: Option<&Snap>) -> Result<IndexSettings
             return Err(Failure::unavailable("the catalog has no text index"));
         }
     };
-    if settings.mode == Mode::Compat {
-        return Err(Failure::Unsupported(
-            "the compatibility mode of the text index is not served".into(),
-        ));
-    }
     Ok(settings)
 }
 
@@ -162,12 +162,25 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         Err(_) if alone => None,
         Err(f) => return Err(f),
     };
+    let compat = settings.mode == Mode::Compat;
+    if compat
+        && let Some(s) = &snap
+        && !s.fields.is_compat(&c.index)
+        && !alone
+    {
+        // The settings of the clause name the compatibility mode, and the
+        // index of the catalog holds another mode.
+        return Err(Failure::unavailable(format!(
+            "the text index {} of the catalog is not in the compatibility mode",
+            c.index
+        )));
+    }
     let fields: Fields = match &snap {
         Some(s) => s.fields.clone(),
         None => {
             let layout = weights
                 .iter()
-                .map(|(i, _)| (i.clone(), Mode::Enhanced, settings.language.clone()))
+                .map(|(i, _)| (i.clone(), settings.mode, settings.language.clone()))
                 .collect();
             index::schema(&layout).1
         }
@@ -253,6 +266,9 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
     } else {
         replaced.union(&staged_rids).copied().collect()
     };
+    if compat {
+        return run_compat(store, q, &snap, alone, &staged, &overlay_rids).map(Step::Done);
+    }
     let mut translator = Translator::new(&reads, settings.fuzzy);
     let mut docs = Vec::new();
     for rid in &overlay_rids {
@@ -344,6 +360,68 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         ));
     }
     Ok(Step::Done(Answer { found, strategy }))
+}
+
+/// The staged texts of a query: the language and the text of each key of
+/// an index that the query reads, `None` for an unindex.
+type StagedTexts<'c> = HashMap<(&'c str, i32), Option<(&'c str, &'c str)>>;
+
+/// Answer the clause of `q` in the compatibility mode: the documents of
+/// `overlay_rids` replace their documents of the index, with their staged
+/// text, else their live text at the snapshot.
+fn run_compat(
+    store: &Store,
+    q: &Query<'_>,
+    snap: &Option<Arc<Snap>>,
+    alone: bool,
+    staged: &StagedTexts<'_>,
+    overlay_rids: &BTreeSet<i32>,
+) -> Result<Answer, Failure> {
+    let c = q.clause;
+    let index = c.index.as_str();
+    let mut docs = Vec::new();
+    for rid in overlay_rids {
+        let text = match staged.get(&(index, *rid)) {
+            Some(found) => found.map(|(_, t)| t.to_owned()),
+            None if alone => None,
+            None => store
+                .text_before(Oid(q.catalog), index, *rid, Tid(q.tid))
+                .map_err(|e| Failure::of(&e))?
+                .map(|t| t.text),
+        };
+        if let Some(text) = text {
+            docs.push(compat::Doc::new(*rid, lexicon::words(&text)));
+        }
+    }
+    let indexed = match (alone, snap) {
+        (false, Some(s)) => {
+            let fields = s.fields.of(index, None);
+            let lengths = s.maps.lengths.get(index);
+            match (fields.first(), lengths) {
+                (Some(f), Some(lengths)) => Some(compat::Indexed {
+                    searcher: &s.searcher,
+                    maps: &s.maps,
+                    text: f.text,
+                    pairs: f.pairs,
+                    lengths,
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let replaced: HashSet<i32> = overlay_rids.iter().copied().collect();
+    let mut run = compat::Run::new(indexed, &replaced, &docs, q.filter);
+    let (found, strategy) = run
+        .search(&c.node, q.want, q.forced)
+        .map_err(|e| Failure::unavailable(format!("the search of the text index fails: {e}")))?;
+    if matches!(q.want, Want::Top(_)) && found.hits.len().saturating_mul(8) > MAX_BYTES {
+        return Err(error(
+            TextErrorKind::TooLarge,
+            format!("{} hits pass the cap of a reply", found.hits.len()),
+        ));
+    }
+    Ok(Answer { found, strategy })
 }
 
 /// Answer `text_info`: the documents of `index` at the snapshot before
