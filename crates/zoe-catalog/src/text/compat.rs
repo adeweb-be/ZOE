@@ -198,8 +198,7 @@ pub struct Run<'a> {
 impl<'a> Run<'a> {
     /// A query on `index`, or on the overlay alone for `None`, with the
     /// replaced rids `replaced`, the documents of the text overlay that
-    /// have a text in the index, and the filter `filter`, sorted. `forced`
-    /// forces a strategy, for the tests.
+    /// have a text in the index, and the filter `filter`, sorted.
     pub fn new(
         index: Option<Indexed<'a>>,
         replaced: &std::collections::HashSet<i32>,
@@ -863,17 +862,19 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Run `node` for `want`. Return the hits and the strategy of the
-    /// search of the index, `None` with no index.
+    /// Run `node` for `want`. `forced` forces a strategy, for the tests.
+    /// Return the hits and the strategy of the search of the index, `None`
+    /// with no index.
     pub fn search(
         &mut self,
         node: &Node,
         want: Want,
         forced: Option<Strategy>,
     ) -> tantivy::Result<(Found, Option<Strategy>)> {
-        let strategy = match self.index.is_some() {
-            true => Some(self.prepare(node, forced)?),
-            false => None,
+        let strategy = if self.index.is_some() {
+            Some(self.prepare(node, forced)?)
+        } else {
+            None
         };
         let mut top = Top::new(match want {
             Want::Top(limit) => limit,
