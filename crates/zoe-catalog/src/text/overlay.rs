@@ -5,8 +5,9 @@
 //! that the query reads, and scores the words of the query in each
 //! document as tantivy scores them in the index: the BM25 of each term with
 //! the statistics of the current index, times the weight of its field; a
-//! glob and a fuzzy match with the constant score of their weight. So a
-//! document scores the same in the overlay and in the index.
+//! glob and a fuzzy match with the constant score of their weight, and the
+//! exact stem of a glob with its BM25 too. So a document scores the same in
+//! the overlay and in the index.
 
 use std::collections::{HashMap, HashSet};
 
@@ -334,9 +335,17 @@ impl<'s> Scorer<'s> {
                     let Some(glob) = translator.glob(read, pattern) else {
                         continue;
                     };
-                    if fw.tf.keys().any(|w| glob.matches(w)) {
-                        total = Some(total.unwrap_or(0.0) + read.weight);
+                    if !fw.tf.keys().any(|w| glob.matches(w)) {
+                        continue;
                     }
+                    let mut s = read.weight;
+                    if let Some(stem) = &glob.stem
+                        && let Some(&freq) = fw.tf.get(stem)
+                    {
+                        let term = Term::from_field_text(read.field.text, stem);
+                        s += self.bm25(&[term], read.weight, fw.words.len() as u32, freq);
+                    }
+                    total = Some(total.unwrap_or(0.0) + s);
                 }
                 total.map_or(Eval::No, Eval::Yes)
             }

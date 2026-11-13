@@ -10,11 +10,13 @@
 //!   document, so an `and` leaves it out.
 //! - A phrase of two words reads the term of their pair. A longer phrase
 //!   needs each of its pairs, and the positions of its words in a row.
-//! - A glob matches the terms of its pattern, with a constant score. Its
-//!   literal parts are folded, and also analysed with the analyzer of the
-//!   field: a term matches the pattern with the folded literal parts, or
-//!   with the analysed ones. So `documents*` finds the stem `document`, and
-//!   `doc*` still finds each term that starts with `doc`.
+//! - A glob matches the terms of its pattern with its literal parts
+//!   folded. A pattern of one literal, alone or with a final `*`, also
+//!   matches the analysed literal as an exact term. A match scores a
+//!   constant, and the exact term adds its BM25 score. So `running*` finds
+//!   the stem `run` and each term that starts with `running`, not
+//!   `runway`. A document of the stem ranks above a document of the prefix
+//!   alone.
 //! - With fuzzy matching, a word also matches the terms at the edit
 //!   distance of the settings, with a constant score.
 //! - `and` needs each item and none of the nots; `or` any item.
@@ -28,7 +30,7 @@ use tantivy::query::{
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::{Searcher, Term};
 
-use super::analysis;
+use super::analysis::{self, GlobChar, GlobPart};
 use super::clause::Node;
 use super::index::{Analyzers, LangFields, pairs_of};
 
@@ -42,13 +44,17 @@ pub struct Read {
 }
 
 /// A glob in the language of one field: the positions of its folded form
-/// and of its analysed form, and their regular expression.
+/// and of its exact stem, and their regular expression.
 #[derive(Clone, Debug)]
 pub struct Glob {
     /// The positions of each form, each form once.
-    pub forms: Vec<Vec<analysis::GlobChar>>,
+    pub forms: Vec<Vec<GlobChar>>,
     /// The regular expression of the forms.
     pub regex: String,
+    /// The analysed literal of a pattern of one literal, alone or with a
+    /// final `*`, when the analyzer gives one word: an exact term that
+    /// adds its BM25 score.
+    pub stem: Option<String>,
 }
 
 impl Glob {
@@ -95,17 +101,24 @@ impl<'a> Translator<'a> {
         }
         let parts = analysis::glob_parts(pattern);
         let folded = analysis::glob_chars(&parts, analysis::fold);
-        let language = read.field.language.clone();
-        let analyzers = &mut self.analyzers;
-        let analysed = analysis::glob_chars(&parts, |literal| {
-            match analyzers.words(&language, literal).as_slice() {
-                [one] => one.clone(),
-                _ => analysis::fold(literal),
+        let stem = match parts.as_slice() {
+            [GlobPart::Lit(literal)] | [GlobPart::Lit(literal), GlobPart::Any] => {
+                match self
+                    .analyzers
+                    .words(&read.field.language, literal)
+                    .as_slice()
+                {
+                    [one] => Some(one.clone()),
+                    _ => None,
+                }
             }
-        });
+            _ => None,
+        };
         let mut forms = vec![folded];
-        if analysed != forms[0] {
-            forms.push(analysed);
+        if let Some(stem) = &stem
+            && !analysis::glob_matches(&forms[0], stem)
+        {
+            forms.push(stem.chars().map(GlobChar::Char).collect());
         }
         let regex = match forms.as_slice() {
             [one] => analysis::glob_regex(one),
@@ -117,7 +130,7 @@ impl<'a> Translator<'a> {
         };
         let glob = RegexQuery::from_pattern(&regex, read.field.text)
             .is_ok()
-            .then_some(Glob { forms, regex });
+            .then_some(Glob { forms, regex, stem });
         self.globs.insert(key, glob.clone());
         glob
     }
@@ -142,6 +155,21 @@ impl<'a> Translator<'a> {
         } else {
             Box::new(BoostQuery::new(q, read.weight))
         }
+    }
+
+    /// The query of `glob` on the field of `read`: its forms with a
+    /// constant score of 1, plus the BM25 score of its exact stem.
+    fn glob_query(read: &Read, glob: Glob) -> Box<dyn Query> {
+        let Ok(forms) = RegexQuery::from_pattern(&glob.regex, read.field.text) else {
+            return Box::new(EmptyQuery);
+        };
+        let forms: Box<dyn Query> = Box::new(forms);
+        let Some(stem) = glob.stem else {
+            return forms;
+        };
+        let term = Term::from_field_text(read.field.text, &stem);
+        let stem: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+        Self::any(vec![forms, stem])
     }
 
     fn any(clauses: Vec<Box<dyn Query>>) -> Box<dyn Query> {
@@ -207,11 +235,8 @@ impl<'a> Translator<'a> {
             Node::Glob { pattern } => {
                 let mut across = Vec::new();
                 for read in self.reads {
-                    let glob = self.glob(read, pattern);
-                    let q: Box<dyn Query> = match glob
-                        .and_then(|g| RegexQuery::from_pattern(&g.regex, read.field.text).ok())
-                    {
-                        Some(q) => Box::new(q),
+                    let q = match self.glob(read, pattern) {
+                        Some(glob) => Self::glob_query(read, glob),
                         None => Box::new(EmptyQuery),
                     };
                     across.push(Self::boosted(read, q));
