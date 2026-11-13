@@ -39,8 +39,8 @@ The search form of Plone sends `munge_search_term` of the words of the
 user: each word joined with `AND`, the last one with `*`.
 `test_the_search_form_in_the_default_mode` records its hits in the
 enhanced mode, where the glob of the last word also matches the stem of
-the word: `running*` finds the words of the stem `run` and the words that
-start with it, such as `runway`.
+the word as an exact term: `running*` finds the words of the stem `run`
+and the words that start with `running`, not `runway`.
 
 `just plone zoe backends` runs these tests.
 """
@@ -145,8 +145,9 @@ FILTERS = {
 
 # The hits of each query with each filter: the ids, in groups of equal
 # score, from the highest score. `gardens` finds the stem `garden`; `cafe`
-# and `Café` find `café`; `run*` finds the words of the stem `run` and
-# `runway`, with the constant score of a glob in each field.
+# and `Café` find `café`; `run*` finds the words that start with `run`,
+# with the constant score of a glob in each field, and the stem `run` adds
+# its BM25 score: n2 holds `runner` and `run`, n3 `runway` only.
 EXPECTED = {
     ('"night sky"', "alone"): [{"n6"}],
     ('"night sky"', "path"): [{"n6"}],
@@ -175,20 +176,20 @@ EXPECTED = {
     ("gardens", "alone"): [{"n1"}, {"n6"}, {"n7"}],
     ("gardens", "path"): [{"n6"}, {"n7"}],
     ("gardens", "type"): [{"n1"}, {"n6"}],
-    ("run*", "alone"): [{"n2", "n3"}, {"n1"}],
+    ("run*", "alone"): [{"n2"}, {"n3"}, {"n1"}],
     ("run*", "path"): [],
-    ("run*", "type"): [{"n2", "n3"}, {"n1"}],
+    ("run*", "type"): [{"n2"}, {"n3"}, {"n1"}],
 }
 
 # The hits of the search form of Plone in the default mode, as `EXPECTED`.
-# `running` becomes `running*`, which finds `runway` (n3) with the same
-# score as the runners of n2; ZCTextIndex finds the words that start with
-# `running` only, in n1 and n2.
+# `running` becomes `running*`, which finds the stem `run` in n1 and n2, as
+# ZCTextIndex finds `running` there, and not `runway` (n3). The stem keeps
+# its BM25 score, so `garden*` ranks n6 and n7 as `gardens` does.
 SEARCH_FORM = {
     "café notes": [{"n4"}],
     "coff": [{"n7"}, {"n5"}, {"n4"}],
-    "garden": [{"n1"}, {"n6", "n7"}],
-    "running": [{"n2", "n3"}, {"n1"}],
+    "garden": [{"n1"}, {"n6"}, {"n7"}],
+    "running": [{"n2"}, {"n1"}],
 }
 
 # The texts of the search form.
