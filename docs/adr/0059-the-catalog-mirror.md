@@ -212,7 +212,7 @@ Each named storage of `zoe serve` and each store of the process keeps the mirror
 
 ## Amendment (ZOE-302): the order clause
 
-Status: proposed. It adds the key `o` to the plan of section 8, a change of the wire protocol, and a sort on a GopipIndex to section 7. It changes no record, no on-disk format and no public Python API. "Order" and "positions" are the words of ADR 0052, section 1.
+Status: accepted. It adds the key `o` to the plan of section 8, a change of the wire protocol, and a sort on a GopipIndex to section 7. It changes no record, no on-disk format and no public Python API. "Order" and "positions" are the words of ADR 0052, section 1.
 
 `GopipIndex` of plone.folder stores nothing. At a sort, its `documentToKeyMap` splits the path of each rid of the result, from `paths`, at its last `/` into a parent and an id. When the result has one parent, it finds that container from the Zope root and gives each rid the place of its id in `getOrdering().idsInOrder()`, or in `objectIds()` for a container without `getOrdering`. With several parents, it asks `getObjectPosition` of each container, which reads the positions. So a listing of one folder of `DefaultOrdering` reads one record: the order, the `PersistentList` that `_order()` gives. In the inventory of ZOE-283, 1,105 of the 2,322 searches that sort on `getObjPositionInParent` have one path at depth 1; 934 have depth 3 (the navigation) and 234 have `navtree`, and these stay on the Python path.
 
