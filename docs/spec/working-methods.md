@@ -98,7 +98,7 @@ First usable release: the server gate; the in-process storage is usable from the
 | Incremental security index | Should | phase 6 | inherited bitmap pointers; equality with `reindexObjectSecurity` is the test |
 | Traversal pushdown | Should | phase 6 | the client prefetches the chain from the path trie |
 | Reference index | Should | phase 6 | back-references from the mirror's decode pass; link integrity and relations |
-| Ordered folders | Should | phase 6 | order index in the mirror; `zoe.plone` ordering adapter |
+| Ordered folders | Should | phase 6 | order index in the mirror for a listing of one folder, from the order of `DefaultOrdering` (ADR 0059), with no ordering adapter; several folders take the Python path |
 | Shadow indexes | Should | phase 6 | background rebuild, atomic swap |
 | Branches (forks) | Should | phase 7 | branch id reserved in the key layout from phase 1 |
 | Snapshot test fixtures | Should | phase 7 | `zoe.testing` layer on forks; first fork consumer |

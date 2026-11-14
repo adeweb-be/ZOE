@@ -102,7 +102,7 @@ N6 bounds the resident memory of a server by its configuration. The mirrors add 
 
 ### 7. What the mirror serves, and the reasons of a fallback
 
-Served: the clauses of FieldIndex, DateIndex, UUIDIndex and KeywordIndex (`query`, `range`, `operator`, `not`), BooleanIndex (`query`), DateRangeIndex (`query`) and ExtendedPathIndex (`query`, `level`, `operator`, `depth`, `navtree`, `navtree_start`); a sort on one or several FieldIndex, DateIndex or UUIDIndex, with `sort_order`, `sort_limit`, `b_start` and `b_size`; a query without sort. Each answer gives the rids in the order of ZCatalog, the length of its lazy result and `actual_result_count`.
+Served: the clauses of FieldIndex, DateIndex, UUIDIndex and KeywordIndex (`query`, `range`, `operator`, `not`), BooleanIndex (`query`), DateRangeIndex (`query`) and ExtendedPathIndex (`query`, `level`, `operator`, `depth`, `navtree`, `navtree_start`); a sort on one or several FieldIndex, DateIndex or UUIDIndex, with `sort_order`, `sort_limit`, `b_start` and `b_size`; a sort on one GopipIndex with an order clause (the amendment of ZOE-302); a query without sort. Each answer gives the rids in the order of ZCatalog, the length of its lazy result and `actual_result_count`.
 
 A query takes the Python path, whole, with one of these reasons:
 
@@ -114,7 +114,7 @@ A query takes the Python path, whole, with one of these reasons:
 | `index` | an index of the query is of another class: ZCTextIndex, DateRecurringIndex, any add-on index |
 | `option` | an option that the plan does not carry, such as `usage` |
 | `and_range` | a range with the operator `and` |
-| `sort` | a sort on another index (GopipIndex until ZOE-302, ExtendedPathIndex), `merge=False`, a `sort_limit` of 0, or several sort indexes on the path of ZCatalog that iterates the index |
+| `sort` | a sort on another index (ExtendedPathIndex, a GopipIndex that the order clause of ZOE-302 does not serve), `merge=False`, a `sort_limit` of 0, or several sort indexes on the path of ZCatalog that iterates the index |
 | `transaction` | the transaction changed records before ZOE-291 merged: the interim rule of ZOE-286 (section 8) |
 | `too_large` | the plan and the transaction overlay pass the cap of a call (section 8) |
 | `plan` | the server does not know a key or a kind of clause of the plan: a client newer than the server (the order clause of ZOE-302, the text clause of ADR 0060) |
@@ -154,6 +154,7 @@ overlay = nil | [[oid, pickle]...]
 - `rows` and `paths` cover the first `rn` rids of `r`, with the cells of the columns `cols`. The client gives `b_size` as `rn`, or a page of its own when the query has no `b_size`. A `LazyMap` makes a brain past these rows with the stock `Catalog.__getitem__`, which loads the bucket of `data`.
 - A cell is msgpack: nil, bool, an int of 64 bits, float, str, bin, an array for a tuple, a map for a dict, and three ext types: `Missing.Value` (ext 1, empty), `DateTime` (ext 2: `_micros` as int64, the naive flag, the name of `_tz`), `Message` (ext 3: the msgpack array of the arguments of its `__reduce__`). A row with a cell of another type (a list, a `datetime`, a `set`, an instance, a larger int) comes as nil, and the client makes its brain with the stock `__getitem__`.
 - The reply has no scores. ADR 0060 adds them, with the text clause.
+- Amendment (ZOE-302): the key `o` of a plan is the order clause of a sort on a GopipIndex: the amendment at the end of this record.
 - Amendment (ADR 0060, section 12): a plan holds at most one text clause, `{"k": "t", "i": index, "q": node, "lg": [language...] | nil, "cl": [index...], "st": [staged...], "set": settings | nil}`. The mirror runs the other clauses first and gives the rids of their result to the text index of the catalog. The reply gets `sc`, the integer score of each rid of `r` as a signed 32-bit big-endian int in one bin, when the plan has a text clause and no sort; with a sort, the hits of the text clause are a set in the order of the sort. A failure of the text clause gives the error form `{"tid": tid, "e": error, "why": text}`, with `unavailable`, `packed`, `cleared`, `corrupt` and `too_large`. A text clause of another form makes the plan malformed: `ValueError`.
 
 The transaction overlay (Q6) is the records that the transaction changed in the database of the catalog:
@@ -209,3 +210,43 @@ Each named storage of `zoe serve` and each store of the process keeps the mirror
 5. **The client sends only the records of the catalog.** The client would need the set of the oids of the catalog; the server already has it.
 6. **The client keeps the pickles of a transaction between two searches**, while no call of `catalogObject`, `uncatalogObject` or of the schema came between them. A savepoint moves the registered objects to the savepoint storage. `manage_catalogClear`, `clearIndex` and a direct call of the `index_object` of an index change the catalog without these calls. A resend costs 0.4 to 5.7 ms of pickling (finding).
 7. **A rebase that builds a whole new base.** It holds two copies of the base at once: about 3 GB for the catalog of `xlarge`, over the default bound.
+
+## Amendment (ZOE-302): the order clause
+
+Status: accepted. It adds the key `o` to the plan of section 8, a change of the wire protocol, and a sort on a GopipIndex to section 7. It changes no record, no on-disk format and no public Python API. "Order" and "positions" are the words of ADR 0052, section 1.
+
+`GopipIndex` of plone.folder stores nothing. At a sort, its `documentToKeyMap` splits the path of each rid of the result, from `paths`, at its last `/` into a parent and an id. When the result has one parent, it finds that container from the Zope root and gives each rid the place of its id in `getOrdering().idsInOrder()`, or in `objectIds()` for a container without `getOrdering`. With several parents, it asks `getObjectPosition` of each container, which reads the positions. So a listing of one folder of `DefaultOrdering` reads one record: the order, the `PersistentList` that `_order()` gives. In the inventory of ZOE-283, 1,105 of the 2,322 searches that sort on `getObjPositionInParent` have one path at depth 1; 934 have depth 3 (the navigation) and 234 have `navtree`, and these stay on the Python path.
+
+1. **The clause.**
+
+   ```text
+   plan  = {..., "o": order}
+   order = {"i": index, "oid": oid, "p": path}
+   ```
+
+   `i` is the GopipIndex, and `s` is `[[i, reverse]]`. `oid` is the 8 bytes of the oid of the order of the container. `p` is the path of the container, as the parent of a path of `paths`: `/` and its components, such as `/plone/news`. The client puts `o` in a plan only for such a sort. A plan with `o` whose `s` is not `[[i, bool]]`, or whose `oid` is not 8 bytes, is malformed (`ValueError`). An `o` that is not a map gets `plan`: a form of the clause that this version does not know. `o` is a key of the plan: not a clause of `c`, because it filters no row, and not a third item of the sort, because an older server reads a sort of three items as a malformed plan. A server that does not know `o` replies `plan`, and the client takes the Python path.
+
+2. **The read of the order.** At each query with `o`, the mirror reads the record of `oid` before the tid of the plan, as `loadBefore` does, or takes it from the transaction overlay (point 4), and decodes it. It keeps nothing of the order across queries: no change set, no entry in its map of oids, no term of the bound. The record is a `persistent.list.PersistentList` whose state holds the list `data`; an item that is not a str keeps its place and names no row. A record that does not load before the tid (none, a deletion, a revision that a pack removed), that is larger than 16 MiB, or that does not decode as such, gives `index_unavailable`. The mirror reads an order only at the oid of the plan, before the tid of the plan, or from the overlay of the query.
+
+   The measures, with ids of 17 to 18 bytes written as `DefaultOrdering` writes them, on a ZOE store: at 300 items the order is one record of 7,444 bytes (the positions: 9 records, 8,713 bytes), its `loadBefore` from Python takes 0.6 µs, and its decode with `zoe-pickle` 87 µs (the tree 61 µs, the heap 22 µs, the map of the ids 4 µs). At 10,000 items: one record of 283,211 bytes (the positions: 308 records, 316,768 bytes), 18.7 µs, and 3.4 ms (1,662, 1,553 and 145 µs). So the order costs a listing about 0.1 ms at 300 items and 3.4 ms at 10,000 items, under the 5 ms at p99 of G2. A structure kept across tids with the change sets saves the decode of an order that did not change, but it needs a first read anyway, the oids of the listed folders in the map of the mirror, their change sets in the window and the rebase, and a term of the bound.
+
+3. **The sort.** The mirror makes the map of `documentToKeyMap` step by step. It takes the rows of the result in the order of rids and splits the path of each row in the version at its last `/`. A row whose parent is not `p` gives `sort`: the result has several containers. Each row goes into a map under its id, and a later row replaces an earlier row of the same id. Each item of the order then gives its place, from 0, to the row of its id: a later place replaces an earlier one, and the rid 0 gets no place (`if rid:`). So no two rows share a place, and the sort has no ties. The sort takes the paths of `sortResults` that the mirror takes for one FieldIndex, with the place as the key: `_sort_iterate_resultset`, `_sort_nbest` for a reverse sort and `_sort_nbest_reverse` for an ascending one, never the path that iterates the index, since `len()` of a GopipIndex is 2**31 - 1. A row without a place leaves the result and `actual_result_count`. `sort_order`, `sort_limit`, `b_start` and `b_size` act as section 7 gives. A batch past the middle of the result takes the other end, and that rule counts the rows without a place in the length of the result, as `sortResults` does. The mirror serves `o` only when `i` is a `plone.folder.nogopip.GopipIndex` in the version; else `sort`.
+
+4. **The overlay.** When the transaction overlay of the query holds a record of `oid`, the mirror decodes that record and does not read the store. The client sends every record that the transaction changed (section 8). So a move, a creation, a rename or a delete in the container, which writes the order, reaches the mirror, and the listing gives the order of the transaction. The rows and their paths come from the version with the overlay, as for each query. The order is one record, so it needs no shape. A record of the order in the overlay that does not decode gives `overlay`.
+
+5. **The hook.** It puts `o` in the plan for a sort on one index of the class `plone.folder.nogopip.GopipIndex`, alone, when:
+
+   - the plan has one path clause, with one path, the level 0, `depth` 1 and no `navtree`; `p` is that path without its empty components;
+   - the container, found as `documentToKeyMap` finds it (`plone.folder.nogopip.traverse` from `getPhysicalRoot()` of the `ISiteRoot` utility), has `getOrdering`, and its ordering is a `DefaultOrdering`, the class itself;
+   - `_order()` of the ordering, which `idsInOrder` copies, is a `PersistentList`, the class itself, with an oid, in the Connection of the catalog.
+
+   Else the search takes the Python path with `sort`: the GopipIndex among several sort indexes; several paths, another level or depth, `navtree`, or no path clause; a container that does not traverse, has no `getOrdering`, or has another ordering (`unordered`, `partial`, an add-on); no order, an order of another class (a plain `list`), an order without an oid (new in the transaction, before a savepoint), or an order in another database (below a mount point). A `ConflictError` of these steps goes to the caller. Another exception gives `sort`, and the stock search answers or raises as it does. On a reply with `f`, the hook runs the stock search (section 7). The throwaway mirror of a test storage reads the order through its `load`, as it reads the trees.
+
+6. **The reasons.** Section 7 then serves a sort on one GopipIndex with an order clause. No reason is new: `sort` covers a sort on a GopipIndex that this amendment does not serve, on both sides; `index_unavailable` an order that does not read; `overlay` an order of the overlay that does not decode.
+
+Alternatives:
+
+- **The positions of the container, which Q11 names.** `documentToKeyMap` reads them only for several containers. For one container it reads the order, and the two can differ (ADR 0052: a merge of the order alone leaves `pos` wrong); then only the order gives the answer of the Python path. The positions are a tree, 308 records at 10,000 items, and their read over the overlay needs the shapes of their nodes.
+- **The order kept across tids with the change sets** (point 2).
+- **The ids of the order in the plan.** It serves every ordering and needs no read on the server. But a folder of 10,000 items sends 10,000 values and about 184 KB at each search, and the client copies the order and counts the values of the plan in Python at each search.
+- **Several containers.** They need the positions of each container; a later card.

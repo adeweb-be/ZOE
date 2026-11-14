@@ -19,6 +19,7 @@
 //!           "and": bool, "d": depth, "nt": bool, "ns": navtree_start,
 //!           "ip": [component...]}
 //! value  = nil | bool | int | float | str | [value...] (a tuple)
+//! order  = {"i": index, "oid": oid, "p": path}  (the key "o" of a plan)
 //! reply  = {"tid": tid, "r": rids, "sc": scores | nil, "n": len,
 //!           "a": actual_result_count,
 //!           "rows": [[cell...] | nil...] | nil, "paths": [path | nil...] | nil}
@@ -46,9 +47,16 @@
 //! `decode_typed` also gives the kind of each clause. The mirror checks it
 //! against the class of the index of the clause: a clause of another kind
 //! gives the reason `plan`.
+//!
+//! `decode_ordered` also reads the order clause of the amendment of
+//! ADR 0059 (`order`): the key `o`, whose sort `s` is `[[i, reverse]]` with
+//! a bool. `decode_typed`, `decode_request` and `decode_plan` give
+//! `Unknown` for a plan with the key `o`, whatever its form, so a caller
+//! that cannot serve it gives the reason `plan`.
 
 use crate::base::Kind;
 use crate::cell;
+use crate::order::Order;
 use crate::query::{Clause, Columns, Plan, Reply};
 use crate::reason::{Fallback, Reason};
 use crate::value::Val;
@@ -479,24 +487,74 @@ fn path_clause(items: &[(&str, &Wire)]) -> Result<Clause, PlanError> {
     Ok(clause)
 }
 
-/// Reads a plan, without its rows.
+/// Reads a plan, without its rows. A plan with the key `o` is `Unknown`.
 pub fn decode_plan(wire: &Wire) -> Result<Plan, PlanError> {
     decode_request(wire).map(|(plan, _)| plan)
 }
 
 /// Reads a plan and the rows that its reply gives: `cols` and `rn`. A
-/// negative `rn` gives no row.
+/// negative `rn` gives no row. A plan with the key `o` is `Unknown`.
 pub fn decode_request(wire: &Wire) -> Result<(Plan, Columns), PlanError> {
     decode_typed(wire).map(|(plan, columns, _)| (plan, columns))
 }
 
 /// Reads a plan as `decode_request` does, and gives the kind of each of
-/// its clauses, in their order.
+/// its clauses, in their order. A plan with the key `o` is `Unknown`.
 pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), PlanError> {
+    decode(wire, false).map(|(plan, columns, kinds, _)| (plan, columns, kinds))
+}
+
+/// Reads the order clause `o` of a plan whose sort is `sort`. An `o` that
+/// is not a map is a form that this version does not know: `Unknown`.
+fn order(wire: &Wire, sort: &[(String, Option<bool>)]) -> Result<Option<Order>, PlanError> {
+    match wire {
+        Wire::Nil => return Ok(None),
+        Wire::Map(_) => {}
+        _ => return Err(PlanError::Unknown("o of another form".into())),
+    }
+    let (mut index, mut oid, mut path) = (None, None, None);
+    for (key, v) in items(wire, "o")? {
+        match (key, v) {
+            ("i", Wire::Str(name)) => index = Some(name.clone()),
+            ("oid", Wire::Bin(bytes)) => {
+                let bytes: [u8; 8] = bytes
+                    .as_slice()
+                    .try_into()
+                    .or_else(|_| malformed("the oid of o is not 8 bytes"))?;
+                oid = Some(u64::from_be_bytes(bytes));
+            }
+            ("p", Wire::Str(p)) => path = Some(p.clone()),
+            ("i" | "oid" | "p", _) => return malformed(format!("{key} of o has another type")),
+            (other, _) => return Err(PlanError::Unknown(format!("a key {other:?} of o"))),
+        }
+    }
+    let (Some(index), Some(oid), Some(path)) = (index, oid, path) else {
+        return malformed("o without i, oid or p");
+    };
+    match sort {
+        [(name, Some(_))] if *name == index => Ok(Some(Order { index, oid, path })),
+        _ => malformed("a plan with o whose sort is not [[i, reverse]]"),
+    }
+}
+
+/// Reads a plan as `decode_typed` does, with its order clause.
+pub fn decode_ordered(
+    wire: &Wire,
+) -> Result<(Plan, Columns, Vec<ClauseKind>, Option<Order>), PlanError> {
+    decode(wire, true)
+}
+
+/// Reads a plan with its order clause when `with_order` is true. Else the key
+/// `o` is a key that this version does not know.
+fn decode(
+    wire: &Wire,
+    with_order: bool,
+) -> Result<(Plan, Columns, Vec<ClauseKind>, Option<Order>), PlanError> {
     let mut plan = Plan::default();
     let mut columns = Columns::default();
     let mut kinds = Vec::new();
     let mut clauses = None;
+    let mut ordered = None;
     let mut unknown = None;
     for (key, v) in items(wire, "the plan")? {
         match key {
@@ -549,6 +607,7 @@ pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), Pla
                     ),
                 }
             }
+            "o" if with_order => ordered = Some(v),
             other => {
                 unknown.get_or_insert_with(|| format!("a plan key {other:?}"));
             }
@@ -557,11 +616,21 @@ pub fn decode_typed(wire: &Wire) -> Result<(Plan, Columns, Vec<ClauseKind>), Pla
     let Some(clauses) = clauses else {
         return malformed("a plan without c");
     };
+    let order = match ordered {
+        Some(v) => match order(v, &plan.sort) {
+            Err(PlanError::Unknown(why)) => {
+                unknown.get_or_insert(why);
+                None
+            }
+            other => other?,
+        },
+        None => None,
+    };
     if let Some(why) = unknown {
         return Err(PlanError::Unknown(why));
     }
     plan.clauses = clauses;
-    Ok((plan, columns, kinds))
+    Ok((plan, columns, kinds, order))
 }
 
 /// Tells if `wire` is a text clause: a map whose `k` is `t`.

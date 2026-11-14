@@ -10,6 +10,10 @@
 //! iterates the index, the path that sorts the result set, `_sort_nbest`
 //! and `_sort_nbest_reverse`. A batch past the middle of the result takes
 //! the other end, as `sortResults` does.
+//!
+//! A view with an order (`View::ordered`) sorts on the `GopipIndex` of the
+//! order clause: the key of each row is its place in the order, as
+//! `documentToKeyMap` gives it for the rows of one container.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -22,6 +26,7 @@ use crate::base::{
 };
 use crate::cell;
 use crate::change::{Overrides, Slot, same, value};
+use crate::order::{GOPIP, OrderList};
 use crate::plan::ClauseKind;
 use crate::reason::{Fallback, Reason};
 use crate::security::{Overlay, Resolver, SecurityIndex, Version, value_matches};
@@ -129,6 +134,8 @@ pub struct View<'a> {
     /// The rids of the overrides that the base has no row for, in order.
     /// Their rows follow the rows of the base.
     extra: Vec<i32>,
+    /// The order of the order clause of the query, if it has one.
+    order: Option<&'a OrderList>,
 }
 
 impl<'a> View<'a> {
@@ -142,7 +149,19 @@ impl<'a> View<'a> {
             .collect();
         extra.sort_unstable();
         extra.dedup();
-        View { base, over, extra }
+        View {
+            base,
+            over,
+            extra,
+            order: None,
+        }
+    }
+
+    /// The view with the order of an order clause: its sort on the
+    /// GopipIndex of the order takes the place of each row in the order.
+    pub fn ordered(mut self, order: &'a OrderList) -> View<'a> {
+        self.order = Some(order);
+        self
     }
 
     fn row_of(&self, rid: i32) -> u32 {
@@ -1191,11 +1210,16 @@ impl<'a> View<'a> {
             return Ok(self.reply(page, len, rlen));
         }
         let mut sorts = Vec::with_capacity(plan.sort.len());
-        for (name, reverse) in &plan.sort {
-            let (i, f) = self.field(name)?;
-            sorts.push((i, f, *reverse));
+        match self.order {
+            Some(order) => self.gopip(plan, order)?,
+            None => {
+                for (name, reverse) in &plan.sort {
+                    let (i, f) = self.field(name)?;
+                    sorts.push((i, f, *reverse));
+                }
+            }
         }
-        let mut reverse: Vec<Option<bool>> = sorts.iter().map(|s| s.2).collect();
+        let mut reverse: Vec<Option<bool>> = plan.sort.iter().map(|s| s.1).collect();
         if reverse[0].is_none() {
             return fallback(Reason::Sort, "a sort without an order for its first index");
         }
@@ -1236,6 +1260,25 @@ impl<'a> View<'a> {
             limit = Some(b_start + size);
         }
         let first_reverse = reverse[0].unwrap_or(false);
+        if let Some(order) = self.order {
+            // `len()` of a GopipIndex is 2**31 - 1, so the path that
+            // iterates the index never runs. The places are distinct, so
+            // `_sort_iterate_resultset`, `_sort_nbest` and
+            // `_sort_nbest_reverse` give the rows by place, up to the
+            // limit. A row without a place leaves the result and the count.
+            let mut items = self.places(&rs, order)?;
+            let actual = items.len() as i64;
+            if first_reverse {
+                items.sort_unstable_by(|a, b| b.cmp(a));
+            } else {
+                items.sort_unstable();
+            }
+            let mut result: Vec<i32> = items.into_iter().map(|(_, rid)| rid).collect();
+            if let Some(l) = limit {
+                result.truncate(l.max(0) as usize);
+            }
+            return Ok(Self::sequence(result, actual, b_start, b_size, switched));
+        }
         let (i0, f0, _) = sorts[0];
         let first_length = self.length(i0);
         let iterate_index =
@@ -1341,6 +1384,92 @@ impl<'a> View<'a> {
             actual,
             ..Reply::default()
         })
+    }
+
+    /// `_limit_sequence` of a sorted result that is not the path that
+    /// iterates the index: the batch, and the order of a switched batch.
+    fn sequence(
+        mut result: Vec<i32>,
+        actual: i64,
+        b_start: i64,
+        b_size: Option<i64>,
+        switched: bool,
+    ) -> Reply {
+        if let Some(size) = b_size {
+            result = result
+                .into_iter()
+                .skip(b_start.max(0) as usize)
+                .take(size.max(0) as usize)
+                .collect();
+        }
+        if switched {
+            result.reverse();
+        }
+        Reply {
+            len: result.len() as i64,
+            rids: result,
+            actual,
+            ..Reply::default()
+        }
+    }
+
+    /// Checks that `plan` sorts on the GopipIndex of `order` alone, and
+    /// that the index is a GopipIndex in this version: else `sort`.
+    fn gopip(&self, plan: &Plan, order: &OrderList) -> Result<(), Fallback> {
+        if !matches!(&plan.sort[..], [(name, Some(_))] if *name == order.index) {
+            return fallback(Reason::Sort, "an order clause with another sort");
+        }
+        let class = format!("{}.{}", GOPIP.0, GOPIP.1);
+        match self.base.by_name.get(&order.index) {
+            Some(&i) if self.base.indexes[i].class == class => Ok(()),
+            _ => fallback(
+                Reason::Sort,
+                format!("an order clause on {}, not a GopipIndex", order.index),
+            ),
+        }
+    }
+
+    /// The place of each row of `rs` in `order`, as `documentToKeyMap` of
+    /// plone.folder gives it for the rows of one container: each row by its
+    /// id, a later rid over an earlier one with the same id; then each item
+    /// of the order gives its index to the row of its id, a later index
+    /// over an earlier one, and no index to the rid 0. A row whose parent
+    /// is not the container of the order gives `sort`. Returns (place, rid)
+    /// for each row with a place.
+    fn places(&self, rs: &RoaringBitmap, order: &OrderList) -> Result<Vec<(u64, i32)>, Fallback> {
+        let mut rids: HashMap<String, i32> = HashMap::with_capacity(rs.len() as usize);
+        for row in self.by_rid(rs) {
+            let rid = self.rid_of(row);
+            let path = value(self.base, self.over, Slot::Paths, rid);
+            let split = path
+                .as_ref()
+                .and_then(Val::text)
+                .and_then(|p| p.rsplit_once('/'));
+            match split {
+                Some((parent, id)) if parent == order.path => {
+                    rids.insert(id.to_owned(), rid);
+                }
+                _ => {
+                    return fallback(
+                        Reason::Sort,
+                        "a row of the result outside the container of the order",
+                    );
+                }
+            }
+        }
+        let mut places: HashMap<i32, u64> = HashMap::with_capacity(rids.len());
+        for (place, id) in order.ids.iter().enumerate() {
+            if let Some(id) = id
+                && let Some(&rid) = rids.get(&**id)
+                && rid != 0
+            {
+                places.insert(rid, place as u64);
+            }
+        }
+        Ok(places
+            .into_iter()
+            .map(|(rid, place)| (place, rid))
+            .collect())
     }
 
     fn reply(&self, rows: Vec<u32>, len: i64, actual: i64) -> Reply {
