@@ -126,10 +126,9 @@ The enhanced mode does not split CJK, Thai or Hangul text as the splitter of Plo
 
 The mode `compat` gives the results of ZCTextIndex with the lexicon `plone_lexicon` of Plone 6.1: the same hits, the same order, the same counts and the same scores, also at an old snapshot and in a transaction that changed texts. Use it when the tests of a site pin the ranking of ZCTextIndex, or for CJK, Thai or Hangul text. It has no stemming, no stop words, no boost and no fuzzy matching. To install the text index in this mode, run `zoe.plone.textindex.install_text(site.portal_setup, mode="compat")` and commit. To switch an installed index, call `setSettings(mode="compat")` on it and commit: the store rebuilds its text index from the texts that it holds, and the site needs no reindex.
 
-`@search` of plone.restapi works on a `ZoeTextIndex`: `zoe.plone` gives it the query parser that plone.restapi registers for ZCTextIndex. The suites of Plone and plone.restapi pass with `ZoeTextIndex` in the mode `compat` (`just plone zoe catalog text`), except 10 tests. These tests check what `ZoeTextIndex` does not copy, not a search result:
+`@search` of plone.restapi works on a `ZoeTextIndex`: `zoe.plone` gives it the query parser that plone.restapi registers for ZCTextIndex. `getEntryForObject` gives the words of the text that the transaction staged for the object, else the words of the committed text. An unindex in the transaction gives no words.
 
-- The 3 tests `test{SearchableText,Description,Title}IsZCTextIndex` of `Products.CMFPlone.tests.testCatalogTool` check that the class name of the index is `ZCTextIndex`.
-- The 7 tests of `plone.restapi.tests.test_indexers.TestSearchableTextIndexer` read `getEntryForObject`. It does not count the texts that the transaction staged. In these tests, each text is staged.
+The suites of Plone and plone.restapi pass with `ZoeTextIndex` in the mode `compat` (`just plone zoe catalog text`), except the 3 tests `test{SearchableText,Description,Title}IsZCTextIndex` of `Products.CMFPlone.tests.testCatalogTool`. They check that the class name of the index is `ZCTextIndex`.
 
 To go back, import the profile `zoe.plone:text-uninstall`. It fills ZCTextIndex indexes of the type `Okapi BM25 Rank` while the `ZoeTextIndex` indexes serve, then puts them in their places. It also resumes after a failure halfway when you import it again. The backend `catalog` refuses its uninstall while a site holds a `ZoeTextIndex`.
 

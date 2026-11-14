@@ -201,7 +201,7 @@ impl<'a> Run<'a> {
     /// have a text in the index, and the filter `filter`, sorted.
     pub fn new(
         index: Option<Indexed<'a>>,
-        replaced: &std::collections::HashSet<i32>,
+        replaced: &BTreeSet<i32>,
         overlay: &'a [Doc],
         filter: Option<&'a [i32]>,
     ) -> Run<'a> {

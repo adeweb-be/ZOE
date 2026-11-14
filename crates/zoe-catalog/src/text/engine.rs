@@ -410,8 +410,7 @@ fn run_compat(
         }
         _ => None,
     };
-    let replaced: HashSet<i32> = overlay_rids.iter().copied().collect();
-    let mut run = compat::Run::new(indexed, &replaced, &docs, q.filter);
+    let mut run = compat::Run::new(indexed, overlay_rids, &docs, q.filter);
     let (found, strategy) = run
         .search(&c.node, q.want, q.forced)
         .map_err(|e| Failure::unavailable(format!("the search of the text index fails: {e}")))?;

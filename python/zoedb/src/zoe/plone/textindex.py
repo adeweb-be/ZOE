@@ -47,10 +47,12 @@ indexes that the transaction cleared (`cl`). When the catalog has an index
 `Language`, the clause holds the fields of the languages of the `Language`
 clause of the query (`lg`, see `_languages_of`). Staged texts that pass the
 cap of a call raise `zoe.storage.Unavailable`. `numObjects` gives the
-distinct words of the index, `indexSize` its documents, an empty text
-included, and `getEntryForObject` the
-words of the live text of a rid, split with the pipeline of the lexicon:
-all three read `text_info` and do not count the staged texts.
+distinct words of the index, and `indexSize` its documents, an empty
+text included: both read `text_info` and do not count the staged texts.
+`getEntryForObject` gives the words of the live text of a rid, split with
+the pipeline of the lexicon. It reads the text that the current
+transaction staged for the rid first: an unindex or a clear gives no
+text. Else it reads `text_info`.
 
 The requirements. The index needs the backend `catalog` of `zoe.plone` in
 the process and a storage with the extension `text`: a `zoe.Storage`, a
@@ -67,10 +69,11 @@ query goes to the base at its last tid. The clause holds the texts of each
 the settings of the index (`set`). It lists an index in `cl` when the base
 holds no record of the catalog, when the base has no text index for the
 catalog, and when a `DemoStorage` of the stack holds a clear delta of the
-index. On a test storage, `getEntryForObject` and `indexSize` read the
-texts of the stack first, then the base; `numObjects` counts the words of
-the base, or, when the base has no text index for the catalog, the
-distinct words of the texts of the stack, split with the lexicon.
+index. On a test storage, `getEntryForObject` (after the staged text)
+and `indexSize` read the texts of the stack first, then the base;
+`numObjects` counts the words of the base, or, when the base has no text
+index for the catalog, the distinct words of the texts of the stack,
+split with the lexicon.
 
 The profile steps. `zoe.plone:text` replaces the ZCTextIndex indexes
 `SearchableText`, `Title` and `Description` of `portal_catalog` with
@@ -1075,7 +1078,11 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
 
     def getEntryForObject(self, documentId, default=None):
         """Return the words of the live text of the rid `documentId`, split
-        with the pipeline of the lexicon, or `default`."""
+        with the pipeline of the lexicon, or `default`. A text that the
+        current transaction staged comes before the committed text."""
+        text = self._staged_text(documentId)
+        if text is not False:
+            return default if text is None else self._split(text)
         info, chain, _storage, _tid = self._info(documentId)
         if chain is None:
             text = None if info is None else info["text"]
@@ -1091,6 +1098,24 @@ class ZoeTextIndex(Persistent, Implicit, SimpleItem):
         if text is None:
             return default
         return self._split(text)
+
+    def _staged_text(self, rid):
+        """The text of the rid `rid` that the current transaction staged:
+        the text, None for an unindex or a clear, or False when the
+        transaction staged nothing for the rid."""
+        catalog = self._catalog()
+        jar = self._jar(catalog)
+        self._check(jar)
+        deltas = _deltas(jar, create=False)
+        oid = catalog._p_oid
+        if deltas is None or oid is None:
+            return False
+        found = deltas.texts.get((oid, self.id, rid))
+        if found is not None:
+            return found[1]
+        if (oid, self.id) in deltas.clears:
+            return None
+        return False
 
     def _split(self, text):
         last = [text]

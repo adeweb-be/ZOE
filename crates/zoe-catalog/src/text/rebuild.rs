@@ -107,7 +107,7 @@ pub fn catalogs(store: &Store, only: Option<u64>) -> Result<Vec<(u64, CatalogSet
         let settings = settings.map_err(|why| {
             format!("the catalog {catalog:#018x}: the settings of zoe.text: {why}")
         })?;
-        if !texts::layout_of(&settings).is_empty() {
+        if !settings.layout().is_empty() {
             out.push((catalog, settings));
         }
     }
@@ -169,7 +169,7 @@ pub fn rebuild(
     let new = beside(&path, "new");
     let old = beside(&path, "old");
     clean(&path).map_err(|e| failed("the removal of a directory of a rebuild fails", &e))?;
-    let layout = texts::layout_of(settings);
+    let layout = settings.layout();
     let cancel = AtomicBool::new(false);
     // The store is open read-only, so no pack runs: a pack watermark
     // past the last tid is a damaged store.

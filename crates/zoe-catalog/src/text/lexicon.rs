@@ -276,6 +276,7 @@ impl Glob {
     }
 
     /// The prefix that each word of the glob starts with.
+    #[cfg(test)]
     pub fn prefix(&self) -> &str {
         match self {
             Glob::Word(w) => w,
