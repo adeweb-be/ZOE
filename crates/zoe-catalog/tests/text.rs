@@ -983,6 +983,11 @@ struct Mirrored {
 }
 
 fn mirrored(name: &str, n: i32) -> Mirrored {
+    mirrored_with(name, n, &settings(&["en"]))
+}
+
+/// The catalog of `mirrored`, with the text settings `text_settings`.
+fn mirrored_with(name: &str, n: i32, text_settings: &CatalogSettings) -> Mirrored {
     let dir = fresh_dir(name);
     let store = Arc::new(Store::open(dir.path()).unwrap());
     let mut model = CatalogModel::new(
@@ -1025,7 +1030,7 @@ fn mirrored(name: &str, n: i32) -> Mirrored {
         .iter()
         .map(|(rid, text)| set("Title", *rid, text))
         .collect();
-    let tid = testing::commit_text(&store, catalog, &ops, Some(&settings(&["en"])), false).unwrap();
+    let tid = testing::commit_text(&store, catalog, &ops, Some(text_settings), false).unwrap();
     let mirrors = start(
         &store,
         dir.path(),
@@ -1080,6 +1085,46 @@ fn text_plan(
         ("bz", b_size.map_or(Wire::Nil, Wire::Int)),
         ("cols", Wire::Nil),
         ("rn", Wire::Int(0)),
+    ])
+}
+
+/// A plan of `catalog_query` with the clauses `clauses`, the sorts
+/// `sorts`, the limit `limit`, and `b_start` and `b_size`.
+fn sorted_plan(
+    clauses: Vec<Wire>,
+    sorts: &[(&str, bool)],
+    limit: Option<i64>,
+    b_start: i64,
+    b_size: Option<i64>,
+) -> Wire {
+    map(vec![
+        ("c", Wire::Array(clauses)),
+        (
+            "s",
+            Wire::Array(
+                sorts
+                    .iter()
+                    .map(|(name, reverse)| Wire::Array(vec![s(name), Wire::Bool(*reverse)]))
+                    .collect(),
+            ),
+        ),
+        ("l", limit.map_or(Wire::Nil, Wire::Int)),
+        ("bs", Wire::Int(b_start)),
+        ("bz", b_size.map_or(Wire::Nil, Wire::Int)),
+        ("cols", Wire::Nil),
+        ("rn", Wire::Int(0)),
+    ])
+}
+
+/// A clause on the FieldIndex `index` with the keys `keys`.
+fn field_clause(index: &str, keys: Vec<Wire>) -> Wire {
+    map(vec![
+        ("k", s("v")),
+        ("i", s(index)),
+        ("q", Wire::Array(keys)),
+        ("and", Wire::Bool(false)),
+        ("r", Wire::Nil),
+        ("not", Wire::Array(vec![])),
     ])
 }
 
@@ -1984,4 +2029,141 @@ fn a_security_clause_and_a_text_clause_run_in_one_plan() {
     let scores = reply.scores.expect("the scores of the text clause");
     assert!(scores.iter().all(|s| *s > 1));
     mirrors.stop();
+}
+
+/// The num of the rid `rid` in the catalog of `mirrored` of `n` entries,
+/// and of the entries that `a_text_clause_with_a_sort_gives_the_order_of_the_sort_with_its_ties`
+/// adds below the rid 1000.
+fn num_of(n: i32, rid: i32) -> i64 {
+    if rid >= 1000 {
+        i64::from(n - (rid - 1000) / 3)
+    } else {
+        10_000 + i64::from(rid)
+    }
+}
+
+/// Check that each text clause with a sort gives the rows that the same
+/// sort gives to a clause on `num` that selects the same rows.
+fn check_sorts(site: &Site, n: i32, name: &str) {
+    let now = site.now();
+    for words in [["kalo"], ["mite"], ["ruso"]] {
+        // The hits of the clause, with no filter: a set in rid order.
+        let c = clause::decode_clause(&clause_of("Title", atom(&words)), false).unwrap();
+        let query = Query {
+            catalog: site.catalog,
+            tid: now,
+            clause: &c,
+            filter: None,
+            want: Want::Set,
+            forced: None,
+        };
+        let set = engine::run(site.mirrors.texts(), &site.store, &query)
+            .unwrap()
+            .found;
+        let rids: Vec<i32> = set.hits.iter().map(|h| h.1).collect();
+        let mut sorted = rids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(rids, sorted, "{name} {words:?}");
+        assert_eq!(set.count, rids.len() as u64, "{name} {words:?}");
+        assert!(!rids.is_empty(), "{name} {words:?}");
+        let nums: Vec<Wire> = rids.iter().map(|r| Wire::Int(num_of(n, *r))).collect();
+        for kind in [None, Some("even")] {
+            let mut filter = Vec::new();
+            if let Some(kind) = kind {
+                filter.push(field_clause("kind", vec![s(kind)]));
+            }
+            for (sorts, limit, b_start, b_size) in [
+                (vec![("kind", true)], Some(20), 0, Some(20)),
+                (vec![("kind", false)], Some(20), 0, Some(20)),
+                (vec![("kind", true)], None, 0, Some(10)),
+                (vec![("kind", false)], Some(5), 0, None),
+                (vec![("kind", true)], None, 0, None),
+                (vec![("kind", true)], Some(30), 10, Some(10)),
+                (vec![("kind", false), ("num", true)], Some(12), 0, Some(12)),
+                (vec![("num", false)], Some(7), 0, Some(7)),
+            ] {
+                let what =
+                    format!("{name} {words:?} {kind:?} {sorts:?} {limit:?} {b_start} {b_size:?}");
+                let mut with_text = filter.clone();
+                with_text.push(plan_clause("Title", atom(&words)));
+                let plan = sorted_plan(with_text, &sorts, limit, b_start, b_size);
+                let got = site
+                    .mirrors
+                    .query_wire(site.catalog, now, &plan)
+                    .unwrap()
+                    .unwrap();
+                let mut with_nums = filter.clone();
+                with_nums.push(field_clause("num", nums.clone()));
+                let plan = sorted_plan(with_nums, &sorts, limit, b_start, b_size);
+                let want = site
+                    .mirrors
+                    .query_wire(site.catalog, now, &plan)
+                    .unwrap()
+                    .unwrap();
+                assert!(got.error.is_none(), "{what}");
+                assert!(got.scores.is_none(), "{what}");
+                assert!(!want.rids.is_empty(), "{what}");
+                assert_eq!(got.rids, want.rids, "{what}");
+                assert_eq!(got.len, want.len, "{what}");
+                assert_eq!(got.actual, want.actual, "{what}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_text_clause_with_a_sort_gives_the_order_of_the_sort_with_its_ties() {
+    // In each mode, the hits of a text clause with a sort come in the
+    // order that the sort gives to the same rows from a clause on `num`:
+    // the order of ZCatalog, ties included. `kind` has three keys, so the
+    // sort on it holds many ties. `kalo` and `mite` have many hits, `ruso`
+    // few.
+    let mut compat = settings(&["en"]);
+    for s in compat.indexes.values_mut() {
+        s.mode = zoe_catalog::text::Mode::Compat;
+        s.boosts.clear();
+        s.fuzzy = 0;
+    }
+    for (name, text_settings) in [
+        ("text-sorts-enhanced", settings(&["en"])),
+        ("text-sorts-compat", compat),
+    ] {
+        let n = 800;
+        let mut m = mirrored_with(name, n, &text_settings);
+        check_sorts(&m.site, n, name);
+        // New entries whose rids come below the rids of the base: their
+        // rows of the version come after the rows of the base, out of rid
+        // order.
+        let mut texts = Vec::new();
+        for j in 0..30 {
+            let rid = 1 + 3 * j;
+            let kind = if j % 2 == 0 { "even" } else { "odd" };
+            m.model.catalog(
+                rid,
+                &format!("/site/new-{j}"),
+                &[
+                    ("kind", Val::Str(kind.into())),
+                    ("num", Val::Int(num_of(n, rid))),
+                    ("getId", Val::Str(format!("new-{j}").into())),
+                ],
+            );
+            let text = if j % 3 == 0 {
+                "kalo mite ruso"
+            } else {
+                "kalo mite"
+            };
+            texts.push((rid, text));
+        }
+        let site = &m.site;
+        let tid = testing::commit(&site.store, &m.model.records(), &[], &[]).unwrap();
+        site.mirrors.committed(tid);
+        let ops: Vec<TextOp<'_>> = texts.iter().map(|(rid, t)| set("Title", *rid, t)).collect();
+        let tid = site.commit(&ops);
+        assert!(site.mirrors.wait_for(site.catalog, WAIT, |s| {
+            s.is_some_and(|s| s.applied.is_some_and(|a| a >= tid))
+        }));
+        site.ready_at(tid);
+        check_sorts(site, n, &format!("{name} with new entries"));
+    }
 }

@@ -44,10 +44,11 @@ pub use clause::{
     CallError, Node, Staged, TextClause, TextError, TextErrorKind, TextHits, TextInfo,
 };
 pub use engine::{Answer, Query};
-pub use search::{Strategy, Want};
+pub use search::{Filter, Strategy, Want};
 pub use settings::{CatalogSettings, IndexSettings, Mode};
 pub use texts::{Failure, TextConfig, TextHooks, TextState, Texts};
 
 /// The search of a text clause inside the rids of the other clauses of a
-/// plan, sorted, for what the plan wants.
-pub type TextSearch<'a> = dyn FnMut(&[i32], Want) -> Result<search::Found, Failure> + 'a;
+/// plan, for what the plan wants.
+pub type TextSearch<'a> =
+    dyn FnMut(search::Filter<'_>, Want) -> Result<search::Found, Failure> + 'a;

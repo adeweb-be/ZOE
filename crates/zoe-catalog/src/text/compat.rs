@@ -39,7 +39,7 @@ use super::analysis::pair;
 use super::clause::Node;
 use super::index::{Lengths, Maps};
 use super::lexicon::Glob;
-use super::search::{self, DocBits, Found, Strategy, Top, Want};
+use super::search::{self, DocBits, Filter, Found, HitDocs, Strategy, Top, Want};
 
 /// `k1` of `OkapiIndex`.
 const K1: f64 = 1.2;
@@ -185,7 +185,7 @@ pub struct Run<'a> {
     /// The replaced documents of each segment.
     excluded: Vec<Option<DocBits>>,
     overlay: &'a [Doc],
-    filter: Option<&'a [i32]>,
+    filter: Option<Filter<'a>>,
     checks: Vec<Check>,
     /// The documents of the filter of each segment, when they drive.
     drive: Vec<Option<Vec<DocId>>>,
@@ -193,6 +193,8 @@ pub struct Run<'a> {
     mean: f64,
     df: HashMap<String, u64>,
     globs: HashMap<String, Vec<String>>,
+    /// False when the search wants a set: the hits get no score.
+    scored: bool,
 }
 
 impl<'a> Run<'a> {
@@ -203,7 +205,7 @@ impl<'a> Run<'a> {
         index: Option<Indexed<'a>>,
         replaced: &BTreeSet<i32>,
         overlay: &'a [Doc],
-        filter: Option<&'a [i32]>,
+        filter: Option<Filter<'a>>,
     ) -> Run<'a> {
         let segments = index
             .as_ref()
@@ -220,6 +222,7 @@ impl<'a> Run<'a> {
             mean: 0.0,
             df: HashMap::new(),
             globs: HashMap::new(),
+            scored: true,
         };
         let (mut n, mut total) = (0i64, 0i64);
         if let Some(ix) = &run.index {
@@ -259,7 +262,12 @@ impl<'a> Run<'a> {
 
     /// Choose how the search meets its filter, from the bound of the hits
     /// of `node`, and build the checks of each segment.
-    fn prepare(&mut self, node: &Node, forced: Option<Strategy>) -> tantivy::Result<Strategy> {
+    fn prepare(
+        &mut self,
+        node: &Node,
+        want: Want,
+        forced: Option<Strategy>,
+    ) -> tantivy::Result<Strategy> {
         let Some(ix) = &self.index else {
             return Ok(Strategy::None);
         };
@@ -268,7 +276,7 @@ impl<'a> Run<'a> {
             Some(s) => s,
             None => {
                 let bound = self.bound(node)?;
-                search::strategy(num_docs, self.filter.map(|f| f.len() as u64), bound)
+                search::strategy(num_docs, self.filter.map(|f| f.len()), bound)
             }
         };
         let Some(ix) = &self.index else {
@@ -281,10 +289,15 @@ impl<'a> Run<'a> {
         };
         let segments = ix.searcher.segment_readers().len();
         self.checks.clear();
+        // The keys of a set come from a merge of the filter with the hits:
+        // with a bitset, that merge applies the filter, and the search needs
+        // none.
+        let unfiltered = want == Want::Keys && chosen == Strategy::Bitset;
         match (chosen, self.filter) {
             (Strategy::None, _) | (_, None) => {
                 self.checks.extend((0..segments).map(|_| Check::Live));
             }
+            _ if unfiltered => self.checks.extend((0..segments).map(|_| Check::Live)),
             (Strategy::HitsDrive, Some(_)) => {
                 self.checks.extend((0..segments).map(|_| Check::Rids));
             }
@@ -292,22 +305,18 @@ impl<'a> Run<'a> {
                 let mut bits: Vec<DocBits> =
                     ix.maps.max_docs.iter().map(|m| DocBits::new(*m)).collect();
                 let mut drive: Vec<Vec<DocId>> = vec![Vec::new(); segments];
-                // Both lists are in rid order: one merge.
-                let mut docs = ix.maps.by_rid.iter().peekable();
-                for rid in filter {
-                    while docs.peek().is_some_and(|d| d.0 < *rid) {
-                        docs.next();
-                    }
-                    if let Some(&&(r, ord, doc)) = docs.peek()
-                        && r == *rid
-                        && self.excluded[ord as usize]
-                            .as_ref()
-                            .is_none_or(|e| !e.contains(doc))
+                let excluded = &self.excluded;
+                search::each_doc(ix.maps, filter, |_, _, ord, doc| {
+                    if excluded[ord as usize]
+                        .as_ref()
+                        .is_none_or(|e| !e.contains(doc))
                     {
                         bits[ord as usize].insert(doc);
-                        drive[ord as usize].push(doc);
+                        if chosen == Strategy::FilterDrives {
+                            drive[ord as usize].push(doc);
+                        }
                     }
-                }
+                });
                 if chosen == Strategy::FilterDrives {
                     for (ord, mut d) in drive.into_iter().enumerate() {
                         d.sort_unstable();
@@ -336,7 +345,7 @@ impl<'a> Run<'a> {
                 let rid = ix.maps.doc_to_rid[ord][doc as usize];
                 seg.alive_bitset().is_none_or(|a| a.is_alive(doc))
                     && self.excluded[ord].as_ref().is_none_or(|e| !e.contains(doc))
-                    && self.filter.is_some_and(|f| f.binary_search(&rid).is_ok())
+                    && self.filter.is_some_and(|f| f.contains(rid))
             }
         }
     }
@@ -508,6 +517,9 @@ impl<'a> Run<'a> {
     /// The scores of `word` in the segment `ord`, for the documents that
     /// may be hits.
     fn term_scores(&mut self, ord: usize, word: &str) -> tantivy::Result<Scores> {
+        if !self.scored {
+            return self.term_docs(ord, word);
+        }
         let Some(idf) = self.idf(word)? else {
             return Ok(Vec::new());
         };
@@ -546,6 +558,45 @@ impl<'a> Run<'a> {
             if self.keep(ord, seg, d) {
                 let len = lengths[d as usize].saturating_sub(1);
                 out.push((d, okapi(postings.term_freq(), len, idf, mean)));
+            }
+            d = postings.advance();
+        }
+        Ok(out)
+    }
+
+    /// The documents of the segment `ord` that hold `word` and that may be
+    /// hits, with the score 0.
+    fn term_docs(&self, ord: usize, word: &str) -> tantivy::Result<Scores> {
+        let Some(ix) = &self.index else {
+            return Ok(Vec::new());
+        };
+        let seg = &ix.searcher.segment_readers()[ord];
+        let term = Term::from_field_text(ix.text, word);
+        let Some(mut postings) = seg
+            .inverted_index(ix.text)?
+            .read_postings(&term, IndexRecordOption::Basic)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        if let Some(docs) = &self.drive[ord] {
+            for &d in docs {
+                if postings.doc() < d {
+                    postings.seek(d);
+                }
+                if postings.doc() == TERMINATED {
+                    break;
+                }
+                if postings.doc() == d {
+                    out.push((d, 0));
+                }
+            }
+            return Ok(out);
+        }
+        let mut d = postings.doc();
+        while d != TERMINATED {
+            if self.keep(ord, seg, d) {
+                out.push((d, 0));
             }
             d = postings.advance();
         }
@@ -697,7 +748,7 @@ impl<'a> Run<'a> {
                 let mut acc = Vec::new();
                 for w in words {
                     let s = self.term_scores(ord, w)?;
-                    acc = union(&acc, &s);
+                    acc = if acc.is_empty() { s } else { union(&acc, &s) };
                 }
                 Some(acc)
             }
@@ -705,7 +756,7 @@ impl<'a> Run<'a> {
                 let mut acc = Vec::new();
                 for w in self.expand(pattern)? {
                     let s = self.term_scores(ord, &w)?;
-                    acc = union(&acc, &s);
+                    acc = if acc.is_empty() { s } else { union(&acc, &s) };
                 }
                 Some(acc)
             }
@@ -726,6 +777,9 @@ impl<'a> Run<'a> {
                     cand = self.in_a_row(ord, words, cand)?;
                 }
                 let mut acc: Scores = cand.iter().map(|d| (*d, 0)).collect();
+                if !self.scored {
+                    return Ok(Some(acc));
+                }
                 for w in words {
                     let s = self.term_scores_for(ord, w, &cand)?;
                     for (a, b) in acc.iter_mut().zip(s) {
@@ -766,7 +820,7 @@ impl<'a> Run<'a> {
                 let mut acc = Vec::new();
                 for n in items {
                     if let Some(r) = self.eval(ord, n)? {
-                        acc = union(&acc, &r);
+                        acc = if acc.is_empty() { r } else { union(&acc, &r) };
                     }
                 }
                 Some(acc)
@@ -872,14 +926,10 @@ impl<'a> Run<'a> {
         forced: Option<Strategy>,
     ) -> tantivy::Result<(Found, Option<Strategy>)> {
         let strategy = if self.index.is_some() {
-            Some(self.prepare(node, forced)?)
+            Some(self.prepare(node, want, forced)?)
         } else {
             None
         };
-        let mut top = Top::new(match want {
-            Want::Top(limit) => limit,
-            Want::Set => None,
-        });
         let mut count = 0u64;
         if matches!(node, Node::Atom { words } if words.is_empty()) {
             // `Catalog.search` gives no hit for a tree that matches every
@@ -890,6 +940,37 @@ impl<'a> Run<'a> {
             .index
             .as_ref()
             .map_or(0, |i| i.searcher.segment_readers().len());
+        if !matches!(want, Want::Top(_)) {
+            // A set has no score: the words read no frequency.
+            self.scored = false;
+            let mut found = Found::default();
+            if let Some(maps) = self.index.as_ref().map(|ix| ix.maps) {
+                let mut docs = HitDocs::new(maps);
+                for ord in 0..segments {
+                    if let Some(hits) = self.eval(ord, node)? {
+                        for (doc, _) in hits {
+                            docs.insert(ord, doc);
+                        }
+                    }
+                }
+                found = match (want, self.filter) {
+                    (Want::Keys, Some(filter)) => docs.into_keys(maps, filter),
+                    _ => docs.into_found(maps),
+                };
+            }
+            let mut more = Vec::new();
+            for doc in self.overlay {
+                if self.in_filter(doc.rid) && matches!(self.eval_doc(doc, node)?, Eval::Yes(_)) {
+                    more.push(doc.rid);
+                }
+            }
+            search::add_to_set(&mut found, want, more, self.filter);
+            return Ok((found, strategy));
+        }
+        let mut top = Top::new(match want {
+            Want::Top(limit) => limit,
+            Want::Set | Want::Keys => None,
+        });
         for ord in 0..segments {
             let Some(hits) = self.eval(ord, node)? else {
                 continue;
@@ -900,21 +981,15 @@ impl<'a> Run<'a> {
             let rids = &ix.maps.doc_to_rid[ord];
             for (doc, score) in hits {
                 count += 1;
-                let score = if want == Want::Set { 0 } else { score };
                 top.push((score, rids[doc as usize]));
             }
         }
-        let overlay = self.overlay;
-        for doc in overlay {
-            if self
-                .filter
-                .is_some_and(|f| f.binary_search(&doc.rid).is_err())
-            {
+        for doc in self.overlay {
+            if !self.in_filter(doc.rid) {
                 continue;
             }
             if let Eval::Yes(score) = self.eval_doc(doc, node)? {
                 count += 1;
-                let score = if want == Want::Set { 0 } else { score };
                 top.push((score, doc.rid));
             }
         }
@@ -922,9 +997,15 @@ impl<'a> Run<'a> {
             Found {
                 count,
                 hits: top.into_sorted(),
+                keys: None,
             },
             strategy,
         ))
+    }
+
+    /// Tell if the filter holds `rid`.
+    fn in_filter(&self, rid: i32) -> bool {
+        self.filter.is_none_or(|f| f.contains(rid))
     }
 }
 

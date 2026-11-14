@@ -825,11 +825,12 @@ impl Mirrors {
                 catalog,
                 tid,
                 clause,
-                filter: Some(filter),
+                filter: None,
                 want,
                 forced: None,
             };
-            crate::text::engine::run(self.texts.as_ref(), store, &query).map(|a| a.found)
+            crate::text::engine::run_in(self.texts.as_ref(), store, &query, Some(filter))
+                .map(|a| a.found)
         })
     }
 
