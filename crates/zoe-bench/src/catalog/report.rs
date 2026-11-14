@@ -197,6 +197,26 @@ fn table(out: &mut String, cells: &Json) {
         );
     }
     out.push('\n');
+    for cell in cells.as_array().into_iter().flatten() {
+        let Some(queries) = cell["by_query"].as_array() else {
+            continue;
+        };
+        let _ = writeln!(out, "Each query of the cell {}:\n", text(&cell["name"]));
+        let _ = writeln!(out, "| query | answered | p50 | p99 | max |");
+        let _ = writeln!(out, "| --- | --- | --- | --- | --- |");
+        for q in queries {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                text(&q["name"]),
+                text(&q["count"]),
+                ms(&q["p50_seconds"]),
+                ms(&q["p99_seconds"]),
+                ms(&q["max_seconds"]),
+            );
+        }
+        out.push('\n');
+    }
 }
 
 fn spread(out: &mut String, what: &str, value: &Json) {

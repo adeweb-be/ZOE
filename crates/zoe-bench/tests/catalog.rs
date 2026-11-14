@@ -680,7 +680,10 @@ fn intersect_gives_the_numbers_of_each_query() {
         let c = cell(&intersect["cells"], &format!("c{concurrency}"), concurrency);
         answered(c);
         let queries = c["by_query"].as_array().expect("the queries of the cell");
-        let names: Vec<&str> = queries.iter().map(|q| q["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = queries
+            .iter()
+            .map(|q| q["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names, ["listing", "folders"], "{c}");
         let mut count = 0;
         for q in queries {
@@ -698,7 +701,9 @@ fn intersect_gives_the_numbers_of_each_query() {
     let report = std::fs::read_to_string(&markdown).unwrap();
     for name in ["listing", "folders"] {
         assert!(
-            report.lines().any(|l| l.starts_with(&format!("| {name} |"))),
+            report
+                .lines()
+                .any(|l| l.starts_with(&format!("| {name} |"))),
             "no row of {name} in the report:\n{report}"
         );
     }
