@@ -27,6 +27,8 @@ them. They check:
 - a change of the boosts applies to the next query;
 - `numObjects`, `indexSize` and `getEntryForObject` give the values of
   `text_info`;
+- `getEntryForObject` gives the text that the current transaction staged,
+  else the committed text;
 - `zoe.plone:text-uninstall` gives ZCTextIndex indexes that hold every
   catalogued object;
 - on a storage without the extension `text`, the profile step raises
@@ -577,6 +579,18 @@ class TestTheIndex(TextTests):
                 ["cafe", "notes"],
             )
             self.assertIsNone(self.index(site).getEntryForObject(2**31 - 1))
+
+    def test_the_entry_reads_the_staged_text_first(self):
+        with opened(self.db) as site:
+            index = self.index(site, "Title")
+            rid = site.portal_catalog.getrid("/plone/n4")
+            site["n4"].setTitle("Staged words")
+            index.index_object(rid, site["n4"])
+            self.assertEqual(index.getEntryForObject(rid), ["staged", "words"])
+            index.unindex_object(rid)
+            self.assertIsNone(index.getEntryForObject(rid))
+            transaction.abort()
+            self.assertEqual(index.getEntryForObject(rid), ["cafe", "notes"])
 
     def test_the_uninstall_step_gives_full_zctextindexes_and_the_backend_refuses(
         self,

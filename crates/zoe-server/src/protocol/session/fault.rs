@@ -43,8 +43,8 @@ impl Fault {
     }
 
     /// The exception of a text call that fails as a call: `ValueError`
-    /// for arguments of another form, `Unsupported` for the compatibility
-    /// mode.
+    /// for arguments of another form, `Unsupported` for a call that the
+    /// text index does not serve.
     pub(super) fn of_text(error: zoe_catalog::text::CallError) -> Self {
         match error {
             zoe_catalog::text::CallError::Malformed(why) => Self::value_error(why),

@@ -11,6 +11,14 @@
 //! holds one token when the document has a text in the index, also an
 //! empty text: an empty text counts as a document, as in ZCTextIndex.
 //!
+//! A text index in the compatibility mode has one field of the words of
+//! the lexicon `plone_lexicon`, whatever the language of the text, and the
+//! field of its pairs. Its fast field `n<i>` holds the number of words of
+//! the document plus one, and 0 when the document has no text in the
+//! index: the score of `OkapiIndex` needs the exact length, which the norms
+//! of tantivy round. The maps keep these numbers in memory, with the
+//! documents and the words of each such index.
+//!
 //! The payload of each tantivy commit holds the tid up to which the index
 //! holds the deltas, and the layout of the settings that built it.
 
@@ -34,6 +42,7 @@ use tantivy::tokenizer::{PreTokenizedString, TextAnalyzer, Token};
 use tantivy::{DocId, Index, IndexReader, ReloadPolicy, Searcher, TantivyDocument};
 
 use super::analysis;
+use super::lexicon;
 use super::settings::{Layout, Mode};
 
 /// The name of the fast field of the rid.
@@ -60,9 +69,17 @@ pub struct Fields {
     /// The presence field of each text index, by index id: its norm is
     /// above 0 when the document has a text in the index.
     pub present: HashMap<String, Field>,
+    /// The fast field of the number of words plus one of each document,
+    /// for each text index in the compatibility mode.
+    pub lengths: HashMap<String, Field>,
 }
 
 impl Fields {
+    /// Tell if `index` is in the compatibility mode.
+    pub fn is_compat(&self, index: &str) -> bool {
+        self.lengths.contains_key(index)
+    }
+
     /// The fields of `index` that read the languages `languages`, or every
     /// field for `None`.
     pub fn of(&self, index: &str, languages: Option<&[String]>) -> Vec<LangFields> {
@@ -154,12 +171,19 @@ pub fn schema(layout: &Layout) -> (Schema, Fields) {
             b.add_text_field(&format!("h{i}"), presence.clone()),
         );
     }
+    let mut lengths = HashMap::new();
+    for (i, (name, mode, _)) in layout.iter().enumerate() {
+        if *mode == Mode::Compat {
+            lengths.insert(name.clone(), b.add_u64_field(&format!("n{i}"), FAST));
+        }
+    }
     (
         b.build(),
         Fields {
             rid,
             indexes,
             present,
+            lengths,
         },
     )
 }
@@ -265,7 +289,14 @@ pub fn document(
         }
         let names: Vec<String> = langs.iter().map(|f| f.language.clone()).collect();
         let f = &langs[field_of(&names, language)];
-        let words = analyzers.words(&f.language, text);
+        let words = match fields.lengths.get(index) {
+            Some(length) => {
+                let words = lexicon::words(text);
+                d.add_u64(*length, words.len() as u64 + 1);
+                words
+            }
+            None => analyzers.words(&f.language, text),
+        };
         let pairs = pairs_of(&words);
         d.add_pre_tokenized_text(
             f.pairs,
@@ -392,39 +423,100 @@ pub struct Maps {
     pub by_rid: Vec<(i32, u32, DocId)>,
     /// The number of documents of each segment.
     pub max_docs: Vec<u32>,
+    /// The lengths of each text index in the compatibility mode, by index
+    /// id.
+    pub lengths: HashMap<String, Lengths>,
 }
 
-/// The rids of each segment that the last maps read, so a reload reads
-/// only the new segments.
-pub type SegmentRids = HashMap<SegmentId, Arc<Vec<i32>>>;
+/// The number of words of each document of one text index in the
+/// compatibility mode.
+#[derive(Debug, Default)]
+pub struct Lengths {
+    /// The number of words plus one of each document of each segment, 0
+    /// for a document with no text in the index.
+    pub segments: Vec<Arc<Vec<u32>>>,
+    /// The live documents with a text in the index.
+    pub docs: u64,
+    /// The words of those documents.
+    pub total: u64,
+}
+
+impl Lengths {
+    /// The number of words plus one of the document `doc` of the segment
+    /// `ord`, 0 when it has no text in the index.
+    #[inline]
+    pub fn of(&self, ord: usize, doc: DocId) -> u32 {
+        self.segments[ord][doc as usize]
+    }
+}
+
+/// What the last maps read of a segment: its rids and the lengths of each
+/// text index in the compatibility mode.
+#[derive(Clone, Debug, Default)]
+pub struct SegmentData {
+    rids: Arc<Vec<i32>>,
+    lengths: HashMap<String, Arc<Vec<u32>>>,
+}
+
+/// What the last maps read of each segment, so a reload reads only the new
+/// segments.
+pub type SegmentRids = HashMap<SegmentId, SegmentData>;
 
 impl Maps {
-    /// The maps of `searcher`. `cache` holds the rids of the segments that
-    /// a reload already read, and keeps those of the segments of
-    /// `searcher`.
-    pub fn build(searcher: &Searcher, cache: &mut SegmentRids) -> tantivy::Result<Maps> {
+    /// The maps of `searcher`, whose schema has `fields`. `cache` holds
+    /// what a reload already read of the segments, and keeps what it reads
+    /// of the segments of `searcher`.
+    pub fn build(
+        searcher: &Searcher,
+        fields: &Fields,
+        cache: &mut SegmentRids,
+    ) -> tantivy::Result<Maps> {
         let mut maps = Maps::default();
         let mut seen = SegmentRids::new();
+        for name in fields.lengths.keys() {
+            maps.lengths.insert(name.clone(), Lengths::default());
+        }
         for (ord, seg) in searcher.segment_readers().iter().enumerate() {
             let id = seg.segment_id();
-            let rids = match cache.get(&id) {
-                Some(r) => Arc::clone(r),
-                None => {
-                    let col = seg.fast_fields().i64(RID)?;
-                    let rids: Vec<i32> = (0..seg.max_doc())
+            let mut data = cache.get(&id).cloned().unwrap_or_default();
+            if data.rids.len() != seg.max_doc() as usize {
+                let col = seg.fast_fields().i64(RID)?;
+                data.rids = Arc::new(
+                    (0..seg.max_doc())
                         .map(|d| col.first(d).unwrap_or(0) as i32)
+                        .collect(),
+                );
+            }
+            for (name, field) in &fields.lengths {
+                if !data.lengths.contains_key(name) {
+                    let col = seg.fast_fields().u64(seg.schema().get_field_name(*field))?;
+                    let lens: Vec<u32> = (0..seg.max_doc())
+                        .map(|d| col.first(d).unwrap_or(0).min(u64::from(u32::MAX)) as u32)
                         .collect();
-                    Arc::new(rids)
-                }
-            };
-            for doc in 0..seg.max_doc() {
-                if seg.alive_bitset().is_none_or(|a| a.is_alive(doc)) {
-                    maps.by_rid.push((rids[doc as usize], ord as u32, doc));
+                    data.lengths.insert(name.clone(), Arc::new(lens));
                 }
             }
-            seen.insert(id, Arc::clone(&rids));
-            maps.doc_to_rid.push(rids);
+            let alive = |doc: DocId| seg.alive_bitset().is_none_or(|a| a.is_alive(doc));
+            for doc in 0..seg.max_doc() {
+                if alive(doc) {
+                    maps.by_rid.push((data.rids[doc as usize], ord as u32, doc));
+                }
+            }
+            for (name, lens) in &data.lengths {
+                let Some(entry) = maps.lengths.get_mut(name) else {
+                    continue;
+                };
+                for (doc, &n) in lens.iter().enumerate() {
+                    if n > 0 && alive(doc as DocId) {
+                        entry.docs += 1;
+                        entry.total += u64::from(n - 1);
+                    }
+                }
+                entry.segments.push(Arc::clone(lens));
+            }
+            maps.doc_to_rid.push(Arc::clone(&data.rids));
             maps.max_docs.push(seg.max_doc());
+            seen.insert(id, data);
         }
         maps.by_rid.sort_unstable_by_key(|e| e.0);
         *cache = seen;
@@ -446,6 +538,14 @@ impl Maps {
 
     /// The bytes of the maps.
     pub fn heap_bytes(&self) -> usize {
-        self.by_rid.capacity() * 12 + self.doc_to_rid.iter().map(|r| r.len() * 4).sum::<usize>()
+        let lengths: usize = self
+            .lengths
+            .values()
+            .flat_map(|l| l.segments.iter())
+            .map(|s| s.len() * 4)
+            .sum();
+        self.by_rid.capacity() * 12
+            + self.doc_to_rid.iter().map(|r| r.len() * 4).sum::<usize>()
+            + lengths
     }
 }
