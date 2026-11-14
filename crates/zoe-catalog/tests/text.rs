@@ -249,6 +249,23 @@ impl Site {
         );
     }
 
+    /// Stop the mirrors, then start them again with a rebase past
+    /// `rebase_rows` rows of overrides.
+    fn restart_rebasing(&mut self, rebase_rows: usize) {
+        self.mirrors.stop();
+        let weak = Arc::downgrade(&self.store);
+        let open: Opener = Arc::new(move || weak.upgrade().map(|s| s as Arc<dyn Reads>));
+        let config = Config {
+            rebase_rows,
+            text: TextConfig {
+                dir: Some(self.dir.path().to_owned()),
+                read_only: false,
+            },
+            ..Config::default()
+        };
+        self.mirrors = Mirrors::start(open, self.store.last_transaction().0, config);
+    }
+
     /// Stop the mirrors, then start them again with the hand-offs up to
     /// `published` only: the index follows no later commit until the test
     /// hands it one.
@@ -2032,8 +2049,7 @@ fn a_security_clause_and_a_text_clause_run_in_one_plan() {
 }
 
 /// The num of the rid `rid` in the catalog of `mirrored` of `n` entries,
-/// and of the entries that `a_text_clause_with_a_sort_gives_the_order_of_the_sort_with_its_ties`
-/// adds below the rid 1000.
+/// and of the entries that `add_entries` adds below the rid 1000.
 fn num_of(n: i32, rid: i32) -> i64 {
     if rid >= 1000 {
         i64::from(n - (rid - 1000) / 3)
@@ -2068,7 +2084,9 @@ fn check_sorts(site: &Site, n: i32, name: &str) {
         assert_eq!(set.count, rids.len() as u64, "{name} {words:?}");
         assert!(!rids.is_empty(), "{name} {words:?}");
         let nums: Vec<Wire> = rids.iter().map(|r| Wire::Int(num_of(n, *r))).collect();
-        for kind in [None, Some("even")] {
+        // No filter, a filter that the hits drive or a bitset, and the
+        // filter of the rare entries, which drives.
+        for kind in [None, Some("even"), Some("rare")] {
             let mut filter = Vec::new();
             if let Some(kind) = kind {
                 filter.push(field_clause("kind", vec![s(kind)]));
@@ -2103,7 +2121,7 @@ fn check_sorts(site: &Site, n: i32, name: &str) {
                     .unwrap();
                 assert!(got.error.is_none(), "{what}");
                 assert!(got.scores.is_none(), "{what}");
-                assert!(!want.rids.is_empty(), "{what}");
+                assert!(want.actual > 0, "{what}");
                 assert_eq!(got.rids, want.rids, "{what}");
                 assert_eq!(got.len, want.len, "{what}");
                 assert_eq!(got.actual, want.actual, "{what}");
@@ -2134,36 +2152,60 @@ fn a_text_clause_with_a_sort_gives_the_order_of_the_sort_with_its_ties() {
         check_sorts(&m.site, n, name);
         // New entries whose rids come below the rids of the base: their
         // rows of the version come after the rows of the base, out of rid
-        // order.
-        let mut texts = Vec::new();
-        for j in 0..30 {
-            let rid = 1 + 3 * j;
-            let kind = if j % 2 == 0 { "even" } else { "odd" };
-            m.model.catalog(
-                rid,
-                &format!("/site/new-{j}"),
-                &[
-                    ("kind", Val::Str(kind.into())),
-                    ("num", Val::Int(num_of(n, rid))),
-                    ("getId", Val::Str(format!("new-{j}").into())),
-                ],
-            );
-            let text = if j % 3 == 0 {
-                "kalo mite ruso"
-            } else {
-                "kalo mite"
-            };
-            texts.push((rid, text));
-        }
-        let site = &m.site;
-        let tid = testing::commit(&site.store, &m.model.records(), &[], &[]).unwrap();
-        site.mirrors.committed(tid);
-        let ops: Vec<TextOp<'_>> = texts.iter().map(|(rid, t)| set("Title", *rid, t)).collect();
-        let tid = site.commit(&ops);
-        assert!(site.mirrors.wait_for(site.catalog, WAIT, |s| {
-            s.is_some_and(|s| s.applied.is_some_and(|a| a >= tid))
-        }));
-        site.ready_at(tid);
-        check_sorts(site, n, &format!("{name} with new entries"));
+        // order, in the overrides.
+        add_entries(&mut m, n, 1);
+        check_sorts(&m.site, n, &format!("{name} with new entries"));
+        // A new build orders the rows again. More entries below the rids of
+        // the base pass the rebase threshold: their rows come after the
+        // rows of the base, out of rid order, in the rebased base.
+        m.site.restart_rebasing(10);
+        let catalog = m.site.catalog;
+        assert!(
+            m.site
+                .mirrors
+                .wait_for(catalog, WAIT, |s| s.is_some_and(|s| s.state == "ready"))
+        );
+        add_entries(&mut m, n, 2);
+        assert!(
+            m.site
+                .mirrors
+                .wait_for(catalog, WAIT, |s| s.is_some_and(|s| s.rebases >= 1))
+        );
+        check_sorts(&m.site, n, &format!("{name} after a rebase"));
     }
+}
+
+/// Add 30 entries to the catalog of `m`, with the rids `first + 3 * j`,
+/// below the rids of the base, and their texts. Wait until the mirror and
+/// the text index hold them.
+fn add_entries(m: &mut Mirrored, n: i32, first: i32) {
+    let mut texts = Vec::new();
+    for j in 0..30 {
+        let rid = first + 3 * j;
+        let kind = if j % 2 == 0 { "even" } else { "odd" };
+        m.model.catalog(
+            rid,
+            &format!("/site/new-{rid}"),
+            &[
+                ("kind", Val::Str(kind.into())),
+                ("num", Val::Int(num_of(n, rid))),
+                ("getId", Val::Str(format!("new-{rid}").into())),
+            ],
+        );
+        let text = if j % 3 == 0 {
+            "kalo mite ruso"
+        } else {
+            "kalo mite"
+        };
+        texts.push((rid, text));
+    }
+    let site = &m.site;
+    let tid = testing::commit(&site.store, &m.model.records(), &[], &[]).unwrap();
+    site.mirrors.committed(tid);
+    let ops: Vec<TextOp<'_>> = texts.iter().map(|(rid, t)| set("Title", *rid, t)).collect();
+    let tid = site.commit(&ops);
+    assert!(site.mirrors.wait_for(site.catalog, WAIT, |s| {
+        s.is_some_and(|s| s.applied.is_some_and(|a| a >= tid))
+    }));
+    site.ready_at(tid);
 }

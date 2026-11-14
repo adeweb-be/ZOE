@@ -453,6 +453,8 @@ pub fn search(
 /// The documents of a set of hits, a bitset for each segment.
 pub struct HitDocs {
     bits: Vec<DocBits>,
+    /// The number of the documents of the set, also the documents outside
+    /// a filter.
     count: usize,
 }
 
@@ -482,8 +484,9 @@ impl HitDocs {
         }
     }
 
-    /// The keys of the hits in `filter`. Each document must be a live
-    /// document of `maps` whose rid is in the filter.
+    /// The keys of the hits in `filter`, and their number in `count`. Each
+    /// document must be a live document of `maps`. The set can hold
+    /// documents outside the filter: they give no key and no count.
     pub fn into_keys(self, maps: &Maps, filter: Filter<'_>) -> Found {
         if self.count.saturating_mul(16) < filter.len() as usize {
             // A small set: the key of each hit.

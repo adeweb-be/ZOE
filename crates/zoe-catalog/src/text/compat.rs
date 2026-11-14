@@ -200,7 +200,7 @@ pub struct Run<'a> {
 impl<'a> Run<'a> {
     /// A query on `index`, or on the overlay alone for `None`, with the
     /// replaced rids `replaced`, the documents of the text overlay that
-    /// have a text in the index, and the filter `filter`, sorted.
+    /// have a text in the index, and the filter `filter`.
     pub fn new(
         index: Option<Indexed<'a>>,
         replaced: &BTreeSet<i32>,
