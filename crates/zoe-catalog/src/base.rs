@@ -429,16 +429,40 @@ fn group(pairs: Pairs, mut each: impl FnMut(u32, u32)) -> Result<(Keys, Postings
             Keys::Int(keys)
         }
         Pairs::Str(arena, mut v) => {
-            v.sort_unstable_by(|a, b| arena.get(a.0).cmp(arena.get(b.0)).then(a.1.cmp(&b.1)));
-            let mut keys = StrArena::default();
-            let mut last: Option<u32> = None;
-            for (place, row) in v {
-                if last.is_none_or(|l| arena.get(l) != arena.get(place)) {
-                    flush(&mut group, &mut postings);
-                    keys.push(arena.get(place));
-                    last = Some(place);
+            // Only the distinct texts sort as strs. Each pair takes the
+            // number of its text, then the slot of that text, and the pairs
+            // sort as numbers.
+            let mut ids: HashMap<&str, u32> = HashMap::new();
+            let mut texts: Vec<&str> = Vec::new();
+            for pair in &mut v {
+                let text = arena.get(pair.0);
+                let next = texts.len() as u32;
+                let id = *ids.entry(text).or_insert(next);
+                if id == next {
+                    texts.push(text);
                 }
-                each(row, (keys.len() - 1) as u32);
+                pair.0 = id;
+            }
+            drop(ids);
+            let mut order: Vec<u32> = (0..texts.len() as u32).collect();
+            order.sort_unstable_by(|a, b| texts[*a as usize].cmp(texts[*b as usize]));
+            let mut slots = vec![0u32; texts.len()];
+            let mut keys = StrArena::default();
+            for (slot, id) in order.iter().enumerate() {
+                slots[*id as usize] = slot as u32;
+                keys.push(texts[*id as usize]);
+            }
+            for pair in &mut v {
+                pair.0 = slots[pair.0 as usize];
+            }
+            v.sort_unstable();
+            let mut last: Option<u32> = None;
+            for (slot, row) in v {
+                if last != Some(slot) {
+                    flush(&mut group, &mut postings);
+                    last = Some(slot);
+                }
+                each(row, slot);
                 group.push(row);
             }
             keys.shrink();
@@ -644,24 +668,51 @@ impl KeywordIndex {
     /// a row, for `rows` rows.
     pub fn build(pairs: Pairs, rows: usize) -> Result<KeywordIndex, String> {
         let mut found: Vec<(u32, u32)> = Vec::new();
-        let (keys, postings) = group(pairs, |row, slot| found.push((row, slot)))?;
-        found.sort_unstable();
-        found.dedup();
-        let mut starts = Vec::with_capacity(rows + 1);
-        let mut slots = Vec::with_capacity(found.len());
-        let mut indexed = RoaringBitmap::new();
-        let mut k = 0;
-        for row in 0..rows as u32 {
-            starts.push(slots.len() as u32);
-            while k < found.len() && found[k].0 == row {
-                slots.push(found[k].1);
-                k += 1;
+        let (keys, postings) = group(pairs, |row, slot| {
+            if (row as usize) < rows {
+                found.push((row, slot));
             }
-            if slots.len() as u32 > starts[row as usize] {
-                indexed.insert(row);
+        })?;
+        // `group` gives the slots in ascending order. So a count of the
+        // slots of each row and one pass over `found` lay out the slots of
+        // each row in ascending order, and a repeated slot comes next to
+        // its twin.
+        let mut ends = vec![0u32; rows + 1];
+        for (row, _) in &found {
+            ends[*row as usize + 1] += 1;
+        }
+        for row in 0..rows {
+            ends[row + 1] += ends[row];
+        }
+        let mut next = ends.clone();
+        let mut slots = vec![0u32; found.len()];
+        for (row, slot) in found {
+            let at = &mut next[row as usize];
+            slots[*at as usize] = slot;
+            *at += 1;
+        }
+        drop(next);
+        // Remove each repeated slot of a row, in place.
+        let mut starts = Vec::with_capacity(rows + 1);
+        let mut indexed = RoaringBitmap::new();
+        let mut kept = 0usize;
+        for row in 0..rows {
+            starts.push(kept as u32);
+            let first = kept;
+            for i in ends[row] as usize..ends[row + 1] as usize {
+                let slot = slots[i];
+                if kept == first || slots[kept - 1] != slot {
+                    slots[kept] = slot;
+                    kept += 1;
+                }
+            }
+            if kept > first {
+                indexed.insert(row as u32);
             }
         }
-        starts.push(slots.len() as u32);
+        starts.push(kept as u32);
+        slots.truncate(kept);
+        slots.shrink_to_fit();
         Ok(KeywordIndex {
             keys,
             postings,
