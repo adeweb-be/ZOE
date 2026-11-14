@@ -1,6 +1,6 @@
 # 0054. One published format for every benchmark: one layout, the index of version 2, the B5 summary and `just bench publish`
 
-Status: accepted. It changes no on-disk format, no wire protocol and no public Python API. It changes the output of `just bench plone report --json` and the layout of the results repository. The amendment at the end, the family `catalog`, is proposed.
+Status: accepted. It changes no on-disk format, no wire protocol and no public Python API. It changes the output of `just bench plone report --json` and the layout of the results repository. The amendment at the end, the family `catalog`, is accepted.
 
 ## Context
 
@@ -102,7 +102,7 @@ Each scenario of a cell of a native result holds `ratio`, `low`, `high` and `ver
 
 ## Amendment: the family `catalog`
 
-Status: proposed. Card ZOE-300, decision Q14 of the plan of phase 6 (#597). It adds a fifth family for the results of `zoe-bench catalog` (ZOE-299). It changes no on-disk format, no wire protocol and no public Python API. The four families of sections 1 to 8 do not change.
+Status: accepted. Card ZOE-300, decision Q14 of the plan of phase 6 (#597). It adds a fifth family for the results of `zoe-bench catalog` (ZOE-299). It changes no on-disk format, no wire protocol and no public Python API. The four families of sections 1 to 8 do not change.
 
 1. **The family and its key** (section 1). The family `catalog` has one document for each run of `just bench catalog`, valid against `bench/schema/catalog.schema.json`. Its key is `catalog`: the fixture of the run, with its `name`, its `preset` (the preset whose spec equals the spec of the fixture, else `custom`) and its counts. No other family uses this key, and a catalog document holds none of the keys of the other families. In `plone` the fixture is the key `fixture`. A catalog document cannot use that key, because `fixture` names `plone`.
 2. **The layout** (section 2). `results/catalog/<machine>/<fixture>/<started>-<commit>.json`. `<machine>` is `machine.name`, and `<fixture>` is `catalog.name`. `run.started` is in UTC to the second, so `<started>` is `YYYYMMDDTHHMMSSZ`. The path has no `<python>` part, where the four families have one. No Python runs on the measured path: the client is `zoe-bench`, the server is `zoe serve`. A Zope process makes the plans once and stores them with the fixture, so its Python build belongs to the fixture, not to the run. A `<python>` part would split the runs of one machine by a build that does not change their numbers. `catalog` joins the family names that a machine cannot take; no machine of the results repository has it.
@@ -126,7 +126,7 @@ Status: proposed. Card ZOE-300, decision Q14 of the plan of phase 6 (#597). It a
 - **A part of the set is publishable, as for the native gate.** The latest document of a machine would hide the scenarios that it does not hold.
 - **`index_version` 3.** No key of an entry changes.
 
-### Points for the human
+### Points settled at acceptance
 
-1. **`python` of the entry.** Proposed: null. The other choice is the build of the plans.
-2. **`text-rebuild` alone.** Proposed: refused. ZOE-299 runs `text-rebuild` alone, so its numbers publish only when `just bench catalog` can run it with the default set in one run. The other choice: `text-rebuild` alone on `catalog-1m` is a full run of its own set, and the dashboard shows the latest document of each set.
+1. **`python` of the entry.** Null. The other choice was the build of the plans.
+2. **`text-rebuild` alone.** Refused. ZOE-299 runs `text-rebuild` alone, so its numbers publish only when `just bench catalog` can run it with the default set in one run. The other choice was: `text-rebuild` alone on `catalog-1m` is a full run of its own set, and the dashboard shows the latest document of each set.
