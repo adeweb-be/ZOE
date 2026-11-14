@@ -52,6 +52,7 @@ LOG_SCRIPT = textwrap.dedent(
 
     from AccessControl.SecurityManagement import newSecurityManager
     from AccessControl.SpecialUsers import system
+    from DateTime import DateTime
     from zope.component.hooks import setSite
 
     probe, out, queries = sys.argv[1:]
@@ -65,6 +66,9 @@ LOG_SCRIPT = textwrap.dedent(
     plonebench_catalog.install(out)
     searches = 0
     for query in json.loads(open(queries).read()):
+        if "start" in query:
+            # DateRecurringIndex takes a DateTime, not a str.
+            query["start"]["query"] = DateTime(query["start"]["query"])
         catalog.unrestrictedSearchResults(**query)
         searches += 1
     print(json.dumps({"searches": searches}))
