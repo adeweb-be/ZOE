@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/adeweb-be/ZOE/main/bench/schema/catalog.schema.json",
+  "title": "ZOE catalog benchmark result",
+  "description": "One run of `zoe-bench catalog`, which `just bench catalog` writes (ADR 0054, the family catalog): the catalog mirror and the text index of zoe serve on one catalog fixture, through the protocol, from a client that runs no Python, on one machine. Results are numbers about a synthetic corpus, never data. It holds no host name, user name, path, address or password. A number that its counter does not give is null, never 0. A latency counts only for an answered query.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "machine", "run", "catalog", "settings", "server", "metrics", "scenarios"],
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0 },
+    "bytes": { "description": "A number of bytes, or null when the counter does not give it.", "type": ["integer", "null"], "minimum": 0 },
+    "seconds": { "description": "A time in seconds, or null when the run does not give it.", "type": ["number", "null"], "minimum": 0 },
+    "reasons": {
+      "description": "A count for each reason or kind, keyed by its name.",
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "spread": {
+      "description": "The p50, the p99 and the maximum of a set of times; null for an empty set.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "p50_seconds", "p99_seconds", "max_seconds"],
+      "properties": {
+        "count": { "$ref": "#/$defs/count" },
+        "p50_seconds": { "$ref": "#/$defs/seconds" },
+        "p99_seconds": { "$ref": "#/$defs/seconds" },
+        "max_seconds": { "$ref": "#/$defs/seconds" }
+      }
+    },
+    "cell": {
+      "description": "One cell: the queries of one set of plans at one concurrency, for a time.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "concurrency", "queries", "answered", "p50_seconds", "p99_seconds", "max_seconds", "qps", "refusals", "errors"],
+      "properties": {
+        "name": { "description": "The name of the cell, such as c16, or a text variant.", "type": "string", "minLength": 1 },
+        "concurrency": { "description": "The connections that send the queries.", "type": "integer", "minimum": 1 },
+        "queries": { "description": "The queries sent.", "$ref": "#/$defs/count" },
+        "answered": { "description": "The queries with an answer: no reply f, no reply e.", "$ref": "#/$defs/count" },
+        "p50_seconds": { "description": "The median latency of the answered queries.", "$ref": "#/$defs/seconds" },
+        "p99_seconds": { "description": "The 99th percentile of the same latencies.", "$ref": "#/$defs/seconds" },
+        "max_seconds": { "description": "The longest of the same latencies.", "$ref": "#/$defs/seconds" },
+        "qps": { "description": "The answered queries per second of the cell.", "type": "number", "minimum": 0 },
+        "refusals": { "description": "The replies f, by reason.", "$ref": "#/$defs/reasons" },
+        "errors": { "description": "The replies e by kind, and the calls that failed as call.", "$ref": "#/$defs/reasons" }
+      }
+    },
+    "cells": { "type": "array", "items": { "$ref": "#/$defs/cell" } },
+    "probe": {
+      "description": "The probe of the invalidation hub: one connection commits a small object at a short interval, another one listens.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["commits", "missed", "invalidation_delay", "commit"],
+      "properties": {
+        "commits": { "$ref": "#/$defs/count" },
+        "missed": { "description": "The commits whose invalidation did not come.", "$ref": "#/$defs/count" },
+        "invalidation_delay": { "description": "The time from the begin of a commit to its invalidation at the listener.", "$ref": "#/$defs/spread" },
+        "commit": { "description": "The time of a commit.", "$ref": "#/$defs/spread" }
+      }
+    },
+    "scenario": {
+      "description": "One scenario, with the memory of the server and the gauges of the mirror after it.",
+      "type": "object",
+      "required": ["name", "rss_bytes", "peak_rss_bytes", "mirror_bytes", "build_seconds"],
+      "properties": {
+        "name": { "enum": ["cold", "intersect", "mix", "text", "text-rebuild"] },
+        "rss_bytes": { "description": "The resident set of zoe serve after the scenario.", "$ref": "#/$defs/bytes" },
+        "peak_rss_bytes": { "description": "The peak of the resident set of zoe serve since its start.", "$ref": "#/$defs/bytes" },
+        "mirror_bytes": { "description": "zoe_catalog_mirror_bytes of the catalog.", "type": ["number", "null"], "minimum": 0 },
+        "build_seconds": { "description": "zoe_catalog_mirror_build_seconds of the catalog: the build time of the mirror.", "$ref": "#/$defs/seconds" }
+      },
+      "allOf": [
+        { "if": { "properties": { "name": { "const": "cold" } } }, "then": { "$ref": "#/$defs/cold" } },
+        { "if": { "properties": { "name": { "const": "intersect" } } }, "then": { "$ref": "#/$defs/intersect" } },
+        { "if": { "properties": { "name": { "const": "mix" } } }, "then": { "$ref": "#/$defs/mix" } },
+        { "if": { "properties": { "name": { "const": "text" } } }, "then": { "$ref": "#/$defs/text" } },
+        { "if": { "properties": { "name": { "const": "text-rebuild" } } }, "then": { "$ref": "#/$defs/text-rebuild" } }
+      ]
+    },
+    "cold": {
+      "description": "The cold start: the pages of the store leave the page cache, then zoe serve opens it. Until the mirror is ready, the replies are not_ready.",
+      "required": ["page_cache_dropped_bytes", "listening_seconds", "mirror_ready_seconds", "first_answer_seconds", "text_ready_seconds", "refusals", "errors", "first_answers", "hub_during_build"],
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": true, "rss_bytes": true, "peak_rss_bytes": true, "mirror_bytes": true, "build_seconds": true,
+        "page_cache_dropped_bytes": { "description": "The bytes of the store that left the page cache.", "$ref": "#/$defs/bytes" },
+        "listening_seconds": { "description": "The time from the spawn of zoe serve to its line listening.", "$ref": "#/$defs/seconds" },
+        "mirror_ready_seconds": { "description": "The time from the spawn to zoe_catalog_mirror_ready.", "$ref": "#/$defs/seconds" },
+        "first_answer_seconds": { "description": "The time from the spawn to the first answer.", "$ref": "#/$defs/seconds" },
+        "text_ready_seconds": { "description": "The time from the spawn to the first answer of the text index.", "$ref": "#/$defs/seconds" },
+        "refusals": { "description": "The replies f before the answers, by reason.", "$ref": "#/$defs/reasons" },
+        "errors": { "$ref": "#/$defs/reasons" },
+        "first_answers": { "description": "The latency of the first answered queries.", "$ref": "#/$defs/spread" },
+        "hub_during_build": { "description": "The delay of the invalidations while the mirror builds.", "$ref": "#/$defs/probe" }
+      }
+    },
+    "intersect": {
+      "description": "The five-index intersections with a sort of the fixture, warm (G2); and a full page of brains.",
+      "required": ["cells", "page"],
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": true, "rss_bytes": true, "peak_rss_bytes": true, "mirror_bytes": true, "build_seconds": true,
+        "cells": { "$ref": "#/$defs/cells" },
+        "page": {
+          "description": "A full page of brains: with all the columns, without the date columns and without rows; and the time that a client takes to decode and encode the reply. Null when the plans have no intersection with columns.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["rows", "columns", "date_columns", "reply_bytes", "cells", "client_decode", "client_encode"],
+          "properties": {
+            "rows": { "$ref": "#/$defs/count" },
+            "columns": { "$ref": "#/$defs/count" },
+            "date_columns": { "description": "The names of the columns that hold a date.", "type": "array", "items": { "type": "string" } },
+            "reply_bytes": { "$ref": "#/$defs/count" },
+            "cells": { "$ref": "#/$defs/cells" },
+            "client_decode": { "$ref": "#/$defs/spread" },
+            "client_encode": { "$ref": "#/$defs/spread" }
+          }
+        }
+      }
+    },
+    "mix": {
+      "description": "The plans of the query log, warm; then the path queries with many overridden rows, and the invalidations while the mirror rebases.",
+      "required": ["lines", "native", "native_share", "client_reasons", "server_reasons", "cells", "overrides", "rebase"],
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": true, "rss_bytes": true, "peak_rss_bytes": true, "mirror_bytes": true, "build_seconds": true,
+        "lines": { "description": "The lines of the log.", "$ref": "#/$defs/count" },
+        "native": { "description": "The lines that the mirror answers.", "$ref": "#/$defs/count" },
+        "native_share": { "description": "native divided by lines, or null for no line.", "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "client_reasons": { "description": "The lines that the client sends to the Python path, by reason.", "$ref": "#/$defs/reasons" },
+        "server_reasons": { "description": "The lines that the server refuses, by reason.", "$ref": "#/$defs/reasons" },
+        "cells": { "$ref": "#/$defs/cells" },
+        "overrides": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["writes", "override_rows", "cells"],
+          "properties": {
+            "writes": { "$ref": "#/$defs/count" },
+            "override_rows": { "$ref": "#/$defs/count" },
+            "cells": { "$ref": "#/$defs/cells" }
+          }
+        },
+        "rebase": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["writes", "rows", "past_threshold", "hub"],
+          "properties": {
+            "writes": { "$ref": "#/$defs/count" },
+            "rows": { "$ref": "#/$defs/count" },
+            "past_threshold": { "type": "boolean" },
+            "hub": { "$ref": "#/$defs/probe" }
+          }
+        }
+      }
+    },
+    "text": {
+      "description": "The text queries in each variant, in each mode of the text indexes, warm (G4).",
+      "required": ["modes"],
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": true, "rss_bytes": true, "peak_rss_bytes": true, "mirror_bytes": true, "build_seconds": true,
+        "modes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mode", "text_ready_seconds", "filter_rids", "commits", "cells"],
+            "properties": {
+              "mode": { "description": "enhanced or compat, or null when the plans give no mode.", "type": ["string", "null"] },
+              "text_ready_seconds": { "$ref": "#/$defs/seconds" },
+              "filter_rids": { "description": "The rids of the filter of text_query.", "$ref": "#/$defs/count" },
+              "commits": {
+                "description": "The commits of text deltas during the run.",
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["transactions", "deltas", "seconds", "lag_cleared_seconds"],
+                "properties": {
+                  "transactions": { "$ref": "#/$defs/count" },
+                  "deltas": { "$ref": "#/$defs/count" },
+                  "seconds": { "$ref": "#/$defs/seconds" },
+                  "lag_cleared_seconds": { "$ref": "#/$defs/seconds" }
+                }
+              },
+              "cells": { "$ref": "#/$defs/cells" }
+            }
+          }
+        }
+      }
+    },
+    "text-rebuild": {
+      "description": "The rebuild of the text index in the store with one indexing thread, from a store without text/.",
+      "required": ["mode", "rebuild_seconds", "peak_rss_at_rebuild_bytes", "mirror_ready_seconds"],
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": true, "rss_bytes": true, "peak_rss_bytes": true, "mirror_bytes": true, "build_seconds": true,
+        "mode": { "type": ["string", "null"] },
+        "rebuild_seconds": { "$ref": "#/$defs/seconds" },
+        "peak_rss_at_rebuild_bytes": { "$ref": "#/$defs/bytes" },
+        "mirror_ready_seconds": { "$ref": "#/$defs/seconds" }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "description": "The version of this schema. A change that a reader of the previous version cannot read increments it.",
+      "const": 1
+    },
+    "machine": {
+      "description": "The machine of the client and of zoe serve. It holds no host name, user name or path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "cpu", "logical_cpus", "memory_bytes", "os", "kernel", "arch"],
+      "properties": {
+        "name": { "description": "A stable name for the machine, used as a path segment in the results repository.", "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "cpu": { "description": "The CPU model.", "type": "string", "minLength": 1 },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "memory_bytes": { "description": "The physical memory, or 0 when the system does not give it.", "type": "integer", "minimum": 0 },
+        "os": { "type": "string", "minLength": 1 },
+        "kernel": { "description": "The kernel release.", "type": "string", "minLength": 1 },
+        "arch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started", "commit", "dirty"],
+      "properties": {
+        "started": { "description": "When the run started, in UTC, to the second.", "type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+        "commit": { "description": "The ZOE commit of the run, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
+        "dirty": { "description": "True when the tree held changes that the commit does not; false when it held none; null when git fails. Only false is publishable (ADR 0054).", "type": ["boolean", "null"] }
+      }
+    },
+    "catalog": {
+      "description": "The catalog fixture of the run. Its key names the family catalog.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "preset", "counts"],
+      "properties": {
+        "name": { "description": "The name of the fixture, used as a path segment in the results repository.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "preset": { "description": "The preset whose spec equals the spec of the fixture, such as catalog-1m, else custom. Only catalog-1m is publishable.", "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "counts": {
+          "description": "The counts of the fixture: its entries, and the entries of each index and of each column.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["size", "indexes", "columns"],
+          "properties": {
+            "size": { "description": "The entries of the catalog.", "$ref": "#/$defs/count" },
+            "indexes": { "$ref": "#/$defs/reasons" },
+            "columns": { "$ref": "#/$defs/reasons" }
+          }
+        }
+      }
+    },
+    "settings": {
+      "description": "The options of the run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seconds", "rounds", "ready_timeout_seconds", "text_commits", "text_batch", "text_pause_seconds", "rebase_seconds"],
+      "properties": {
+        "seconds": { "description": "The time of a cell.", "type": "number", "exclusiveMinimum": 0 },
+        "rounds": { "description": "The least rounds of the calls of each connection in a cell.", "type": "integer", "minimum": 0 },
+        "ready_timeout_seconds": { "description": "The longest wait for the mirror and for the text index.", "type": "number", "exclusiveMinimum": 0 },
+        "text_commits": { "description": "The commits of text deltas of the scenario text.", "$ref": "#/$defs/count" },
+        "text_batch": { "description": "The text deltas of each of these commits.", "type": "integer", "minimum": 1 },
+        "text_pause_seconds": { "description": "The time between two of these commits.", "type": "number", "minimum": 0 },
+        "rebase_seconds": { "description": "The time that the probe of the invalidations runs after the last write of the mix.", "type": "number", "minimum": 0 }
+      }
+    },
+    "server": {
+      "description": "zoe serve: its settings, and its memory and the gauges of the mirror at the end of the run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalog_memory", "catalog_rebase_rows", "mirror_bytes", "build_seconds", "rss_bytes", "peak_rss_bytes", "adr_0059_line_bytes", "over_adr_line"],
+      "properties": {
+        "catalog_memory": { "description": "--catalog-memory of zoe serve, such as 8GB, or null for its default.", "type": ["string", "null"] },
+        "catalog_rebase_rows": { "description": "--catalog-rebase-rows of zoe serve.", "$ref": "#/$defs/count" },
+        "mirror_bytes": { "type": ["number", "null"], "minimum": 0 },
+        "build_seconds": { "$ref": "#/$defs/seconds" },
+        "rss_bytes": { "$ref": "#/$defs/bytes" },
+        "peak_rss_bytes": { "$ref": "#/$defs/bytes" },
+        "adr_0059_line_bytes": { "description": "The memory of a catalog of 1,000,000 entries that ADR 0059 states.", "$ref": "#/$defs/count" },
+        "over_adr_line": { "description": "True when mirror_bytes is above that line; null when mirror_bytes is null.", "type": ["boolean", "null"] }
+      }
+    },
+    "metrics": {
+      "description": "The scrape of GET /metrics of the admin port during the whole run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interval_seconds", "scrapes"],
+      "properties": {
+        "interval_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "scrapes": { "description": "The time of a scrape.", "$ref": "#/$defs/spread" }
+      }
+    },
+    "scenarios": {
+      "description": "One entry per scenario, in the order of the run: cold, intersect, mix, text, text-rebuild. A full run holds intersect, text, mix and cold.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/scenario" }
+    }
+  }
+}

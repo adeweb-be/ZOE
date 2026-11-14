@@ -11,9 +11,12 @@ A checkout of the results repository holds every family (ADR 0054):
     results/native/<machine>/<python>/<started>-<commit>.json
     results/client/<machine>/<python>/<started>-<commit>.json
     results/plone/<machine>/<python>/<fixture>/<started>-<commit>.json
+    results/catalog/<machine>/<fixture>/<started>-<commit>.json
 
-A file under another directory of `results/` is a result of zodbshootout
-in the layout of version 1. `index.json` of version 2 lists every document
+A catalog run has no Python on its measured path, so its path has no
+<python> part, and its entry in the index has `python` null. A file
+under another directory of `results/` is a result of zodbshootout in
+the layout of version 1. `index.json` of version 2 lists every document
 of the tree, oldest first.
 """
 
@@ -31,6 +34,7 @@ FAMILY_KEYS = {
     "cells": "native",
     "rows": "client",
     "fixture": "plone",
+    "catalog": "catalog",
 }
 FAMILIES = tuple(FAMILY_KEYS.values())
 
@@ -77,7 +81,11 @@ def published_path(document: dict) -> str | None:
     repository, with `/`. Return None when a part of it cannot be a part
     of a path."""
     kind = family(document)
-    parts = [document["machine"]["name"], python_tag(document["python"])]
+    parts = [document["machine"]["name"]]
+    if kind == "catalog":
+        parts.append(document["catalog"]["name"])
+    else:
+        parts.append(python_tag(document["python"]))
     if kind == "shootout":
         parts.append(document["storage"])
     elif kind == "plone":
@@ -112,6 +120,11 @@ def entry(path: str, document: dict) -> dict:
     elif kind == "client":
         stacks = _once(row["client"] for row in document["rows"])
         scenarios = _once(row["workload"] for row in document["rows"])
+    elif kind == "catalog":
+        # One stack runs: zoe serve with its mirror.
+        stacks = ["zoe"]
+        scenarios = _once(s["name"] for s in document["scenarios"])
+        fixture = document["catalog"]["name"]
     else:
         stacks = _once(stack["name"] for stack in document["stacks"])
         scenarios = _once(s["name"] for s in document["scenarios"])
@@ -120,7 +133,7 @@ def entry(path: str, document: dict) -> dict:
         "family": kind,
         "path": path,
         "machine": document["machine"]["name"],
-        "python": python_tag(document["python"]),
+        "python": None if kind == "catalog" else python_tag(document["python"]),
         "stacks": stacks,
         "fixture": fixture,
         "scenarios": scenarios,

@@ -16,7 +16,8 @@ Pages serves the checkout. It has no build step:
 
   - `method`: these keys of the document, unchanged: `machine`, `python`,
     `software` and `run`; for `plone` also `fixture`, `settings`, `stacks`
-    and `scenarios`; for `native` also `rule`.
+    and `scenarios`; for `native` also `rule`. For `catalog`: `machine`,
+    `run`, `catalog`, `settings`, `server` and `metrics`.
   - `plone`: `tables`, one per scenario and step, in the order of the
     `scenarios` of the document, then of `step`. A table holds `scenario`,
     `step`, `users` and `rows`: one row per stack that ran the step, in the
@@ -42,6 +43,14 @@ Pages serves the checkout. It has no build step:
     `undecided` when the document holds null, or null when the document
     does not hold the key. The page shows a dash for null.
   - `client`: `rows`, the rows of the document, in its order.
+  - `catalog`: `scenario_results`, the scenarios of the document,
+    unchanged (`scenarios` is the key of the index, with their names); and
+    `tables`, one per list `cells` of a scenario, depth first, in the
+    order of the document. A table holds `scenario` (its name), `label`
+    and `cells` (the cells of the document, unchanged). The label is the
+    path of keys from the scenario to the list, without `cells`, joined
+    with " · ". An item of a list adds the key of the list, then its
+    `mode`, its `name` or its position.
 
   `shootout`: the charts of zodbshootout, one per machine, Python build,
   cell and scenario of the `shootout` documents. A chart holds `machine`,
@@ -52,9 +61,11 @@ Pages serves the checkout. It has no build step:
   run.
 
   `selection`: the documents of the tables, for the selectors of the page.
-  One group per family `native`, `client` and `plone`, machine, Python
-  build and, for `plone`, fixture. A group holds `family`, `machine`,
-  `python`, `fixture` (null except for `plone`), `latest` (the path of
+  One group per family `native`, `client`, `plone` and `catalog`, machine,
+  Python build and, for `plone` and `catalog`, fixture. A group holds
+  `family`, `machine`, `python` (null for `catalog`, whose runs have no
+  Python on their measured path), `fixture` (null except for `plone` and
+  `catalog`), `latest` (the path of
   the newest document of the group) and `earlier` (the paths of the other
   documents, newest first). The newest document has the latest `started`,
   then the last path. The page shows the latest document of a group, and
@@ -67,10 +78,11 @@ loads `data.js`, fits the width of a phone, has a dark mode, and says how
 to reproduce the results (`just bench showcase`).
 
 The test publishes the sample documents of `tests/data/publish`, one of
-each family, and the documents of `tests/data/dashboard` into an empty
-checkout with `just bench publish --main HEAD`. Then it runs `data.js` of
-the checkout under node, which devenv gives (`dashboard_model.mjs`). The
-documents of `tests/data/dashboard` give:
+each family but `catalog`, the sample of `tests/data/catalog` and the
+documents of `tests/data/dashboard` into an empty checkout with
+`just bench publish --main HEAD`. Then it runs `data.js` of the checkout
+under node, which devenv gives (`dashboard_model.mjs`). The documents of
+`tests/data/dashboard` give:
 
 - a second run of zeo and a run of zoe-native, for the charts of
   zodbshootout;
@@ -81,7 +93,9 @@ documents of `tests/data/dashboard` give:
 - a second run of the client benchmark, so a group has an earlier
   document;
 - B5 on `medium`, with the curves of `edit` and `create-spread` at 1, 4,
-  8, 16 and 32 users.
+  8, 16 and 32 users;
+- a second run of the catalog benchmark on the same machine and fixture,
+  with `text-rebuild`, so the catalog group has an earlier document.
 
 They hold numbers about a synthetic corpus, and the first commit of the
 repository. The test runs no benchmark.
@@ -105,14 +119,15 @@ REPOSITORY = BENCH.parent
 DASHBOARD = BENCH / "dashboard"
 TESTS = pathlib.Path(__file__).parent
 SAMPLES = TESTS / "data" / "publish"
+CATALOG = TESTS / "data" / "catalog"
 EXTRA = TESTS / "data" / "dashboard"
 DRIVER = TESTS / "dashboard_model.mjs"
-FAMILIES = ("shootout", "native", "client", "plone")
+FAMILIES = ("shootout", "native", "client", "plone", "catalog")
 BASELINE = "zeo"
 CURVES = ("edit", "create-spread")
 # The families of the tables. The page shows the latest document of each
 # group, and a selector gives the earlier ones.
-SELECTED = ("native", "client", "plone")
+SELECTED = ("native", "client", "plone", "catalog")
 # The numbers of a row of a B5 table, by their name in a step.
 COLUMNS = (
     "ok_per_second",
@@ -142,6 +157,7 @@ METHOD = {
         "stacks",
         "scenarios",
     ),
+    "catalog": ("machine", "run", "catalog", "settings", "server", "metrics"),
 }
 # The files of the page, which the browser loads.
 PAGE_SUFFIXES = (".html", ".js", ".mjs", ".css")
@@ -177,7 +193,7 @@ def site(tmp_path_factory):
     (root / "index.json").write_text(
         json.dumps({"index_version": 1, "results": []}, indent=2) + "\n"
     )
-    publish = ("publish", "--main", "HEAD", SAMPLES, EXTRA, root)
+    publish = ("publish", "--main", "HEAD", SAMPLES, CATALOG, EXTRA, root)
     done = run(sys.executable, "-m", "shootout", *map(str, publish))
     assert done.returncode == 0, output(done)
     return root
@@ -305,6 +321,7 @@ def test_publish_copies_the_page_into_the_checkout(site):
         "results/native/",
         "results/client/",
         "results/plone/",
+        "results/catalog/",
         "just bench publish",
     ):
         assert text in readme, text
@@ -456,6 +473,84 @@ def test_the_client_benchmark_gives_each_row(page, docs):
         assert len(document["rows"]) == len(rows), document["path"]
         for got, row in zip(document["rows"], rows, strict=True):
             assert holds(got, row), (document["path"], row)
+
+
+def catalog_tables(scenario):
+    """The tables of a catalog scenario, as data.js gives them."""
+    tables = []
+
+    def walk(value, path):
+        for key, item in value.items():
+            if key == "cells" and isinstance(item, list):
+                tables.append(
+                    {
+                        "scenario": scenario["name"],
+                        "label": " · ".join(path),
+                        "cells": item,
+                    }
+                )
+            elif isinstance(item, list):
+                for position, element in enumerate(item):
+                    if isinstance(element, dict):
+                        name = element.get("mode")
+                        if name is None:
+                            name = element.get("name")
+                        if name is None:
+                            name = position
+                        walk(element, [*path, key, str(name)])
+            elif isinstance(item, dict):
+                walk(item, [*path, key])
+
+    walk(scenario, [])
+    return tables
+
+
+def test_the_catalog_tables_hold_the_cells_of_each_scenario(page, docs):
+    runs = entries(page, "catalog")
+    assert len(runs) == 2
+    labels = set()
+    for document in runs:
+        source = docs[document["path"]]
+        assert document["python"] is None, document["path"]
+        assert document["stacks"] == ["zoe"], document["path"]
+        assert document["fixture"] == source["catalog"]["name"], document["path"]
+        assert document["scenario_results"] == source["scenarios"], document["path"]
+        expected = [t for s in source["scenarios"] for t in catalog_tables(s)]
+        assert document["tables"] == expected, document["path"]
+        labels.update((t["scenario"], t["label"]) for t in document["tables"])
+    # The cells of a scenario, of the page of brains, of the path queries
+    # and of each mode of the text indexes.
+    assert {
+        ("intersect", ""),
+        ("intersect", "page"),
+        ("mix", ""),
+        ("mix", "overrides"),
+        ("text", "modes · enhanced"),
+        ("text", "modes · compat"),
+    } <= labels
+
+
+def test_the_selection_gives_the_latest_catalog_document_of_each_machine(page, index):
+    runs = [e for e in index["results"] if e["family"] == "catalog"]
+    groups = [g for g in page["model"]["selection"] if g["family"] == "catalog"]
+    machines = {(e["machine"], e["fixture"]) for e in runs}
+    assert [(g["machine"], g["fixture"]) for g in groups] == sorted(machines)
+    for group in groups:
+        assert group["python"] is None
+        members = [
+            e
+            for e in runs
+            if (e["machine"], e["fixture"]) == (group["machine"], group["fixture"])
+        ]
+        members.sort(key=lambda e: (e["started"], e["path"]), reverse=True)
+        assert group["latest"] == members[0]["path"]
+        assert group["earlier"] == [e["path"] for e in members[1:]]
+    # The later run holds text-rebuild, so the page shows it first.
+    [group] = groups
+    assert "text-rebuild" in next(
+        e["scenarios"] for e in runs if e["path"] == group["latest"]
+    )
+    assert group["earlier"]
 
 
 def test_zodbshootout_charts_each_cell_against_the_start_of_the_run(page, index, docs):
