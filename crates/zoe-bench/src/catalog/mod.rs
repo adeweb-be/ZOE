@@ -73,6 +73,9 @@ const SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
 /// The interval of the commits of the probe of the invalidations.
 const PROBE_INTERVAL: Duration = Duration::from_millis(20);
 
+/// The seed of the order of the calls of the mix.
+const MIX_SEED: u64 = 299;
+
 /// The oid of the object of the probe of the invalidations.
 const PROBE_OID: Oid = Oid(1 << 62);
 
@@ -290,6 +293,23 @@ async fn text_ready(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// The calls of the lines of a log: each plan `weight` times, in an order
+/// shuffled with the seed `seed`, so the cells replay the frequencies of
+/// the log.
+fn weighted(queries: &[plans::Query], seed: u64) -> Vec<Call> {
+    let mut calls: Vec<Call> = queries
+        .iter()
+        .filter_map(|q| q.plan.as_ref().map(|plan| (plan, q.weight)))
+        .flat_map(|(plan, weight)| (0..weight).map(move |_| Call::Query(plan.clone())))
+        .collect();
+    let mut rng = crate::schedule::Rng::new(seed, 0);
+    for i in (1..calls.len()).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        calls.swap(i, j);
+    }
+    calls
 }
 
 /// The text clause of a plan, without `k`: the clause of `text_query`.
@@ -824,7 +844,7 @@ impl Runner {
         let catalog = self.plans.catalog;
         let pace = self.pace();
         let queries: Vec<_> = self.plans.of("mix").into_iter().cloned().collect();
-        let calls = self.calls("mix");
+        let calls = weighted(&queries, MIX_SEED);
         let paths = self.calls("path");
         let writes = self.plans.writes.clone();
         let rebase_rows = self.settings.rebase_rows;
@@ -963,7 +983,8 @@ impl Runner {
         );
         let session = self.session().await?;
         let client = session.cells()[0].clone();
-        let since = Instant::now();
+        // As in `cold`: the seconds from the spawn of the server.
+        let since = session.server.started;
         let ready = match &probe {
             Some(clause) => text_ready(&client, catalog, clause, since, timeout).await,
             None => None,
@@ -1099,31 +1120,55 @@ impl Runner {
         let _ = std::fs::remove_dir_all(&dir);
         let session = Session::open(&self.settings.launch, self.scrapes.clone()).await?;
         let started = session.server.started;
-        let clause = self.probe_clause();
-        let ready = match &clause {
-            Some(clause) => {
-                text_ready(
-                    &session.cells()[0],
-                    self.plans.catalog,
-                    clause,
-                    started,
-                    self.settings.ready_timeout,
-                )
-                .await
-            }
+        let catalog = self.plans.catalog;
+        let timeout = self.settings.ready_timeout;
+        // The resident memory of the server every 100 ms, for the peak of
+        // the rebuild after the build of the mirror.
+        let pid = session.server.pid();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut samples = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    if let Some(rss) = server::Memory::of(pid).rss_bytes {
+                        samples.push((Instant::now(), rss));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                samples
+            })
+        };
+        let text = self.probe_clause().map(|clause| {
+            let client = session.cells()[0].clone();
+            tokio::spawn(
+                async move { text_ready(&client, catalog, &clause, started, timeout).await },
+            )
+        });
+        let mirror = session.ready(catalog, timeout).await.ok();
+        let mirror_at = Instant::now();
+        let rss_at_mirror = session.server.memory().rss_bytes;
+        let ready = match text {
+            Some(task) => task.await.map_err(fail)?,
             None => None,
         };
-        let memory = session.server.memory();
-        let mirror = session
-            .ready(self.plans.catalog, self.settings.ready_timeout)
-            .await
-            .ok();
+        stop.store(true, Ordering::SeqCst);
+        let samples = sampler.await.map_err(fail)?;
+        let peak_after = samples
+            .iter()
+            .filter(|(at, _)| *at >= mirror_at)
+            .map(|(_, rss)| *rss)
+            .max();
+        let peak = session.server.memory().peak_rss_bytes;
         self.session = Some(session);
         Ok(json!({
             "mode": self.mode,
             "rebuild_seconds": ready,
-            "peak_rss_at_rebuild_bytes": memory.peak_rss_bytes,
             "mirror_ready_seconds": mirror,
+            "rss_at_mirror_ready_bytes": rss_at_mirror,
+            "peak_rss_after_mirror_ready_bytes": peak_after,
+            "rebuild_after_mirror_ready": ready.zip(mirror).map(|(t, m)| t > m),
+            "peak_rss_with_mirror_build_bytes": peak,
         }))
     }
 }
@@ -1226,7 +1271,8 @@ async fn wait_text_lag(session: &Session, catalog: Oid, timeout: Duration) -> Op
 }
 
 /// The outcome of `check`: each plan with an answer of the Python path,
-/// sent once and compared.
+/// sent once and compared. The refusals are by scenario: only a line of the
+/// log (`mix`) may take the Python path.
 pub async fn check(launch: &Launch, plans: &Plans, timeout: Duration) -> Result<Json, RunError> {
     let session = Session::open(launch, Arc::new(Mutex::new(Vec::new()))).await?;
     let outcome = check_on(&session, plans, timeout).await;
@@ -1247,7 +1293,7 @@ async fn check_on(session: &Session, plans: &Plans, timeout: Duration) -> Result
     }
     let (mut checked, mut matched) = (0, 0);
     let mut mismatches = Vec::new();
-    let mut refusals: BTreeMap<String, u64> = BTreeMap::new();
+    let mut refusals: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut errors: BTreeMap<String, u64> = BTreeMap::new();
     let mut scenarios: BTreeMap<String, u64> = BTreeMap::new();
     let mut client_side: BTreeMap<String, u64> = BTreeMap::new();
@@ -1268,7 +1314,8 @@ async fn check_on(session: &Session, plans: &Plans, timeout: Duration) -> Result
         match answer(&reply) {
             Answer::Answered => {}
             Answer::Refused(reason) => {
-                *refusals.entry(reason).or_default() += 1;
+                let by = refusals.entry(q.scenario.clone()).or_default();
+                *by.entry(reason).or_default() += 1;
                 continue;
             }
             Answer::Failed(kind) => {

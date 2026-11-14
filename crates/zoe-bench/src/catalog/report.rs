@@ -89,8 +89,11 @@ pub fn markdown(doc: &Json) -> String {
                 for key in [
                     "mode",
                     "rebuild_seconds",
-                    "peak_rss_at_rebuild_bytes",
                     "mirror_ready_seconds",
+                    "rss_at_mirror_ready_bytes",
+                    "peak_rss_after_mirror_ready_bytes",
+                    "rebuild_after_mirror_ready",
+                    "peak_rss_with_mirror_build_bytes",
                 ] {
                     let _ = writeln!(out, "- {key}: {}", text(&scenario[key]));
                 }

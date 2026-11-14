@@ -127,6 +127,11 @@ impl Server {
         }
     }
 
+    /// The pid of the server process.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The memory of the server process now.
     pub fn memory(&self) -> Memory {
         Memory::of(self.child.id())
@@ -219,9 +224,11 @@ pub fn catalog_label(catalog: Oid) -> String {
     format!("catalog=\"{:016x}\"", catalog.0)
 }
 
-/// Drop the pages of every file under `dir` from the page cache, with
-/// `posix_fadvise(POSIX_FADV_DONTNEED)`. Return the bytes of the files, or
-/// `None` where the system has no such call.
+/// Drop the pages of every file under `dir` from the page cache: write the
+/// dirty pages of each file to the disk, then call
+/// `posix_fadvise(POSIX_FADV_DONTNEED)`. Return the bytes of the files for
+/// which both calls succeeded, or `None` where the system has no such
+/// call.
 pub fn drop_page_cache(dir: &Path) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -239,9 +246,9 @@ pub fn drop_page_cache(dir: &Path) -> Option<u64> {
                     stack.push(entry.path());
                 } else if kind.is_file()
                     && let Ok(file) = std::fs::File::open(entry.path())
+                    && dont_need(&file)
                 {
                     bytes += file.metadata().map_or(0, |m| m.len());
-                    dont_need(&file);
                 }
             }
         }
@@ -254,16 +261,20 @@ pub fn drop_page_cache(dir: &Path) -> Option<u64> {
     }
 }
 
-/// Drop the clean pages of `file` from the page cache.
+/// Write the dirty pages of `file` to the disk, then drop its pages from
+/// the page cache: `POSIX_FADV_DONTNEED` drops only clean pages. Return
+/// true when both calls succeed.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn dont_need(file: &std::fs::File) {
+fn dont_need(file: &std::fs::File) -> bool {
     use std::os::fd::AsRawFd;
+    if file.sync_data().is_err() {
+        return false;
+    }
     // SAFETY: posix_fadvise(2) reads only its arguments; the descriptor is
     // open for the life of `file`.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-    }
+    let code = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    code == 0
 }
 
 /// The directory of the text index of `catalog` in `store`.

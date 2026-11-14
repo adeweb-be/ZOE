@@ -236,6 +236,9 @@ def run(name: str | None, args: list[str]) -> Path:
     stack.copy_store(target / "store" / "zoe", store)
     for kept in (target / "store").glob("zoe.text-*"):
         stack.copy_store(kept, work / kept.name)
+    # A page that is still dirty does not leave the page cache, so the copy
+    # goes to the disk before the scenario `cold` drops its pages.
+    stack.sync_files(work)
     started = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out = WORK / f"{started}.json"
     report = WORK / f"{started}.md"

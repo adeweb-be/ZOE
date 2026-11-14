@@ -632,7 +632,11 @@ fn each_scenario_runs_and_gives_its_numbers() {
     // text-rebuild: the rebuild of the text index from a store without it.
     number(&rebuild["rebuild_seconds"], "the rebuild");
     if cfg!(target_os = "linux") {
-        number(&rebuild["peak_rss_at_rebuild_bytes"], "the peak");
+        number(
+            &rebuild["rss_at_mirror_ready_bytes"],
+            "the RSS at the mirror",
+        );
+        number(&rebuild["peak_rss_after_mirror_ready_bytes"], "the peak");
     }
 
     let report = std::fs::read_to_string(&markdown).unwrap();

@@ -201,8 +201,12 @@ def test_the_plans_replay_to_the_answers_of_the_python_path(checked):
     _, report, code = checked
     assert report["mismatches"] == [], report["mismatches"]
     assert report["errors"] == {}
-    assert report["checked"] > 0
-    assert report["matched"] == report["checked"] - sum(report["refusals"].values())
+    assert report["matched"] > 0
+    # Only a line of the log may take the Python path: each plan of the
+    # query set and of the path queries replays natively.
+    assert set(report["refusals"]) <= {"mix"}, report["refusals"]
+    refused = sum(sum(by.values()) for by in report["refusals"].values())
+    assert report["matched"] == report["checked"] - refused
     assert code == 0
 
 

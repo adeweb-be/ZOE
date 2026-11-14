@@ -414,8 +414,14 @@ fn catalog_command(args: CatalogArgs) -> ExitCode {
         return match runtime.block_on(catalog::check(&launch, &plans, timeout)) {
             Ok(report) => {
                 let code = print("catalog", &report);
-                let clean = report["checked"].as_u64().unwrap_or(0) > 0
-                    && report["mismatches"].as_array().is_some_and(Vec::is_empty);
+                // A plan answers, none differs, and only a line of the log
+                // takes the Python path.
+                let clean = report["matched"].as_u64().unwrap_or(0) > 0
+                    && report["mismatches"].as_array().is_some_and(Vec::is_empty)
+                    && report["errors"].as_object().is_some_and(|e| e.is_empty())
+                    && report["refusals"]
+                        .as_object()
+                        .is_some_and(|r| r.keys().all(|k| k == "mix"));
                 if clean { code } else { ExitCode::FAILURE }
             }
             Err(e) => {
