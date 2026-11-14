@@ -6,6 +6,9 @@
 //!   JSON, the throughput, the latency of `loadBefore` and the contention.
 //! - `zoe-bench saturate` adds clients step by step until the p99 of
 //!   `loadBefore` passes a ceiling, and prints the steps as JSON.
+//! - `zoe-bench catalog` starts `zoe serve` on a catalog fixture, runs the
+//!   plans of its plans file through `catalog_query` and `text_query`, and
+//!   prints the result as JSON.
 //!
 //! The exit code is 0 on success, 1 on a failure and 2 on a usage error.
 
@@ -14,9 +17,13 @@ use std::io::{self, BufReader, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use zoe_bench::catalog::plans::Plans;
+use zoe_bench::catalog::server::Launch;
+use zoe_bench::catalog::{self, Scenario};
 use zoe_bench::conflicts::Ranking;
 use zoe_bench::hot::{self, HotSettings, Object};
 use zoe_bench::load::{self, LoadSettings, SaturateSettings, Workload};
@@ -48,6 +55,72 @@ enum Command {
     /// write-intent locks, and report the conflicts and the commits of a
     /// sync.
     Hot(HotArgs),
+    /// Start zoe serve on a catalog fixture and run the plans of its plans
+    /// file: the five-index intersections, the cold start, the text
+    /// queries and the query mix.
+    Catalog(CatalogArgs),
+}
+
+#[derive(Debug, Args)]
+struct CatalogArgs {
+    /// The `zoe` binary.
+    #[arg(long, env = "ZOE_BINARY", value_name = "FILE")]
+    zoe: PathBuf,
+    /// The ZOE store of the fixture: a copy, which the run changes.
+    #[arg(long, value_name = "DIR")]
+    store: PathBuf,
+    /// The plans file of the fixture.
+    #[arg(long, value_name = "FILE")]
+    plans: PathBuf,
+    /// The scenarios, separated by commas. They run in the order cold,
+    /// intersect, mix, text, text-rebuild.
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "cold,intersect,mix,text"
+    )]
+    scenario: Vec<Scenario>,
+    /// The bound of the mirrors of zoe serve, such as 8GB. Without it, the
+    /// default of the server.
+    #[arg(long, value_name = "SIZE")]
+    catalog_memory: Option<String>,
+    /// The rebase threshold of the mirror: `--catalog-rebase-rows` of zoe
+    /// serve, whose default it is.
+    #[arg(long, default_value = "20000", value_name = "ROWS")]
+    rebase_rows: u64,
+    /// The time of each cell, in seconds.
+    #[arg(long, default_value = "20", value_name = "SECONDS", value_parser = seconds)]
+    seconds: f64,
+    /// The least rounds of the calls of each connection in a cell.
+    #[arg(long, default_value = "1", value_name = "N")]
+    rounds: usize,
+    /// The longest wait for the mirror and for the text index, in seconds.
+    #[arg(long, default_value = "900", value_name = "SECONDS", value_parser = seconds)]
+    ready_timeout: f64,
+    /// The commits of text deltas of the scenario text.
+    #[arg(long, default_value = "20", value_name = "N")]
+    text_commits: usize,
+    /// The text deltas of each of these commits.
+    #[arg(long, default_value = "500", value_name = "N", value_parser = positive)]
+    text_batch: usize,
+    /// The time between two of these commits, in seconds.
+    #[arg(long, default_value = "0.6", value_name = "SECONDS", value_parser = seconds_or_zero)]
+    text_pause: f64,
+    /// The time that the probe of the invalidations runs after the last
+    /// write of the mix, for the rebase, in seconds.
+    #[arg(long, default_value = "30", value_name = "SECONDS", value_parser = seconds_or_zero)]
+    rebase_seconds: f64,
+    /// Whether the tree of the run differs from its commit.
+    #[arg(long, env = "ZOE_BENCH_DIRTY", value_name = "BOOL")]
+    dirty: Option<bool>,
+    /// Also write the Markdown report to this file.
+    #[arg(long, value_name = "FILE")]
+    markdown: Option<PathBuf>,
+    /// Send each plan that has the answer of the Python path once, compare
+    /// the rids and the counts, and exit with 1 on a difference.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -284,6 +357,77 @@ fn main() -> ExitCode {
                     .workload(args.target.storage, args.write_ratio),
             };
             run("saturate", load::saturate(addr, settings))
+        }
+        Command::Catalog(args) => catalog_command(args),
+    }
+}
+
+/// Run `zoe-bench catalog`.
+fn catalog_command(args: CatalogArgs) -> ExitCode {
+    let plans = match Plans::read(&args.plans) {
+        Ok(plans) => plans,
+        Err(e) => {
+            eprintln!("zoe-bench catalog: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let launch = Launch {
+        binary: args.zoe,
+        store: args.store,
+        catalog_memory: args.catalog_memory,
+        rebase_rows: Some(args.rebase_rows),
+    };
+    let timeout = Duration::from_secs_f64(args.ready_timeout);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("zoe-bench catalog: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.check {
+        return match runtime.block_on(catalog::check(&launch, &plans, timeout)) {
+            Ok(report) => {
+                let code = print("catalog", &report);
+                let clean = report["checked"].as_u64().unwrap_or(0) > 0
+                    && report["mismatches"].as_array().is_some_and(Vec::is_empty);
+                if clean { code } else { ExitCode::FAILURE }
+            }
+            Err(e) => {
+                eprintln!("zoe-bench catalog: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let settings = catalog::Settings {
+        launch,
+        scenarios: args.scenario,
+        seconds: args.seconds,
+        rounds: args.rounds,
+        ready_timeout: timeout,
+        text_commits: args.text_commits,
+        text_batch: args.text_batch,
+        text_pause: Duration::from_secs_f64(args.text_pause),
+        rebase_rows: args.rebase_rows,
+        rebase_seconds: args.rebase_seconds,
+        dirty: args.dirty,
+    };
+    match runtime.block_on(catalog::run(settings, plans)) {
+        Ok(doc) => {
+            if let Some(path) = &args.markdown
+                && let Err(e) = std::fs::write(path, catalog::report::markdown(&doc))
+            {
+                eprintln!("zoe-bench catalog: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            print("catalog", &doc)
+        }
+        Err(e) => {
+            eprintln!("zoe-bench catalog: {e}");
+            ExitCode::FAILURE
         }
     }
 }
