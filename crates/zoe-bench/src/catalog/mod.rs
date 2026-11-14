@@ -1236,11 +1236,11 @@ async fn check_on(session: &Session, plans: &Plans, timeout: Duration) -> Result
     let mut refusals: BTreeMap<String, u64> = BTreeMap::new();
     let mut errors: BTreeMap<String, u64> = BTreeMap::new();
     let mut scenarios: BTreeMap<String, u64> = BTreeMap::new();
-    let mut client: BTreeMap<String, u64> = BTreeMap::new();
+    let mut client_side: BTreeMap<String, u64> = BTreeMap::new();
     for q in &plans.queries {
         if q.plan.is_none() {
             let reason = q.reason.clone().unwrap_or_else(|| "?".into());
-            *client.entry(reason).or_default() += q.weight;
+            *client_side.entry(reason).or_default() += q.weight;
         }
         let (Some(plan), Some(expect)) = (&q.plan, &q.expect) else {
             continue;
@@ -1286,6 +1286,6 @@ async fn check_on(session: &Session, plans: &Plans, timeout: Duration) -> Result
         "refusals": refusals,
         "errors": errors,
         "scenarios": scenarios,
-        "client_reasons": client,
+        "client_reasons": client_side,
     }))
 }
