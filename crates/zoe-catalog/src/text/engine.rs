@@ -32,7 +32,7 @@ use super::compat;
 use super::index::{self, Fields};
 use super::lexicon;
 use super::overlay::{Doc, OwnStats, Scorer};
-use super::search::{self, Found, Scope, Strategy, Want, to_int};
+use super::search::{self, Filter, Found, Scope, Strategy, Want, to_int};
 use super::settings::{IndexSettings, Mode};
 use super::texts::{Failure, Snap, Texts};
 use super::translate::{Read, Translator};
@@ -58,7 +58,7 @@ pub struct Query<'a> {
 }
 
 /// What a text query found, and the strategy of the search of the index.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Answer {
     /// The hits.
     pub found: Found,
@@ -114,6 +114,17 @@ fn settings_of(clause: &TextClause, snap: Option<&Snap>) -> Result<IndexSettings
 /// that the index lacks. All the waits of one query take at most
 /// `catalog-wait` together.
 pub fn run(texts: Option<&Texts>, store: &Store, q: &Query<'_>) -> Result<Answer, Failure> {
+    run_in(texts, store, q, q.filter.map(Filter::Rids))
+}
+
+/// Answer the text query `q` as `run` does, inside `filter` in the place
+/// of the filter of `q`.
+pub fn run_in(
+    texts: Option<&Texts>,
+    store: &Store,
+    q: &Query<'_>,
+    filter: Option<Filter<'_>>,
+) -> Result<Answer, Failure> {
     let watermark = check_packed(store, q.tid)?;
     let deadline = texts.map(|t| Instant::now() + t.wait());
     let mut at = (watermark > 0).then_some(watermark);
@@ -122,7 +133,7 @@ pub fn run(texts: Option<&Texts>, store: &Store, q: &Query<'_>) -> Result<Answer
             (Some(t), Some(deadline)) => t.snap_by(q.catalog, at, deadline),
             _ => Err(Failure::unavailable("the catalog has no text index")),
         };
-        match run_on(store, q, snap)? {
+        match run_on(store, q, filter, snap)? {
             Step::Done(answer) => return Ok(answer),
             Step::Wait(tid) => at = Some(at.map_or(tid, |a| a.max(tid))),
         }
@@ -144,7 +155,12 @@ enum Step {
     Wait(u64),
 }
 
-fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Result<Step, Failure> {
+fn run_on(
+    store: &Store,
+    q: &Query<'_>,
+    filter: Option<Filter<'_>>,
+    snap: Result<Arc<Snap>, Failure>,
+) -> Result<Step, Failure> {
     let c = q.clause;
     let settings =
         settings_of(c, snap.as_ref().ok().map(|s| &**s)).map_err(|e| match (&snap, e) {
@@ -267,7 +283,7 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         replaced.union(&staged_rids).copied().collect()
     };
     if compat {
-        return run_compat(store, q, &snap, alone, &staged, &overlay_rids).map(Step::Done);
+        return run_compat(store, q, filter, &snap, alone, &staged, &overlay_rids).map(Step::Done);
     }
     let mut translator = Translator::new(&reads, settings.fuzzy);
     let mut docs = Vec::new();
@@ -301,7 +317,7 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         }
     };
     let mut scorer = Scorer::new(stats, settings.fuzzy);
-    let in_filter = |rid: i32| q.filter.is_none_or(|f| f.binary_search(&rid).is_ok());
+    let in_filter = |rid: i32| filter.is_none_or(|f| f.contains(rid));
     let mut overlay_hits = Vec::new();
     for doc in &docs {
         if !in_filter(doc.rid) {
@@ -322,7 +338,7 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         let bound = index_translator.bound(&s.searcher, &c.node);
         let replaced_all: HashSet<i32> = overlay_rids.iter().copied().collect();
         let scope = Scope {
-            filter: q.filter,
+            filter,
             replaced: &replaced_all,
         };
         let (f, chosen) = search::search(
@@ -338,12 +354,15 @@ fn run_on(store: &Store, q: &Query<'_>, snap: Result<Arc<Snap>, Failure>) -> Res
         found = f;
         strategy = Some(chosen);
     }
-    found.count += overlay_hits.len() as u64;
     match q.want {
-        Want::Set => found
-            .hits
-            .extend(overlay_hits.into_iter().map(|(_, rid)| (0, rid))),
+        Want::Set | Want::Keys => search::add_to_set(
+            &mut found,
+            q.want,
+            overlay_hits.into_iter().map(|(_, rid)| rid).collect(),
+            filter,
+        ),
         Want::Top(limit) => {
+            found.count += overlay_hits.len() as u64;
             found.hits.extend(overlay_hits);
             found.hits.sort_unstable_by(|a, b| b.cmp(a));
             if let Some(limit) = limit {
@@ -372,6 +391,7 @@ type StagedTexts<'c> = HashMap<(&'c str, i32), Option<(&'c str, &'c str)>>;
 fn run_compat(
     store: &Store,
     q: &Query<'_>,
+    filter: Option<Filter<'_>>,
     snap: &Option<Arc<Snap>>,
     alone: bool,
     staged: &StagedTexts<'_>,
@@ -410,7 +430,7 @@ fn run_compat(
         }
         _ => None,
     };
-    let mut run = compat::Run::new(indexed, overlay_rids, &docs, q.filter);
+    let mut run = compat::Run::new(indexed, overlay_rids, &docs, filter);
     let (found, strategy) = run
         .search(&c.node, q.want, q.forced)
         .map_err(|e| Failure::unavailable(format!("the search of the text index fails: {e}")))?;

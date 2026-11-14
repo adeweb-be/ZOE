@@ -454,19 +454,6 @@ impl<'a> View<'a> {
         Ok(rs)
     }
 
-    /// The row of `rid`, when the version has one.
-    #[cfg(feature = "text")]
-    fn row_if(&self, rid: i32) -> Option<u32> {
-        match self.base.rows.row(rid) {
-            Some(row) => Some(row),
-            None => self
-                .extra
-                .binary_search(&rid)
-                .ok()
-                .map(|i| (self.base.rows.len() + i) as u32),
-        }
-    }
-
     /// Answers `plan` with a text clause, and the rows of `columns` (ADR
     /// 0060, section 12). The clauses of `plan` run first; `text` answers
     /// the text clause inside the rids of their result.
@@ -484,7 +471,7 @@ impl<'a> View<'a> {
         columns: &Columns,
         text: &mut crate::text::TextSearch<'_>,
     ) -> Result<Reply, Fallback> {
-        use crate::text::{Failure, TextError, TextErrorKind, Want};
+        use crate::text::{Failure, Filter, TextError, TextErrorKind, Want};
         let mut trace = Trace::default();
         let rows = match self.result_set(plan, &mut trace)? {
             Some(rs) => rs,
@@ -498,8 +485,28 @@ impl<'a> View<'a> {
         if rows.is_empty() {
             return Ok(empty(plan.sort.is_empty()));
         }
-        let mut rids: Vec<i32> = rows.iter().map(|r| self.rid_of(r)).collect();
-        rids.sort_unstable();
+        // The filter of the text clause: the rows of the result. The first
+        // rows of the base ascend with their rids; the other rows come
+        // apart, in rid order.
+        let n = self.base.rows.len() as u32;
+        let mut more: Vec<(i32, u32)> = self
+            .base
+            .rows
+            .later()
+            .iter()
+            .filter(|(_, row)| rows.contains(*row))
+            .copied()
+            .collect();
+        more.extend(
+            rows.range(n..)
+                .map(|row| (self.extra[(row - n) as usize], row)),
+        );
+        more.sort_unstable();
+        let filter = Filter::Rows {
+            rows: &rows,
+            rids: self.base.rows.sorted_rids(),
+            more: &more,
+        };
         let failed = |f: Failure| -> Result<Reply, Fallback> {
             match f {
                 Failure::Text(e) => Ok(Reply {
@@ -518,7 +525,7 @@ impl<'a> View<'a> {
                 b_size = plan.limit;
             }
             let limit = b_size.map(|size| b_start + size.max(0) as usize);
-            let found = match text(&rids, Want::Top(limit)) {
+            let found = match text(filter, Want::Top(limit)) {
                 Ok(found) => found,
                 Err(f) => return failed(f),
             };
@@ -552,18 +559,11 @@ impl<'a> View<'a> {
                 ..Reply::default()
             }
         } else {
-            let found = match text(&rids, Want::Set) {
+            let found = match text(filter, Want::Keys) {
                 Ok(found) => found,
                 Err(f) => return failed(f),
             };
-            let mut hits = RoaringBitmap::new();
-            for (_, rid) in found.hits {
-                if let Some(row) = self.row_if(rid)
-                    && rows.contains(row)
-                {
-                    hits.insert(row);
-                }
-            }
+            let hits = found.keys.unwrap_or_default();
             if hits.is_empty() {
                 return Ok(empty(false));
             }

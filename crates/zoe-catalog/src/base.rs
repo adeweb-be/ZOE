@@ -158,6 +158,16 @@ impl Rows {
         self.rids[row as usize]
     }
 
+    /// The rids of the first rows, which ascend with the rows.
+    pub fn sorted_rids(&self) -> &[i32] {
+        &self.rids[..self.sorted]
+    }
+
+    /// The rows after the first rows, each with its rid, in rid order.
+    pub fn later(&self) -> &[(i32, u32)] {
+        &self.later
+    }
+
     /// The number of rows, the removed ones included.
     pub fn len(&self) -> usize {
         self.rids.len()

@@ -21,6 +21,13 @@
 //!
 //! A query with no bound has one pass that scores every hit. The search
 //! leaves out the replaced documents of the text overlay.
+//!
+//! A filter is a sorted list of rids, or the rows of the mirror with their
+//! rids. Each rid of a filter has a key: its place in the list, or its row.
+//! A set of the hits for a sort gives the keys of its hits (`Want::Keys`):
+//! one merge of the filter with the documents of the hits, in rid order.
+//! With a bitset, that merge applies the filter, and the search reads the
+//! hits with no filter.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -31,6 +38,8 @@ use tantivy::query::{
     BooleanQuery, ConstScorer, EnableScoring, Explanation, Occur, Query, Scorer, Weight,
 };
 use tantivy::{DocId, DocSet, Score, Searcher, SegmentReader, TERMINATED};
+
+use roaring::RoaringBitmap;
 
 use super::index::Maps;
 
@@ -136,19 +145,144 @@ pub enum Want {
     Top(Option<usize>),
     /// The rids of the hits, with no score.
     Set,
+    /// The keys of the hits in the filter, with no rid and no score. With
+    /// no filter, as `Set`.
+    Keys,
 }
 
 /// A hit: the integer score and the rid. The greater is the better.
 pub type Hit = (i64, i32);
 
 /// What a search found.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Found {
     /// The number of the hits in the filter.
     pub count: u64,
-    /// The hits: by score, then rid descending, for `Want::Top`; in no
-    /// order, with the score 0, for `Want::Set`.
+    /// The hits: by score, then rid descending, for `Want::Top`; in rid
+    /// order, with the score 0, for `Want::Set`; none for `Want::Keys` with
+    /// a filter.
     pub hits: Vec<Hit>,
+    /// The keys of the hits, for `Want::Keys` with a filter.
+    pub keys: Option<RoaringBitmap>,
+}
+
+/// The filter of a search: the rids of the other clauses. Each rid of the
+/// filter has a key.
+#[derive(Clone, Copy, Debug)]
+pub enum Filter<'a> {
+    /// The rids, sorted, each once. The key of a rid is its place.
+    Rids(&'a [i32]),
+    /// The rows `rows` of a table. The key of a rid is its row.
+    Rows {
+        /// The rows.
+        rows: &'a RoaringBitmap,
+        /// The rid of each first row of the table, in ascending order.
+        rids: &'a [i32],
+        /// The other rows of `rows`, each with its rid, in rid order.
+        more: &'a [(i32, u32)],
+    },
+}
+
+impl Filter<'_> {
+    /// The number of the rids.
+    pub fn len(&self) -> u64 {
+        match self {
+            Filter::Rids(rids) => rids.len() as u64,
+            Filter::Rows { rows, .. } => rows.len(),
+        }
+    }
+
+    /// Tell if the filter holds no rid.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The key of `rid`, when the filter holds it.
+    #[inline]
+    pub fn key_of(&self, rid: i32) -> Option<u32> {
+        match self {
+            Filter::Rids(rids) => rids.binary_search(&rid).ok().map(|k| k as u32),
+            Filter::Rows { rows, rids, more } => match rids.binary_search(&rid) {
+                Ok(row) => Some(row as u32).filter(|row| rows.contains(*row)),
+                Err(_) => more
+                    .binary_search_by_key(&rid, |m| m.0)
+                    .ok()
+                    .map(|i| more[i].1),
+            },
+        }
+    }
+
+    /// Tell if the filter holds `rid`.
+    #[inline]
+    pub fn contains(&self, rid: i32) -> bool {
+        self.key_of(rid).is_some()
+    }
+
+    /// A bound of the keys: each key is below it.
+    pub fn key_bound(&self) -> usize {
+        match self {
+            Filter::Rids(rids) => rids.len(),
+            Filter::Rows { rows, .. } => rows.max().map_or(0, |m| m as usize + 1),
+        }
+    }
+
+    /// Call `f` with each rid and its key, in rid order.
+    #[inline]
+    pub fn for_each(&self, mut f: impl FnMut(i32, u32)) {
+        match self {
+            Filter::Rids(rids) => {
+                for (k, rid) in rids.iter().enumerate() {
+                    f(*rid, k as u32);
+                }
+            }
+            Filter::Rows { rows, rids, more } => {
+                // The first rows ascend with their rids: a merge with the
+                // other rows.
+                let mut m = 0;
+                let first = rids.len() as u32;
+                let mut iter = rows.iter();
+                let mut buf = [0u32; 256];
+                'rows: loop {
+                    let batch = iter.next_many(&mut buf);
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for &row in batch.iter() {
+                        if row >= first {
+                            break 'rows;
+                        }
+                        let rid = rids[row as usize];
+                        while m < more.len() && more[m].0 < rid {
+                            f(more[m].0, more[m].1);
+                            m += 1;
+                        }
+                        f(rid, row);
+                    }
+                }
+                for &(rid, row) in &more[m..] {
+                    f(rid, row);
+                }
+            }
+        }
+    }
+}
+
+/// Call `f` with the rid, the key, the segment and the document of each
+/// rid of `filter` that is a live document of `maps`, in rid order.
+pub fn each_doc(maps: &Maps, filter: Filter<'_>, mut f: impl FnMut(i32, u32, u32, DocId)) {
+    // Both lists are in rid order: one merge.
+    let docs = &maps.by_rid;
+    let mut i = 0;
+    filter.for_each(|rid, key| {
+        while i < docs.len() && docs[i].0 < rid {
+            i += 1;
+        }
+        if let Some(&(r, ord, doc)) = docs.get(i)
+            && r == rid
+        {
+            f(rid, key, ord, doc);
+        }
+    });
 }
 
 /// The check of the filter in one segment.
@@ -163,8 +297,8 @@ enum Check {
 
 /// The filter of a search and the replaced rids.
 pub struct Scope<'a> {
-    /// The rids of the filter, sorted, or `None` for no filter.
-    pub filter: Option<&'a [i32]>,
+    /// The filter, or `None` for no filter.
+    pub filter: Option<Filter<'a>>,
     /// The rids of the replaced documents.
     pub replaced: &'a HashSet<i32>,
 }
@@ -181,8 +315,8 @@ pub fn search(
     want: Want,
     forced: Option<Strategy>,
 ) -> tantivy::Result<(Found, Strategy)> {
-    let chosen = forced
-        .unwrap_or_else(|| strategy(maps.num_docs(), scope.filter.map(|f| f.len() as u64), bound));
+    let chosen =
+        forced.unwrap_or_else(|| strategy(maps.num_docs(), scope.filter.map(|f| f.len()), bound));
     let chosen = match (scope.filter, chosen) {
         (None, _) => Strategy::None,
         (Some(_), Strategy::None) => Strategy::Bitset,
@@ -200,29 +334,25 @@ pub fn search(
     }
     let mut checks: Vec<Check> = Vec::with_capacity(segments.len());
     let mut drive_docs: Vec<Vec<DocId>> = vec![Vec::new(); segments.len()];
+    // The keys of a set come from a merge of the filter with the hits: with
+    // a bitset, that merge applies the filter, and the search needs none.
+    let unfiltered = want == Want::Keys && chosen == Strategy::Bitset;
     match (chosen, scope.filter) {
         (Strategy::None, _) | (_, None) => {
             checks.extend(excluded.into_iter().map(Check::Live));
         }
+        _ if unfiltered => checks.extend(excluded.into_iter().map(Check::Live)),
         (Strategy::HitsDrive, Some(_)) => checks.extend((0..segments.len()).map(|_| Check::Rids)),
         (Strategy::FilterDrives | Strategy::Bitset, Some(filter)) => {
             let mut bits: Vec<DocBits> = maps.max_docs.iter().map(|m| DocBits::new(*m)).collect();
-            // Both lists are in rid order: one merge.
-            let mut docs = maps.by_rid.iter().peekable();
-            for rid in filter {
-                while docs.peek().is_some_and(|d| d.0 < *rid) {
-                    docs.next();
-                }
-                if let Some(&&(r, ord, doc)) = docs.peek()
-                    && r == *rid
-                    && !scope.replaced.contains(rid)
-                {
+            each_doc(maps, filter, |rid, _, ord, doc| {
+                if scope.replaced.is_empty() || !scope.replaced.contains(&rid) {
                     bits[ord as usize].insert(doc);
                     if chosen == Strategy::FilterDrives {
                         drive_docs[ord as usize].push(doc);
                     }
                 }
-            }
+            });
             for d in &mut drive_docs {
                 d.sort_unstable();
             }
@@ -259,28 +389,28 @@ pub fn search(
             Check::Rids => {
                 let rid = maps.doc_to_rid[ord][doc as usize];
                 seg.alive_bitset().is_none_or(|a| a.is_alive(doc))
-                    && scope.filter.is_some_and(|f| f.binary_search(&rid).is_ok())
+                    && scope.filter.is_some_and(|f| f.contains(rid))
                     && !scope.replaced.contains(&rid)
             }
         }
     };
     let rid_of = |ord: usize, doc: DocId| maps.doc_to_rid[ord][doc as usize];
     let found = match want {
-        Want::Set => {
+        Want::Set | Want::Keys => {
             let weight = query.weight(EnableScoring::disabled_from_searcher(searcher))?;
-            let mut hits = Vec::new();
+            let mut docs = HitDocs::new(maps);
             for (ord, seg) in segments.iter().enumerate() {
-                weight.for_each_no_score(seg, &mut |docs| {
-                    for &d in docs {
+                weight.for_each_no_score(seg, &mut |found| {
+                    for &d in found {
                         if keep(ord, seg, d) {
-                            hits.push((0, rid_of(ord, d)));
+                            docs.insert(ord, d);
                         }
                     }
                 })?;
             }
-            Found {
-                count: hits.len() as u64,
-                hits,
+            match (want, scope.filter) {
+                (Want::Keys, Some(filter)) => docs.into_keys(maps, filter),
+                _ => docs.into_found(maps),
             }
         }
         Want::Top(limit) => {
@@ -313,10 +443,148 @@ pub fn search(
             Found {
                 count,
                 hits: top.into_sorted(),
+                keys: None,
             }
         }
     };
     Ok((found, chosen))
+}
+
+/// The documents of a set of hits, a bitset for each segment.
+pub struct HitDocs {
+    bits: Vec<DocBits>,
+    /// The number of the documents of the set, also the documents outside
+    /// a filter.
+    count: usize,
+}
+
+impl HitDocs {
+    /// An empty set for the segments of `maps`.
+    pub fn new(maps: &Maps) -> HitDocs {
+        HitDocs {
+            bits: maps.max_docs.iter().map(|m| DocBits::new(*m)).collect(),
+            count: 0,
+        }
+    }
+
+    /// Add the document `doc` of the segment `ord`, once.
+    #[inline]
+    pub fn insert(&mut self, ord: usize, doc: DocId) {
+        self.bits[ord].insert(doc);
+        self.count += 1;
+    }
+
+    /// The hits in rid order, with the score 0. Each document must be a
+    /// live document of `maps`.
+    pub fn into_found(self, maps: &Maps) -> Found {
+        Found {
+            count: self.count as u64,
+            hits: self.by_rid(maps),
+            keys: None,
+        }
+    }
+
+    /// The keys of the hits in `filter`, and their number in `count`. Each
+    /// document must be a live document of `maps`. The set can hold
+    /// documents outside the filter: they give no key and no count.
+    pub fn into_keys(self, maps: &Maps, filter: Filter<'_>) -> Found {
+        if self.count.saturating_mul(16) < filter.len() as usize {
+            // A small set: the key of each hit.
+            let mut keys: Vec<u32> = self
+                .by_rid(maps)
+                .into_iter()
+                .filter_map(|(_, rid)| filter.key_of(rid))
+                .collect();
+            keys.sort_unstable();
+            return Found {
+                count: keys.len() as u64,
+                hits: Vec::new(),
+                keys: Some(RoaringBitmap::from_sorted_iter(keys).unwrap_or_default()),
+            };
+        }
+        // A large set: the merge of the filter with the documents, into a
+        // bitset of the keys.
+        let mut words = vec![0u64; filter.key_bound().div_ceil(64)];
+        let mut count = 0u64;
+        each_doc(maps, filter, |_, key, ord, doc| {
+            if self.bits[ord as usize].contains(doc) {
+                words[(key >> 6) as usize] |= 1 << (key & 63);
+                count += 1;
+            }
+        });
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        Found {
+            count,
+            hits: Vec::new(),
+            keys: Some(RoaringBitmap::from_lsb0_bytes(0, &bytes)),
+        }
+    }
+
+    /// The hits in rid order, with the score 0. A large set walks the
+    /// documents in rid order; a small one sorts its rids.
+    fn by_rid(&self, maps: &Maps) -> Vec<Hit> {
+        let mut hits: Vec<Hit> = Vec::with_capacity(self.count);
+        if self.count.saturating_mul(16) >= maps.by_rid.len() {
+            for &(rid, ord, doc) in &maps.by_rid {
+                if self.bits[ord as usize].contains(doc) {
+                    hits.push((0, rid));
+                }
+            }
+        } else {
+            for (ord, bits) in self.bits.iter().enumerate() {
+                let rids = &maps.doc_to_rid[ord];
+                for (w, word) in bits.words.iter().enumerate() {
+                    let mut word = *word;
+                    while word != 0 {
+                        let doc = (w as u32) * 64 + word.trailing_zeros();
+                        hits.push((0, rids[doc as usize]));
+                        word &= word - 1;
+                    }
+                }
+            }
+            hits.sort_unstable_by_key(|h| h.1);
+        }
+        hits
+    }
+}
+
+/// Add the hits `more` of the text overlay to the set `found` of
+/// `want`. Each is in `filter` and not in `found`.
+pub fn add_to_set(found: &mut Found, want: Want, more: Vec<i32>, filter: Option<Filter<'_>>) {
+    found.count += more.len() as u64;
+    match (want, filter) {
+        (Want::Keys, Some(filter)) => found
+            .keys
+            .get_or_insert_with(RoaringBitmap::new)
+            .extend(more.iter().filter_map(|rid| filter.key_of(*rid))),
+        _ => merge_by_rid(
+            &mut found.hits,
+            more.into_iter().map(|rid| (0, rid)).collect(),
+        ),
+    }
+}
+
+/// Merge the hits `more`, in rid order, into the hits `hits`, in rid
+/// order. No rid is in both.
+pub fn merge_by_rid(hits: &mut Vec<Hit>, mut more: Vec<Hit>) {
+    if more.is_empty() {
+        return;
+    }
+    more.sort_unstable_by_key(|h| h.1);
+    let mut out = Vec::with_capacity(hits.len() + more.len());
+    let (mut i, mut j) = (0, 0);
+    while i < hits.len() && j < more.len() {
+        if hits[i].1 < more[j].1 {
+            out.push(hits[i]);
+            i += 1;
+        } else {
+            out.push(more[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&hits[i..]);
+    out.extend_from_slice(&more[j..]);
+    *hits = out;
 }
 
 /// The first hits by score, then rid descending.
@@ -458,6 +726,146 @@ mod tests {
         );
         assert_eq!(strategy(10_000, Some(5_000), Some(5_000)), Strategy::Bitset);
         assert_eq!(strategy(10_000, Some(5_000), None), Strategy::Bitset);
+    }
+
+    /// Maps of two segments of 40 documents, each with a distinct rid, the
+    /// document 1 of the first segment deleted.
+    fn two_segments() -> Maps {
+        let mut maps = Maps::default();
+        for ord in 0..2u32 {
+            let rids: Vec<i32> = (0..40)
+                .map(|doc| ((ord as i32 * 40 + doc) * 37) % 101 - 50)
+                .collect();
+            for (doc, rid) in rids.iter().enumerate() {
+                if (ord, doc) != (0, 1) {
+                    maps.by_rid.push((*rid, ord, doc as DocId));
+                }
+            }
+            maps.doc_to_rid.push(Arc::new(rids));
+            maps.max_docs.push(40);
+        }
+        maps.by_rid.sort_unstable_by_key(|e| e.0);
+        maps
+    }
+
+    #[test]
+    fn a_set_of_hits_comes_in_rid_order() {
+        let maps = two_segments();
+        let live = maps.by_rid.clone();
+        // A small set sorts its rids; a large one walks the documents in
+        // rid order.
+        for step in [1, 2, 3, 7, 17, 40, 79, 100] {
+            for first in [0, 1, 5] {
+                let mut docs = HitDocs::new(&maps);
+                let mut want = Vec::new();
+                for (rid, ord, doc) in live.iter().skip(first).step_by(step) {
+                    docs.insert(*ord as usize, *doc);
+                    want.push((0, *rid));
+                }
+                let found = docs.into_found(&maps);
+                assert_eq!(found.hits, want, "{step} {first}");
+                assert_eq!(found.count, want.len() as u64);
+                assert_eq!(found.keys, None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_set_in_a_filter_gives_the_keys_of_its_hits() {
+        let maps = two_segments();
+        let live = maps.by_rid.clone();
+        // A filter of every other rid from -60 to 58: as a list; as the rows
+        // of a table whose first rows ascend with their rids, without the
+        // rows 3 and 5; and as such a table whose rids from -10 to 8 are
+        // later rows, from the row 100 on, out of rid order.
+        let rids: Vec<i32> = (-30..30).map(|k| 2 * k).collect();
+        let mut rows: RoaringBitmap = (0..rids.len() as u32).collect();
+        rows.remove(3);
+        rows.remove(5);
+        let listed: Vec<i32> = rows.iter().map(|r| rids[r as usize]).collect();
+        let first: Vec<i32> = rids
+            .iter()
+            .copied()
+            .filter(|r| !(-10..10).contains(r))
+            .collect();
+        let mut more: Vec<(i32, u32)> = (-5..5).map(|k| (2 * k, 109 - (k + 5) as u32)).collect();
+        more.sort_unstable();
+        let mut split: RoaringBitmap = (0..first.len() as u32).collect();
+        split.extend(more.iter().map(|m| m.1));
+        let filters = [
+            Filter::Rids(&listed),
+            Filter::Rows {
+                rows: &rows,
+                rids: &rids,
+                more: &[],
+            },
+            Filter::Rows {
+                rows: &split,
+                rids: &first,
+                more: &more,
+            },
+        ];
+        for filter in filters {
+            let mut seen = Vec::new();
+            filter.for_each(|rid, key| seen.push((rid, key)));
+            assert_eq!(seen.len() as u64, filter.len());
+            assert!(
+                seen.iter()
+                    .all(|(rid, key)| filter.key_of(*rid) == Some(*key))
+            );
+            assert!(
+                seen.iter()
+                    .all(|(_, key)| (*key as usize) < filter.key_bound())
+            );
+            assert!(seen.windows(2).all(|w| w[0].0 < w[1].0));
+            assert!(!filter.contains(1) && !filter.contains(-61) && !filter.contains(60));
+            let rid_of: HashMap<u32, i32> = seen.iter().map(|(rid, key)| (*key, *rid)).collect();
+            let rids_of = |found: &Found| -> Vec<i32> {
+                let keys = found.keys.as_ref().unwrap();
+                let mut out: Vec<i32> = keys.iter().map(|k| rid_of[&k]).collect();
+                out.sort_unstable();
+                out
+            };
+            // A small set looks up the key of each hit; a large one merges
+            // the filter with the documents.
+            for step in [1, 2, 9, 30, 79] {
+                let mut docs = HitDocs::new(&maps);
+                let mut want = Vec::new();
+                for (rid, ord, doc) in live.iter().step_by(step) {
+                    docs.insert(*ord as usize, *doc);
+                    if filter.contains(*rid) {
+                        want.push(*rid);
+                    }
+                }
+                let found = docs.into_keys(&maps, filter);
+                assert!(found.hits.is_empty());
+                assert_eq!(rids_of(&found), want, "{filter:?} {step}");
+                assert_eq!(found.count, want.len() as u64);
+            }
+            let mut found = HitDocs::new(&maps).into_keys(&maps, filter);
+            add_to_set(&mut found, Want::Keys, vec![4, -8], Some(filter));
+            assert_eq!(rids_of(&found), vec![-8, 4]);
+            assert_eq!(found.count, 2);
+        }
+        let mut found = HitDocs::new(&maps).into_found(&maps);
+        add_to_set(&mut found, Want::Set, vec![4, -8], Some(filters[0]));
+        assert_eq!(found.hits, vec![(0, -8), (0, 4)]);
+        assert_eq!(found.count, 2);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_rid_order() {
+        let mut hits = vec![(0, -4), (0, 2), (0, 9)];
+        merge_by_rid(&mut hits, vec![(0, 10), (0, -7), (0, 3)]);
+        assert_eq!(
+            hits,
+            vec![(0, -7), (0, -4), (0, 2), (0, 3), (0, 9), (0, 10)]
+        );
+        merge_by_rid(&mut hits, Vec::new());
+        assert_eq!(hits.len(), 6);
+        let mut empty = Vec::new();
+        merge_by_rid(&mut empty, vec![(0, 1)]);
+        assert_eq!(empty, vec![(0, 1)]);
     }
 
     #[test]

@@ -111,6 +111,7 @@
   - [Field-addressable objects, before the design of phase 6](spikes/field-addressable-objects.md)
   - [The catalog mirror, built from the index trees of a catalog of one million entries](spikes/catalog-mirror.md)
   - [The native text index on tantivy, its delta record type, and the compatibility with ZCTextIndex](spikes/text-index.md)
+  - [Text queries with a sort, and the filter of every row](findings/text-queries-with-a-sort.md)
   - [The incremental security index](spikes/security-index.md)
   - [The tail of the five-index intersection is the range of `generic-numbers`](findings/intersection-tail.md)
   - [The cold build of the mirror waits on the sort of the keys of `object_provides`](findings/cold-build.md)
