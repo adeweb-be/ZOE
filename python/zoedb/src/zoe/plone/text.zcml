@@ -19,6 +19,18 @@
       />
   <zcml:customAction handler=".register_text_index" />
 
+  <!-- @search of plone.restapi parses the query of each index with an
+       adapter for the class of the index. ZoeTextIndex takes the queries
+       of ZCTextIndex, so it gets the parser of ZCTextIndex. -->
+  <configure zcml:condition="installed plone.restapi">
+    <adapter
+        factory="plone.restapi.search.query.ZCTextIndexQueryParser"
+        for=".textindex.ZoeTextIndex
+             zope.interface.Interface
+             zope.interface.Interface"
+        />
+  </configure>
+
   <genericsetup:registerProfile
       name="text"
       title="ZOE text index"

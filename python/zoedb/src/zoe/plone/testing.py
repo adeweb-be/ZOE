@@ -243,10 +243,29 @@ def replace_text_indexes(mode):
         # can stage their texts there.
         transaction.savepoint(optimistic=True)
         textindex.install_text(site.portal_setup, mode=mode)
+        _register_query_parser()
         return site
 
     addPloneSite._zoe_original = original
     factory.addPloneSite = addPloneSite
+
+
+def _register_query_parser():
+    """Register the query parser of plone.restapi for `ZoeTextIndex`, as
+    `text.zcml` does. The layers load no ZCML of zoe.plone, and the
+    cleanup layer of plone.testing clears the global registry. So the
+    registration goes into the registry that the layer which creates the
+    site pushed. Do nothing without plone.restapi."""
+    try:
+        from plone.restapi.search.query import ZCTextIndexQueryParser
+    except ImportError:
+        return
+    from zope.component import provideAdapter
+    from zope.interface import Interface
+
+    from zoe.plone.textindex import ZoeTextIndex
+
+    provideAdapter(ZCTextIndexQueryParser, (ZoeTextIndex, Interface, Interface))
 
 
 _text_log = {}
