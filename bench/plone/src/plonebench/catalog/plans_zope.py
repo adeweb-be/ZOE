@@ -329,7 +329,8 @@ def renames(leaves):
     """The writes: renames of leaf folders that keep the rids, on a
     `DemoStorage` over the store, in transactions of `rename_batch`
     folders. Return the records and the rows of each transaction."""
-    demo = DemoStorage(base=storage)
+    # The close of the other database leaves the store open.
+    demo = DemoStorage(base=storage, close_base_on_close=False)
     other = DB(demo)
     tm = transaction.TransactionManager()
     connection = other.open(transaction_manager=tm)
