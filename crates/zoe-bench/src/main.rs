@@ -121,6 +121,12 @@ struct CatalogArgs {
     /// the rids and the counts, and exit with 1 on a difference.
     #[arg(long)]
     check: bool,
+    /// Give the text indexes of the store, with no server on it, the
+    /// settings of this mode of the plans file, keep the text index of the
+    /// mode before beside the store, and put the kept index of this mode in
+    /// place. Run nothing else.
+    #[arg(long, value_name = "MODE", conflicts_with = "check")]
+    set_mode: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -371,6 +377,22 @@ fn catalog_command(args: CatalogArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(mode) = &args.set_mode {
+        let Some(value) = plans.modes.get(mode) else {
+            eprintln!("zoe-bench catalog: the plans file has no mode {mode}");
+            return ExitCode::from(2);
+        };
+        return match catalog::server::set_mode(&args.store, plans.catalog, mode, value) {
+            Ok(changed) => print(
+                "catalog",
+                &serde_json::json!({"mode": mode, "changed": changed}),
+            ),
+            Err(e) => {
+                eprintln!("zoe-bench catalog: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let launch = Launch {
         binary: args.zoe,
         store: args.store,

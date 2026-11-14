@@ -1235,11 +1235,18 @@ async fn check_on(session: &Session, plans: &Plans, timeout: Duration) -> Result
     let mut mismatches = Vec::new();
     let mut refusals: BTreeMap<String, u64> = BTreeMap::new();
     let mut errors: BTreeMap<String, u64> = BTreeMap::new();
+    let mut scenarios: BTreeMap<String, u64> = BTreeMap::new();
+    let mut client: BTreeMap<String, u64> = BTreeMap::new();
     for q in &plans.queries {
+        if q.plan.is_none() {
+            let reason = q.reason.clone().unwrap_or_else(|| "?".into());
+            *client.entry(reason).or_default() += q.weight;
+        }
         let (Some(plan), Some(expect)) = (&q.plan, &q.expect) else {
             continue;
         };
         checked += 1;
+        *scenarios.entry(q.scenario.clone()).or_default() += 1;
         let reply = client
             .catalog_query(catalog, last(client), plan.clone(), Value::Nil)
             .await
@@ -1278,5 +1285,7 @@ async fn check_on(session: &Session, plans: &Plans, timeout: Duration) -> Result
         "mismatches": mismatches,
         "refusals": refusals,
         "errors": errors,
+        "scenarios": scenarios,
+        "client_reasons": client,
     }))
 }
