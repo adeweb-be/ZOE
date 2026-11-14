@@ -1154,10 +1154,13 @@ impl Runner {
         };
         stop.store(true, Ordering::SeqCst);
         let samples = sampler.await.map_err(fail)?;
+        // The RSS when the mirror is ready counts too: a rebuild that ends
+        // first leaves no sample after it.
         let peak_after = samples
             .iter()
             .filter(|(at, _)| *at >= mirror_at)
             .map(|(_, rss)| *rss)
+            .chain(rss_at_mirror)
             .max();
         let peak = session.server.memory().peak_rss_bytes;
         self.session = Some(session);
