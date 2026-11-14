@@ -33,7 +33,10 @@ export const CURVES = ["edit", "create-spread"];
 
 // The families of the tables. The page shows the latest document of each
 // group, and a selector gives the earlier ones.
-export const SELECTED = ["native", "client", "plone"];
+export const SELECTED = ["native", "client", "plone", "catalog"];
+
+// The families whose groups have a fixture.
+const FIXTURED = ["plone", "catalog"];
 
 // The keys of a document that the method of the page shows.
 const METHOD = {
@@ -50,6 +53,7 @@ const METHOD = {
     "stacks",
     "scenarios",
   ],
+  catalog: ["machine", "run", "catalog", "settings", "server", "metrics"],
 };
 
 export async function load(read) {
@@ -87,6 +91,9 @@ function describe(entry, source) {
     document.cells = nativeCells(source);
   } else if (entry.family === "client") {
     document.rows = source.rows;
+  } else if (entry.family === "catalog") {
+    document.scenario_results = source.scenarios;
+    document.tables = catalogTables(source);
   }
   return document;
 }
@@ -194,6 +201,31 @@ function nativeCells(source) {
   return cells;
 }
 
+// One table per list `cells` of a catalog scenario, depth first, in the
+// order of the document. The label is the path of keys to the list, without
+// `cells`. An item of a list adds its key, then its `mode`, its `name` or
+// its position.
+function catalogTables(source) {
+  const tables = [];
+  const walk = (scenario, value, path) => {
+    for (const [key, item] of Object.entries(value)) {
+      if (key === "cells" && Array.isArray(item)) {
+        tables.push({ scenario, label: path.join(" · "), cells: item });
+      } else if (Array.isArray(item)) {
+        item.forEach((element, at) => {
+          if (element !== null && typeof element === "object" && !Array.isArray(element)) {
+            walk(scenario, element, [...path, key, String(element.mode ?? element.name ?? at)]);
+          }
+        });
+      } else if (item !== null && typeof item === "object") {
+        walk(scenario, item, [...path, key]);
+      }
+    }
+  };
+  for (const scenario of source.scenarios) walk(scenario.name, scenario, []);
+  return tables;
+}
+
 // One chart per machine, Python build, cell and scenario of zodbshootout,
 // over every run: a line per storage, a point per document.
 function shootoutCharts(entries, sources) {
@@ -244,19 +276,21 @@ function shootoutCharts(entries, sources) {
   return [...charts.values()];
 }
 
-// One group per family of SELECTED, machine, Python build and, for plone,
-// fixture: the newest document and the others, newest first.
+// One group per family of SELECTED, machine, Python build and, for plone
+// and catalog, fixture: the newest document and the others, newest first.
+// A catalog document has no Python build: its python is null.
 function selection(entries) {
   const groups = new Map();
   for (const entry of entries) {
     if (!SELECTED.includes(entry.family)) continue;
-    const fixture = entry.family === "plone" ? (entry.fixture ?? null) : null;
-    const key = JSON.stringify([entry.family, entry.machine, entry.python, fixture]);
+    const fixture = FIXTURED.includes(entry.family) ? (entry.fixture ?? null) : null;
+    const python = entry.python ?? null;
+    const key = JSON.stringify([entry.family, entry.machine, python, fixture]);
     if (!groups.has(key)) {
       groups.set(key, {
         family: entry.family,
         machine: entry.machine,
-        python: entry.python,
+        python,
         fixture,
         members: [],
       });

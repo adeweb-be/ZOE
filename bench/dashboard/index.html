@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZOE benchmarks</title>
-<meta name="description" content="The published benchmark results of ZOE against ZEO 6: the Plone end-to-end benchmark, the native gate, the client benchmark and zodbshootout.">
+<meta name="description" content="The published benchmark results of ZOE against ZEO 6: the Plone end-to-end benchmark, the native gate, the client benchmark, the catalog benchmark and zodbshootout.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232a78d6'/%3E%3Cpath d='M3 12l3-4 3 2 4-6' stroke='%23fff' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha512-CQBWl4fJHWbryGE+Pc7UAxWMUMNMWzWxF4SQo9CgkJIN1kx6djDQZjh3Y8SZ1d+6I+1zze6Z7kHXO7q3UyZAWw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <style>
@@ -208,6 +208,7 @@
       <a href="#plone">Plone end-to-end</a>
       <a href="#native">Native gate</a>
       <a href="#client">Client benchmark</a>
+      <a href="#catalog">Catalog</a>
       <a href="#shootout">zodbshootout</a>
       <a href="#reproduce">Reproduce</a>
     </nav>
@@ -239,6 +240,12 @@
     <div id="client-body"></div>
   </section>
 
+  <section class="family" id="catalog" hidden>
+    <h2>Catalog</h2>
+    <p class="note">zoe-bench catalog: the catalog mirror and the text index of zoe serve on a catalog fixture, through the protocol, from a client that runs no Python. One result per fixture. The Python selector does not apply: no Python runs on the measured path.</p>
+    <div id="catalog-body"></div>
+  </section>
+
   <section class="family" id="shootout" hidden>
     <h2>zodbshootout</h2>
     <p class="note">Each line is one storage; each point is one full run on the chosen machine and Python build. Click a point to open its ZOE commit.</p>
@@ -259,7 +266,7 @@
       <p>In a checkout of the ZOE repository, inside <code>devenv shell</code>, one command runs the published set on one machine: B5 on the fixtures <code>small</code> and <code>medium</code> with the stacks <code>zeo</code> and <code>zoe-native-qi-kv</code>, the native gate and the client benchmark. It resumes after a stop.</p>
       <pre><code>just bench showcase --plan    # each run of the set and its estimate; runs nothing
 just bench showcase           # writes target/bench/showcase/&lt;started&gt;/</code></pre>
-      <p>zodbshootout runs on its own: <code>just bench</code> writes <code>target/bench/results</code>. Then <code>just bench publish</code> checks each document and copies it into a checkout of the results repository, with this page:</p>
+      <p>zodbshootout runs on its own: <code>just bench</code> writes <code>target/bench/results</code>. The catalog benchmark too: <code>just bench catalog</code> runs its default set on <code>catalog-1m</code> and writes <code>target/bench/catalog/&lt;started&gt;.json</code>. Then <code>just bench publish</code> checks each document and copies it into a checkout of the results repository, with this page:</p>
       <pre><code>just bench publish target/bench/showcase/&lt;started&gt; CHECKOUT</code></pre>
       <p>It takes only a full run of a clean tree at a commit of <code>main</code>, and for B5 only verified runs. It never commits and never pushes. The harness and what it measures: <a href="https://github.com/adeweb-be/ZOE/blob/main/bench/README.md">bench/README.md</a>.</p>
     </div>
@@ -276,7 +283,7 @@ import { load, BASELINE, COLUMNS, CURVES } from "./data.js";
 
 const COMMIT_URL = "https://github.com/adeweb-be/ZOE/commit/";
 const DASH = "–";
-const FAMILIES = ["plone", "native", "client", "shootout"];
+const FAMILIES = ["plone", "native", "client", "catalog", "shootout"];
 // The colour slot of each stack and storage. A colour follows its name.
 const SLOT = {
   "zoe-native": 1,
@@ -511,6 +518,11 @@ function empty(family) {
 }
 function runLine(document) {
   const run = document.method.run ?? {};
+  if (document.family === "catalog") {
+    return h("p", { class: "meta" },
+      "Machine ", h("strong", {}, document.machine),
+      " · commit ", commitLink(run.commit), ` · started ${when(run.started)}`);
+  }
   const plone = document.family === "plone" ? `Plone ${document.method.software?.Plone ?? DASH} on ` : "";
   return h("p", { class: "meta" },
     "Machine ", h("strong", {}, document.machine),
@@ -522,10 +534,13 @@ function methodBlock(document) {
   const parts = [
     h("h5", {}, "Machine"),
     kv(method.machine, { memory_bytes: (value) => (typeof value === "number" ? `${num(value / 2 ** 30)} GiB` : DASH) }),
-    h("h5", {}, "Python"), kv(method.python),
-    h("h5", {}, "Software"), kv(method.software),
+    method.python ? [h("h5", {}, "Python"), kv(method.python)] : null,
+    method.software ? [h("h5", {}, "Software"), kv(method.software)] : null,
     h("h5", {}, "Run"), kv(method.run, { started: when, commit: commitLink }),
   ];
+  if (method.catalog) parts.push(h("h5", {}, "Fixture"), kv(method.catalog));
+  if (method.server) parts.push(h("h5", {}, "Server"), catalogKv(method.server));
+  if (method.metrics) parts.push(h("h5", {}, "Metrics"), catalogKv(method.metrics));
   if (method.rule) parts.push(h("h5", {}, "Rule"), kv(method.rule));
   if (method.fixture) parts.push(h("h5", {}, "Fixture"), kv(method.fixture));
   if (method.settings) parts.push(h("h5", {}, "Settings"), kv(method.settings));
@@ -759,6 +774,119 @@ function renderClient(machine, python) {
     : [empty("client")]));
 }
 
+// The scenarios of zoe-bench catalog.
+const CATALOG_SCENARIOS = {
+  cold: "The pages of the store leave the page cache, then zoe serve opens it. Until the mirror is ready, the replies are not_ready.",
+  intersect: "The five-index intersections with a sort of the fixture, warm, at 1 and 16 connections (G2); then a full page of brains.",
+  mix: "The plans of the query log, warm, at 1, 4 and 16 connections; then the path queries with many overridden rows, and the invalidations while the mirror rebases.",
+  text: "The text queries in each variant and in each mode of the text indexes, warm, at 1 and 16 connections (G4); then text_query with a filter, staged texts, commits of text deltas and a snapshot behind the index.",
+  "text-rebuild": "The rebuild of the text index in the store with one indexing thread, from a store without its text index.",
+};
+// A size in bytes, scaled to MiB or GiB.
+function size(value) {
+  if (typeof value !== "number") return DASH;
+  if (value >= 2 ** 30) return `${num(value / 2 ** 30)} GiB`;
+  if (value >= 2 ** 20) return `${num(value / 2 ** 20)} MiB`;
+  return `${exact.format(value)} B`;
+}
+// The unit of a number of a catalog document, from the end of its key.
+function catalogValue(key, value) {
+  if (typeof value !== "number") return plain(value);
+  if (key.endsWith("_bytes")) return size(value);
+  if (key.endsWith("_seconds")) return value < 1 ? `${num(value, 1000)} ms` : `${num(value)} s`;
+  if (key.endsWith("_share")) return `${num(value, 100)} %`;
+  return exact.format(value);
+}
+// A list of keys and values of a catalog document, nested for an object,
+// each number with its unit.
+function catalogKv(object) {
+  const list = h("dl", { class: "kv" });
+  for (const [key, value] of Object.entries(object ?? {})) {
+    const nested = value !== null && typeof value === "object" && !Array.isArray(value);
+    list.append(h("dt", {}, key), h("dd", {}, nested ? catalogKv(value) : catalogValue(key, value)));
+  }
+  return list;
+}
+// A count for each reason, as text.
+function reasons(counts) {
+  const items = Object.entries(counts ?? {});
+  return items.length ? items.map(([reason, count]) => `${reason} ${exact.format(count)}`).join(", ") : DASH;
+}
+const CATALOG_COLUMNS = [
+  ["concurrency", "connections", (value) => num(value)],
+  ["queries", "queries", (value) => num(value)],
+  ["answered", "answered", (value) => num(value)],
+  ["p50_seconds", "p50 (ms)", (value) => num(value, 1000)],
+  ["p99_seconds", "p99 (ms)", (value) => num(value, 1000)],
+  ["max_seconds", "max (ms)", (value) => num(value, 1000)],
+  ["qps", "queries / s", (value) => num(value)],
+  ["refusals", "refusals (f)", reasons, "text"],
+  ["errors", "errors (e)", reasons, "text"],
+];
+function cellTable(cells) {
+  const head = h("thead", {}, h("tr", {},
+    h("th", { scope: "col" }, "cell"),
+    CATALOG_COLUMNS.map(([, label, , kind]) => header(label, { class: kind }))));
+  const body = h("tbody", {}, cells.map((cell) => h("tr", {},
+    h("th", { scope: "row" }, h("code", {}, cell.name)),
+    CATALOG_COLUMNS.map(([key, , format, kind]) => h("td", { class: kind }, format(cell[key]))))));
+  return wrap(h("table", {}, head, body));
+}
+// A value of a catalog scenario without its lists of cells: the tables
+// show them.
+function withoutCells(value) {
+  if (Array.isArray(value)) return value.map(withoutCells);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, item]) => !(key === "cells" && Array.isArray(item)))
+    .map(([key, item]) => [key, withoutCells(item)]));
+}
+function catalogScenario(document, scenario) {
+  const scalars = {};
+  const nested = [];
+  for (const [key, value] of Object.entries(scenario)) {
+    if (key === "name" || (key === "cells" && Array.isArray(value))) continue;
+    if (value !== null && typeof value === "object") nested.push([key, withoutCells(value)]);
+    else scalars[key] = value;
+  }
+  const tables = document.tables.filter((table) => table.scenario === scenario.name);
+  return h("section", {},
+    h("h4", {}, h("code", {}, scenario.name)),
+    CATALOG_SCENARIOS[scenario.name] ? h("p", { class: "desc" }, CATALOG_SCENARIOS[scenario.name]) : null,
+    catalogKv(scalars),
+    tables.map((table) => [table.label ? h("h5", {}, table.label) : null, cellTable(table.cells)]),
+    nested.length
+      ? h("details", {}, h("summary", {}, `The other numbers of ${scenario.name}`),
+        nested.map(([key, value]) => [h("h5", {}, key), Array.isArray(value)
+          ? value.map((item) => (item !== null && typeof item === "object" ? catalogKv(item) : plain(item)))
+          : catalogKv(value)]))
+      : null);
+}
+function catalogDocument(document) {
+  const fixture = document.method.catalog ?? {};
+  const server = document.method.server ?? {};
+  return h("div", {},
+    runLine(document),
+    h("p", { class: "meta" },
+      `Fixture ${fixture.name}: preset ${fixture.preset}, ${num(fixture.counts?.size)} catalog entries. `,
+      `Mirror ${size(server.mirror_bytes)}, built in ${catalogValue("build_seconds", server.build_seconds)}; `,
+      `zoe serve resident ${size(server.rss_bytes)}, peak ${size(server.peak_rss_bytes)}.`),
+    h("p", { class: "note" },
+      "A latency counts only for an answered query: a reply f (a refusal) or e (an error) gives none, and the table counts it by reason. ",
+      "queries / s is the answered queries of a cell over its time. ",
+      "Below each scenario: the memory of zoe serve and the gauges of the mirror after it. These are the numbers of the document."),
+    document.scenario_results.map((scenario) => catalogScenario(document, scenario)),
+    methodBlock(document));
+}
+function renderCatalog(machine) {
+  const groups = state.model.selection.filter((group) => group.family === "catalog" && group.machine === machine);
+  $("catalog-body").replaceChildren(...(groups.length
+    ? groups.map((group) => groupBlock(group, `Fixture ${group.fixture}`, catalogDocument))
+    : [h("div", { class: "empty" }, documentsOf("catalog").length
+      ? "No result of this family for this machine."
+      : "No result of this family is published yet.")]));
+}
+
 const HOUR = 3600000;
 const DAY = 24 * HOUR;
 // The steps of a time axis, from an hour to a year.
@@ -916,8 +1044,9 @@ function fillSelect(select, values, wanted) {
 }
 function refreshPythons() {
   const machine = $("machine").value;
+  // A catalog document has no Python build.
   const pythons = [...new Set(state.model.documents
-    .filter((document) => document.machine === machine)
+    .filter((document) => document.machine === machine && document.python)
     .map((document) => document.python))].sort();
   fillSelect($("python"), pythons, $("python").value || readStored("zoe-bench-python"));
 }
@@ -929,6 +1058,7 @@ function render() {
   renderPlone(machine, python);
   renderNative(machine, python);
   renderClient(machine, python);
+  renderCatalog(machine);
   renderShootout(machine, python);
   flush();
 }

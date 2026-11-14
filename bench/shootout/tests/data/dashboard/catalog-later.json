@@ -1,0 +1,699 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "name": "reference",
+    "cpu": "Synthetic CPU",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "Linux",
+    "kernel": "6.0.0",
+    "arch": "x86_64"
+  },
+  "run": {
+    "started": "2026-01-02T04:00:00Z",
+    "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+    "dirty": false
+  },
+  "catalog": {
+    "name": "catalog-1m-0c51e2a4f7d9",
+    "preset": "catalog-1m",
+    "counts": {
+      "size": 1000000,
+      "indexes": {
+        "Creator": 1000000,
+        "SearchableText": 1000000,
+        "effective": 1000000,
+        "path": 1000000,
+        "portal_type": 1000000,
+        "review_state": 964210,
+        "sortable_title": 1000000,
+        "Subject": 412877
+      },
+      "columns": {
+        "Title": 1000000,
+        "created": 1000000,
+        "effective": 1000000,
+        "expires": 87112,
+        "modified": 1000000,
+        "review_state": 964210
+      }
+    }
+  },
+  "settings": {
+    "seconds": 20.0,
+    "rounds": 1,
+    "ready_timeout_seconds": 900.0,
+    "text_commits": 20,
+    "text_batch": 500,
+    "text_pause_seconds": 0.6,
+    "rebase_seconds": 30.0
+  },
+  "server": {
+    "catalog_memory": null,
+    "catalog_rebase_rows": 20000,
+    "mirror_bytes": 1296543252.48,
+    "build_seconds": 37.628,
+    "rss_bytes": 1666984181,
+    "peak_rss_bytes": 2654826659,
+    "adr_0059_line_bytes": 1500000000,
+    "over_adr_line": false
+  },
+  "metrics": {
+    "interval_seconds": 1.0,
+    "scrapes": {
+      "count": 1820,
+      "p50_seconds": 0.0008,
+      "p99_seconds": 0.0021,
+      "max_seconds": 0.0034
+    }
+  },
+  "scenarios": [
+    {
+      "page_cache_dropped_bytes": 2147483648,
+      "listening_seconds": 0.21,
+      "mirror_ready_seconds": 38.18,
+      "first_answer_seconds": 38.272000000000006,
+      "text_ready_seconds": 3.128,
+      "refusals": {
+        "not_ready": 4102
+      },
+      "errors": {},
+      "first_answers": {
+        "count": 50,
+        "p50_seconds": 0.001932,
+        "p99_seconds": 0.004416,
+        "max_seconds": 0.004692000000000001
+      },
+      "hub_during_build": {
+        "commits": 1180,
+        "missed": 0,
+        "invalidation_delay": {
+          "count": 1180,
+          "p50_seconds": 0.0009,
+          "p99_seconds": 0.0031,
+          "max_seconds": 0.0042
+        },
+        "commit": {
+          "count": 1180,
+          "p50_seconds": 0.0006,
+          "p99_seconds": 0.0018,
+          "max_seconds": 0.0025
+        }
+      },
+      "name": "cold",
+      "rss_bytes": 1481763717,
+      "peak_rss_bytes": 1728724336,
+      "mirror_bytes": 1234803097.6000001,
+      "build_seconds": 36.616
+    },
+    {
+      "cells": [
+        {
+          "name": "c1",
+          "concurrency": 1,
+          "queries": 9000,
+          "answered": 9000,
+          "p50_seconds": 0.001748,
+          "p99_seconds": 0.003312,
+          "max_seconds": 0.004784,
+          "qps": 450.0,
+          "refusals": {},
+          "errors": {}
+        },
+        {
+          "name": "c16",
+          "concurrency": 16,
+          "queries": 88000,
+          "answered": 88000,
+          "p50_seconds": 0.002576,
+          "p99_seconds": 0.004324000000000001,
+          "max_seconds": 0.007452,
+          "qps": 4400.0,
+          "refusals": {},
+          "errors": {}
+        }
+      ],
+      "page": {
+        "rows": 1000,
+        "columns": 42,
+        "date_columns": [
+          "created",
+          "effective",
+          "expires",
+          "modified"
+        ],
+        "reply_bytes": 612345,
+        "cells": [
+          {
+            "name": "all_columns",
+            "concurrency": 1,
+            "queries": 2400,
+            "answered": 2400,
+            "p50_seconds": 0.0065320000000000005,
+            "p99_seconds": 0.009384000000000002,
+            "max_seconds": 0.012236,
+            "qps": 120.0,
+            "refusals": {},
+            "errors": {}
+          },
+          {
+            "name": "no_date_columns",
+            "concurrency": 1,
+            "queries": 2900,
+            "answered": 2900,
+            "p50_seconds": 0.005704,
+            "p99_seconds": 0.008188,
+            "max_seconds": 0.009292,
+            "qps": 145.0,
+            "refusals": {},
+            "errors": {}
+          },
+          {
+            "name": "no_rows",
+            "concurrency": 1,
+            "queries": 9800,
+            "answered": 9800,
+            "p50_seconds": 0.001656,
+            "p99_seconds": 0.002668,
+            "max_seconds": 0.00368,
+            "qps": 490.0,
+            "refusals": {},
+            "errors": {}
+          }
+        ],
+        "client_decode": {
+          "count": 50,
+          "p50_seconds": 0.0011,
+          "p99_seconds": 0.0015,
+          "max_seconds": 0.0016
+        },
+        "client_encode": {
+          "count": 50,
+          "p50_seconds": 0.0004,
+          "p99_seconds": 0.0006,
+          "max_seconds": 0.0007
+        }
+      },
+      "name": "intersect",
+      "rss_bytes": 1512633794,
+      "peak_rss_bytes": 1728724336,
+      "mirror_bytes": 1234803097.6000001,
+      "build_seconds": 36.616
+    },
+    {
+      "lines": 5000,
+      "native": 4875,
+      "native_share": 0.975,
+      "client_reasons": {
+        "unsupported_index": 75
+      },
+      "server_reasons": {
+        "overlay": 50
+      },
+      "cells": [
+        {
+          "name": "c1",
+          "concurrency": 1,
+          "queries": 21000,
+          "answered": 20790,
+          "p50_seconds": 0.000644,
+          "p99_seconds": 0.002852,
+          "max_seconds": 0.008648000000000001,
+          "qps": 1039.5,
+          "refusals": {
+            "overlay": 210
+          },
+          "errors": {}
+        },
+        {
+          "name": "c4",
+          "concurrency": 4,
+          "queries": 80000,
+          "answered": 79200,
+          "p50_seconds": 0.0007360000000000001,
+          "p99_seconds": 0.00322,
+          "max_seconds": 0.009292,
+          "qps": 3960.0,
+          "refusals": {
+            "overlay": 800
+          },
+          "errors": {}
+        },
+        {
+          "name": "c16",
+          "concurrency": 16,
+          "queries": 240000,
+          "answered": 237600,
+          "p50_seconds": 0.001012,
+          "p99_seconds": 0.004784,
+          "max_seconds": 0.013156000000000001,
+          "qps": 11880.0,
+          "refusals": {
+            "overlay": 2400
+          },
+          "errors": {}
+        }
+      ],
+      "overrides": {
+        "writes": 36,
+        "override_rows": 17880,
+        "cells": [
+          {
+            "name": "path_base",
+            "concurrency": 1,
+            "queries": 30000,
+            "answered": 30000,
+            "p50_seconds": 0.00046,
+            "p99_seconds": 0.001104,
+            "max_seconds": 0.001932,
+            "qps": 1500.0,
+            "refusals": {},
+            "errors": {}
+          },
+          {
+            "name": "path_overrides",
+            "concurrency": 1,
+            "queries": 26000,
+            "answered": 26000,
+            "p50_seconds": 0.000552,
+            "p99_seconds": 0.0014720000000000002,
+            "max_seconds": 0.002392,
+            "qps": 1300.0,
+            "refusals": {},
+            "errors": {}
+          }
+        ]
+      },
+      "rebase": {
+        "writes": 6,
+        "rows": 20880,
+        "past_threshold": true,
+        "hub": {
+          "commits": 1450,
+          "missed": 0,
+          "invalidation_delay": {
+            "count": 1450,
+            "p50_seconds": 0.001,
+            "p99_seconds": 0.0042,
+            "max_seconds": 0.0063
+          },
+          "commit": {
+            "count": 1450,
+            "p50_seconds": 0.0006,
+            "p99_seconds": 0.0019,
+            "max_seconds": 0.0027
+          }
+        }
+      },
+      "name": "mix",
+      "rss_bytes": 1574373949,
+      "peak_rss_bytes": 1790464491,
+      "mirror_bytes": 1296543252.48,
+      "build_seconds": 36.616
+    },
+    {
+      "modes": [
+        {
+          "mode": "enhanced",
+          "text_ready_seconds": 0.4,
+          "filter_rids": 41250,
+          "commits": {
+            "transactions": 20,
+            "deltas": 10000,
+            "seconds": 14.2,
+            "lag_cleared_seconds": 0.8
+          },
+          "cells": [
+            {
+              "name": "alone",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.001104,
+              "p99_seconds": 0.006256,
+              "max_seconds": 0.0087584,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "alone",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.001104,
+              "p99_seconds": 0.006256,
+              "max_seconds": 0.0087584,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.0014720000000000002,
+              "p99_seconds": 0.007452,
+              "max_seconds": 0.0104328,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.0014720000000000002,
+              "p99_seconds": 0.007452,
+              "max_seconds": 0.0104328,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "selective",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.000828,
+              "p99_seconds": 0.00322,
+              "max_seconds": 0.004508,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "selective",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.000828,
+              "p99_seconds": 0.00322,
+              "max_seconds": 0.004508,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "sorted",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.001932,
+              "p99_seconds": 0.008648000000000001,
+              "max_seconds": 0.0121072,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "sorted",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.001932,
+              "p99_seconds": 0.008648000000000001,
+              "max_seconds": 0.0121072,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing_sorted",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.002208,
+              "p99_seconds": 0.010304,
+              "max_seconds": 0.0144256,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing_sorted",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.002208,
+              "p99_seconds": 0.010304,
+              "max_seconds": 0.0144256,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "text_query",
+              "concurrency": 1,
+              "queries": 3000,
+              "answered": 3000,
+              "p50_seconds": 0.002852,
+              "p99_seconds": 0.013064000000000001,
+              "max_seconds": 0.01564,
+              "qps": 150.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "staged",
+              "concurrency": 1,
+              "queries": 3500,
+              "answered": 3500,
+              "p50_seconds": 0.001748,
+              "p99_seconds": 0.00828,
+              "max_seconds": 0.010212,
+              "qps": 175.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "after_commits/alone",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.001196,
+              "p99_seconds": 0.0065320000000000005,
+              "max_seconds": 0.008556,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "behind/alone",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.0013800000000000002,
+              "p99_seconds": 0.007176,
+              "max_seconds": 0.009108000000000002,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            }
+          ]
+        },
+        {
+          "mode": "compat",
+          "text_ready_seconds": 2.9,
+          "filter_rids": 41250,
+          "commits": {
+            "transactions": 20,
+            "deltas": 10000,
+            "seconds": 14.2,
+            "lag_cleared_seconds": 0.8
+          },
+          "cells": [
+            {
+              "name": "alone",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.001104,
+              "p99_seconds": 0.006256,
+              "max_seconds": 0.0087584,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "alone",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.001104,
+              "p99_seconds": 0.006256,
+              "max_seconds": 0.0087584,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.0014720000000000002,
+              "p99_seconds": 0.007452,
+              "max_seconds": 0.0104328,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.0014720000000000002,
+              "p99_seconds": 0.007452,
+              "max_seconds": 0.0104328,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "selective",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.000828,
+              "p99_seconds": 0.00322,
+              "max_seconds": 0.004508,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "selective",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.000828,
+              "p99_seconds": 0.00322,
+              "max_seconds": 0.004508,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "sorted",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.001932,
+              "p99_seconds": 0.008648000000000001,
+              "max_seconds": 0.0121072,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "sorted",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.001932,
+              "p99_seconds": 0.008648000000000001,
+              "max_seconds": 0.0121072,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing_sorted",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.002208,
+              "p99_seconds": 0.010304,
+              "max_seconds": 0.0144256,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "listing_sorted",
+              "concurrency": 16,
+              "queries": 64000,
+              "answered": 64000,
+              "p50_seconds": 0.002208,
+              "p99_seconds": 0.010304,
+              "max_seconds": 0.0144256,
+              "qps": 3200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "text_query",
+              "concurrency": 1,
+              "queries": 3000,
+              "answered": 3000,
+              "p50_seconds": 0.002852,
+              "p99_seconds": 0.013064000000000001,
+              "max_seconds": 0.01564,
+              "qps": 150.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "staged",
+              "concurrency": 1,
+              "queries": 3500,
+              "answered": 3500,
+              "p50_seconds": 0.001748,
+              "p99_seconds": 0.00828,
+              "max_seconds": 0.010212,
+              "qps": 175.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "after_commits/alone",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 4000,
+              "p50_seconds": 0.001196,
+              "p99_seconds": 0.0065320000000000005,
+              "max_seconds": 0.008556,
+              "qps": 200.0,
+              "refusals": {},
+              "errors": {}
+            },
+            {
+              "name": "behind/alone",
+              "concurrency": 1,
+              "queries": 4000,
+              "answered": 3988,
+              "p50_seconds": 0.0013800000000000002,
+              "p99_seconds": 0.007176,
+              "max_seconds": 0.009108000000000002,
+              "qps": 199.4,
+              "refusals": {},
+              "errors": {
+                "behind": 12
+              }
+            }
+          ]
+        }
+      ],
+      "name": "text",
+      "rss_bytes": 1636114104,
+      "peak_rss_bytes": 1852204646,
+      "mirror_bytes": 1296543252.48,
+      "build_seconds": 36.616
+    },
+    {
+      "mode": "enhanced",
+      "rebuild_seconds": 471.408,
+      "peak_rss_at_rebuild_bytes": 2885681152,
+      "mirror_ready_seconds": 37.628,
+      "name": "text-rebuild",
+      "rss_bytes": 1666984181,
+      "peak_rss_bytes": 2654826659,
+      "mirror_bytes": 1296543252.48,
+      "build_seconds": 37.628
+    }
+  ]
+}

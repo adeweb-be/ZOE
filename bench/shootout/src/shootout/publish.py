@@ -16,7 +16,8 @@ A document is publishable when it is of a known family and valid against
 the schema of its family, when it is not a quick run, when its commit is on
 the branch REF of the ZOE repository, when its tree had no change that the
 commit does not hold, when each run of a B5 summary passed its
-verification, and when its path is free in the checkout. No file that
+verification, when a catalog run is a full run, and when its path is free
+in the checkout. No file that
 `publish` writes passes through a symbolic link, so it writes nothing
 outside the checkout.
 """
@@ -44,8 +45,13 @@ SCHEMA_OF = {
     "native": "native.schema.json",
     "client": "client.schema.json",
     "plone": "plone.schema.json",
+    "catalog": "catalog.schema.json",
 }
 MAIN = "origin/main"
+# A full catalog run: the preset of G2, G3 and G4, and each scenario of the
+# default set of `zoe-bench catalog`.
+CATALOG_PRESET = "catalog-1m"
+CATALOG_SCENARIOS = ("intersect", "text", "mix", "cold")
 
 
 class UsageError(Exception):
@@ -289,6 +295,23 @@ def _documents(sources: list[str]) -> list[tuple[str, Path]]:
     return documents
 
 
+def _partial(document: dict) -> list[str]:
+    """Return why a catalog document is not a full run: a full run is on
+    the preset CATALOG_PRESET and holds each scenario of
+    CATALOG_SCENARIOS."""
+    reasons = []
+    preset = document["catalog"]["preset"]
+    if preset != CATALOG_PRESET:
+        reasons.append(f"a partial run: the preset is {preset}, not {CATALOG_PRESET}")
+    ran = {scenario["name"] for scenario in document["scenarios"]}
+    missing = [name for name in CATALOG_SCENARIOS if name not in ran]
+    if missing:
+        reasons.append(
+            f"a partial run: it does not hold the scenarios {', '.join(missing)}"
+        )
+    return reasons
+
+
 def _check(
     data: bytes, main: str, schemas: dict, on_main: dict[str, bool]
 ) -> tuple[str | None, list[str], dict | None]:
@@ -332,6 +355,8 @@ def _check(
                     f"the verification of run {result['id']} is "
                     f"{result['verification']}"
                 )
+    if kind == "catalog":
+        reasons += _partial(document)
     target = layout.published_path(document)
     if target is None:
         reasons.append("its path in the layout holds a part that is not a name")
