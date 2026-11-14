@@ -119,8 +119,8 @@ pub struct Trace {
     pub range_by_keys: usize,
 }
 
-/// More keys than this in a range, with no smaller result set: the range
-/// tests the key of each row of the index.
+/// More keys than this in a range, with no result set of fewer rows than
+/// their postings: the range tests the key of each row of the index.
 const MANY_KEYS: u32 = 4096;
 
 fn fallback<T>(reason: Reason, why: impl Into<String>) -> Result<T, Fallback> {
@@ -923,9 +923,9 @@ impl<'a> View<'a> {
     /// `index.values(lo, hi)` gives them.
     ///
     /// When the result set of the other clauses holds fewer rows than the
-    /// range has keys, the range tests the keys of each row of that set:
-    /// one read of the ranks of each row costs less than the union of the
-    /// rows of each key.
+    /// postings of the keys of the range, the range tests the keys of each
+    /// row of that set: one read of the slots of a row costs less than the
+    /// union of a row of a posting.
     fn range(
         &self,
         i: usize,
@@ -973,7 +973,7 @@ impl<'a> View<'a> {
             let keys = end - first;
             let in_keys = |row: u32| keyed.row_in(row, first, end);
             match rs {
-                Some(rs) if rs.len() < u64::from(keys) => {
+                Some(rs) if keyed.holds_more_than(first, end, rs.len()) => {
                     trace.range_by_rows += 1;
                     rows.extend(rs.iter().filter(|row| in_keys(*row)));
                 }
@@ -1935,6 +1935,24 @@ impl<'a> Keyed<'a> {
             Keyed::One(f) => f.slot(row).is_some_and(|s| s >= first && s < end),
             Keyed::Many(k) => k.row_slots(row).iter().any(|s| *s >= first && *s < end),
         }
+    }
+
+    /// Tells if the postings of the keys at the slots from `first` to
+    /// `end`, `end` excluded, hold more than `n` rows in all. A row counts
+    /// once for each of its keys. The count stops past `n`.
+    fn holds_more_than(self, first: u32, end: u32, n: u64) -> bool {
+        let postings = self.postings();
+        let mut rows = 0u64;
+        for slot in first..end {
+            rows += match postings.get(slot) {
+                Posting::One(_) => 1,
+                Posting::Many(b) => b.len(),
+            };
+            if rows > n {
+                return true;
+            }
+        }
+        false
     }
 
     /// The keys of a value of the overrides.

@@ -642,3 +642,69 @@ fn each_scenario_runs_and_gives_its_numbers() {
     let report = std::fs::read_to_string(&markdown).unwrap();
     assert!(report.contains("## intersect") && report.contains("### mode compat"));
 }
+
+/// The scenario `intersect` gives p50, p99 and max for each query of its
+/// set, by name, in each cell, and the report shows them.
+#[test]
+fn intersect_gives_the_numbers_of_each_query() {
+    let dir = fresh_dir("catalog-intersect");
+    let (store, plans) = prepare(&dir);
+    let markdown = dir.join("report.md");
+    let output = Command::new(BENCH)
+        .arg("catalog")
+        .arg("--zoe")
+        .arg(zoe_binary())
+        .arg("--store")
+        .arg(&store)
+        .arg("--plans")
+        .arg(&plans)
+        .arg("--markdown")
+        .arg(&markdown)
+        .args(["--scenario", "intersect"])
+        .args(["--seconds", "0.2", "--ready-timeout", "120"])
+        .env("ZOE_BENCH_DIRTY", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "zoe-bench catalog failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: Json = serde_json::from_slice(&output.stdout).expect("the result is JSON");
+    let scenarios = doc["scenarios"].as_array().unwrap();
+    let [intersect] = &scenarios[..] else {
+        panic!("one scenario: {scenarios:?}")
+    };
+    assert_eq!(intersect["name"], "intersect");
+    for concurrency in [1, 16] {
+        let c = cell(&intersect["cells"], &format!("c{concurrency}"), concurrency);
+        answered(c);
+        let queries = c["by_query"].as_array().expect("the queries of the cell");
+        let names: Vec<&str> = queries
+            .iter()
+            .map(|q| q["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["listing", "folders"], "{c}");
+        let mut count = 0;
+        for q in queries {
+            let n = number(&q["count"], "the answers of a query");
+            assert!(n > 0.0, "{q}");
+            count += n as u64;
+            let p50 = number(&q["p50_seconds"], "the p50 of a query");
+            let p99 = number(&q["p99_seconds"], "the p99 of a query");
+            let max = number(&q["max_seconds"], "the max of a query");
+            assert!(0.0 < p50 && p50 <= p99 && p99 <= max, "{q}");
+        }
+        assert_eq!(count, c["answered"].as_u64().unwrap(), "{c}");
+    }
+
+    let report = std::fs::read_to_string(&markdown).unwrap();
+    for name in ["listing", "folders"] {
+        assert!(
+            report
+                .lines()
+                .any(|l| l.starts_with(&format!("| {name} |"))),
+            "no row of {name} in the report:\n{report}"
+        );
+    }
+}
