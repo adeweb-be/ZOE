@@ -4,8 +4,9 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 
 ## Layout
 
-- `src/main.rs`: the command, with clap: `conflicts`, `hot`, `load` and `saturate`.
+- `src/main.rs`: the command, with clap: `catalog`, `conflicts`, `hot`, `load` and `saturate`.
 - `src/lib.rs`: the modules, and `Error`, the error of a run of `hot`, `load` or `saturate`.
+- `src/catalog/`: `catalog`, the catalog mirror and the text index of `zoe serve` on a fixture (`bench/README.md`, "zoe-bench catalog"). `plans.rs` reads the plans file that a step of the harness makes in Zope; `server.rs` starts and stops `zoe serve`, reads `/metrics` and `/proc`, drops the pages of a store from the page cache and changes the mode of its text indexes with no server on it; `cells.rs` runs the cells; `mod.rs` the scenarios and the result; `report.rs` the Markdown report. `tests/catalog.rs` runs each scenario on a small store of `zoe_catalog::testing`, with the `zoe` binary that `cargo test --workspace` builds.
 - `src/conflicts.rs`: the ranking of the ConflictErrors of Zope logs.
 - `src/hot.rs`: `hot`, the writers of one hot object (F7, N5). Each writer increments a `BTrees.Length`, which tier 1 merges, or a `PersistentMapping`, which no tier merges, with vote-time locks or with early write-intent locks (`--early-locks`, ADR 0045). The report gives the commits, the `ConflictError`s, the transactions that gave up, and from `GET /metrics` of the admin port the syncs, the lock hand-offs and the intent locks of the run.
 - `src/load.rs`: `load` and `saturate` on `zoe-client`, and their reports. `Report` is the form of the report of `load`, `saturate` and `hot`.
@@ -31,3 +32,5 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 - `machine.name` is a slug of `ZOE_BENCH_MACHINE`, or a slug of the CPU model.
 - The lock wait is the time of the vote, because the server takes the locks of the oids at the vote.
 - zoe-bench uses `zoe-client` and does not change its API. tokio is allowed in this crate.
+- `catalog` runs no Python. A latency counts only for an answered query: a reply `f` is a refusal with its reason, a reply `e` an error with its kind. Its result holds no host name, user name, path or address.
+- `catalog/server.rs` holds the only `unsafe` code of the crate: one function with `#[allow(unsafe_code)]` and a `SAFETY` comment, which calls `posix_fadvise(POSIX_FADV_DONTNEED)` on Linux. The workspace lint `unsafe_code = "deny"` stays.

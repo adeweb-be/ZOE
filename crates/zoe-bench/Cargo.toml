@@ -11,18 +11,24 @@ publish.workspace = true
 [dependencies]
 clap.workspace = true
 futures.workspace = true
+# The pages of a store leave the page cache, and the stop of `zoe serve`.
+libc.workspace = true
+# The plans of `catalog` and the replies of `catalog_query`.
+rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# The clients and the runtime of `load`, `saturate` and `hot`; `hot` reads
-# the metrics of the admin port over a socket.
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util"] }
+# The clients and the runtime of `load`, `saturate`, `hot` and `catalog`;
+# `hot` and `catalog` read the metrics of the admin port over a socket.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time"] }
 zoe-client.workspace = true
 zoe-core.workspace = true
 # The names of the extensions.
 zoe-wire.workspace = true
 
 [dev-dependencies]
+# The small catalog store of the test of `catalog`, with its text deltas.
+zoe-catalog = { workspace = true, features = ["testing", "text"] }
 # The measurements of the core: a storage backend of redb that times the
 # database file, and a subscriber of the span `fsync`.
 redb.workspace = true
