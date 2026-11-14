@@ -522,13 +522,11 @@ pub fn events() -> Vec<Captured> {
 const DATABASE: &str = "zoe.redb";
 
 /// A `MemVfs` that counts the syncs of the database file and of the files
-/// of the write-ahead log, and the growths of the database file. Its clones
-/// share the files and the counts.
+/// of the write-ahead log. Its clones share the files and the count.
 #[derive(Clone, Default)]
 pub struct CountingVfs {
     vfs: MemVfs,
     syncs: Arc<AtomicU64>,
-    growths: Arc<AtomicU64>,
 }
 
 /// A file of `CountingVfs`.
@@ -538,8 +536,6 @@ pub struct CountedFile {
     /// The count of the database file and of the files of the log, `None`
     /// for another file.
     syncs: Option<Arc<AtomicU64>>,
-    /// The count of growths of the database file, `None` for another file.
-    growths: Option<Arc<AtomicU64>>,
 }
 
 impl CountingVfs {
@@ -549,22 +545,10 @@ impl CountingVfs {
         self.syncs.load(Ordering::SeqCst)
     }
 
-    /// Return the number of times the database file became longer. redb
-    /// syncs the database file after each growth, also in a commit that
-    /// does not sync.
-    pub fn growths(&self) -> u64 {
-        self.growths.load(Ordering::SeqCst)
-    }
-
     fn counted(&self, name: &str, file: MemFile) -> CountedFile {
         let counted = name == DATABASE || name.starts_with("wal/");
         let syncs = counted.then(|| Arc::clone(&self.syncs));
-        let growths = (name == DATABASE).then(|| Arc::clone(&self.growths));
-        CountedFile {
-            file,
-            syncs,
-            growths,
-        }
+        CountedFile { file, syncs }
     }
 }
 
@@ -578,11 +562,6 @@ impl redb::StorageBackend for CountedFile {
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        if let Some(growths) = &self.growths
-            && len > self.file.len()?
-        {
-            growths.fetch_add(1, Ordering::SeqCst);
-        }
         self.file.set_len(len)
     }
 

@@ -754,15 +754,12 @@ mod tests {
         let batches = Arc::new(Batches::default());
         assert!(store.set_observer(batches.clone()));
         let before = vfs.syncs();
-        let grown = vfs.growths();
         for n in 1..=10 {
             deferred(&store, Tid(n), Oid(n), b"pickle")
                 .finish()
                 .unwrap();
         }
-        // redb syncs the database file when it makes it longer. The batch
-        // itself does not sync.
-        assert_eq!(vfs.syncs() - before, vfs.growths() - grown);
+        assert_eq!(vfs.syncs(), before);
         assert_eq!(store.last_transaction(), Tid(10));
         assert_eq!(store.load(Oid(10)).unwrap(), (b"pickle".to_vec(), Tid(10)));
         // A batch without a sync and `Store::sync` call no observer method.
