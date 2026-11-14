@@ -61,7 +61,20 @@ In the enhanced mode, the search of a set holds the read of the hits and the mer
 
 The slowest call of `listing` and of `selective` is a single call each time, of another word in each run: the load of the machine. Their means fell (enhanced `listing` from 8.75 to 6.51 ms, compat `listing` from 10.24 to 7.15 ms).
 
-GATE_RUN
+The scenario `text` of `just bench catalog` on `catalog-1m`, through `zoe serve`, p99 in ms: the gate run of phase 6 at `56030a82`, and a run of the fix on a clean tree, on the same machine, without a resource wrapper.
+
+| Mode | Cell | alone | listing | selective | sort | listing_sort |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| enhanced | c1, gate | 18.0 | 19.2 | 11.1 | 47.9 | 40.6 |
+| enhanced | c1, fix | 11.0 | 14.9 | 7.3 | 12.9 | 18.0 |
+| enhanced | c16, gate | 46.9 | 68.9 | 37.6 | 107.5 | 85.7 |
+| enhanced | c16, fix | 31.3 | 37.0 | 23.6 | 40.2 | 40.1 |
+| compat | c1, gate | 20.6 | 20.8 | 3.8 | 80.8 | 72.4 |
+| compat | c1, fix | 12.8 | 19.2 | 3.8 | 19.3 | 17.9 |
+| compat | c16, gate | 53.4 | 53.3 | 10.1 | 232.9 | 258.0 |
+| compat | c16, fix | 42.0 | 45.5 | 10.7 | 44.1 | 69.4 |
+
+Each variant meets 20 ms at p99 at concurrency 1 in both modes. The p50 of the sorted variants is 8.6 to 9.8 ms; their p99 in the compatibility mode stays close to the line (19.3 ms for `sort`, 11.5 ms for the same variant after the commits of the run).
 
 ## Limits
 
