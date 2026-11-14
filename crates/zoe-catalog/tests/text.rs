@@ -1394,7 +1394,8 @@ fn a_clause_of_another_form_is_malformed() {
         ("rn", Wire::Int(0)),
     ]);
     assert!(site.mirrors.query_wire(site.catalog, now, &plan).is_err());
-    // The compatibility mode is not served.
+    // The compatibility mode is served: an index in `cl` with no staged
+    // text has no hit.
     let compat = map(vec![
         ("mode", s("compat")),
         ("language", strs(&["en"])),
@@ -1409,7 +1410,7 @@ fn a_clause_of_another_form_is_malformed() {
         &q,
         &Wire::Nil,
     );
-    assert!(matches!(found, Err(CallError::Unsupported(_))));
+    assert!(matches!(found, Ok(Ok(hits)) if hits.rids.is_empty()));
 }
 
 #[test]
@@ -1494,6 +1495,70 @@ fn a_glob_matches_the_analysed_and_the_folded_literal_part() {
         site.rids(now, &clause_of("Title", glob("doc*"))),
         BTreeSet::from([1, 2])
     );
+}
+
+/// The scores of the hits of the glob `pattern` on Title, by rid: in the
+/// index, and in the text overlay with `texts` staged again at the rids 1,
+/// 2 and on. The two give the same scores.
+fn glob_scores(site: &Site, texts: &[&str], pattern: &str) -> BTreeMap<i32, i32> {
+    let now = site.now();
+    let scores = |clause: &Wire| -> BTreeMap<i32, i32> {
+        let hits = site.query(now, clause, None).unwrap();
+        hits.rids.into_iter().zip(hits.scores).collect()
+    };
+    let indexed = scores(&clause_of("Title", glob(pattern)));
+    let st = (1..)
+        .zip(texts)
+        .map(|(rid, text)| staged("Title", rid, Some(text)))
+        .collect();
+    let overlaid = scores(&clause_with("Title", glob(pattern), vec![], st, Wire::Nil));
+    assert_eq!(indexed, overlaid, "{pattern}");
+    indexed
+}
+
+#[test]
+fn a_glob_finds_the_exact_stem_of_its_literal_and_not_the_other_words_of_the_stem() {
+    let site = Site::new("text-glob-exact-stem", &settings(&["en"]));
+    let mut words = vec!["run", "runs", "running", "runner", "runway"];
+    let ops: Vec<TextOp<'_>> = (1..)
+        .zip(&words)
+        .map(|(rid, word)| set("Title", rid, word))
+        .collect();
+    let tid = site.commit(&ops);
+    site.ready_at(tid);
+    // `running*` finds the stem `run` of `running` as an exact term, and
+    // the terms that start with `running`: not `runner` or `runway`.
+    let running = glob_scores(&site, &words, "running*");
+    assert_eq!(
+        running.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([1, 2, 3])
+    );
+    // `run*` finds each term that starts with `run`. The exact stem adds
+    // its BM25 score to the constant score of the glob, so the documents
+    // of the stem rank above those of the prefix alone.
+    let run = glob_scores(&site, &words, "run*");
+    assert_eq!(
+        run.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([1, 2, 3, 4, 5])
+    );
+    let stem = [run[&1], run[&2], run[&3]];
+    assert!(stem.iter().all(|s| *s > run[&4]), "{run:?}");
+    assert_eq!(run[&4], run[&5]);
+    // A term that starts with `running` and is not the stem: the prefix
+    // finds it, below the documents of the stem. The stem is in half of
+    // the documents, so its BM25 score alone is below the constant score.
+    words.push("runningboard");
+    let tid = site.commit(&[set("Title", 6, "runningboard")]);
+    site.ready_at(tid);
+    let running = glob_scores(&site, &words, "running*");
+    assert_eq!(
+        running.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([1, 2, 3, 6])
+    );
+    let stem = [running[&1], running[&2], running[&3]];
+    assert!(stem.iter().all(|s| *s > running[&6]), "{running:?}");
+    assert_eq!(running[&6], 1024);
+    assert!(running[&1] - running[&6] < running[&6], "{running:?}");
 }
 
 #[test]

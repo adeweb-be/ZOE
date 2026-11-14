@@ -26,7 +26,6 @@ from ZODB.POSException import (
     ReadConflictError,
     StorageError,
     UndoError,
-    Unsupported,
 )
 
 import zoe
@@ -254,14 +253,14 @@ def check_errors(storage, oid, rids, now):
     assert cleared["r"] == []
     with pytest.raises(ReadConflictError):
         settled(lambda: storage.text_query(oid, now, clause("Title", ["kalo"])))
-    # A clause of another form, and the compatibility mode.
+    # A clause of another form; the compatibility mode is served.
     with pytest.raises(ValueError):
         storage.text_query(oid, last, {"i": "Title"})
     compat = {"mode": "compat", "language": ["en"], "boosts": {}}
-    with pytest.raises(Unsupported):
-        storage.text_query(
-            oid, last, clause("Title", ["kalo"], cl=["Title"], set=compat)
-        )
+    reply = storage.text_query(
+        oid, last, clause("Title", ["kalo"], cl=["Title"], set=compat)
+    )
+    assert reply["r"] == []
 
 
 def test_zoe_storage_stages_and_queries_text_deltas(tmp_path):

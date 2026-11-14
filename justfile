@@ -284,6 +284,11 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
 # test storage, and compares their answers. It prints the counts by path,
 # by reason and side of the Python path and of the mismatches, and fails
 # when a mismatch occurs; the options that follow go to `bin/test`.
+# `just plone zoe catalog text` runs them so with the three ZCTextIndex
+# indexes of each site replaced by `ZoeTextIndex` indexes in the mode
+# compat (ZOE_PLONE_TEXT of zoe.plone.testing), and writes the texts of the
+# suites and their query log in target/plone/zoe/var/catalog-text, which
+# `just bench catalog replay --text` replays.
 # `just plone zoe backends` runs the suite of plone.locking
 # on the locking backend of zoe.plone, with the tests of zoe.plone; it
 # builds the `zoe` binary first, for the tests that start `zoe serve`.
@@ -554,10 +559,24 @@ plone scenario="zoe" command="start" *args:
             # summary adds them up. The suites pass or fail as with the
             # stock search, since the mode compare returns the stock result.
             set -- "${args[@]}"
+            # `text` replaces the ZCTextIndex indexes of each site with
+            # `ZoeTextIndex` indexes in the mode compat, and writes the
+            # texts and the query log of the probe of bench/plone for the
+            # replay of the text queries.
+            text=()
+            if [ "${1:-}" = text ]; then
+                shift
+                log="$target/zoe/var/catalog-text"
+                rm -rf "$log"
+                probe="{{ justfile_directory() }}/bench/plone/src/plonebench/probe"
+                text=(ZOE_PLONE_TEXT=compat ZOE_PLONE_TEXT_LOG="$log"
+                    PYTHONPATH="$probe${PYTHONPATH:+:$PYTHONPATH}")
+                echo "just plone: the texts and the query log of the suites go to $log"
+            fi
             counts="$target/zoe/var/catalog-counts.jsonl"
             rm -f "$counts"
             status=0
-            ZOE_PLONE_BACKENDS=catalog ZOE_PLONE_CATALOG_MODE=compare \
+            env "${text[@]}" ZOE_PLONE_BACKENDS=catalog ZOE_PLONE_CATALOG_MODE=compare \
                 ZOE_PLONE_CATALOG_COUNTS="$counts" \
                 "$target/zoe/bin/test" -s Products.CMFPlone \
                 -s plone.app.contenttypes -s plone.restapi "$@" || status=$?

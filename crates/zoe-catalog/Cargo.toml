@@ -11,6 +11,9 @@ publish.workspace = true
 [dependencies]
 # The plan, the reply and the overlay of `catalog_query` as msgpack values,
 # for the server and the native client.
+# The glob of the compatibility mode whose prefix is a regular expression
+# (feature `text`). tantivy already depends on it.
+regex = { version = "1", optional = true }
 rmpv.workspace = true
 roaring.workspace = true
 # The settings of the namespace `zoe.text` (feature `text`).
@@ -19,6 +22,8 @@ serde_json = { workspace = true, optional = true }
 tantivy = { workspace = true, optional = true }
 # The log of a damaged delta (feature `text`).
 tracing = { workspace = true, optional = true }
+# The NFKC of the splitter of the compatibility mode (feature `text`).
+unicode-normalization = { version = "0.1", optional = true }
 zoe-core.workspace = true
 zoe-pickle.workspace = true
 
@@ -29,7 +34,13 @@ zoe-pickle.workspace = true
 testing = ["zoe-pickle/testing"]
 # The native text index of each registered catalog, on tantivy (ADR 0060).
 # A build without it has no text index and links no tantivy.
-text = ["dep:tantivy", "dep:serde_json", "dep:tracing"]
+text = [
+    "dep:tantivy",
+    "dep:serde_json",
+    "dep:tracing",
+    "dep:regex",
+    "dep:unicode-normalization",
+]
 
 [dev-dependencies]
 serde_json.workspace = true

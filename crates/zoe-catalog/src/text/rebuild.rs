@@ -91,7 +91,7 @@ pub struct Rebuilt {
 
 /// The catalogs whose text index a rebuild writes, with their settings, in
 /// the order of their oids: each registered catalog whose settings in
-/// `zoe.text` name a text index in the enhanced mode. With `only`, that
+/// `zoe.text` name a text index. With `only`, that
 /// catalog alone.
 ///
 /// Settings that do not read fail the call, as does an `only` that names
@@ -107,7 +107,7 @@ pub fn catalogs(store: &Store, only: Option<u64>) -> Result<Vec<(u64, CatalogSet
         let settings = settings.map_err(|why| {
             format!("the catalog {catalog:#018x}: the settings of zoe.text: {why}")
         })?;
-        if !texts::layout_of(&settings).is_empty() {
+        if !settings.layout().is_empty() {
             out.push((catalog, settings));
         }
     }
@@ -115,7 +115,7 @@ pub fn catalogs(store: &Store, only: Option<u64>) -> Result<Vec<(u64, CatalogSet
         && out.is_empty()
     {
         return Err(format!(
-            "the catalog {catalog:#018x} is not registered, or has no text index in the enhanced mode"
+            "the catalog {catalog:#018x} is not registered, or has no text index"
         ));
     }
     Ok(out)
@@ -169,7 +169,7 @@ pub fn rebuild(
     let new = beside(&path, "new");
     let old = beside(&path, "old");
     clean(&path).map_err(|e| failed("the removal of a directory of a rebuild fails", &e))?;
-    let layout = texts::layout_of(settings);
+    let layout = settings.layout();
     let cancel = AtomicBool::new(false);
     // The store is open read-only, so no pack runs: a pack watermark
     // past the last tid is a damaged store.

@@ -969,7 +969,7 @@ impl Storage {
         let Some(mirrors) = self.mirrors() else {
             // The plan comes first, as on the path of the mirrors: a
             // malformed plan raises, an unknown key gives `plan`.
-            let fallback = match zoe_catalog::decode_plan(&plan) {
+            let fallback = match zoe_catalog::decode_ordered(&plan) {
                 Err(zoe_catalog::PlanError::Malformed(why)) => {
                     return Err(PyValueError::new_err(why));
                 }

@@ -20,6 +20,9 @@
 //!   names it.
 //! - `fuzzy` is the edit distance of fuzzy matching: 0, the default, turns
 //!   it off.
+//! - In the mode `compat`, the index has the words of the lexicon
+//!   `plone_lexicon`, whatever the language, and a query reads the index
+//!   alone: the languages, the boosts and `fuzzy` do not apply.
 //! - `indexed_attrs` is for `ZoeTextIndex`: the text index does not read it.
 //!
 //! A change of `mode` or `language`, or of the set of the indexes, starts a
@@ -38,8 +41,8 @@ pub const NAMESPACE: &str = "zoe.text";
 pub enum Mode {
     /// The analyzer of the language, the BM25 of tantivy and the boosts.
     Enhanced,
-    /// The words and the score of ZCTextIndex. This build does not serve
-    /// it: a query in this mode is `Unsupported`.
+    /// The words of the lexicon `plone_lexicon` and the score of
+    /// `OkapiIndex`: the results of ZCTextIndex.
     Compat,
 }
 
@@ -92,8 +95,12 @@ impl IndexSettings {
     }
 
     /// The indexes that a query on `index` reads, with their weights: the
-    /// index, then the indexes of `boosts`, each once.
+    /// index, then the indexes of `boosts`, each once. In the mode
+    /// `compat`, the index alone.
     pub fn read(&self, index: &str) -> Vec<(String, f32)> {
+        if self.mode == Mode::Compat {
+            return vec![(index.to_owned(), 1.0)];
+        }
         let own = self
             .boosts
             .iter()
@@ -170,11 +177,18 @@ impl CatalogSettings {
         serde_json::to_vec(&Json::Object(top)).expect("JSON")
     }
 
-    /// The layout of the tantivy index of these settings.
+    /// The layout of the tantivy index of these settings. An index in the
+    /// mode `compat` has one field, with no language.
     pub fn layout(&self) -> Layout {
         self.indexes
             .iter()
-            .map(|(name, s)| (name.clone(), s.mode, s.language.clone()))
+            .map(|(name, s)| {
+                let languages = match s.mode {
+                    Mode::Enhanced => s.language.clone(),
+                    Mode::Compat => Vec::new(),
+                };
+                (name.clone(), s.mode, languages)
+            })
             .collect()
     }
 }

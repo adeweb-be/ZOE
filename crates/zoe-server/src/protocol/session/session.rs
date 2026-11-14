@@ -376,8 +376,7 @@ impl Session {
     /// section 12): `text_query(catalog, tid, clause, filter)`. `catalog`
     /// and `tid` are 8 bytes; `filter` is nil or the rids as signed 32-bit
     /// big-endian ints. The call runs on the read pool, outside the
-    /// transaction. A clause of another form fails with `ValueError`, and
-    /// the compatibility mode with `Unsupported`.
+    /// transaction. A clause of another form fails with `ValueError`.
     fn text_query(&self, args: Args<'_>) -> Result<Value, Fault> {
         let [catalog, tid, clause, filter] = args.exactly::<4>()?;
         let (catalog, tid) = (u64_of(catalog)?, u64_of(tid)?);

@@ -4,8 +4,8 @@
 //! - `unavailable` and `too_large` raise `zoe.storage.Unavailable`, a
 //!   `StorageError`; `packed` and `cleared` raise `ReadConflictError`;
 //!   `corrupt` raises `StorageSystemError`.
-//! - A clause or a filter of another form raises `ValueError`, and the
-//!   compatibility mode raises `Unsupported`.
+//! - A clause or a filter of another form raises `ValueError`, and a call
+//!   that the text index does not serve raises `Unsupported`.
 //! - Each rid from Python goes through `zoe_core::check_rid`: a rid outside
 //!   the signed 32-bit range raises `ValueError`.
 

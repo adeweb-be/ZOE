@@ -27,6 +27,21 @@ the index: they install the backend and put the index into their own
 sites. `ZOE_PLONE_BACKENDS=security just plone zoe suites -s zoe.plone -t
 TestTheFixtureOfTheSuites` checks that the site of the fixture holds it.
 
+`ZOE_PLONE_TEXT=compat` (or `install(text="compat")`) replaces the
+ZCTextIndex indexes `SearchableText`, `Title` and `Description` of each
+Plone site that `Products.CMFPlone.factory.addPloneSite` creates with
+`ZoeTextIndex` indexes in the mode `compat` (ADR 0060, section 11), with
+`install_text` of `zoe.plone.textindex`, in the transaction that creates
+the site. It needs the backend `catalog` in `ZOE_PLONE_BACKENDS`. On the
+`DemoStorage` of a layer, each text query then sends the texts of the
+stack to the ZOE storage below, which answers from them alone. `just
+plone zoe catalog text` runs the suites so. With it, `ZOE_PLONE_TEXT_LOG`
+names a directory where each process writes what the replay of the text
+queries reads (`plonebench.catalog.text_replay`): the texts that each
+`ZoeTextIndex` stages, in `texts-<pid>.jsonl`, and the query log of the
+probe `plonebench_catalog` of the harness, in `catalog-<pid>.jsonl`. The
+probe must be on the path of the process.
+
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of
 `STARTUP`. zope.testrunner then sets up the layer before `STARTUP` and
@@ -57,8 +72,11 @@ the `zoe.testing.ZoeServer`. The server is the `zoe` binary that
 `ZOE_BINARY` names.
 """
 
+import json
+import os
 import shutil
 import tempfile
+import threading
 
 import transaction
 from plone.testing import Layer, zca, zodb
@@ -161,16 +179,32 @@ ZOE_STORAGE = ZoeStorage()
 ZOE_SERVE = ZoeServe()
 
 
-def install(zeo=None):
+#: The variable of the mode of the text indexes of the sites of the suites.
+TEXT = "ZOE_PLONE_TEXT"
+
+#: The variable of the directory of the documents and the searches of the
+#: suites, for the replay of the text queries.
+TEXT_LOG = "ZOE_PLONE_TEXT_LOG"
+
+
+def install(zeo=None, text=None):
     """Make a ZOE storage the base storage of the Plone fixtures.
 
     Without `zeo`, the base is a `zoe.Storage` (`ZOE_STORAGE`). With `zeo`,
     as `host:port`, it is a ZEO client of the `zoe serve` at that address
-    (`ZOE_SERVE`). Return the layer.
+    (`ZOE_SERVE`). `text`, else `ZOE_PLONE_TEXT`, names the mode of the
+    `ZoeTextIndex` indexes that replace the ZCTextIndex indexes of each
+    new Plone site: `compat`. Return the layer.
     """
     from zoe.plone import backends_from_environment, properties, registry
 
     backends_from_environment()
+    text = text or os.environ.get(TEXT, "").strip() or None
+    if text is not None:
+        replace_text_indexes(text)
+    log = os.environ.get(TEXT_LOG, "").strip()
+    if log:
+        record_texts(log)
     # plone.app.testing loads no ZCML of zoe.plone, so the layer installs
     # the guard of a stock registry and the patch of the mutable property
     # sheet, as configure.zcml does in an instance.
@@ -185,6 +219,89 @@ def install(zeo=None):
     if layer not in startup.__bases__:
         startup.__bases__ = (layer, *startup.__bases__)
     return layer
+
+
+def replace_text_indexes(mode):
+    """Make each Plone site that `addPloneSite` creates hold `ZoeTextIndex`
+    indexes in the mode `mode` in the place of its ZCTextIndex indexes,
+    with `install_text`, in the transaction that creates the site. A
+    second call changes only the mode."""
+    from Products.CMFPlone import factory
+
+    from zoe.plone import catalog, textindex
+
+    if not catalog.installed():
+        raise RuntimeError(
+            f"{TEXT} needs the backend catalog: add catalog to ZOE_PLONE_BACKENDS"
+        )
+    textindex._mode(mode)
+    original = getattr(factory.addPloneSite, "_zoe_original", factory.addPloneSite)
+
+    def addPloneSite(*args, **kwargs):
+        site = original(*args, **kwargs)
+        # The new objects of the site get their database, so the indexes
+        # can stage their texts there.
+        transaction.savepoint(optimistic=True)
+        textindex.install_text(site.portal_setup, mode=mode)
+        _register_query_parser()
+        return site
+
+    addPloneSite._zoe_original = original
+    factory.addPloneSite = addPloneSite
+
+
+def _register_query_parser():
+    """Register the query parser of plone.restapi for `ZoeTextIndex`, as
+    `text.zcml` does. The layers load no ZCML of zoe.plone, and the
+    cleanup layer of plone.testing clears the global registry. So the
+    registration goes into the registry that the layer which creates the
+    site pushed. Do nothing without plone.restapi."""
+    try:
+        from plone.restapi.search.query import ZCTextIndexQueryParser
+    except ImportError:
+        return
+    from zope.component import provideAdapter
+    from zope.interface import Interface
+
+    from zoe.plone.textindex import ZoeTextIndex
+
+    provideAdapter(ZCTextIndexQueryParser, (ZoeTextIndex, Interface, Interface))
+
+
+_text_log = {}
+
+
+def record_texts(directory):
+    """Write the texts that each `ZoeTextIndex` stages, and the query log of
+    the probe `plonebench_catalog`, under `directory`, for the replay of
+    the text queries. Each text is one JSON line `{"i": index, "t": text}`.
+    A second call does nothing."""
+    from zoe.plone import textindex
+
+    if _text_log:
+        return
+    os.makedirs(directory, exist_ok=True)
+    pid = os.getpid()
+    try:
+        import plonebench_catalog
+    except ImportError as e:
+        raise RuntimeError(
+            f"{TEXT_LOG} needs the probe plonebench_catalog on the path"
+        ) from e
+    plonebench_catalog.install(os.path.join(directory, f"catalog-{pid}.jsonl"))
+    out = open(os.path.join(directory, f"texts-{pid}.jsonl"), "a", buffering=1)
+    lock = threading.Lock()
+    stage = textindex._Deltas.set
+
+    def staging(self, catalog, index, rid, language, text):
+        if text is not None:
+            line = json.dumps({"i": index, "t": text}, ensure_ascii=False)
+            with lock:
+                out.write(line + "\n")
+        return stage(self, catalog, index, rid, language, text)
+
+    textindex._Deltas.set = staging
+    _text_log["out"] = out
 
 
 class ZoeSite(Layer):
