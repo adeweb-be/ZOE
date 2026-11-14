@@ -697,6 +697,19 @@ plone scenario="zoe" command="start" *args:
 # of the mismatches, never a value; it fails on a mismatch. It needs
 # `just plone zoeclient build`, builds `zoe` in release first and holds
 # the bench lock.
+# `just bench catalog plans [--fixture NAME] [--log LOG...]` makes the
+# plans of a catalog fixture, `catalog-1m` by default, once, in a Zope
+# process: its ZoeTextIndex indexes and their text deltas, the registration
+# key of its catalog, the plans of its query set, of the logs and of its
+# path queries, the writes of the run, and its text index in each mode. It
+# writes plans.msgpack beside the manifest. `just bench catalog` runs
+# `zoe-bench catalog` with the scenarios cold, intersect, mix and text on a
+# copy of that fixture through zoe serve, and writes the JSON result and
+# the Markdown report to target/bench/catalog/<started>.json and .md;
+# `just bench catalog SCENARIO` runs one scenario: cold, intersect, mix,
+# text or text-rebuild. Other options go to `zoe-bench catalog`, such as
+# `--catalog-memory 8GB`. Each builds `zoe` and `zoe-bench` in release first
+# and holds the bench lock.
 # `just bench replay RUN` runs the log replay of bench/replay (B6): the
 # transactions of the store that the B5 run RUN kept (`--keep-store` on
 # zeo), against ZEO and against zoe serve, in the interpreter of the
@@ -722,7 +735,8 @@ plone scenario="zoe" command="start" *args:
 # ZOE_BENCH_LOCK (target/bench/bench.lock by default), from before its
 # build to its end, so one benchmark runs at a time: `run`, `native`,
 # `client`, `load`, `saturate`, `plone prepare`, `plone run`,
-# `plone campaign`, `catalog prepare` and `replay RUN`. The showcase takes it for each of its
+# `plone campaign`, `catalog prepare`, `catalog plans`, `catalog` with its
+# scenarios, and `replay RUN`. The showcase takes it for each of its
 # runs. A child command of a holder takes it through the open file that
 # ZOE_BENCH_LOCK_FD names, so it does not wait for its parent. The tests,
 # the reports, `gate`, `index` and `publish` take no lock.
@@ -777,7 +791,10 @@ bench *args="run":
         "shootout run "* | "shootout client run" | "shootout native run" | zoe-bench\ *) lock=true ;;
         "shootout profile terms" | "shootout profile loop") lock=true ;;
         "plone prepare "* | "plone run "* | "plone campaign "* | "plone loadpath "*) lock=true ;;
-        "plone catalog prepare" | "plone catalog replay") lock=true ;;
+        "plone catalog prepare" | "plone catalog replay" | "plone catalog plans") lock=true ;;
+        "plone catalog " | "plone catalog run" | "plone catalog -"*) lock=true ;;
+        "plone catalog cold" | "plone catalog intersect" | "plone catalog mix") lock=true ;;
+        "plone catalog text" | "plone catalog text-rebuild") lock=true ;;
         "replay test "* | "replay report "*) lock=false ;;
         replay\ *) lock=true ;;
         *) lock=false ;;
@@ -815,6 +832,15 @@ _bench-plone *args:
         "prepare "* | "run "* | "campaign "* | "serve "* | "loadpath "* | "catalog prepare" | "catalog replay")
             ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
             export ZOE_BINARY
+            ;;
+        "catalog " | "catalog run" | "catalog plans" | "catalog -"* | "catalog cold" | "catalog intersect" | "catalog mix" | "catalog text" | "catalog text-rebuild")
+            ZOE_BINARY="${ZOE_BINARY:-$(just _zoe release)}"
+            export ZOE_BINARY
+            if [ -z "${ZOE_BENCH_BINARY:-}" ]; then
+                cargo build --release --locked -p zoe-bench --bin zoe-bench >&2
+                ZOE_BENCH_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe-bench"
+            fi
+            export ZOE_BENCH_BINARY
             ;;
     esac
     if [ "${1:-}" = loadpath ]; then

@@ -6,6 +6,15 @@
     python -m plonebench.catalog inventory LOG... [--json FILE]
     python -m plonebench.catalog replay LOG... STORE [--legs inprocess,serve]
     python -m plonebench.catalog replay --text DIR... [--legs inprocess,serve]
+    python -m plonebench.catalog plans [--fixture NAME] [--log LOG...] [--expect]
+        [--catalog-memory SIZE] [--rows N]
+    python -m plonebench.catalog [run] [--fixture NAME] [ZOE-BENCH OPTIONS...]
+    python -m plonebench.catalog SCENARIO [--fixture NAME] [ZOE-BENCH OPTIONS...]
+
+`run`, the default, runs `zoe-bench catalog` with its default scenarios on
+a copy of the fixture, `catalog-1m` by default; a SCENARIO (cold,
+intersect, mix, text or text-rebuild) runs that scenario alone. The other
+options go to `zoe-bench catalog`.
 
 `just bench catalog ...` runs it in the environment of bench/plone.
 """
@@ -21,8 +30,16 @@ from plonebench.catalog import fixture, plan
 
 
 def main(argv: list[str] | None = None) -> int:
-    from plonebench.catalog import replay
+    from plonebench.catalog import plans, replay
 
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if (
+        not argv
+        or argv[0] == "run"
+        or argv[0] in plans.SCENARIOS
+        or argv[0].startswith("-")
+    ):
+        return _run(argv)
     defaults = replay.Settings()
     parser = argparse.ArgumentParser(prog="plonebench.catalog")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -68,7 +85,15 @@ def main(argv: list[str] | None = None) -> int:
         " `just plone zoe catalog text`, against ZCTextIndex",
     )
     replaying.add_argument("--json", help="also write the report to this file")
-    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    making = commands.add_parser(
+        "plans", help="make the plans of a fixture for zoe-bench catalog"
+    )
+    making.add_argument("--fixture", help="the name of the fixture")
+    making.add_argument("--log", nargs="*", default=[], help="query logs")
+    making.add_argument("--expect", action="store_true")
+    making.add_argument("--catalog-memory", default=None)
+    making.add_argument("--rows", type=int, default=None)
+    args = parser.parse_args(argv)
     if args.command == "prepare":
         spec = plan.PRESETS[args.preset]
         if args.seed is not None:
@@ -88,12 +113,51 @@ def main(argv: list[str] | None = None) -> int:
             with open(args.json, "w") as out:
                 json.dump(found, out, indent=1)
         return 0
+    if args.command == "plans":
+        target = fixture.fixture_dir(args.fixture or plans.default_fixture())
+        out = plans.make(
+            target,
+            args.log,
+            expect=args.expect,
+            catalog_memory=args.catalog_memory,
+            rows=args.rows,
+        )
+        print(out)
+        return 0
     if args.command == "replay" and args.text:
         return _replay_text(args)
     if args.command == "replay":
         return _replay(args)
     for line in fixture.fixtures():
         print(line)
+    return 0
+
+
+def _run(argv: list[str]) -> int:
+    """`run` or a scenario alone: the options of `zoe-bench catalog`, and
+    `--fixture NAME`."""
+    from plonebench.catalog import plans
+
+    if argv and argv[0] == "run":
+        argv = argv[1:]
+    args = []
+    if argv and argv[0] in plans.SCENARIOS:
+        args += ["--scenario", argv[0]]
+        argv = argv[1:]
+    name = None
+    rest = iter(argv)
+    for arg in rest:
+        if arg == "--fixture":
+            name = next(rest, None)
+        elif arg.startswith("--fixture="):
+            name = arg.split("=", 1)[1]
+        else:
+            args.append(arg)
+    try:
+        plans.run(name, args)
+    except (FileNotFoundError, RuntimeError) as error:
+        print(f"plonebench.catalog: {error}", file=sys.stderr)
+        return 1
     return 0
 
 
