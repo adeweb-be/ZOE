@@ -113,6 +113,7 @@
   - [The native text index on tantivy, its delta record type, and the compatibility with ZCTextIndex](spikes/text-index.md)
   - [Text queries with a sort, and the filter of every row](findings/text-queries-with-a-sort.md)
   - [The incremental security index](spikes/security-index.md)
+  - [The tail of the five-index intersection is the range of `generic-numbers`](findings/intersection-tail.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
   - [zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)

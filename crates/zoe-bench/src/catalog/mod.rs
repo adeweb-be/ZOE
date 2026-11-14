@@ -14,9 +14,10 @@
 //!   the time to the first answer of the text index, and the delay of the
 //!   invalidations of commits during the build.
 //! - `intersect`: the five-index intersections with a sort of the fixture,
-//!   warm, at concurrency 1 and 16 (G2); and a full page of brains, with
-//!   all the columns, without the date columns and without rows, with the
-//!   time that a client takes to decode and encode the reply.
+//!   warm, at concurrency 1 and 16 (G2), with the numbers of each query by
+//!   name; and a full page of brains, with all the columns, without the
+//!   date columns and without rows, with the time that a client takes to
+//!   decode and encode the reply.
 //! - `mix`: the plans of the query log at concurrency 1, 4 and 16, warm,
 //!   with the native share of the log; then the path queries before and
 //!   after the writes of the plans file, which give many overridden rows,
@@ -726,14 +727,30 @@ impl Runner {
 
     async fn intersect(&mut self) -> Result<Json, RunError> {
         let catalog = self.plans.catalog;
-        let calls = self.calls("intersect");
+        let (names, calls): (Vec<String>, Vec<Call>) = self
+            .plans
+            .of("intersect")
+            .into_iter()
+            .filter_map(|q| Some((q.name.clone(), Call::Query(q.plan.clone()?))))
+            .unzip();
         let pace = self.pace();
         let session = self.session().await?;
         cells::once(&session.cells()[0], catalog, &calls).await;
         let mut out = Vec::new();
         for concurrency in [1, 16] {
             let name = format!("c{concurrency}");
-            out.push(cells::run(&name, session.cells(), catalog, &calls, concurrency, pace).await);
+            out.push(
+                cells::run_by_query(
+                    &name,
+                    session.cells(),
+                    catalog,
+                    &calls,
+                    &names,
+                    concurrency,
+                    pace,
+                )
+                .await,
+            );
         }
         let page = self.page().await?;
         Ok(json!({"cells": out, "page": page}))

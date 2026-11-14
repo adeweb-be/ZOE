@@ -97,12 +97,33 @@ pub struct Cell {
     pub refusals: BTreeMap<String, u64>,
     /// The replies `e` by kind, and the calls that failed (`call`).
     pub errors: BTreeMap<String, u64>,
+    /// The numbers of each query, by name, in the order of the calls: for
+    /// a cell of `run_by_query` only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_query: Vec<QuerySpread>,
+}
+
+/// The numbers of the answers of one query of a cell.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct QuerySpread {
+    /// The name of the query.
+    pub name: String,
+    /// The answers.
+    pub count: u64,
+    /// The median latency of an answer, in seconds.
+    pub p50_seconds: Option<f64>,
+    /// The 99th percentile.
+    pub p99_seconds: Option<f64>,
+    /// The longest.
+    pub max_seconds: Option<f64>,
 }
 
 /// The tally of the calls of one connection.
 #[derive(Default)]
 struct Tally {
     latencies: Vec<u64>,
+    /// The latencies of the answers of each call, by the index of the call.
+    by_call: BTreeMap<usize, Vec<u64>>,
     sent: u64,
     refusals: BTreeMap<String, u64>,
     errors: BTreeMap<String, u64>,
@@ -111,6 +132,9 @@ struct Tally {
 impl Tally {
     fn add(&mut self, other: Tally) {
         self.latencies.extend(other.latencies);
+        for (k, ns) in other.by_call {
+            self.by_call.entry(k).or_default().extend(ns);
+        }
         self.sent += other.sent;
         for (k, n) in other.refusals {
             *self.refusals.entry(k).or_default() += n;
@@ -120,12 +144,13 @@ impl Tally {
         }
     }
 
-    fn note(&mut self, outcome: Result<Value, ClientError>, elapsed: Duration) {
+    fn note(&mut self, call: usize, outcome: Result<Value, ClientError>, elapsed: Duration) {
         self.sent += 1;
         match outcome.as_ref().map(answer) {
             Ok(Answer::Answered) => {
-                self.latencies
-                    .push(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+                let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+                self.latencies.push(ns);
+                self.by_call.entry(call).or_default().push(ns);
             }
             Ok(Answer::Refused(reason)) => *self.refusals.entry(reason).or_default() += 1,
             Ok(Answer::Failed(kind)) => *self.errors.entry(kind).or_default() += 1,
@@ -154,7 +179,36 @@ impl Tally {
             },
             refusals: self.refusals,
             errors: self.errors,
+            by_query: Vec::new(),
         }
+    }
+
+    /// The numbers of each name of `names`, the name of each call, in the
+    /// order of their first call.
+    fn by_query(&self, names: &[String]) -> Vec<QuerySpread> {
+        let mut order: Vec<&String> = Vec::new();
+        let mut latencies: BTreeMap<&String, Vec<u64>> = BTreeMap::new();
+        for (k, name) in names.iter().enumerate() {
+            if !latencies.contains_key(name) {
+                order.push(name);
+            }
+            let ns = latencies.entry(name).or_default();
+            ns.extend(self.by_call.get(&k).into_iter().flatten());
+        }
+        order
+            .into_iter()
+            .map(|name| {
+                let mut ns = latencies.remove(name).unwrap_or_default();
+                ns.sort_unstable();
+                QuerySpread {
+                    name: name.clone(),
+                    count: ns.len() as u64,
+                    p50_seconds: percentile(&ns, 0.50),
+                    p99_seconds: percentile(&ns, 0.99),
+                    max_seconds: percentile(&ns, 1.0),
+                }
+            })
+            .collect()
     }
 }
 
@@ -180,8 +234,38 @@ pub async fn run(
     concurrency: usize,
     pace: Pace,
 ) -> Cell {
+    let (tally, seconds) = measure(clients, catalog, calls, concurrency, pace).await;
+    tally.cell(name, concurrency, seconds)
+}
+
+/// `run`, with the numbers of each query: `names` gives the name of each
+/// call.
+pub async fn run_by_query(
+    name: &str,
+    clients: &[Arc<Client>],
+    catalog: Oid,
+    calls: &[Call],
+    names: &[String],
+    concurrency: usize,
+    pace: Pace,
+) -> Cell {
+    let (tally, seconds) = measure(clients, catalog, calls, concurrency, pace).await;
+    let by_query = tally.by_query(names);
+    Cell {
+        by_query,
+        ..tally.cell(name, concurrency, seconds)
+    }
+}
+
+async fn measure(
+    clients: &[Arc<Client>],
+    catalog: Oid,
+    calls: &[Call],
+    concurrency: usize,
+    pace: Pace,
+) -> (Tally, f64) {
     if calls.is_empty() {
-        return Tally::default().cell(name, concurrency, 0.0);
+        return (Tally::default(), 0.0);
     }
     let calls: Arc<[Call]> = calls.to_vec().into();
     let start = Instant::now();
@@ -198,11 +282,11 @@ pub async fn run(
                 let least = pace.rounds * calls.len();
                 let mut n = 0;
                 while n < least || Instant::now() < deadline {
-                    let call = &calls[(i + n) % calls.len()];
+                    let k = (i + n) % calls.len();
                     let tid = pace.tid.unwrap_or_else(|| last(&client));
                     let sent = Instant::now();
-                    let outcome = send(&client, catalog, tid, call).await;
-                    tally.note(outcome, sent.elapsed());
+                    let outcome = send(&client, catalog, tid, &calls[k]).await;
+                    tally.note(k, outcome, sent.elapsed());
                     n += 1;
                 }
                 tally
@@ -213,8 +297,7 @@ pub async fn run(
     for task in tasks {
         total.add(task.await.expect("a task of a cell panicked"));
     }
-    let seconds = start.elapsed().as_secs_f64();
-    total.cell(name, concurrency, seconds)
+    (total, start.elapsed().as_secs_f64())
 }
 
 /// Send each call once on `client`, as a warm-up. Return the replies.
@@ -244,10 +327,10 @@ mod tests {
         };
         let mut tally = Tally::default();
         let ms = Duration::from_millis(1);
-        tally.note(Ok(reply("f", "not_ready")), ms);
-        tally.note(Ok(reply("e", "unavailable")), ms);
-        tally.note(Ok(reply("n", "")), ms);
-        tally.note(Err(ClientError::Disconnected), ms);
+        tally.note(0, Ok(reply("f", "not_ready")), ms);
+        tally.note(0, Ok(reply("e", "unavailable")), ms);
+        tally.note(1, Ok(reply("n", "")), ms);
+        tally.note(1, Err(ClientError::Disconnected), ms);
         let cell = tally.cell("c", 1, 1.0);
         assert_eq!((cell.queries, cell.answered), (4, 1));
         assert_eq!(cell.refusals["not_ready"], 1);
@@ -255,5 +338,21 @@ mod tests {
         assert_eq!(cell.errors["call"], 1);
         assert_eq!(cell.p99_seconds, Some(0.001));
         assert_eq!(cell.qps, 1.0);
+    }
+
+    #[test]
+    fn the_numbers_of_each_query_follow_its_name() {
+        let ms = |n: u64| Duration::from_millis(n);
+        let mut tally = Tally::default();
+        tally.note(0, Ok(Value::Map(vec![])), ms(1));
+        tally.note(1, Ok(Value::Map(vec![])), ms(5));
+        tally.note(2, Ok(Value::Map(vec![])), ms(3));
+        let names = ["b".to_owned(), "a".to_owned(), "b".to_owned()];
+        let queries = tally.by_query(&names);
+        let got: Vec<(&str, u64, Option<f64>)> = queries
+            .iter()
+            .map(|q| (q.name.as_str(), q.count, q.max_seconds))
+            .collect();
+        assert_eq!(got, [("b", 2, Some(0.003)), ("a", 1, Some(0.005))]);
     }
 }

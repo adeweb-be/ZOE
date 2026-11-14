@@ -42,7 +42,23 @@
         "max_seconds": { "description": "The longest of the same latencies.", "$ref": "#/$defs/seconds" },
         "qps": { "description": "The answered queries per second of the cell.", "type": "number", "minimum": 0 },
         "refusals": { "description": "The replies f, by reason.", "$ref": "#/$defs/reasons" },
-        "errors": { "description": "The replies e by kind, and the calls that failed as call.", "$ref": "#/$defs/reasons" }
+        "errors": { "description": "The replies e by kind, and the calls that failed as call.", "$ref": "#/$defs/reasons" },
+        "by_query": {
+          "description": "The answers of each query of the cell, by name, in the order of the calls: in the cells of the scenario intersect.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "count", "p50_seconds", "p99_seconds", "max_seconds"],
+            "properties": {
+              "name": { "description": "The name of the query in the query set.", "type": "string", "minLength": 1 },
+              "count": { "description": "The answers of the query.", "$ref": "#/$defs/count" },
+              "p50_seconds": { "description": "The median latency of its answers.", "$ref": "#/$defs/seconds" },
+              "p99_seconds": { "description": "The 99th percentile of the same latencies.", "$ref": "#/$defs/seconds" },
+              "max_seconds": { "description": "The longest of the same latencies.", "$ref": "#/$defs/seconds" }
+            }
+          }
+        }
       }
     },
     "cells": { "type": "array", "items": { "$ref": "#/$defs/cell" } },
