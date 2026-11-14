@@ -498,6 +498,9 @@ fn each_scenario_runs_and_gives_its_numbers() {
     );
     let doc: Json = serde_json::from_slice(&output.stdout).expect("the result is JSON");
 
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["settings"]["seconds"], 0.2);
+    assert_eq!(doc["settings"]["text_commits"], 3);
     assert_eq!(doc["catalog"]["name"], "catalog-test");
     assert_eq!(doc["catalog"]["preset"], "custom");
     assert_eq!(doc["catalog"]["counts"]["size"], ENTRIES);

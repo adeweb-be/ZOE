@@ -58,6 +58,9 @@ use server::{Launch, Server};
 /// `xlarge`, as ADR 0059 states it (decision 1): 1.5 GB.
 pub const ADR_LINE_BYTES: u64 = 1_500_000_000;
 
+/// The version of the form of the result document.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// The connections of a session: the most of a cell.
 const CONNECTIONS: usize = 16;
 
@@ -493,7 +496,9 @@ pub async fn run(settings: Settings, plans: Plans) -> Result<Json, RunError> {
     let scrapes = runner.scrapes.lock().expect("scrapes").clone();
     let mirror = runner.server["mirror_bytes"].as_f64();
     let plans = &runner.plans;
+    let settings = &runner.settings;
     Ok(json!({
+        "schema_version": SCHEMA_VERSION,
         "machine": machine,
         "run": {"started": run.started, "commit": run.commit, "dirty": runner.settings.dirty},
         "catalog": {"name": plans.name, "preset": plans.preset, "counts": plans.counts},
@@ -506,6 +511,15 @@ pub async fn run(settings: Settings, plans: Plans) -> Result<Json, RunError> {
             "peak_rss_bytes": runner.server["peak_rss_bytes"],
             "adr_0059_line_bytes": ADR_LINE_BYTES,
             "over_adr_line": mirror.map(|b| b > ADR_LINE_BYTES as f64),
+        },
+        "settings": {
+            "seconds": settings.seconds,
+            "rounds": settings.rounds,
+            "ready_timeout_seconds": settings.ready_timeout.as_secs_f64(),
+            "text_commits": settings.text_commits,
+            "text_batch": settings.text_batch,
+            "text_pause_seconds": settings.text_pause.as_secs_f64(),
+            "rebase_seconds": settings.rebase_seconds,
         },
         "metrics": {
             "interval_seconds": SCRAPE_INTERVAL.as_secs_f64(),

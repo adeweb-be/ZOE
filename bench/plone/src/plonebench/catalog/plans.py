@@ -79,6 +79,15 @@ def rename_rows(entries: int) -> int:
     return RENAME_ROWS_1M if entries >= 1_000_000 else max(50, entries // 40)
 
 
+def preset_of(manifest: dict) -> str:
+    """The preset whose spec equals the spec of the fixture, else
+    `custom`: a fixture of a preset with another seed is `custom`."""
+    for name, spec in plan.PRESETS.items():
+        if spec.to_json() == plan.CatalogSpec.from_json(manifest["spec"]).to_json():
+            return name
+    return "custom"
+
+
 def zope_conf(home: Path, store: Path, catalog_memory: str | None) -> str:
     """The zope.conf of the step: the zoeclient scenario on the store in
     the process, with the backend `catalog` in the mode `on`."""
@@ -152,7 +161,7 @@ def make(
     spec = plan.CatalogSpec.from_json(manifest["spec"])
     settings = {
         "name": target.name,
-        "preset": manifest.get("preset") or "custom",
+        "preset": preset_of(manifest),
         "counts": manifest["counts"],
         "spec": manifest["spec"],
         "queries": manifest["queries"],
