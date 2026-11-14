@@ -112,6 +112,7 @@
   - [The catalog mirror, built from the index trees of a catalog of one million entries](spikes/catalog-mirror.md)
   - [The native text index on tantivy, its delta record type, and the compatibility with ZCTextIndex](spikes/text-index.md)
   - [The incremental security index](spikes/security-index.md)
+  - [The tail of the five-index intersection is the range of `generic-numbers`](findings/intersection-tail.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
   - [zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)
