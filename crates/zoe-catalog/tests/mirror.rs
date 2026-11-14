@@ -813,6 +813,56 @@ fn generic_numbers_tests_the_key_of_each_row_of_the_other_clauses() {
     mirrors.stop();
 }
 
+/// A result set with more rows than the range has keys, but fewer rows than
+/// the postings of those keys: the range tests the key of each row of the
+/// set, and gives the rows that each clause alone gives.
+#[test]
+fn a_range_of_large_postings_tests_the_key_of_each_row_of_the_other_clauses() {
+    let (_store, mirrors, catalog, tid, _data) = zcatalog_store(Config::default());
+    let clause = |index: &str, keys: Vec<Val>, range: Option<(Option<Val>, Option<Val>)>| {
+        zoe_catalog::Clause {
+            index: index.into(),
+            keys,
+            and: false,
+            range,
+            not: Vec::new(),
+        }
+    };
+    let s = |text: &str| Val::Str(text.into());
+    let state = clause("review_state", vec![s("published")], None);
+    let titles = clause(
+        "sortable_title",
+        Vec::new(),
+        Some((Some(s("beta")), Some(s("zeta zeta")))),
+    );
+    let rids = |clauses: Vec<zoe_catalog::Clause>| {
+        let plan = Plan {
+            clauses,
+            ..Plan::default()
+        };
+        let reply = mirrors.query(catalog, tid + 1, &plan).unwrap();
+        (reply.rids, reply.trace)
+    };
+    let (by_state, _) = rids(vec![state.clone()]);
+    let (by_title, alone) = rids(vec![titles.clone()]);
+    assert_eq!(alone.range_by_keys, 1);
+    // The titles are two of 8 words. The range holds the titles whose first
+    // word is not "alpha": 56 keys. It has fewer keys than the result set,
+    // and more rows.
+    let keys = 7 * 8;
+    assert!(by_state.len() > keys && by_state.len() < by_title.len());
+    let (both, trace) = rids(vec![titles, state]);
+    assert_eq!((trace.range_by_rows, trace.range_by_keys), (1, 0));
+    let expected: Vec<i32> = by_state
+        .iter()
+        .copied()
+        .filter(|rid| by_title.contains(rid))
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(both, expected);
+    mirrors.stop();
+}
+
 #[test]
 fn a_new_root_of_a_mirrored_tree_makes_the_mirror_stale_and_it_builds_again() {
     let (gate, reached) = Gate::new();
