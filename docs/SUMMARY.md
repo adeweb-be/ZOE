@@ -88,6 +88,7 @@
   - [0059. The catalog mirror](adr/0059-the-catalog-mirror.md)
   - [0060. The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex](adr/0060-the-native-text-index.md)
   - [0061. The security index: the inherited inputs of `allowedRolesAndUsers`](adr/0061-the-security-index.md)
+  - [0062. The path prefetch: one call loads the chain of a path](adr/0062-the-path-prefetch.md)
 
 # Reference
 
@@ -115,6 +116,7 @@
   - [The incremental security index](spikes/security-index.md)
   - [The tail of the five-index intersection is the range of `generic-numbers`](findings/intersection-tail.md)
   - [The cold build of the mirror waits on the sort of the keys of `object_provides`](findings/cold-build.md)
+  - [A prefetch of the chain of a path saves 2 to 5 % of a cold Plone request](findings/path-prefetch.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
   - [zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)

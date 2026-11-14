@@ -64,3 +64,4 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0059](0059-the-catalog-mirror.md) | The catalog mirror: a base built from the index trees, a change set per commit, and `catalog_query` | accepted | |
 | [0060](0060-the-native-text-index.md) | The native text index: the text deltas, ZOE format 4, tantivy and ZoeTextIndex | accepted | |
 | [0061](0061-the-security-index.md) | The security index: the inherited inputs of `allowedRolesAndUsers` | accepted | |
+| [0062](0062-the-path-prefetch.md) | The path prefetch: one call loads the chain of a path | proposed | |
