@@ -243,11 +243,9 @@ fn a_conversion_syncs_once_per_batch() {
     assert!(report.problems.is_empty(), "{report:?}");
     assert_eq!((report.transactions, report.copied), (COUNT, COUNT));
     assert_eq!(store.last_transaction(), *tids.last().unwrap());
-    // One sync for each batch, and a few more. redb syncs the file each
-    // time it grows it. A new file holds 72 KiB, and redb doubles it up to
-    // the size of this store, about 4 MiB: that is six growths.
+    // One sync for each batch, and a few more for the end.
     assert!(
-        taken <= COUNT / BATCH + 9,
+        taken <= COUNT / BATCH + 5,
         "{COUNT} transactions took {taken} syncs of the database file"
     );
 }
