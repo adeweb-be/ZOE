@@ -537,10 +537,7 @@ fn pass(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
 /// Read the registration keys and the settings, when a commit wrote them
 /// since the last read.
 fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
-    let generations = (
-        store.kv_generation(CATALOGS).map_or(0, |t| t.0),
-        store.kv_generation(NAMESPACE).map_or(0, |t| t.0),
-    );
+    let generations = generations(store);
     if shared.lock().generations == Some(generations) {
         return;
     }
@@ -632,6 +629,23 @@ fn read_settings(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, L
     inner.loaded = true;
     drop(inner);
     shared.changed.notify_all();
+}
+
+/// The tids of the last commits that wrote the registration keys and the
+/// settings.
+fn generations(store: &Store) -> (u64, u64) {
+    (
+        store.kv_generation(CATALOGS).map_or(0, |t| t.0),
+        store.kv_generation(NAMESPACE).map_or(0, |t| t.0),
+    )
+}
+
+/// Tell if no commit wrote the registration keys or the settings after
+/// the thread read them. Read the last tid of the store before this check:
+/// when it holds, the settings of the entries are those at that tid, and a
+/// snap can show that tid.
+fn settings_hold(shared: &Shared, store: &Store) -> bool {
+    shared.lock().generations == Some(generations(store))
 }
 
 /// The settings in `zoe.text` of each registered catalog that has them,
@@ -773,6 +787,11 @@ fn open_index(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live
                 first_pending: None,
                 cap,
             };
+            if !settings_hold(shared, store) {
+                // The settings changed: the next pass reads them first.
+                set_state(shared, catalog, TextState::Opening);
+                return;
+            }
             if publish(shared, catalog, &mut live, &settings).is_err() {
                 return;
             }
@@ -1066,6 +1085,14 @@ fn rebuild(
             return;
         }
     };
+    // The build read the last tid first. A commit up to that tid that
+    // wrote the settings shows in the generations: then the index can
+    // have another layout than the settings at its tid. The next pass
+    // reads the settings, then opens the index or builds it again.
+    if !settings_hold(shared, store) {
+        set_state(shared, catalog, TextState::Opening);
+        return;
+    }
     let reader = match index::reader(&built.index) {
         Ok(r) => r,
         Err(e) => {
@@ -1201,6 +1228,11 @@ fn follow(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
         rebuild_after_pack(shared, store, lives, catalog);
     }
     let target = shared.lock().target.min(store.last_transaction().0);
+    // A commit up to `target` that wrote the settings: the next pass reads
+    // them before an index takes a tid after it.
+    if !settings_hold(shared, store) {
+        return;
+    }
     let Some(from) = lives
         .values()
         .filter(|l| l.writer.is_some() && l.applied < target)

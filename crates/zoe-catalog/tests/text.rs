@@ -22,7 +22,7 @@ use serde_json::{Value as Json, json};
 use zoe_catalog::testing::{self, CatalogModel, IndexKind, TextOp};
 use zoe_catalog::text::clause::{self, TextHits};
 use zoe_catalog::text::{
-    CallError, CatalogSettings, IndexSettings, Query, Strategy, TextConfig, TextError,
+    CallError, CatalogSettings, IndexSettings, Mode, Query, Strategy, TextConfig, TextError,
     TextErrorKind, Want, engine,
 };
 use zoe_catalog::value::Val;
@@ -2208,4 +2208,107 @@ fn add_entries(m: &mut Mirrored, n: i32, first: i32) {
         s.is_some_and(|s| s.applied.is_some_and(|a| a >= tid))
     }));
     site.ready_at(tid);
+}
+
+/// The settings of `settings`, with each index in the mode `compat`.
+fn compat(languages: &[&str]) -> CatalogSettings {
+    let mut out = settings(languages);
+    for s in out.indexes.values_mut() {
+        s.mode = Mode::Compat;
+    }
+    out
+}
+
+/// Wait for the index to hold the deltas up to `tid`, and give the modes
+/// of the settings and of the fields of `Title` that a query at `tid`
+/// sees.
+fn modes_at(site: &Site, tid: u64) -> (Vec<Mode>, bool) {
+    site.ready_at(tid);
+    let texts = site.mirrors.texts().expect("the text indexes");
+    let snap = texts.snap(site.catalog, Some(tid)).expect("a snap");
+    let modes = snap.settings.indexes.values().map(|s| s.mode).collect();
+    (modes, snap.fields.is_compat("Title"))
+}
+
+#[test]
+fn a_change_of_the_settings_during_a_rebuild_builds_again() {
+    let mut site = Site::new("text-mode-rebuild", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo")]);
+    site.ready_at(t1);
+    // The rebuild of the mode `compat` starts, then a commit changes the
+    // mode back before the rebuild reads the last tid.
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let back = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let store = Arc::downgrade(&site.store);
+    let hooks = Hooks {
+        before_text_build: Some(Arc::new({
+            let armed = Arc::clone(&armed);
+            let back = Arc::clone(&back);
+            move |catalog| {
+                if armed.swap(false, Ordering::SeqCst)
+                    && let Some(store) = store.upgrade()
+                {
+                    let tid =
+                        testing::commit_text(&store, catalog, &[], Some(&settings(&["en"])), false)
+                            .unwrap();
+                    back.store(tid, Ordering::SeqCst);
+                }
+            }
+        })),
+        ..Hooks::default()
+    };
+    site.restart(hooks);
+    site.ready_at(t1);
+    armed.store(true, Ordering::SeqCst);
+    let t2 = testing::commit_text(
+        &site.store,
+        site.catalog,
+        &[],
+        Some(&compat(&["en"])),
+        false,
+    )
+    .unwrap();
+    site.mirrors.committed(t2);
+    let started = Instant::now();
+    while back.load(Ordering::SeqCst) == 0 {
+        assert!(started.elapsed() < WAIT, "the rebuild starts");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t3 = back.load(Ordering::SeqCst);
+    site.mirrors.committed(t3);
+    // At t3 the index has the settings of t3: the enhanced mode.
+    let (modes, is_compat) = modes_at(&site, t3);
+    assert_eq!(modes, [Mode::Enhanced; 4]);
+    assert!(!is_compat);
+}
+
+#[test]
+fn a_change_of_the_settings_during_a_pass_holds_the_tid_of_the_index() {
+    let mut site = Site::new("text-mode-follow", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo")]);
+    site.ready_at(t1);
+    // The open of the index reads the settings, then a commit changes the
+    // mode before the index follows the commits.
+    let gate = Gate::default();
+    let (tx, reached) = mpsc::channel();
+    let hooks = Hooks {
+        before_text_cap: Some(gate.hook(tx)),
+        ..Hooks::default()
+    };
+    site.restart(hooks);
+    reached.recv_timeout(WAIT).expect("the open starts");
+    let t2 = testing::commit_text(
+        &site.store,
+        site.catalog,
+        &[],
+        Some(&compat(&["en"])),
+        false,
+    )
+    .unwrap();
+    site.mirrors.committed(t2);
+    gate.release();
+    // At t2 the index has the settings of t2: the mode `compat`.
+    let (modes, is_compat) = modes_at(&site, t2);
+    assert_eq!(modes, [Mode::Compat; 4]);
+    assert!(is_compat);
 }
