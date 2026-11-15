@@ -1349,6 +1349,12 @@ fn start_build(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
     if inner.building || inner.built.is_some() {
         return;
     }
+    // The store shows a commit before its hand-off. A build reads at the
+    // last hand-off: it waits for the hand-off of the commit that wrote
+    // the registration that the thread read.
+    if inner.generation.is_some_and(|g| g > inner.target) {
+        return;
+    }
     let Some((&catalog, e)) = inner
         .entries
         .iter_mut()
