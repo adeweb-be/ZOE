@@ -372,7 +372,6 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
             cat = site.portal_catalog._catalog
             names = list(aq_base(cat).schema)
             _, first, _ = self.native(site, LISTING)
-            _, again, _ = self.native(site, LISTING)
             dates = 0
             for got in first:
                 want = cat[got.getRID()]
@@ -388,6 +387,7 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
                         self.assertEqual(a.__getstate__(), b.__getstate__(), name)
                         self.assertEqual(a.ISO8601(), b.ISO8601(), name)
             self.assertGreater(dates, ITEMS)
+            _, again, _ = self.native(site, LISTING)
             # A value that can change is in one brain only: in the brains of
             # one reply, and in the brains of two replies of one query.
             owner = {}
