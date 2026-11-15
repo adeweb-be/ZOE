@@ -10,7 +10,7 @@
 //! each commit to them after its publication.
 
 use pyo3::IntoPyObjectExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::intern;
@@ -87,6 +87,13 @@ fn wire_at(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Wire> {
 /// all.
 const DATES_KEPT: usize = 1 << 14;
 
+/// The cells that `Dates` made with a copy of kept values.
+static DATE_COPIES: AtomicU64 = AtomicU64::new(0);
+/// The cells that `Dates` made with `__setstate__`.
+static DATE_STATES: AtomicU64 = AtomicU64::new(0);
+/// False when a test makes `Dates` call `__setstate__` for each cell.
+static DATE_COPY: AtomicBool = AtomicBool::new(true);
+
 /// The object `name` of the module `module`, imported once.
 fn global<'py>(
     py: Python<'py>,
@@ -102,8 +109,9 @@ fn global<'py>(
 /// and that costs much. So `Dates` keeps the values of the slots of the
 /// `DateTime` of each state that it saw, and gives the next cell of that
 /// state a new `DateTime` with these values. Each cell gets a new
-/// `DateTime`, so two cells share no `DateTime`. The values are ints,
-/// floats, bools and strs.
+/// `DateTime`, so two cells share no `DateTime`. `Dates` keeps a state
+/// only when each value is exactly an int, a float, a bool, a str or None,
+/// because these values do not change.
 struct Dates {
     class: Py<PyAny>,
     /// The names of the slots, or `None` when a `DateTime` can hold a value
@@ -164,7 +172,11 @@ impl Dates {
     /// A new `DateTime` given the state of the data `data` of an ext 2.
     fn make<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         let class = self.class.bind(py);
-        let Some(slots) = &self.slots else {
+        let Some(slots) = self
+            .slots
+            .as_ref()
+            .filter(|_| DATE_COPY.load(Ordering::Relaxed))
+        else {
             return Self::set_state(class, data);
         };
         let kept = self.kept.bind(py);
@@ -175,7 +187,7 @@ impl Dates {
             let made = Self::set_state(class, data)?;
             let values = slots
                 .iter()
-                .map(|name| made.getattr(name.bind(py)).ok())
+                .map(|name| made.getattr(name.bind(py)).ok().filter(fixed))
                 .collect::<Option<Vec<_>>>();
             if let Some(values) = values {
                 if kept.len() >= DATES_KEPT {
@@ -190,6 +202,7 @@ impl Dates {
         for (name, value) in slots.iter().zip(values.iter()) {
             made.setattr(name.bind(py), value)?;
         }
+        DATE_COPIES.fetch_add(1, Ordering::Relaxed);
         Ok(made)
     }
 
@@ -200,8 +213,50 @@ impl Dates {
             cell::date_time(data).ok_or_else(|| PyValueError::new_err("a cell of another form"))?;
         let made = class.call_method1(intern!(py, "__new__"), (class,))?;
         made.call_method1(intern!(py, "__setstate__"), ((micros, naive, tz),))?;
+        DATE_STATES.fetch_add(1, Ordering::Relaxed);
         Ok(made)
     }
+}
+
+/// Tell if `value` is exactly an int, a float, a bool, a str or None.
+fn fixed(value: &Bound<'_, PyAny>) -> bool {
+    value.is_none()
+        || value.is_exact_instance_of::<PyInt>()
+        || value.is_exact_instance_of::<PyFloat>()
+        || value.is_exact_instance_of::<PyBool>()
+        || value.is_exact_instance_of::<PyString>()
+}
+
+/// The counts of the `DateTime` cells, for the tests: `copies`, the cells
+/// made with kept values, `states`, the cells made with `__setstate__`,
+/// `kept`, the states that the process keeps, and `copy`. `copy` False
+/// makes each cell call `__setstate__`, and forgets the kept states.
+#[pyfunction]
+#[pyo3(signature = (copy=None))]
+pub(crate) fn _catalog_dates<'py>(
+    py: Python<'py>,
+    copy: Option<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dates = Dates::get(py)?;
+    if let Some(copy) = copy {
+        DATE_COPY.store(copy, Ordering::Relaxed);
+        if !copy {
+            dates.kept.bind(py).clear();
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("copies", DATE_COPIES.load(Ordering::Relaxed))?;
+    out.set_item("states", DATE_STATES.load(Ordering::Relaxed))?;
+    out.set_item("kept", dates.kept.bind(py).len())?;
+    out.set_item("copy", DATE_COPY.load(Ordering::Relaxed))?;
+    Ok(out)
+}
+
+/// The slots that `Dates` copies for the class `class`, or None when an
+/// instance can hold a value outside its slots. For the tests.
+#[pyfunction]
+pub(crate) fn _catalog_date_slots(class: &Bound<'_, PyAny>) -> PyResult<Option<Vec<Py<PyString>>>> {
+    Dates::slots(class)
 }
 
 /// The Python value of the cell `value`, as the unpickler makes it from the

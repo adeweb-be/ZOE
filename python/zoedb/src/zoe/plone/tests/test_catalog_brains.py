@@ -119,6 +119,15 @@ def changeable(value):
             yield from changeable(item)
 
 
+# The value of a slot that holds none.
+_UNSET = object()
+
+
+def slots_of(value):
+    """The value of each slot of the `DateTime` `value`."""
+    return {name: getattr(value, name, _UNSET) for name in DateTime.__slots__}
+
+
 def tree_oids(jar, root):
     """The oids of the tree at `root` and of each object that it reaches."""
     found, todo = set(), [root]
@@ -384,7 +393,7 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
                     )
                     if isinstance(a, DateTime):
                         dates += 1
-                        self.assertEqual(a.__getstate__(), b.__getstate__(), name)
+                        self.assertEqual(slots_of(a), slots_of(b), name)
                         self.assertEqual(a.ISO8601(), b.ISO8601(), name)
             self.assertGreater(dates, ITEMS)
             _, again, _ = self.native(site, LISTING)
@@ -397,6 +406,23 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
                         self.assertNotIn(id(value), owner, f"{name}: {value!r}")
                         owner[id(value)] = k
             self.assertTrue(owner)
+
+    def test_the_brains_are_the_stock_brains_when_each_cell_calls_setstate(self):
+        from zoe import _zoe
+
+        try:
+            _zoe._catalog_dates(copy=False)
+            with opened(self.db) as site:
+                mark = _zoe._catalog_dates()
+                found, brains, loaded = self.native(site, LISTING)
+                done = _zoe._catalog_dates()
+                self.assertEqual(loaded, set())
+                self.check(site, found, brains, LISTING)
+        finally:
+            _zoe._catalog_dates(copy=True)
+        self.assertEqual(done["copies"], mark["copies"])
+        self.assertGreater(done["states"] - mark["states"], ITEMS)
+        self.assertEqual(done["kept"], 0)
 
     def test_a_search_sorted_on_modified_with_sort_limit_gives_the_stock_brains(self):
         with opened(self.db) as site:
