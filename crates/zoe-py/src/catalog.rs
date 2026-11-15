@@ -10,10 +10,12 @@
 //! each commit to them after its publication.
 
 use pyo3::IntoPyObjectExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use pyo3::exceptions::{PyIndexError, PyValueError};
+use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use zoe_catalog::cell::{self, EXT_DATE_TIME, EXT_MESSAGE, EXT_MISSING};
 use zoe_catalog::counts::{Counts, LATENCY_BUCKETS};
@@ -81,39 +83,187 @@ fn wire_at(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Wire> {
     )))
 }
 
-/// The classes of the ext types of the cells, imported at their first use.
-#[derive(Default)]
-struct Classes<'py> {
-    missing: Option<Bound<'py, PyAny>>,
-    date_time: Option<Bound<'py, PyAny>>,
-    message: Option<Bound<'py, PyAny>>,
-}
+/// The most states that `Dates` keeps. At this count, it forgets them
+/// all.
+const DATES_KEPT: usize = 1 << 14;
 
-/// The object `name` of the module `module`, as the unpickler finds the
-/// GLOBAL of a pickle.
+/// The cells that `Dates` made with a copy of kept values.
+static DATE_COPIES: AtomicU64 = AtomicU64::new(0);
+/// The cells that `Dates` made with `__setstate__`.
+static DATE_STATES: AtomicU64 = AtomicU64::new(0);
+/// False when a test makes `Dates` call `__setstate__` for each cell.
+static DATE_COPY: AtomicBool = AtomicBool::new(true);
+
+/// The object `name` of the module `module`, imported once.
 fn global<'py>(
     py: Python<'py>,
-    slot: &mut Option<Bound<'py, PyAny>>,
+    slot: &'static PyOnceLock<Py<PyAny>>,
     module: &str,
     name: &str,
-) -> PyResult<Bound<'py, PyAny>> {
-    if let Some(found) = slot {
-        return Ok(found.clone());
+) -> PyResult<&'py Bound<'py, PyAny>> {
+    slot.get_or_try_init(py, || Ok(py.import(module)?.getattr(name)?.unbind()))
+        .map(|found| found.bind(py))
+}
+
+/// The `DateTime` objects of the ext 2. `__setstate__` parses the state,
+/// and that costs much. So `Dates` keeps the values of the slots of the
+/// `DateTime` of each state that it saw, and gives the next cell of that
+/// state a new `DateTime` with these values. Each cell gets a new
+/// `DateTime`, so two cells share no `DateTime`. `Dates` keeps a state
+/// only when each value is exactly an int, a float, a bool, a str or None,
+/// because these values do not change.
+struct Dates {
+    class: Py<PyAny>,
+    /// The names of the slots, or `None` when a `DateTime` can hold a value
+    /// outside its slots. Then each cell calls `__setstate__`.
+    slots: Option<Vec<Py<PyString>>>,
+    /// The values of the slots for each data of an ext 2, in the order of
+    /// `slots`.
+    kept: Py<PyDict>,
+}
+
+impl Dates {
+    fn get(py: Python<'_>) -> PyResult<&Dates> {
+        static DATES: PyOnceLock<Dates> = PyOnceLock::new();
+        DATES.get_or_try_init(py, || {
+            let class = py.import("DateTime.DateTime")?.getattr("DateTime")?;
+            let slots = Self::slots(&class)?;
+            Ok(Dates {
+                class: class.unbind(),
+                slots,
+                kept: PyDict::new(py).unbind(),
+            })
+        })
     }
-    let found = py.import(module)?.getattr(name)?;
-    *slot = Some(found.clone());
-    Ok(found)
+
+    /// The slots of `class` when they hold all the state of an instance:
+    /// the class derives from `object` only, and an instance has no
+    /// `__dict__`.
+    fn slots(class: &Bound<'_, PyAny>) -> PyResult<Option<Vec<Py<PyString>>>> {
+        let py = class.py();
+        let bases = class.getattr("__bases__")?;
+        let object = py.get_type::<PyAny>();
+        let only_object = bases
+            .cast::<PyTuple>()
+            .is_ok_and(|b| b.len() == 1 && b.get_item(0).is_ok_and(|b| b.is(&object)));
+        let Ok(slots) = class.getattr("__slots__") else {
+            return Ok(None);
+        };
+        let Ok(slots) = slots.cast_into::<PyTuple>() else {
+            return Ok(None);
+        };
+        let Ok(names) = slots
+            .iter()
+            .map(|s| s.cast_into::<PyString>().map(Bound::unbind))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return Ok(None);
+        };
+        if !only_object {
+            return Ok(None);
+        }
+        let made = class.call_method1(intern!(py, "__new__"), (class,))?;
+        if made.hasattr(intern!(py, "__dict__"))? {
+            return Ok(None);
+        }
+        Ok(Some(names))
+    }
+
+    /// A new `DateTime` given the state of the data `data` of an ext 2.
+    fn make<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        let class = self.class.bind(py);
+        let Some(slots) = self
+            .slots
+            .as_ref()
+            .filter(|_| DATE_COPY.load(Ordering::Relaxed))
+        else {
+            return Self::set_state(class, data);
+        };
+        let kept = self.kept.bind(py);
+        let key = PyBytes::new(py, data);
+        let Some(values) = kept.get_item(&key)? else {
+            // The first cell of a state gets the `DateTime` of
+            // `__setstate__`. `Dates` keeps the values of its slots.
+            let made = Self::set_state(class, data)?;
+            let values = slots
+                .iter()
+                .map(|name| made.getattr(name.bind(py)).ok().filter(fixed))
+                .collect::<Option<Vec<_>>>();
+            if let Some(values) = values {
+                if kept.len() >= DATES_KEPT {
+                    kept.clear();
+                }
+                kept.set_item(&key, PyTuple::new(py, values)?)?;
+            }
+            return Ok(made);
+        };
+        let values = values.cast_into::<PyTuple>()?;
+        let made = class.call_method1(intern!(py, "__new__"), (class,))?;
+        for (name, value) in slots.iter().zip(values.iter()) {
+            made.setattr(name.bind(py), value)?;
+        }
+        DATE_COPIES.fetch_add(1, Ordering::Relaxed);
+        Ok(made)
+    }
+
+    /// A new `DateTime` given its state by `__setstate__`.
+    fn set_state<'py>(class: &Bound<'py, PyAny>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        let py = class.py();
+        let (micros, naive, tz) =
+            cell::date_time(data).ok_or_else(|| PyValueError::new_err("a cell of another form"))?;
+        let made = class.call_method1(intern!(py, "__new__"), (class,))?;
+        made.call_method1(intern!(py, "__setstate__"), ((micros, naive, tz),))?;
+        DATE_STATES.fetch_add(1, Ordering::Relaxed);
+        Ok(made)
+    }
+}
+
+/// Tell if `value` is exactly an int, a float, a bool, a str or None.
+fn fixed(value: &Bound<'_, PyAny>) -> bool {
+    value.is_none()
+        || value.is_exact_instance_of::<PyInt>()
+        || value.is_exact_instance_of::<PyFloat>()
+        || value.is_exact_instance_of::<PyBool>()
+        || value.is_exact_instance_of::<PyString>()
+}
+
+/// The counts of the `DateTime` cells, for the tests: `copies`, the cells
+/// made with kept values, `states`, the cells made with `__setstate__`,
+/// `kept`, the states that the process keeps, and `copy`. `copy` False
+/// makes each cell call `__setstate__`, and forgets the kept states.
+#[pyfunction]
+#[pyo3(signature = (copy=None))]
+pub(crate) fn _catalog_dates<'py>(
+    py: Python<'py>,
+    copy: Option<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dates = Dates::get(py)?;
+    if let Some(copy) = copy {
+        DATE_COPY.store(copy, Ordering::Relaxed);
+        if !copy {
+            dates.kept.bind(py).clear();
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("copies", DATE_COPIES.load(Ordering::Relaxed))?;
+    out.set_item("states", DATE_STATES.load(Ordering::Relaxed))?;
+    out.set_item("kept", dates.kept.bind(py).len())?;
+    out.set_item("copy", DATE_COPY.load(Ordering::Relaxed))?;
+    Ok(out)
+}
+
+/// The slots that `Dates` copies for the class `class`, or None when an
+/// instance can hold a value outside its slots. For the tests.
+#[pyfunction]
+pub(crate) fn _catalog_date_slots(class: &Bound<'_, PyAny>) -> PyResult<Option<Vec<Py<PyString>>>> {
+    Dates::slots(class)
 }
 
 /// The Python value of the cell `value`, as the unpickler makes it from the
 /// record of `data`: a tuple for an array, a dict for a map, `Missing.V`
-/// for the ext 1, a `DateTime` given its state by `__setstate__` for the
-/// ext 2, and the `Message` of its arguments for the ext 3.
-fn cell_value<'py>(
-    py: Python<'py>,
-    classes: &mut Classes<'py>,
-    value: &Wire,
-) -> PyResult<Bound<'py, PyAny>> {
+/// for the ext 1, a `DateTime` with the state of the ext 2 (see `Dates`),
+/// and the `Message` of its arguments for the ext 3.
+fn cell_value<'py>(py: Python<'py>, value: &Wire) -> PyResult<Bound<'py, PyAny>> {
     let bad = || PyValueError::new_err("a cell of another form");
     Ok(match value {
         Wire::Nil => py.None().into_bound(py),
@@ -125,39 +275,30 @@ fn cell_value<'py>(
         Wire::Array(items) => {
             let items = items
                 .iter()
-                .map(|item| cell_value(py, classes, item))
+                .map(|item| cell_value(py, item))
                 .collect::<PyResult<Vec<_>>>()?;
             PyTuple::new(py, items)?.into_any()
         }
         Wire::Map(items) => {
             let out = PyDict::new(py);
             for (k, v) in items {
-                out.set_item(cell_value(py, classes, k)?, cell_value(py, classes, v)?)?;
+                out.set_item(cell_value(py, k)?, cell_value(py, v)?)?;
             }
             out.into_any()
         }
         Wire::Ext(EXT_MISSING, data) if data.is_empty() => {
-            global(py, &mut classes.missing, "Missing", "V")?
+            static MISSING: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+            global(py, &MISSING, "Missing", "V")?.clone()
         }
-        Wire::Ext(EXT_DATE_TIME, data) => {
-            let (micros, naive, tz) = cell::date_time(data).ok_or_else(bad)?;
-            let class = global(py, &mut classes.date_time, "DateTime.DateTime", "DateTime")?;
-            let made = class.call_method1("__new__", (&class,))?;
-            made.call_method1("__setstate__", ((micros, naive, tz),))?;
-            made
-        }
+        Wire::Ext(EXT_DATE_TIME, data) => Dates::get(py)?.make(py, data)?,
         Wire::Ext(EXT_MESSAGE, data) => {
             let args = cell::message_args(data).ok_or_else(bad)?;
             let args = args
                 .iter()
-                .map(|arg| cell_value(py, classes, arg))
+                .map(|arg| cell_value(py, arg))
                 .collect::<PyResult<Vec<_>>>()?;
-            let class = global(
-                py,
-                &mut classes.message,
-                "zope.i18nmessageid.message",
-                "Message",
-            )?;
+            static MESSAGE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+            let class = global(py, &MESSAGE, "zope.i18nmessageid.message", "Message")?;
             class.call1(PyTuple::new(py, args)?)?
         }
         Wire::Ext(..) => return Err(bad()),
@@ -166,11 +307,11 @@ fn cell_value<'py>(
 
 /// The tuple of the cells of the row `bytes`, a msgpack array. `None` when
 /// a cell does not make a Python value: the brain then comes from `data`.
-fn row<'py>(py: Python<'py>, classes: &mut Classes<'py>, bytes: &[u8]) -> Bound<'py, PyAny> {
+fn row<'py>(py: Python<'py>, bytes: &[u8]) -> Bound<'py, PyAny> {
     let made = match cell::decode(bytes) {
         Some(Wire::Array(cells)) => cells
             .iter()
-            .map(|c| cell_value(py, classes, c))
+            .map(|c| cell_value(py, c))
             .collect::<PyResult<Vec<_>>>()
             .and_then(|cells| PyTuple::new(py, cells)),
         _ => Err(PyValueError::new_err("a row of another form")),
@@ -211,7 +352,7 @@ impl Rows {
         Ok(match found {
             Some(bytes) => {
                 self.decoded.fetch_add(1, Ordering::Relaxed);
-                row(py, &mut Classes::default(), bytes)
+                row(py, bytes)
             }
             None => py.None().into_bound(py),
         })
