@@ -2219,6 +2219,101 @@ fn compat(languages: &[&str]) -> CatalogSettings {
     out
 }
 
+/// A gate that holds a thread once, when the test arms it, at most `WAIT`.
+#[derive(Clone, Default)]
+struct Hold {
+    /// Armed, then held.
+    state: Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+impl Hold {
+    fn arm(&self) {
+        self.state.0.lock().unwrap().0 = true;
+    }
+
+    /// In the held thread: hold it when the gate is armed.
+    fn pause(&self) {
+        let (lock, cv) = &*self.state;
+        let mut s = lock.lock().unwrap();
+        if !s.0 {
+            return;
+        }
+        *s = (false, true);
+        cv.notify_all();
+        let deadline = Instant::now() + WAIT;
+        while s.1 && Instant::now() < deadline {
+            s = cv.wait_timeout(s, deadline - Instant::now()).unwrap().0;
+        }
+        s.1 = false;
+    }
+
+    fn hook(&self) -> zoe_catalog::mirrors::Hook {
+        let hold = self.clone();
+        Arc::new(move |_| hold.pause())
+    }
+
+    /// Wait until the gate holds its thread.
+    fn held(&self) {
+        let (lock, cv) = &*self.state;
+        let mut s = lock.lock().unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !s.1 {
+            assert!(Instant::now() < deadline, "the gate holds its thread");
+            s = cv.wait_timeout(s, deadline - Instant::now()).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap().1 = false;
+        cv.notify_all();
+    }
+}
+
+impl Site {
+    /// Stop the mirrors, then start them again with `hooks`. `pass` holds
+    /// the thread of the text indexes at the start of a pass, before it
+    /// reads the settings.
+    fn restart_held(&mut self, hooks: Hooks, pass: &Hold) {
+        self.mirrors.stop();
+        let weak = Arc::downgrade(&self.store);
+        let pass = pass.clone();
+        let open: Opener = Arc::new(move || {
+            if std::thread::current().name() == Some("zoe-text") {
+                pass.pause();
+            }
+            weak.upgrade().map(|s| s as Arc<dyn Reads>)
+        });
+        let config = Config {
+            wait: Duration::from_secs(1),
+            hooks,
+            text: TextConfig {
+                dir: Some(self.dir.path().to_owned()),
+                read_only: false,
+            },
+            ..Config::default()
+        };
+        self.mirrors = Mirrors::start(open, self.store.last_transaction().0, config);
+    }
+
+    /// Commit `settings` and hand the commit to the mirrors.
+    fn commit_settings(&self, settings: &CatalogSettings) -> u64 {
+        let tid =
+            testing::commit_text(&self.store, self.catalog, &[], Some(settings), false).unwrap();
+        self.mirrors.committed(tid);
+        tid
+    }
+
+    /// The mode of `Title` in the snap that a query at `tid` gets now, or
+    /// `None` when no snap holds `tid` within the wait.
+    fn compat_at(&self, tid: u64) -> Option<bool> {
+        let texts = self.mirrors.texts().expect("the text indexes");
+        texts.snap(self.catalog, Some(tid)).ok().map(|s| {
+            s.fields.is_compat("Title") && s.settings.indexes["Title"].mode == Mode::Compat
+        })
+    }
+}
+
 /// Wait for the index to hold the deltas up to `tid`, and give the modes
 /// of the settings and of the fields of `Title` that a query at `tid`
 /// sees.
@@ -2236,14 +2331,17 @@ fn a_change_of_the_settings_during_a_rebuild_builds_again() {
     let t1 = site.commit(&[set("Title", 1, "kalo")]);
     site.ready_at(t1);
     // The rebuild of the mode `compat` starts, then a commit changes the
-    // mode back before the rebuild reads the last tid.
+    // mode back before the rebuild reads the last tid. The thread then
+    // holds at its next pass.
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let back = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pass = Hold::default();
     let store = Arc::downgrade(&site.store);
     let hooks = Hooks {
         before_text_build: Some(Arc::new({
             let armed = Arc::clone(&armed);
             let back = Arc::clone(&back);
+            let pass = pass.clone();
             move |catalog| {
                 if armed.swap(false, Ordering::SeqCst)
                     && let Some(store) = store.upgrade()
@@ -2252,30 +2350,22 @@ fn a_change_of_the_settings_during_a_rebuild_builds_again() {
                         testing::commit_text(&store, catalog, &[], Some(&settings(&["en"])), false)
                             .unwrap();
                     back.store(tid, Ordering::SeqCst);
+                    pass.arm();
                 }
             }
         })),
         ..Hooks::default()
     };
-    site.restart(hooks);
+    site.restart_held(hooks, &pass);
     site.ready_at(t1);
     armed.store(true, Ordering::SeqCst);
-    let t2 = testing::commit_text(
-        &site.store,
-        site.catalog,
-        &[],
-        Some(&compat(&["en"])),
-        false,
-    )
-    .unwrap();
-    site.mirrors.committed(t2);
-    let started = Instant::now();
-    while back.load(Ordering::SeqCst) == 0 {
-        assert!(started.elapsed() < WAIT, "the rebuild starts");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    site.commit_settings(&compat(&["en"]));
+    pass.held();
     let t3 = back.load(Ordering::SeqCst);
     site.mirrors.committed(t3);
+    // No snap at t3 has the mode `compat` of the rebuild.
+    assert_ne!(site.compat_at(t3), Some(true));
+    pass.release();
     // At t3 the index has the settings of t3: the enhanced mode.
     let (modes, is_compat) = modes_at(&site, t3);
     assert_eq!(modes, [Mode::Enhanced; 4]);
@@ -2283,8 +2373,8 @@ fn a_change_of_the_settings_during_a_rebuild_builds_again() {
 }
 
 #[test]
-fn a_change_of_the_settings_during_a_pass_holds_the_tid_of_the_index() {
-    let mut site = Site::new("text-mode-follow", &settings(&["en"]));
+fn a_change_of_the_settings_during_an_open_holds_the_tid_of_the_index() {
+    let mut site = Site::new("text-mode-open", &settings(&["en"]));
     let t1 = site.commit(&[set("Title", 1, "kalo")]);
     site.ready_at(t1);
     // The open of the index reads the settings, then a commit changes the
@@ -2297,18 +2387,77 @@ fn a_change_of_the_settings_during_a_pass_holds_the_tid_of_the_index() {
     };
     site.restart(hooks);
     reached.recv_timeout(WAIT).expect("the open starts");
-    let t2 = testing::commit_text(
-        &site.store,
-        site.catalog,
-        &[],
-        Some(&compat(&["en"])),
-        false,
-    )
-    .unwrap();
-    site.mirrors.committed(t2);
+    let t2 = site.commit_settings(&compat(&["en"]));
     gate.release();
     // At t2 the index has the settings of t2: the mode `compat`.
     let (modes, is_compat) = modes_at(&site, t2);
     assert_eq!(modes, [Mode::Compat; 4]);
     assert!(is_compat);
+}
+
+#[test]
+fn a_change_of_the_settings_before_the_follow_holds_the_tid_of_the_index() {
+    let mut site = Site::new("text-mode-follow", &settings(&["en"]));
+    let t1 = site.commit(&[set("Title", 1, "kalo")]);
+    site.ready_at(t1);
+    let follow = Hold::default();
+    let pass = Hold::default();
+    let hooks = Hooks {
+        before_text_follow: Some(follow.hook()),
+        ..Hooks::default()
+    };
+    site.restart_held(hooks, &pass);
+    site.ready_at(t1);
+    // The thread reads the settings, then a commit changes the mode before
+    // the live index follows the commits. The commit has no delta, so the
+    // index could take its tid at once.
+    follow.arm();
+    site.mirrors.committed(t1);
+    follow.held();
+    let t2 = site.commit_settings(&compat(&["en"]));
+    pass.arm();
+    follow.release();
+    // The thread holds at its next pass, before it reads the settings
+    // again: no snap at t2 has the enhanced mode.
+    pass.held();
+    assert_ne!(site.compat_at(t2), Some(false));
+    pass.release();
+    let (modes, is_compat) = modes_at(&site, t2);
+    assert_eq!(modes, [Mode::Compat; 4]);
+    assert!(is_compat);
+}
+
+#[test]
+fn a_query_after_a_change_of_the_mode_never_answers_in_the_old_mode() {
+    let mut site = Site::new("text-mode-query", &settings(&["en"]));
+    // The enhanced mode stems `running` to `run`; the mode `compat` does
+    // not.
+    let t1 = site.commit(&[set("Title", 1, "running")]);
+    site.ready_at(t1);
+    let run = clause_of("Title", atom(&["run"]));
+    assert_eq!(site.rids(site.now(), &run), BTreeSet::from([1]));
+    let follow = Hold::default();
+    let hooks = Hooks {
+        before_text_follow: Some(follow.hook()),
+        ..Hooks::default()
+    };
+    site.restart(hooks);
+    site.ready_at(t1);
+    // The thread read the settings and holds: its index stays in the
+    // enhanced mode at t1.
+    follow.arm();
+    site.mirrors.committed(t1);
+    follow.held();
+    let t2 = site.commit_settings(&compat(&["en"]));
+    // A query after t2 waits for the index of t2, then gets unavailable,
+    // or answers in the mode `compat`.
+    match site.query(t2 + 1, &run, None) {
+        Ok(hits) => assert!(hits.rids.is_empty(), "{:?}", hits.rids),
+        Err(e) => assert_eq!(e.kind, TextErrorKind::Unavailable, "{e:?}"),
+    }
+    follow.release();
+    site.ready_at(t2);
+    assert!(site.query(t2 + 1, &run, None).unwrap().rids.is_empty());
+    let running = clause_of("Title", atom(&["running"]));
+    assert_eq!(site.rids(t2 + 1, &running), BTreeSet::from([1]));
 }

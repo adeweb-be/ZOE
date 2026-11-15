@@ -140,6 +140,9 @@ struct Shared {
     /// The hook of the tests before the check of the cap of a commit or of
     /// an advance of the tid.
     before_check: Option<Hook>,
+    /// The hook of the tests after the read of the settings, before the
+    /// follow of the commits.
+    before_follow: Option<Hook>,
 }
 
 /// The hooks of the tests of the text indexes, each called with the oid of
@@ -153,6 +156,9 @@ pub struct TextHooks {
     /// Before the check of the cap of a commit of the writer or of an
     /// advance of the tid.
     pub before_check: Option<Hook>,
+    /// After the read of the settings and the opens of a pass, before the
+    /// follow of the commits, for each index that follows them.
+    pub before_follow: Option<Hook>,
 }
 
 impl Shared {
@@ -197,6 +203,7 @@ impl Texts {
             before_build: hooks.before_build,
             before_cap: hooks.before_cap,
             before_check: hooks.before_check,
+            before_follow: hooks.before_follow,
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -640,10 +647,10 @@ fn generations(store: &Store) -> (u64, u64) {
     )
 }
 
-/// Tell if no commit wrote the registration keys or the settings after
-/// the thread read them. Read the last tid of the store before this check:
-/// when it holds, the settings of the entries are those at that tid, and a
-/// snap can show that tid.
+/// Tell if no commit wrote a key of the registration or of the settings,
+/// of any catalog, after the thread read them. Read the last tid of the
+/// store before this check: when it holds, the entries have the layout of
+/// the settings at that tid, and a snap can show that tid.
 fn settings_hold(shared: &Shared, store: &Store) -> bool {
     shared.lock().generations == Some(generations(store))
 }
@@ -1227,10 +1234,21 @@ fn follow(shared: &Arc<Shared>, store: &Store, lives: &mut HashMap<u64, Live>) {
     for catalog in passed {
         rebuild_after_pack(shared, store, lives, catalog);
     }
+    if let Some(hook) = &shared.before_follow {
+        let mut catalogs: Vec<u64> = lives.keys().copied().collect();
+        catalogs.sort_unstable();
+        for catalog in catalogs {
+            hook(catalog);
+        }
+    }
     let target = shared.lock().target.min(store.last_transaction().0);
-    // A commit up to `target` that wrote the settings: the next pass reads
-    // them before an index takes a tid after it.
+    // A commit wrote `zoe.catalog` or `zoe.text` after the read of the
+    // settings: no index takes a new tid, and the next pass reads them
+    // first. The writers commit the deltas that they hold: a check of an
+    // earlier pass passed for those, and the commit clears the timer of
+    // the writer, so the thread keeps its wait.
     if !settings_hold(shared, store) {
+        commit_due(shared, store, lives);
         return;
     }
     let Some(from) = lives

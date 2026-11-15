@@ -86,6 +86,24 @@ fn check_packed(store: &Store, tid: u64) -> Result<u64, Failure> {
     Ok(watermark.0)
 }
 
+/// The tid that an index must hold for a query at the snapshot `tid`: the
+/// last commit that wrote `zoe.catalog` or `zoe.text`, when it is before
+/// the snapshot, else the pack watermark; the larger of the two. An index
+/// at or after the last such commit has the layout of the settings at the
+/// snapshot.
+fn floor(store: &Store, tid: u64, watermark: u64) -> Result<Option<u64>, Failure> {
+    let catalogs = store
+        .kv_generation(crate::read::NAMESPACE)
+        .map_err(|e| Failure::of(&e))?;
+    let settings = store
+        .kv_generation(super::settings::NAMESPACE)
+        .map_err(|e| Failure::of(&e))?;
+    let written = catalogs.0.max(settings.0);
+    let written = (written > 0 && written < tid).then_some(written);
+    let watermark = (watermark > 0).then_some(watermark);
+    Ok(written.max(watermark))
+}
+
 /// The settings of the index of `clause`: those of the clause, else those
 /// of `zoe.text`.
 fn settings_of(clause: &TextClause, snap: Option<&Snap>) -> Result<IndexSettings, Failure> {
@@ -127,7 +145,7 @@ pub fn run_in(
 ) -> Result<Answer, Failure> {
     let watermark = check_packed(store, q.tid)?;
     let deadline = texts.map(|t| Instant::now() + t.wait());
-    let mut at = (watermark > 0).then_some(watermark);
+    let mut at = floor(store, q.tid, watermark)?;
     for _ in 0..3 {
         let snap = match (texts, deadline) {
             (Some(t), Some(deadline)) => t.snap_by(q.catalog, at, deadline),
@@ -460,7 +478,7 @@ pub fn info(
     };
     let deadline = Instant::now() + texts.wait();
     // An index below the pack watermark rebuilds first.
-    let mut at = (watermark > 0).then_some(watermark);
+    let mut at = floor(store, tid, watermark)?;
     for _ in 0..2 {
         let snap = texts.snap_by(catalog, at, deadline)?;
         let Some(fields) = snap.fields.indexes.get(index_id) else {
