@@ -87,7 +87,11 @@ A reply `refused`, and a reply `index_unavailable` whose text names a rid
 outside `paths` or the `_length` of a UUIDIndex, go to the log once for
 each catalog and each text, at WARNING, with the name of the view
 `@@zoe-catalog-repair` of `zoe.plone.catalog_repair`, which repairs that
-damage.
+damage. The text (`why`) of each other reply that takes the Python path
+goes to the log once for each process: the first text of a reason at
+WARNING, each later new text of that reason at DEBUG. A text that the repair
+can mend goes to the log only with the name of the view. The texts name
+indexes, oids and rids, never a value of a query.
 
 The modes: `on`, the default, and `compare`, which also runs the stock
 search, logs each difference at ERROR with the indexes and the options of
@@ -117,7 +121,9 @@ overlay. The mirror answers the one search and is dropped. In the mode
 
 The counts. `_counts_now()` gives the queries by path, the reasons of the
 Python path with their side (`client` for the reasons of the hook,
-`server` for the reasons of a reply), the comparisons of the mode
+`server` for the reasons of a reply), the texts of the replies by reason
+(`whys`, each text cut to 200 characters, at most `_WHYS` texts for each
+reason and the others under `_OTHER`), the comparisons of the mode
 `compare` and the throwaway mirrors among them, the mismatches, and the
 differences of the cache of the request. With `ZOE_PLONE_CATALOG_COUNTS`,
 the process adds its counts and the indexes and the options of each
@@ -208,13 +214,20 @@ _stock_methods = {}
 
 # The counts of this process: `("queries", path)`, `("fallbacks", reason)`
 # for the reasons that the hook decides, `("refusals", reason)` for the
-# reasons of a reply, `("compared",)`, `("throwaways",)`, `("mismatches",)`,
+# reasons of a reply, `("whys", reason, text)` for the text of each reply,
+# `("compared",)`, `("throwaways",)`, `("mismatches",)`,
 # `("cache_differences",)`, `("unchecked", why)`, `("stock_errors",)` for
 # a native answer whose stock search raised, `("overlay_bound",)` for
 # an overlay that does not fit `catalog-memory`, and `("refused", why)` for
 # the text of each refusal of a throwaway build.
 _counts = collections.Counter()
 _counts_lock = threading.Lock()
+
+# The texts of the replies that this process counted, by reason. A reason
+# keeps at most `_WHYS` texts; the others count under `_OTHER`.
+_whys = {}
+_WHYS = 50
+_OTHER = "(other texts)"
 
 # The indexes and the options of each mismatch of the mode `compare`, as
 # the log gives them, at most `_KEPT`.
@@ -588,8 +601,9 @@ def _counts_now():
     """The counts of this process, with the names of ADR 0059, section 11:
     the queries by path, the fallbacks by reason and side (`client` for the
     reasons that the hook decided, `server` for the reasons of a reply),
-    the comparisons of the mode `compare`, the throwaway mirrors, the
-    mismatches and the differences of the cache of the request."""
+    the texts of the replies by reason, the comparisons of the mode
+    `compare`, the throwaway mirrors, the mismatches and the differences
+    of the cache of the request."""
     with _counts_lock:
         counts = dict(_counts)
     out = {
@@ -603,6 +617,7 @@ def _counts_now():
         "overlay_bound": counts.get(("overlay_bound",), 0),
         "stock_errors": counts.get(("stock_errors",), 0),
         "refused": {},
+        "whys": {},
     }
     for key, n in counts.items():
         if key[0] == "queries":
@@ -615,6 +630,8 @@ def _counts_now():
             out["fallbacks"][(key[1], "client")] = n
         elif key[0] == "refusals":
             out["fallbacks"][(key[1], "server")] = n
+        elif key[0] == "whys":
+            out["whys"].setdefault(key[1], {})[key[2]] = n
     return out
 
 
@@ -640,6 +657,7 @@ def _write_counts(path):
         "overlay_bound": counts["overlay_bound"],
         "stock_errors": counts["stock_errors"],
         "refused": counts["refused"],
+        "whys": counts["whys"],
         "mismatched": mismatched,
     }
     try:
@@ -783,8 +801,7 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
         if throwaway and reply["f"] == "refused":
             # The text names oids and records, never a value of a query.
             _count("refused", why[:200])
-        elif not throwaway:
-            _repair_hint(oid, reply["f"], why)
+        _fallback_why(oid, reply["f"], why, log=not throwaway)
         return None, None, plan
     if shift:
         reply = _unshift(reply, shift)
@@ -799,10 +816,37 @@ _hinted = set()
 _REPAIRABLE = ("is not in paths", "the _length of the UUIDIndex differs")
 
 
+def _fallback_why(oid, reason, why, log):
+    """Count the text `why` of a reply of the reason `reason` for the
+    catalog `oid`. With `log`, log the first text of the reason at WARNING
+    and each later new text at DEBUG, once for each process. A text that
+    the repair can mend goes to the log only through `_repair_hint`."""
+    text = why[:200]
+    with _counts_lock:
+        seen = _whys.setdefault(reason, set())
+        first = not seen
+        new = text not in seen and len(seen) < _WHYS
+        if new:
+            seen.add(text)
+        _counts[("whys", reason, text if text in seen else _OTHER)] += 1
+    if not log:
+        return
+    if _repair_hint(oid, reason, why) or not new:
+        return
+    logger.log(
+        logging.WARNING if first else logging.DEBUG,
+        "catalog mirror: a search of the catalog %s takes the Python path (%s): %s",
+        "0x" + oid.hex(),
+        reason,
+        why,
+    )
+
+
 def _repair_hint(oid, reason, why):
     """Log once for each catalog and each text a refusal that the repair
     can mend: a refused catalog, and an index whose reverse map names a
-    rid outside `paths` or whose `_length` is off."""
+    rid outside `paths` or whose `_length` is off. Return True for such a
+    refusal."""
     if reason == "refused":
         text = (
             "catalog mirror: the store refused the catalog %s (%s); its"
@@ -819,13 +863,14 @@ def _repair_hint(oid, reason, why):
             " POST with repair=1 repairs the index."
         )
     else:
-        return
+        return False
     key = (oid, reason, why)
     with _counts_lock:
         if key in _hinted:
-            return
+            return True
         _hinted.add(key)
     logger.warning(text, "0x" + oid.hex(), why)
+    return True
 
 
 def _shift(plan):

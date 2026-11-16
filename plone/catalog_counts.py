@@ -8,12 +8,13 @@ FILE holds one JSON line for each process of `bin/test`: the counts that
 `ZOE_PLONE_CATALOG_COUNTS` names the file. The script adds them up and
 prints first the shares of the searches that the mode `compare` compared
 and that the mirror answered, then the searches by path, the reasons of
-the Python path with their side, the overlays past the bound, the text of
-each refusal of a throwaway build, the comparisons, the throwaway mirrors,
-the differences of the cache of the request of ZCatalog, the searches left
-unchecked by their reason, and the mismatches with the indexes and the
-options of each, never a value. It exits with 1 when a mismatch occurred
-or when the file holds no line.
+the Python path with their side, under each reason of the store the texts
+of its replies (they name indexes, oids and rids, never a value), the
+overlays past the bound, the text of each refusal of a throwaway build,
+the comparisons, the throwaway mirrors, the differences of the cache of
+the request of ZCatalog, the searches left unchecked by their reason, and
+the mismatches with the indexes and the options of each, never a value.
+It exits with 1 when a mismatch occurred or when the file holds no line.
 """
 
 import collections
@@ -35,6 +36,7 @@ fallbacks = collections.Counter()
 total = collections.Counter()
 unchecked = collections.Counter()
 refused = collections.Counter()
+whys = collections.defaultdict(collections.Counter)
 mismatched = collections.Counter()
 for line in lines:
     queries.update(line["queries"])
@@ -46,6 +48,8 @@ for line in lines:
     total["stock_errors"] += line.get("stock_errors", 0)
     unchecked.update(line.get("unchecked", {}))
     refused.update(line.get("refused", {}))
+    for reason, texts in line.get("whys", {}).items():
+        whys[reason].update(texts)
     mismatched.update(line["mismatched"])
 searches = sum(queries.values())
 
@@ -66,6 +70,9 @@ for name, n in sorted(queries.items()):
     print(f"catalog: path {name}: {n} ({share(n)})")
 for (reason, side), n in sorted(fallbacks.items(), key=lambda item: -item[1]):
     print(f"catalog: reason {reason} ({side}): {n} ({share(n)})")
+    if side == "server":
+        for why, k in whys[reason].most_common():
+            print(f"catalog:   why, {k} times: {why}")
 print(f"catalog: overlay past the bound: {total['overlay_bound']}")
 print(f"catalog: native answers whose stock search raised: {total['stock_errors']}")
 for why, n in refused.most_common():
