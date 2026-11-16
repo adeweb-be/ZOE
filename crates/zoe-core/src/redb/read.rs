@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{self, Included, Unbounded};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use redb::ReadableTable;
@@ -16,8 +17,8 @@ use super::{
     refused, text,
 };
 use crate::backend::{
-    Backend, BlobRecord, Bytes, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnRecords,
-    WriteTxn,
+    Backend, BeforeSync, BlobRecord, Bytes, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
+    TxnRecords, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, KeySpace};
@@ -369,6 +370,7 @@ impl Backend for RedbBackend {
         let Db::ReadWrite(db) = &self.db else {
             return Ok(());
         };
+        self.before_sync()?;
         // An empty write transaction with the default durability syncs
         // the file. So the commits without durability before it become
         // durable too.
@@ -378,6 +380,14 @@ impl Backend for RedbBackend {
             .map_err(backend)?;
         self.unsynced.store(false, Ordering::Release);
         Ok(())
+    }
+
+    fn set_before_sync(&self, hook: Arc<dyn BeforeSync>) {
+        let _ = self.before_sync.set(hook);
+    }
+
+    fn abandon(&self) {
+        self.keep_open();
     }
 
     #[cfg(feature = "testing")]

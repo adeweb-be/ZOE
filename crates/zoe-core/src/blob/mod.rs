@@ -14,6 +14,18 @@
 //! removes the intent file. A deferred commit has no sync, so it keeps its
 //! intent file until a durable commit covers it.
 //!
+//! A deferred restore can also defer its blobs
+//! (`begin_restore_deferred_blobs`). Its blob files stay in `blobs/tmp/`
+//! without a sync, and its finish places nothing. Before the next durable
+//! commit, `Waiting::place` places all the waiting blobs at once: it
+//! writes an intent file for each tid, makes the blob files, the intent
+//! files and `blobs/tmp/` durable with one `Vfs::sync_many`, renames each
+//! blob file into its place, then makes the directories durable with a
+//! second `Vfs::sync_many`. A read of a waiting blob places them first. So
+//! the syncs of the blobs come once per durable commit, not once per blob,
+//! and an intent file is durable before any blob file that it names goes
+//! into the tree.
+//!
 //! So a durable blob record always has its file. A crash can leave a blob
 //! file without its blob record, but then the intent file is on disk.
 //! Opening a store reads only `blobs/tmp/`: it removes the blob files that
@@ -40,7 +52,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::backend::BlobRecord;
+use crate::backend::{BeforeSync, BlobRecord};
 use crate::error::{Result, ZoeError};
 use crate::format::blob::{
     BLOB_DIR, LAYOUT, LAYOUT_FILE, NEW_LAYOUT_FILE, TMP_DIR, blob_name, decode_intent,
@@ -71,30 +83,85 @@ pub(crate) struct BlobStore {
     /// The lock on the blob directory itself, once a writer took it. Two
     /// open stores never share a blob directory.
     dir_lock: Mutex<Option<DirLock>>,
-    /// The number of the next temporary file.
+    /// The waiting blobs and the kept intent files. The backend shares it,
+    /// to place the blobs before a durable commit.
+    waiting: Arc<Waiting>,
+}
+
+/// The blobs of the deferred commits that defer their blobs, and the intent
+/// files of the deferred commits that no durable commit covers yet.
+pub(crate) struct Waiting {
+    /// The directory of the blob store.
+    dir: Arc<dyn Dir>,
+    /// The number of the next temporary file of the blob store.
     next_temp: AtomicU64,
+    /// The waiting blobs. The holder of this mutex takes only the mutex of
+    /// `fresh` or of `kept` under it.
+    state: Mutex<WaitingState>,
+    /// The levels of oid directories that `place` created, and whose
+    /// parents it has not synced yet. The holder of this mutex takes no
+    /// other lock.
+    fresh: Mutex<BTreeSet<String>>,
     /// The intent files of the deferred commits that no durable commit
-    /// covers yet. Only a holder of the commit sequencer takes this
-    /// mutex, and it takes no other lock while it holds it.
+    /// covers yet. The holder of this mutex takes no other lock.
     kept: Mutex<Vec<String>>,
+}
+
+/// The waiting blobs, and the outcome of the placements.
+#[derive(Default)]
+struct WaitingState {
+    /// The blobs that wait in `blobs/tmp/` for `place`, in commit order.
+    blobs: Vec<WaitingBlob>,
+    /// True after a placement failed. The blobs then stay waiting for
+    /// good: no call places them, and no commit makes their records
+    /// durable.
+    failed: bool,
+}
+
+/// A blob of a deferred commit that waits in `blobs/tmp/`.
+struct WaitingBlob {
+    oid: Oid,
+    tid: Tid,
+    /// The temporary file of the blob.
+    temp: String,
+    /// True when the file is a hard link of a committed blob file.
+    linked: bool,
 }
 
 impl BlobStore {
     /// Return the blob store of the store directory `dir`. This reads
     /// nothing: `open` checks the store directory.
     pub(crate) fn new(dir: Arc<dyn Dir>) -> Self {
+        let waiting = Arc::new(Waiting {
+            dir: Arc::clone(&dir),
+            next_temp: AtomicU64::new(0),
+            state: Mutex::new(WaitingState::default()),
+            fresh: Mutex::new(BTreeSet::new()),
+            kept: Mutex::new(Vec::new()),
+        });
         Self {
             dir,
             ready: Mutex::new(false),
             dir_lock: Mutex::new(None),
-            next_temp: AtomicU64::new(0),
-            kept: Mutex::new(Vec::new()),
+            waiting,
         }
     }
 
+    /// Return the work that the backend runs before a durable commit:
+    /// the placement of the waiting blobs.
+    pub(crate) fn before_sync(&self) -> Arc<dyn BeforeSync> {
+        Arc::clone(&self.waiting) as Arc<dyn BeforeSync>
+    }
+
+    /// Place the waiting blobs. See `Waiting::place`.
+    pub(crate) fn place_waiting(&self) -> Result<()> {
+        self.waiting.place()
+    }
+
     /// Tell if the blob file of `oid` at `tid` exists. This reads no byte
-    /// of the file.
+    /// of the file. The waiting blobs go into their place first.
     pub(crate) fn has_file(&self, oid: Oid, tid: Tid) -> Result<bool> {
+        self.waiting.place_for(oid, tid)?;
         Ok(self.dir.exists(&blob_name(oid, tid))?)
     }
 
@@ -169,10 +236,14 @@ impl BlobStore {
     /// Create the directory `dir` when it does not exist, and make it
     /// durable. Its parent must exist and be durable. A directory that
     /// exists is durable: `make_ready` and `recover` sync the ones that a
-    /// stopped process can leave.
+    /// stopped process can leave. A directory that `Waiting::place`
+    /// created and has not made durable yet gets the sync of its parent
+    /// here too.
     fn create_dir(&self, dir: &str) -> Result<()> {
         if !self.dir.exists(dir)? {
-            self.dir.create_dir(dir)?;
+            create_new_dir(&*self.dir, dir)?;
+            self.dir.sync_dir_at(parent(dir))?;
+        } else if self.waiting.is_fresh(dir) {
             self.dir.sync_dir_at(parent(dir))?;
         }
         Ok(())
@@ -181,8 +252,7 @@ impl BlobStore {
     /// Return a new name for a temporary file in `blobs/tmp/`. The core
     /// gives only names of this form to its temporary files.
     fn new_temp_name(&self) -> String {
-        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
-        format!("{TMP_DIR}/{n}.tmp")
+        self.waiting.new_temp_name()
     }
 
     /// Return a new temporary file for a blob of the store `store`.
@@ -316,6 +386,7 @@ impl BlobStore {
         record: BlobRecord,
     ) -> Result<PendingBlob> {
         self.make_ready()?;
+        self.waiting.place_for(oid, tid)?;
         let committed = blob_name(oid, tid);
         let temp = self.new_temp_name();
         let linked = match self.dir.hard_link(&committed, &temp) {
@@ -420,6 +491,24 @@ impl BlobStore {
         Ok(Some(intent))
     }
 
+    /// Move the blobs of the deferred commit `tid` to the waiting blobs,
+    /// before its backend commit. Their files stay in `blobs/tmp/`, and
+    /// `Waiting::place` places them before the next durable commit. A
+    /// crash before that leaves only temporary files, and the next open
+    /// removes them.
+    pub(crate) fn defer(&self, tid: Tid, blobs: &mut BTreeMap<Oid, PendingBlob>) {
+        let mut waiting = self.waiting.lock_state();
+        for (&oid, blob) in blobs.iter_mut() {
+            let temp = blob.temp.take().expect("a blob is placed once");
+            waiting.blobs.push(WaitingBlob {
+                oid,
+                tid,
+                temp,
+                linked: blob.linked,
+            });
+        }
+    }
+
     /// Remove the intent file of a finish after its backend commit, or of
     /// a pack after its blob files are gone. A failure leaves the file for
     /// the next open, which keeps the blob files that have their blob
@@ -435,21 +524,17 @@ impl BlobStore {
     /// removes the blob files of the lost commit.
     pub(crate) fn keep(&self, intent: Option<String>) {
         if let Some(intent) = intent {
-            self.lock_kept().push(intent);
+            self.waiting.lock_kept().push(intent);
         }
     }
 
     /// Remove the kept intent files after a durable commit that covers
     /// their commits. A file that a pack removed already is not an error.
     pub(crate) fn release_kept(&self) {
-        let kept = std::mem::take(&mut *self.lock_kept());
+        let kept = std::mem::take(&mut *self.waiting.lock_kept());
         for intent in kept {
             self.finished(Some(intent));
         }
-    }
-
-    fn lock_kept(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
-        crate::lock(&self.kept)
     }
 
     /// Write the intent file of `tid` before a pack commits the removal of
@@ -510,6 +595,7 @@ impl BlobStore {
     /// Open the blob file of `oid` at `tid`, whose blob record is
     /// `record`. A missing file is a corrupt blob.
     pub(crate) fn reader(&self, oid: Oid, tid: Tid, record: BlobRecord) -> Result<BlobReader> {
+        self.waiting.place_for(oid, tid)?;
         let file = self
             .dir
             .read_file(&blob_name(oid, tid))
@@ -524,9 +610,11 @@ impl BlobStore {
         })
     }
 
-    /// Return the path of the blob file of `oid` at `tid`.
-    pub(crate) fn path(&self, oid: Oid, tid: Tid) -> PathBuf {
-        self.dir.path(&blob_name(oid, tid))
+    /// Return the path of the blob file of `oid` at `tid`. The waiting
+    /// blobs go into their place first.
+    pub(crate) fn path(&self, oid: Oid, tid: Tid) -> Result<PathBuf> {
+        self.waiting.place_for(oid, tid)?;
+        Ok(self.dir.path(&blob_name(oid, tid)))
     }
 
     /// Write `bytes` into the new file `name` and sync the file. An intent
@@ -541,9 +629,206 @@ impl BlobStore {
     /// Read the intent file `name` of `tid`, and return the oids that it
     /// names. Return `None` when the intent does not decode.
     fn read_intent(&self, name: &str, tid: Tid) -> Result<Option<Vec<Oid>>> {
-        let mut bytes = Vec::new();
-        self.dir.read_file(name)?.read_to_end(&mut bytes)?;
-        Ok(decode_intent(tid, &bytes).ok())
+        read_intent(&*self.dir, name, tid)
+    }
+}
+
+impl Waiting {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, WaitingState> {
+        crate::lock(&self.state)
+    }
+
+    fn lock_fresh(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        crate::lock(&self.fresh)
+    }
+
+    fn lock_kept(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        crate::lock(&self.kept)
+    }
+
+    /// Return a new name for a temporary file in `blobs/tmp/`. The core
+    /// gives only names of this form to its temporary files.
+    fn new_temp_name(&self) -> String {
+        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
+        format!("{TMP_DIR}/{n}.tmp")
+    }
+
+    /// Tell if `dir` is a level that `place` created and has not made
+    /// durable yet.
+    fn is_fresh(&self, dir: &str) -> bool {
+        self.lock_fresh().contains(dir)
+    }
+
+    /// Place the waiting blobs, as `place` does, before a read of the blob
+    /// of `oid` at `tid`. After a failed placement, only a read of a
+    /// waiting blob fails: the other blobs read as before.
+    fn place_for(&self, oid: Oid, tid: Tid) -> Result<()> {
+        let mut state = self.lock_state();
+        if state.failed {
+            let waits = state
+                .blobs
+                .iter()
+                .any(|blob| blob.oid == oid && blob.tid == tid);
+            return if waits { Err(failed()) } else { Ok(()) };
+        }
+        self.place_locked(&mut state)
+    }
+
+    /// Place the waiting blobs, and keep their intent files until a
+    /// durable commit covers their commits. With no waiting blob, this
+    /// does nothing. See `place_all`.
+    ///
+    /// A failed placement fails each later call too, and the blobs stay
+    /// waiting. A sync that failed can leave bytes that never reach the
+    /// disk, and a second sync can report no error for them. So no call
+    /// renames those files into their place, and no durable commit makes
+    /// their records durable: the hook of the backend and the durable
+    /// commits of the store fail, and the drop of the store abandons the
+    /// database (`Backend::abandon`).
+    fn place(&self) -> Result<()> {
+        let mut state = self.lock_state();
+        self.place_locked(&mut state)
+    }
+
+    fn place_locked(&self, state: &mut WaitingState) -> Result<()> {
+        if state.failed {
+            return Err(failed());
+        }
+        if state.blobs.is_empty() {
+            return Ok(());
+        }
+        match self.place_all(&state.blobs) {
+            Ok(intents) => {
+                state.blobs.clear();
+                self.lock_kept().extend(intents);
+                Ok(())
+            }
+            Err(error) => {
+                state.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Place `blobs`, and return the names of their intent files.
+    ///
+    /// The call writes an intent file for each tid of the blobs, without a
+    /// sync. Then one `Vfs::sync_many` makes the blob files, the intent
+    /// files and `blobs/tmp/` durable. Then the call creates the missing
+    /// levels of each oid directory, makes each blob file read-only and
+    /// renames it into its place, all without a sync. A second
+    /// `Vfs::sync_many` makes the new directories and the renames durable.
+    /// So each blob file is durable in its place when this returns, and an
+    /// intent file names it before it can be on disk in the tree.
+    ///
+    /// A blob file can go into its place before the backend commit of its
+    /// record, as in a finish. A crash then leaves the intent file, and
+    /// the next open removes the blob files without a blob record.
+    fn place_all(&self, blobs: &[WaitingBlob]) -> Result<Vec<String>> {
+        let mut tids: BTreeMap<Tid, Vec<Oid>> = BTreeMap::new();
+        for blob in blobs {
+            tids.entry(blob.tid).or_default().push(blob.oid);
+        }
+        let mut files: Vec<String> = blobs.iter().map(|blob| blob.temp.clone()).collect();
+        let mut intents = Vec::new();
+        for (tid, oids) in tids {
+            let intent = intent_name(tid);
+            self.write_intent(&intent, tid, oids)?;
+            files.push(intent.clone());
+            intents.push(intent);
+        }
+        self.dir.sync_many(&files, &[TMP_DIR.to_owned()])?;
+
+        // The set gives a parent before its children.
+        let mut dirs = BTreeSet::new();
+        let mut created = Vec::new();
+        for blob in blobs {
+            for level in oid_levels(blob.oid) {
+                if !self.dir.exists(&level)? {
+                    // A finish that finds the level syncs its parent
+                    // until the sync below.
+                    self.lock_fresh().insert(level.clone());
+                    create_new_dir(&*self.dir, &level)?;
+                    dirs.insert(parent(&level).to_owned());
+                    created.push(level);
+                }
+            }
+            // A link names a committed file, which is read-only already.
+            if !blob.linked {
+                self.dir.set_read_only(&blob.temp)?;
+            }
+            self.dir
+                .rename(&blob.temp, &blob_name(blob.oid, blob.tid))?;
+            dirs.insert(oid_dir(blob.oid));
+        }
+        let dirs: Vec<String> = dirs.into_iter().collect();
+        self.dir.sync_many(&[], &dirs)?;
+        let mut fresh = self.lock_fresh();
+        for level in &created {
+            fresh.remove(level);
+        }
+        Ok(intents)
+    }
+
+    /// Write the intent file `name` of `tid`, which names `oids`, without a
+    /// sync: the first `sync_many` of `place_all` makes it durable.
+    ///
+    /// An intent file of `tid` that exists keeps its oids, as in
+    /// `intend_removal`: the new file goes in under a temporary name, is
+    /// synced, and replaces the old one by a rename. So a crash leaves one
+    /// of the two, each whole.
+    fn write_intent(&self, name: &str, tid: Tid, oids: Vec<Oid>) -> Result<()> {
+        let mut named: BTreeSet<Oid> = oids.into_iter().collect();
+        if !self.dir.exists(name)? {
+            let named: Vec<Oid> = named.into_iter().collect();
+            let mut file = self.dir.create_file(name)?;
+            file.write_all(&encode_intent(tid, &named))?;
+            file.flush()?;
+            return Ok(());
+        }
+        if let Some(old) = read_intent(&*self.dir, name, tid)? {
+            named.extend(old);
+        }
+        let named: Vec<Oid> = named.into_iter().collect();
+        let temp = self.new_temp_name();
+        let mut file = self.dir.create_file(&temp)?;
+        file.write_all(&encode_intent(tid, &named))?;
+        file.sync()?;
+        drop(file);
+        self.dir.rename(&temp, name)?;
+        Ok(())
+    }
+}
+
+/// Return the error of a placement after a failed one.
+fn failed() -> ZoeError {
+    io::Error::other(
+        "an earlier placement of the waiting blob files failed: \
+         their commits do not become durable",
+    )
+    .into()
+}
+
+impl BeforeSync for Waiting {
+    fn before_sync(&self) -> Result<()> {
+        self.place()
+    }
+}
+
+/// Read the intent file `name` of `tid` in `dir`, and return the oids that
+/// it names. Return `None` when the intent does not decode.
+fn read_intent(dir: &dyn Dir, name: &str, tid: Tid) -> Result<Option<Vec<Oid>>> {
+    let mut bytes = Vec::new();
+    dir.read_file(name)?.read_to_end(&mut bytes)?;
+    Ok(decode_intent(tid, &bytes).ok())
+}
+
+/// Create the directory `name` in `dir`. A directory that another thread
+/// created since the check is not an error.
+fn create_new_dir(dir: &dyn Dir, name: &str) -> io::Result<()> {
+    match dir.create_dir(name) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
     }
 }
 

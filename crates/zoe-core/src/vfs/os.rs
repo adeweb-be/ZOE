@@ -20,6 +20,11 @@ use crate::error::{Result, ZoeError};
 #[derive(Debug)]
 pub struct OsVfs {
     dir: PathBuf,
+    /// The directory, open from the open of the store. `syncfs(2)` on it
+    /// reports each writeback error of its filesystem since then, also an
+    /// error that another descriptor already saw.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    root: File,
     /// The lock file of the store. A directory that holds the blob
     /// directory of a store has none.
     _lock: Option<File>,
@@ -46,6 +51,7 @@ impl OsVfs {
         create_dir_durable(dir)?;
         Ok(Self {
             dir: dir.to_owned(),
+            root: File::open(dir)?,
             _lock: None,
         })
     }
@@ -80,6 +86,7 @@ impl OsVfs {
         match lock.try_lock() {
             Ok(()) => Ok(Self {
                 dir: dir.to_owned(),
+                root: File::open(dir)?,
                 _lock: Some(lock),
             }),
             Err(TryLockError::WouldBlock) => Err(ZoeError::Locked),
@@ -194,6 +201,37 @@ impl Vfs for OsVfs {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
         sync(&file)
+    }
+
+    /// On Linux 5.8 or later, one `syncfs(2)` on the directory makes them
+    /// all durable, when every name is on the filesystem of the directory
+    /// and it is not FUSE, virtiofs included. Elsewhere, each file and each
+    /// directory is synced, as the default does.
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if syncfs_is_sound(&self.root) {
+                let dev = self.root.metadata()?.dev();
+                let mut same = true;
+                for name in dirs.iter().chain(files) {
+                    if fs::metadata(self.dir.join(name))?.dev() != dev {
+                        same = false;
+                        break;
+                    }
+                }
+                if same {
+                    return syncfs(&self.root);
+                }
+            }
+        }
+        for file in files {
+            self.sync_file(file)?;
+        }
+        for dir in dirs {
+            self.sync_dir_at(dir)?;
+        }
+        Ok(())
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {
@@ -566,6 +604,74 @@ fn sync_data(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
+/// The `f_type` of a FUSE filesystem in `statfs(2)`. virtiofs has it too.
+#[cfg(target_os = "linux")]
+const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
+/// Tell if `syncfs(2)` makes the writes of the filesystem of `file`
+/// durable and reports their errors. Before Linux 5.8, it reports no error
+/// of the write-back. A FUSE filesystem can make a sync of the filesystem
+/// do less than a sync of each file. A kernel or a filesystem that this
+/// cannot tell gives false.
+#[cfg(target_os = "linux")]
+fn syncfs_is_sound(file: &File) -> bool {
+    static KERNEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KERNEL.get_or_init(|| {
+        fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .and_then(|release| kernel_version(&release))
+            .is_some_and(|version| version >= (5, 8))
+    }) && filesystem_type(file).is_some_and(|kind| kind != FUSE_SUPER_MAGIC)
+}
+
+/// Return the major and the minor number of the kernel release `release`,
+/// such as `6.8.0-45-generic`.
+#[cfg(target_os = "linux")]
+fn kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split(['.', '-']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Return the `f_type` of the filesystem that holds `file`, from
+/// `fstatfs(2)`, or `None` when the call fails.
+#[cfg(target_os = "linux")]
+fn filesystem_type(file: &File) -> Option<i64> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
+    let mut buf = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the descriptor belongs to `file`, which stays open for the
+    // call, and `buf` has room for one `statfs`.
+    #[allow(unsafe_code)]
+    let done = unsafe { libc::fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) };
+    if done != 0 {
+        return None;
+    }
+    // SAFETY: fstatfs(2) filled `buf`, since it returned 0.
+    #[allow(unsafe_code)]
+    let buf = unsafe { buf.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    Some(buf.f_type as i64)
+}
+
+/// Make every write of the filesystem that holds `file` durable, with
+/// `syncfs(2)`. Since Linux 5.8, the call reports an error of the
+/// write-back of the filesystem.
+#[cfg(target_os = "linux")]
+fn syncfs(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor belongs to `file`, which stays open for the
+    // call. syncfs(2) reads no memory of the process.
+    #[allow(unsafe_code)]
+    let done = unsafe { libc::syncfs(file.as_raw_fd()) };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 fn fsync(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -591,6 +697,16 @@ mod tests {
 
     use super::*;
     use crate::vfs::MemVfs;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_releases_give_their_version() {
+        assert_eq!(kernel_version("6.8.0-45-generic\n"), Some((6, 8)));
+        assert_eq!(kernel_version("5.8"), Some((5, 8)));
+        assert_eq!(kernel_version("4.19.0"), Some((4, 19)));
+        assert_eq!(kernel_version("5"), None);
+        assert_eq!(kernel_version("unknown"), None);
+    }
 
     #[test]
     fn a_store_directory_is_created_with_its_missing_parents() {

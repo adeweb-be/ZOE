@@ -467,7 +467,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         file.check_owner(&self.store.backend)?;
         let stored_bytes = self.check_size(oid, data)?;
         self.check_blob_size(oid, file.size())?;
-        let blob = file.close(&self.store.backend)?;
+        let blob = file.close(&self.store.backend, !self.defer_blobs)?;
         self.stage_blob(oid, serial, data, false, stored_bytes, blob)
     }
 
@@ -585,7 +585,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// stages nothing and drops `file`, which removes it.
     pub fn restore_blob(&mut self, oid: Oid, data: &[u8], file: BlobFile) -> Result<()> {
         let current = self.check_restore_blob(oid, data)?;
-        let blob = file.close(&self.store.backend)?;
+        let blob = file.close(&self.store.backend, !self.defer_blobs)?;
         self.stage_blob(oid, current, data, true, self.stored_bytes, blob)
     }
 

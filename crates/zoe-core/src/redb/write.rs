@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use redb::ReadableTable;
 
@@ -12,7 +13,7 @@ use super::{
     has_records_from, kv, refused, text,
 };
 use crate::backend::{
-    BlobRecord, Framed, NewPayload, NewRecord, Payload, TxnMeta, TxnStatus, WriteTxn,
+    BeforeSync, BlobRecord, Framed, NewPayload, NewRecord, Payload, TxnMeta, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
@@ -33,6 +34,7 @@ pub(super) struct RedbWrite<'a> {
     last_tid: &'a AtomicU64,
     object_count: &'a AtomicU64,
     unsynced: &'a AtomicBool,
+    before_sync: &'a OnceLock<Arc<dyn BeforeSync>>,
     compression: Compression,
     /// The records of the write that the write-ahead log counted already
     /// as new oids: the frames with the previous serial `Tid::ZERO` that
@@ -66,6 +68,7 @@ impl<'a> RedbWrite<'a> {
             last_tid: &backend.last_tid,
             object_count: &backend.object_count,
             unsynced: &backend.unsynced,
+            before_sync: &backend.before_sync,
             compression: backend.compression,
             counted: 0,
             written_tid: None,
@@ -196,10 +199,15 @@ impl<'a> RedbWrite<'a> {
                     .map_err(backend)?;
             }
         }
-        self.txn.commit().map_err(backend)?;
         if deferred {
+            // Set before the commit: a durable commit that takes the writer
+            // after it must run the hook.
             self.unsynced.store(true, Ordering::Release);
         } else {
+            super::before_sync(self.unsynced, self.before_sync)?;
+        }
+        self.txn.commit().map_err(backend)?;
+        if !deferred {
             self.unsynced.store(false, Ordering::Release);
         }
         if let Some((stored, count)) = counts {

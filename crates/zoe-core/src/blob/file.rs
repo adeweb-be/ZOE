@@ -47,12 +47,18 @@ impl BlobFile {
         }
     }
 
-    /// Sync the file and return the blob, ready for a commit in `store`.
-    /// The file must belong to `store`, as `check_owner` checks.
-    pub(crate) fn close(mut self, store: &Arc<Opened>) -> Result<PendingBlob> {
+    /// Close the file and return the blob, ready for a commit in `store`.
+    /// The file must belong to `store`, as `check_owner` checks. With
+    /// `sync`, the call makes the bytes durable. Without it, the call only
+    /// writes them to the file, and the next durable commit syncs them.
+    pub(crate) fn close(mut self, store: &Arc<Opened>, sync: bool) -> Result<PendingBlob> {
         self.check_owner(store)?;
         let mut file = self.file.take().expect("a blob file is closed once");
-        file.sync()?;
+        if sync {
+            file.sync()?;
+        } else {
+            file.flush()?;
+        }
         drop(file);
         Ok(PendingBlob {
             store: Weak::clone(&self.store),

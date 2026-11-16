@@ -150,6 +150,9 @@ pub struct Txn<S: Deref<Target = Store>> {
     tid: Option<Tid>,
     /// True for a restore transaction whose finish commits without a sync.
     deferred: bool,
+    /// True for a deferred restore whose blobs wait for the next durable
+    /// commit.
+    defer_blobs: bool,
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
@@ -255,6 +258,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             thread: thread::current().id(),
             tid: None,
             deferred: false,
+            defer_blobs: false,
             user: user.to_vec(),
             description: description.to_vec(),
             extension: extension.to_vec(),
@@ -342,6 +346,39 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ) -> Result<Self> {
         let mut txn = Self::begin_restore(store, tid, user, description, extension)?;
         txn.deferred = true;
+        Ok(txn)
+    }
+
+    /// Begin a deferred restore, as `begin_restore_deferred` does, whose
+    /// blobs also wait for the next durable commit.
+    ///
+    /// `store_blob` and `restore_blob` do not sync the blob file. The
+    /// finish places no blob: the files stay in the blob temporary
+    /// directory, and the commit is visible with its blob records. Before
+    /// the next durable commit, the store places all the waiting blobs at
+    /// once, with two syncs of the blob directory in all
+    /// (`Vfs::sync_many`): `Store::sync`, a durable finish, any other
+    /// durable write and the close of the store do so. A read of a waiting
+    /// blob places them first. So a copy of many blobs syncs them once
+    /// for each durable commit, not once for each blob.
+    ///
+    /// A failed placement fails each later one and each durable commit,
+    /// and the store never makes the commits of the waiting blobs durable:
+    /// its drop leaves them to the next open.
+    ///
+    /// A crash before the next durable commit loses the commit, as for
+    /// `begin_restore_deferred`. Its blob files are then temporary files,
+    /// or files in their place that an intent file names, and the next
+    /// writer open removes them.
+    pub fn begin_restore_deferred_blobs(
+        store: S,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Self> {
+        let mut txn = Self::begin_restore_deferred(store, tid, user, description, extension)?;
+        txn.defer_blobs = true;
         Ok(txn)
     }
 

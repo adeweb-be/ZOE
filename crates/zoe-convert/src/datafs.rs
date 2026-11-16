@@ -18,10 +18,10 @@
 //! time, whatever the size of the store.
 
 use std::fs::{self, File};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-use zoe_core::{Oid, Store, Tid, TxnInfo, ZoeError};
+use zoe_core::{BlobFile, Oid, Store, Tid, TxnInfo, ZoeError};
 
 use crate::blobs::{BlobDir, is_blob_record};
 use crate::compare::{BLOB_SAMPLE_STRIDE, TxnJoin, TxnPair, check_blob, compare_txn, stop_problem};
@@ -37,6 +37,9 @@ const BATCH_TRANSACTIONS: u64 = 1_000;
 /// pickles and blobs, when that comes before `BATCH_TRANSACTIONS`.
 const BATCH_BYTES: u64 = 64 << 20;
 
+/// The size of one read and one write of the copy of a blob.
+const BLOB_CHUNK: usize = 1 << 20;
+
 /// Convert the FileStorage file `data_fs` into the store `target`, then
 /// verify the store against the file.
 ///
@@ -49,11 +52,14 @@ const BATCH_BYTES: u64 = 64 << 20;
 /// anything. Each transaction is restored under its own tid, with its
 /// user, its description and its extension bytes unchanged.
 ///
-/// A restore commits without a sync of the database file. The store
-/// becomes durable after each batch of at most 1,000 transactions or
-/// 64 MiB of pickles and blobs, whichever comes first, and once more
-/// before the verification. A crash loses only the restores of the open
-/// batch, and a later call resumes after them.
+/// A restore commits without a sync of the database file, and its blob
+/// files wait in the blob temporary directory of the store without a sync.
+/// The store becomes durable after each batch of at most 1,000
+/// transactions or 64 MiB of pickles and blobs, whichever comes first, and
+/// once more before the verification: the blobs of the batch go into their
+/// place with two syncs of the blob directory, then the database file
+/// syncs. A crash loses only the restores of the open batch and their blob
+/// files, and a later call resumes after them.
 ///
 /// The verification compares the tids, the metadata and every pickle of
 /// the file with those of the store, checks that every blob is in the
@@ -156,8 +162,8 @@ fn copy_batches(
 }
 
 /// Restore the transaction `header` of `reader` in `target`, without a
-/// sync of the database file. Return the count of bytes of its pickles and
-/// blobs.
+/// sync of the database file or of its blob files. Return the count of
+/// bytes of its pickles and blobs.
 ///
 /// A blob record with a file in `blobs` is staged with `store_blob`. Its
 /// serial is the current serial of the oid in the store, so the serial
@@ -169,12 +175,13 @@ fn copy_txn(
     blobs: Option<&BlobDir>,
     target: &Store,
 ) -> Result<u64, Error> {
-    let mut txn = target.tpc_begin_restore_deferred(
+    let mut txn = target.tpc_begin_restore_deferred_blobs(
         header.tid,
         &header.user,
         &header.description,
         &header.extension,
     )?;
+    let mut buffer = Vec::new();
     let mut bytes = 0u64;
     for record in reader.records(header) {
         let DataRecord { oid, data } = record?;
@@ -188,7 +195,7 @@ fn copy_txn(
         match (data, source) {
             (Some(pickle), Some((path, mut source))) => {
                 let mut file = target.new_blob_file()?;
-                let size = io::copy(&mut source, &mut file)
+                let size = copy_blob(&mut source, &mut file, &mut buffer)
                     .map_err(|source| Error::Io { path, source })?;
                 bytes = bytes.saturating_add(size);
                 let serial = current_serial(target, oid)?;
@@ -200,6 +207,24 @@ fn copy_txn(
     txn.vote()?;
     txn.finish()?;
     Ok(bytes)
+}
+
+/// Copy the bytes of `source` to `file` in chunks of `BLOB_CHUNK` bytes, and
+/// return their count. `buffer` holds one chunk. It grows at the first
+/// blob and serves each blob after it.
+fn copy_blob(source: &mut File, file: &mut BlobFile, buffer: &mut Vec<u8>) -> io::Result<u64> {
+    buffer.resize(BLOB_CHUNK, 0);
+    let mut size = 0u64;
+    loop {
+        let n = match source.read(buffer) {
+            Ok(0) => return Ok(size),
+            Ok(n) => n,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        file.write_all(&buffer[..n])?;
+        size += n as u64;
+    }
 }
 
 /// Open the blob file `path` of the source. A missing file gives `None`.

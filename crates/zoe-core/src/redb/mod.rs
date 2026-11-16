@@ -27,12 +27,13 @@
 use std::ops::Bound::{self, Excluded};
 use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
 };
 
-use crate::backend::{Record, TxnMeta};
+use crate::backend::{BeforeSync, Record, TxnMeta};
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
 use crate::types::{Oid, Tid};
@@ -59,6 +60,15 @@ const META_LAST_TID: &str = "last_tid";
 const META_NEXT_OID: &str = "next_oid";
 const META_PACK_WATERMARK: &str = "pack_watermark";
 const META_OBJECT_COUNT: &str = "object_count";
+
+/// Run `hook`, when it is set, if `unsynced` tells that the tables hold a
+/// deferred commit that no sync covered.
+fn before_sync(unsynced: &AtomicBool, hook: &OnceLock<Arc<dyn BeforeSync>>) -> Result<()> {
+    match hook.get() {
+        Some(hook) if unsynced.load(Ordering::Acquire) => hook.before_sync(),
+        _ => Ok(()),
+    }
+}
 
 /// Wrap a redb error.
 fn backend(error: impl Into<redb::Error>) -> ZoeError {
@@ -234,8 +244,9 @@ fn decode_object_count(value: Option<&[u8]>) -> Result<u64> {
 
 /// The redb database of a store.
 enum Db {
-    /// The database is open for reads and writes.
-    ReadWrite(Database),
+    /// The database is open for reads and writes. `RedbBackend::abandon`
+    /// keeps a share of it, so that it never closes.
+    ReadWrite(Arc<Database>),
     /// The database file is open read-only. Every write fails.
     ReadOnly(ReadOnlyDatabase),
 }
@@ -261,6 +272,9 @@ pub(crate) struct RedbBackend {
     object_count: AtomicU64,
     /// True while the tables hold a deferred commit that no sync covered.
     unsynced: AtomicBool,
+    /// The work to run before a durable commit makes a deferred commit
+    /// durable. The store sets it once.
+    before_sync: OnceLock<Arc<dyn BeforeSync>>,
     /// How new records are written.
     compression: Compression,
 }
@@ -291,14 +305,14 @@ impl RedbBackend {
 
     /// Open a store that `initialise` wrote, and check its format.
     pub(crate) fn open(db: Database) -> Result<Self> {
-        Self::open_db(Db::ReadWrite(db), false).map(|(backend, _)| backend)
+        Self::open_db(Db::ReadWrite(Arc::new(db)), false).map(|(backend, _)| backend)
     }
 
     /// Open a store for `zoe migrate`: a store of the format before this
     /// one opens too. Return the backend, and true when the store has the
     /// format before this one.
     pub(crate) fn open_migrating(db: Database) -> Result<(Self, bool)> {
-        Self::open_db(Db::ReadWrite(db), true)
+        Self::open_db(Db::ReadWrite(Arc::new(db)), true)
     }
 
     /// Open a store that `initialise` wrote, for reads only, and check its
@@ -371,6 +385,7 @@ impl RedbBackend {
             last_tid: AtomicU64::new(last_tid),
             object_count: AtomicU64::new(object_count),
             unsynced: AtomicBool::new(false),
+            before_sync: OnceLock::new(),
             compression: Compression::default(),
         };
         Ok((backend, previous))
@@ -379,6 +394,23 @@ impl RedbBackend {
     /// Tell if the tables hold a deferred commit that no sync covered yet.
     pub(crate) fn unsynced(&self) -> bool {
         self.unsynced.load(Ordering::Acquire)
+    }
+
+    /// Run the work that a durable commit needs first, when a deferred
+    /// commit is not durable yet.
+    fn before_sync(&self) -> Result<()> {
+        before_sync(&self.unsynced, &self.before_sync)
+    }
+
+    /// Keep the database open until the process ends. The close of redb
+    /// commits with a sync, which makes the deferred commits durable. After
+    /// this call, the drop of the backend does not close the database, so
+    /// those commits stay not durable, and the next open of the store in
+    /// another process ends at the last durable commit.
+    pub(crate) fn keep_open(&self) {
+        if let Db::ReadWrite(db) = &self.db {
+            std::mem::forget(Arc::clone(db));
+        }
     }
 
     /// Add `oids` new oids to the object count in memory. The log counts
