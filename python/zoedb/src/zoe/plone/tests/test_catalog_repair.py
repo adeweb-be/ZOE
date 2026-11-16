@@ -387,7 +387,10 @@ class TestTheRepairOfADamagedCatalog(unittest.TestCase):
             pc = site.portal_catalog
             documents = pc.unrestrictedSearchResults(portal_type="Document")
             self.assertEqual(catalog._last.outcome, "native")
-            self.assertEqual(len(documents), len(DOCUMENTS))
+            # The layer site can hold Documents of other test modules.
+            paths = {f"/plone/{name}" for name in DOCUMENTS}
+            ours = [b.getPath() for b in documents if b.getPath() in paths]
+            self.assertEqual(sorted(ours), sorted(paths))
             found = pc.unrestrictedSearchResults(UID=self.uuids[NO_FORWARD])
             self.assertEqual(catalog._last.outcome, "native")
             self.assertEqual([b.getRID() for b in found], [self.rids["no_forward"]])
