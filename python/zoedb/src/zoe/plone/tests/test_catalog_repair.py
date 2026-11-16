@@ -455,14 +455,14 @@ class TestTheRepairView(unittest.TestCase):
     def test_an_anonymous_get_is_refused(self):
         browser = self.browser(manager=False)
         browser.open(self.url)
-        self.assertNotIn('"dry_run"', browser.contents)
+        self.assertNotIn("dry_run", str(browser.contents))
         self.assertIn(browser.headers["status"][:3], ("302", "401", "403"))
 
     def test_a_post_without_the_token_is_refused(self):
         browser = self.browser()
         browser.post(self.url, urllib.parse.urlencode({"repair": "1"}))
         self.assertTrue(browser.headers["status"].startswith("403"))
-        self.assertNotIn('"dry_run"', browser.contents)
+        self.assertNotIn("dry_run", str(browser.contents))
         self.assertEqual(self.half_found(), 1)
 
     def test_a_post_with_the_token_repairs(self):
