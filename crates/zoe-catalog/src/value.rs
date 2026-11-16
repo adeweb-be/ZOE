@@ -3,7 +3,8 @@
 //! the distinct byte strings of an arena.
 
 use std::cmp::Ordering;
-use std::hash::{DefaultHasher, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 
 use zoe_pickle::python::{Heap, Made, Object, Value};
 
@@ -280,6 +281,8 @@ pub struct Dedup {
     slots: Vec<u32>,
     /// The number of full slots.
     count: usize,
+    /// The seed of the hashes.
+    seed: RandomState,
 }
 
 /// A slot without a byte string.
@@ -291,6 +294,7 @@ impl Dedup {
         Dedup {
             slots: vec![EMPTY; (count * 2).next_power_of_two().max(16)],
             count: 0,
+            seed: RandomState::new(),
         }
     }
 
@@ -307,7 +311,7 @@ impl Dedup {
             self.grow(arena);
         }
         let mask = self.slots.len() - 1;
-        let mut i = hash(data) as usize & mask;
+        let mut i = self.hash(data) as usize & mask;
         loop {
             match self.slots[i] {
                 EMPTY => {
@@ -328,7 +332,7 @@ impl Dedup {
         let mask = size - 1;
         let mut slots = vec![EMPTY; size];
         for place in self.slots.iter().filter(|p| **p != EMPTY) {
-            let mut i = hash(arena.span(*place)) as usize & mask;
+            let mut i = self.hash(arena.span(*place)) as usize & mask;
             while slots[i] != EMPTY {
                 i = (i + 1) & mask;
             }
@@ -341,11 +345,11 @@ impl Dedup {
     pub fn heap_bytes(&self) -> usize {
         self.slots.capacity() * 4
     }
-}
 
-/// The hash of `data`. It is the same in each process.
-fn hash(data: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(data);
-    hasher.finish()
+    /// The hash of `data`, with the seed of the set.
+    fn hash(&self, data: &[u8]) -> u64 {
+        let mut hasher = self.seed.build_hasher();
+        hasher.write(data);
+        hasher.finish()
+    }
 }

@@ -23,6 +23,8 @@ const ABSENT: u32 = 0;
 const OTHER: u32 = 1;
 /// The code of the first distinct cell.
 const FIRST: u32 = 2;
+/// The part of a row without a record in the grid of a build.
+const NO_PART: u32 = u32::MAX;
 
 /// The length of the record of a row without a record.
 pub const NO_RECORD: i32 = i32::MIN;
@@ -335,7 +337,8 @@ pub struct Grid {
     /// The codes, column after column: `ABSENT`, `OTHER`, or `FIRST` and
     /// the place of the cell in the arena of the column of its part.
     codes: Vec<AtomicU32>,
-    /// The number of the part of each row.
+    /// The number of the part of each row, `NO_PART` for a row without a
+    /// record.
     parts: Vec<AtomicU32>,
     /// The length of the record of each row, `NO_RECORD` for no record.
     widths: Vec<AtomicI32>,
@@ -349,7 +352,7 @@ impl Grid {
             width,
             rows,
             codes: atomics(width * rows),
-            parts: atomics(rows),
+            parts: (0..rows).map(|_| AtomicU32::new(NO_PART)).collect(),
             widths: (0..rows).map(|_| AtomicI32::new(NO_RECORD)).collect(),
         }
     }
@@ -481,6 +484,11 @@ impl Grid {
             cells.push(part);
             firsts.push(first);
         }
+        // A rebase joins the arenas of a column into one, so the column
+        // holds at most the 4 GiB of one arena.
+        if u32::try_from(cells.iter().map(|a| a.bytes.len()).sum::<usize>()).is_err() {
+            return Err(FULL.into());
+        }
         let distinct = *starts.last().unwrap_or(&0) as usize;
         let codes = &self.codes[i * self.rows..(i + 1) * self.rows];
         let code = |row: usize| match codes[row].load(AtomicOrdering::Relaxed) {
@@ -551,8 +559,12 @@ impl TablePart {
             Val::Tuple(cells) => (cells, i32::try_from(cells.len()).unwrap_or(i32::MAX)),
             _ => (&[], NOT_A_TUPLE),
         };
+        // A row whose record a part already took is in `data` twice: the
+        // codes of the row would mix the cells of two parts.
+        if grid.parts[at].swap(self.id, AtomicOrdering::Relaxed) != NO_PART {
+            return Err(format!("the row {row} has two records in data"));
+        }
         grid.widths[at].store(width, AtomicOrdering::Relaxed);
-        grid.parts[at].store(self.id, AtomicOrdering::Relaxed);
         for (i, ((arena, dedup), cell)) in self.columns.iter_mut().zip(cells).enumerate() {
             let code = match cell {
                 Val::Cell(Some(bytes)) => {
