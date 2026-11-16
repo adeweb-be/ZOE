@@ -589,6 +589,28 @@ fn a_commit_that_adds_a_key_builds_and_one_that_removes_it_drops() {
 }
 
 #[test]
+fn a_registration_that_the_store_shows_before_its_hand_off_waits_for_it() {
+    let store = store();
+    let mut a = model(10, 60);
+    let mut b = model(10_000, 60);
+    let first = commit(&store, None, &a.records(), &[a.key()], &[]);
+    let mirrors = mirrors(&store, Config::default());
+    assert!(ready_at(&mirrors, a.oid(), first));
+    // The commit of the catalog and its key is in the store, and the
+    // thread has no hand-off of it yet. A hand-off of an older tid makes
+    // the thread read the registration now.
+    let tid = commit(&store, None, &b.records(), &[b.key()], &[]);
+    mirrors.committed(first);
+    assert!(state_is(&mirrors, b.oid(), "pending"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(mirrors.status(b.oid()).unwrap().state, "pending");
+    mirrors.committed(tid);
+    assert!(ready_at(&mirrors, b.oid(), tid));
+    check_like_fresh(&store, &mirrors, b.oid(), tid, "after the hand-off");
+    mirrors.stop();
+}
+
+#[test]
 fn a_key_whose_oid_holds_no_catalog_is_refused() {
     let store = store();
     let mut m = model(10, 20);

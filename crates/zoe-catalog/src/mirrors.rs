@@ -151,6 +151,11 @@ pub struct Hooks {
     /// writer or at an advance of its tid, with the oid of the catalog.
     #[cfg(feature = "text")]
     pub before_text_check: Option<Hook>,
+    /// After a text index read the settings and before it follows the
+    /// commits, with the oid of the catalog of each index that follows
+    /// them.
+    #[cfg(feature = "text")]
+    pub before_text_follow: Option<Hook>,
 }
 
 /// The state of one mirror, as `status` gives it.
@@ -403,6 +408,7 @@ impl Mirrors {
                     before_build: config.hooks.before_text_build.clone(),
                     before_cap: config.hooks.before_text_cap.clone(),
                     before_check: config.hooks.before_text_check.clone(),
+                    before_follow: config.hooks.before_text_follow.clone(),
                 },
             )
         });
@@ -1341,6 +1347,12 @@ fn install_build(shared: &Arc<Shared>) {
 fn start_build(shared: &Arc<Shared>, workers: &mut Vec<JoinHandle<()>>) {
     let mut inner = shared.lock();
     if inner.building || inner.built.is_some() {
+        return;
+    }
+    // The store shows a commit before its hand-off. A build reads at the
+    // last hand-off: it waits for the hand-off of the commit that wrote
+    // the registration that the thread read.
+    if inner.generation.is_some_and(|g| g > inner.target) {
         return;
     }
     let Some((&catalog, e)) = inner
