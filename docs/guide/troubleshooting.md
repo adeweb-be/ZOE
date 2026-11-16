@@ -274,3 +274,13 @@ the catalog 0x2a gets no mirror: uids is not the inverse of paths: they differ i
 **Cause.** The catalog of a site is damaged: a path catalogued twice, a ghost rid, a UUIDIndex without its forward entry, or a half-catalogued row. The mirror never guesses a value, so the store refuses the catalog or the index, and the searches take the Python path. `zoe.plone` logs a warning that names `@@zoe-catalog-repair`.
 
 **Fix.** Make a backup of the store. Open `@@zoe-catalog-repair` on the site as a Manager for the dry run, then POST `repair=1` with the token of plone.protect, or run `zoe.plone.catalog_repair.repair` in a script (see [The repair of a damaged catalog](plone.md#the-repair-of-a-damaged-catalog)). When the report gives `mirror` `next_open`, restart the process that opens the store: the mirror builds at its next open.
+
+### `a search of the catalog 0x… takes the Python path`
+
+```text
+catalog mirror: a search of the catalog 0x2a takes the Python path (index_unavailable): the order: no record of 0x2b before the tid
+```
+
+**Cause.** The store did not answer a search of the catalog, and the search took the Python path of ZCatalog, with the stock results. The words in parentheses give the reason, and the text after them, the `why` of the reply, gives the cause: it names the index, the oid or the rid, never a value of the query. `zoe.plone` logs the first text of each reason at WARNING, once for each process, and each later new text of that reason at DEBUG. The reason `not_ready`, a mirror that builds after a start, logs its first text at INFO. A cause that `@@zoe-catalog-repair` mends goes to the log once, with the name of the view (see above).
+
+**Fix.** Read the reason and the text. `not_ready` while the mirror builds after a start is normal, and logs at INFO. To count the searches of a process, call `zoe.plone.catalog._counts_now()` in a debug session of the instance, or set `ZOE_PLONE_CATALOG_COUNTS` (see [Environment variables](../reference/environment.md)): the process then adds its counts to that file when it exits. `fallbacks` gives the searches of the Python path by reason and side, and `whys` the texts of each reason of the store, with their counts. A reason keeps at most 50 texts, and counts the others under `(other texts)`. For an `index_unavailable` that names a rid outside `paths`, repair the catalog. For the other reasons, see section 7 of [ADR 0059](../adr/0059-the-catalog-mirror.md).
