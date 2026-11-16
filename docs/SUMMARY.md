@@ -115,6 +115,7 @@
   - [The incremental security index](spikes/security-index.md)
   - [The tail of the five-index intersection is the range of `generic-numbers`](findings/intersection-tail.md)
   - [The cold build of the mirror waits on the sort of the keys of `object_provides`](findings/cold-build.md)
+  - [A prefetch of the chain of a path saves 2 to 5 % of a cold Plone request](findings/path-prefetch.md)
   - [The order over several containers, the navigation and `navtree`](findings/order-over-several-containers.md)
 - [Known upstream issues]()
   - [persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
