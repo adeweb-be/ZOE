@@ -12,7 +12,7 @@ They check that:
 - the import of `zoe.plone:text-uninstall` does the same, with
   ZCTextIndex indexes.
 
-`tearDown` puts the blob file back, removes the Files, and leaves the site
+A cleanup puts the blob file back, removes the Files, and leaves the site
 with the `ZoeTextIndex` indexes of the layer.
 
 `just plone zoe backends` runs these tests.
@@ -52,6 +52,8 @@ class TestAnUnreadableObject(unittest.TestCase):
     def setUp(self):
         self.db = self.layer["zoeDB"]
         self.storage = self.layer["zoeStorage"]
+        self.blob_path = None
+        self.addCleanup(self.clean)
         with opened(self.db) as site:
             for oid, (title, description, data) in FILES.items():
                 site.invokeFactory(
@@ -65,16 +67,20 @@ class TestAnUnreadableObject(unittest.TestCase):
                 )
             transaction.commit()
             self.key = key_of(site)
+        # A new blob has no serial after its commit: a load gives it.
+        self.db.cacheMinimize()
+        with opened(self.db) as site:
             blob = site[UNREADABLE].file._blob
-            self.blob_path = self.storage.loadBlob(blob._p_oid, blob._p_serial)
+            blob._p_activate()
+            self.blob_path = blob.committed()
         wait_ready(self.storage, self.key)
         wait_text(self.storage, self.key)
         self.blob_mode = os.stat(self.blob_path).st_mode
         with open(self.blob_path, "rb") as f:
             self.blob_data = f.read()
 
-    def tearDown(self):
-        if not os.path.exists(self.blob_path):
+    def clean(self):
+        if self.blob_path is not None and not os.path.exists(self.blob_path):
             with open(self.blob_path, "wb") as f:
                 f.write(self.blob_data)
             os.chmod(self.blob_path, self.blob_mode)
@@ -88,7 +94,8 @@ class TestAnUnreadableObject(unittest.TestCase):
                 site.portal_setup.runAllImportStepsFromProfile("profile-zoe.plone:text")
             site.manage_delObjects([oid for oid in FILES if oid in site.objectIds()])
             transaction.commit()
-        wait_text(self.storage, self.key)
+            key = key_of(site)
+        wait_text(self.storage, key)
 
     def remove_blob(self):
         """Remove the blob file of `UNREADABLE`, and make each object of
