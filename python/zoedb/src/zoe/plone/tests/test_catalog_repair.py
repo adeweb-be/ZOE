@@ -430,7 +430,7 @@ class TestTheRepairView(unittest.TestCase):
         browser = Browser(self.app)
         browser.handleErrors = True
         browser.raiseHttpErrors = False
-        browser.follow_redirects = False
+        browser.followRedirects = False
         if manager:
             browser.addHeader(
                 "Authorization", f"Basic {SITE_OWNER_NAME}:{SITE_OWNER_PASSWORD}"

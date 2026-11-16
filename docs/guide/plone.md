@@ -132,6 +132,33 @@ The suites of Plone and plone.restapi pass with `ZoeTextIndex` in the mode `comp
 
 To go back, import the profile `zoe.plone:text-uninstall`. It fills ZCTextIndex indexes of the type `Okapi BM25 Rank` while the `ZoeTextIndex` indexes serve, then puts them in their places. It also resumes after a failure halfway when you import it again. The backend `catalog` refuses its uninstall while a site holds a `ZoeTextIndex`.
 
+### The repair of a damaged catalog
+
+With the backend `catalog`, the store mirrors the catalog of each site and answers its searches. The mirror never guesses a value: it refuses a catalog whose `uids` is not the inverse of `paths`, and an index that names a rid outside `paths`. The searches then take the Python path, with the stock results. The store logs `the catalog 0x… gets no mirror`, and `zoe.plone` logs a warning that names `@@zoe-catalog-repair`. A crash during an indexing, or an old bug of an add-on, can leave such damage. The repair finds four kinds:
+
+| Kind | Key of the report | What the catalog holds |
+| --- | --- | --- |
+| a path catalogued twice | `duplicates`, `stale_uids`, `orphan_data` | two rids of `paths` for one path, `uids` names one of them; or an entry of `uids` whose rid does not map back to it; or a row of `data` outside `paths` |
+| a ghost rid | `ghosts` | a rid in the reverse map of an index, but not in `paths` |
+| a UUIDIndex without its forward entry | `uuid_entries` | a rid whose UUID `_index` does not map back to it, or a `_length` of the index that differs from `len(_index)` |
+| a half-catalogued row | `half_catalogued` | a rid of `paths` without an entry in `portal_type`, `path`, `allowedRolesAndUsers` or `effectiveRange` |
+
+The report also gives the `Length` of the catalog against `len(data)`.
+
+Make a backup of the store first (see [Backup and restore](backup-restore.md)). Then, as a Manager, open `@@zoe-catalog-repair` on the site: a GET gives the dry run as JSON, with the count of each kind and its first 20 rids and paths, and writes nothing. A POST with `repair=1` and the token of plone.protect (`_authenticator`) repairs the catalog, commits, and gives the report: for each kind, `found` and `repaired`, then `unrepaired`, each rid that the repair left with the reason, and `mirror`. The repair removes each extra rid and each ghost rid from the indexes, puts back each missing forward entry of a UUIDIndex, catalogs each half-catalogued object again, or uncatalogs it when its path does not traverse, and sets the `Length`. It loads only the objects of the half-catalogued rows.
+
+On a large site, or from cron, run the repair in a script of the instance (`bin/instance run repair.py`), first with `dry_run=True`:
+
+```python
+import json, transaction
+from zoe.plone.catalog_repair import repair
+print(json.dumps(repair(app.Plone.portal_catalog, dry_run=False), indent=2)); transaction.commit()
+```
+
+Replace `Plone` with the id of the site. Outside a request, the repair makes one with the browser layers of the site, so the indexers that look up a view work.
+
+When the mirror builds again: `mirror` is `next_open` when the repair changed `paths` or `uids`. The store refused that catalog, and a refused catalog builds again only at the next open of the store: restart the instance that opens the store with `<zoe>`, or `zoe serve` for the clients of a server. `mirror` is `commit` for the other kinds: the mirror reads the commit, and an index that it refused builds again in the background, with no restart.
+
 ## Uninstall
 
 A client without `zoedb` cannot read the classes of `zoe.plone`. It loads the properties of the members and groups, and the workflow histories of the types with the behaviour, as broken objects. So remove `zoe.plone` in this order:
