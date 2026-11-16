@@ -244,8 +244,9 @@ fn decode_object_count(value: Option<&[u8]>) -> Result<u64> {
 
 /// The redb database of a store.
 enum Db {
-    /// The database is open for reads and writes.
-    ReadWrite(Database),
+    /// The database is open for reads and writes. `RedbBackend::abandon`
+    /// keeps a share of it, so that it never closes.
+    ReadWrite(Arc<Database>),
     /// The database file is open read-only. Every write fails.
     ReadOnly(ReadOnlyDatabase),
 }
@@ -304,14 +305,14 @@ impl RedbBackend {
 
     /// Open a store that `initialise` wrote, and check its format.
     pub(crate) fn open(db: Database) -> Result<Self> {
-        Self::open_db(Db::ReadWrite(db), false).map(|(backend, _)| backend)
+        Self::open_db(Db::ReadWrite(Arc::new(db)), false).map(|(backend, _)| backend)
     }
 
     /// Open a store for `zoe migrate`: a store of the format before this
     /// one opens too. Return the backend, and true when the store has the
     /// format before this one.
     pub(crate) fn open_migrating(db: Database) -> Result<(Self, bool)> {
-        Self::open_db(Db::ReadWrite(db), true)
+        Self::open_db(Db::ReadWrite(Arc::new(db)), true)
     }
 
     /// Open a store that `initialise` wrote, for reads only, and check its
@@ -399,6 +400,17 @@ impl RedbBackend {
     /// commit is not durable yet.
     fn before_sync(&self) -> Result<()> {
         before_sync(&self.unsynced, &self.before_sync)
+    }
+
+    /// Keep the database open until the process ends. The close of redb
+    /// commits with a sync, which makes the deferred commits durable. After
+    /// this call, the drop of the backend does not close the database, so
+    /// those commits stay not durable, and the next open of the store in
+    /// another process ends at the last durable commit.
+    pub(crate) fn keep_open(&self) {
+        if let Db::ReadWrite(db) = &self.db {
+            std::mem::forget(Arc::clone(db));
+        }
     }
 
     /// Add `oids` new oids to the object count in memory. The log counts

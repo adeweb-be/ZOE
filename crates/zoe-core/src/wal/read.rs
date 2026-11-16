@@ -534,6 +534,11 @@ impl Backend for Logged {
         self.core.redb.set_before_sync(hook);
     }
 
+    fn abandon(&self) {
+        Backend::close(self, false);
+        self.core.redb.keep_open();
+    }
+
     #[cfg(feature = "testing")]
     fn read_stored(&self, key: crate::testing::Key) -> Result<Option<Bytes>> {
         self.core.redb.read_stored(key)

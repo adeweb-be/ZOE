@@ -6,12 +6,15 @@
 //! commit places them all first: `Store::sync`, a durable finish, or the
 //! close of the store. A read of a waiting blob places them too. A crash
 //! loses the deferred restores after the last durable commit, and the
-//! next writer open leaves no blob file of them.
+//! next writer open leaves no blob file of them. A failed placement fails
+//! every later one, and its restores never become durable.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Store, Tid, ZoeError};
+use zoe_core::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
+use zoe_core::{Oid, Store, SystemClock, Tid, ZoeError};
 
 /// A `PersistentMapping` record.
 const PICKLE: &[u8] =
@@ -199,4 +202,198 @@ fn the_close_places_the_waiting_blobs() {
     for n in 0..=3 {
         assert_blob(&reopened, Oid(1 + n), Tid(BASE.0 + n));
     }
+}
+
+/// The operation of the blob store that `Faulty` fails once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fault {
+    /// The creation of an intent file.
+    IntentWrite,
+    /// A `sync_many`.
+    SyncMany,
+    /// The rename of a blob file into its place.
+    Rename,
+}
+
+/// A `MemVfs` that fails one operation of the blob store once.
+struct Faulty {
+    vfs: MemVfs,
+    fault: Arc<Mutex<Option<Fault>>>,
+}
+
+impl Faulty {
+    /// Fail the operation `fault` when it comes, once.
+    fn hit(&self, fault: Fault) -> io::Result<()> {
+        let mut armed = self.fault.lock().unwrap();
+        if *armed == Some(fault) {
+            *armed = None;
+            return Err(io::Error::other(format!("injected fault: {fault:?}")));
+        }
+        Ok(())
+    }
+}
+
+impl Vfs for Faulty {
+    type File = MemFile;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.vfs.exists(name)
+    }
+
+    fn open(&self, name: &str) -> io::Result<MemFile> {
+        self.vfs.open(name)
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<MemFile> {
+        self.vfs.create_new(name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        if to.ends_with(".blob") {
+            self.hit(Fault::Rename)?;
+        }
+        self.vfs.rename(from, to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        self.vfs.hard_link(from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.vfs.remove(name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        self.vfs.sync_dir()
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        self.vfs.sync_dir_at(dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        self.vfs.create_dir(name)
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.vfs.list_files(dir)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.vfs.list_entries(dir)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        if name.ends_with(".intent") {
+            self.hit(Fault::IntentWrite)?;
+        }
+        self.vfs.create_file(name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        self.vfs.read_file(name)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.vfs.sync_file(name)
+    }
+
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        self.hit(Fault::SyncMany)?;
+        self.vfs.sync_many(files, dirs)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        self.vfs.set_read_only(name)
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        self.vfs.lock_dir(name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.vfs.path(name)
+    }
+}
+
+/// Check the store in `vfs` after the loss of the restores with deferred
+/// blobs: it ends at `BASE`, its one blob reads, and no blob file of a
+/// lost restore and no temporary file stay.
+fn assert_lost_restores(vfs: &MemVfs, what: &str) {
+    let reopened = Store::open_vfs(vfs.clone()).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(reopened.last_transaction(), BASE, "{what}");
+    assert_blob(&reopened, Oid(1), BASE);
+    assert_eq!(blob_files(vfs).len(), 1, "{what}: {:?}", vfs.names());
+    assert_eq!(tmp_files(vfs), Vec::<String>::new(), "{what}");
+}
+
+#[test]
+fn a_failed_placement_never_makes_the_records_durable() {
+    for fault in [Fault::IntentWrite, Fault::SyncMany, Fault::Rename] {
+        let vfs = MemVfs::new();
+        let armed = Arc::new(Mutex::new(None));
+        let faulty = Faulty {
+            vfs: vfs.clone(),
+            fault: armed.clone(),
+        };
+        let store = Store::open_in(faulty, SystemClock).unwrap();
+        restore_blob(&store, BASE, Oid(1), false);
+        for n in 1..=3 {
+            restore_blob(&store, Tid(BASE.0 + n), Oid(1 + n), true);
+        }
+
+        *armed.lock().unwrap() = Some(fault);
+        assert!(store.sync().is_err(), "{fault:?}");
+        assert_eq!(*armed.lock().unwrap(), None, "{fault:?}: the fault came");
+        // A retry fails: the sync, and a read of a waiting blob. A read of
+        // a blob that does not wait still works.
+        assert!(store.sync().is_err(), "{fault:?}");
+        assert!(
+            store.open_blob(Oid(3), Tid(BASE.0 + 2)).is_err(),
+            "{fault:?}"
+        );
+        assert_blob(&store, Oid(1), BASE);
+        // The drop leaves the deferred restores to the next open.
+        drop(store);
+
+        let what = format!("{fault:?}, after the drop");
+        assert_lost_restores(&vfs.crash_now(|_| 0), &format!("{what} and a crash"));
+        vfs.restart();
+        assert_lost_restores(&vfs, &what);
+    }
+}
+
+#[test]
+fn every_crash_image_of_a_sequence_reservation_holds_a_prefix_without_orphans() {
+    let vfs = MemVfs::new();
+    drop(base_store(&vfs));
+    let vfs = vfs.durable_copy();
+    let store = Store::open_vfs(vfs.clone()).unwrap();
+    restore_blob(&store, Tid(BASE.0 + 1), Oid(2), true);
+    restore_blob(&store, Tid(BASE.0 + 2), Oid(3), true);
+    // The reservation of a sequence commits with a sync, and the hook of
+    // the backend places the waiting blobs first.
+    store.sequence("counter").next().unwrap();
+    vfs.mark("reserved");
+
+    for image in vfs.crash_images() {
+        let files = image.vfs();
+        let reopened = Store::open_vfs(files.clone())
+            .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+        let last = reopened.last_transaction();
+        assert!(
+            (BASE.0..=BASE.0 + 2).contains(&last.0),
+            "{image:?}: the last tid {last:?} is a tid of the copy"
+        );
+        if image.is_after("reserved") {
+            assert_eq!(last, Tid(BASE.0 + 2), "{image:?}: the reservation returned");
+        }
+        for n in 0..=last.0 - BASE.0 {
+            assert_blob(&reopened, Oid(1 + n), Tid(BASE.0 + n));
+        }
+        let expected = (last.0 - BASE.0 + 1) as usize;
+        assert_eq!(blob_files(&files).len(), expected, "{image:?}");
+        assert_eq!(tmp_files(&files), Vec::<String>::new(), "{image:?}");
+    }
+    drop(store);
 }

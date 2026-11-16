@@ -326,6 +326,13 @@ pub trait Backend: Send + Sync {
         let _ = hook;
     }
 
+    /// Leave the deferred commits that are not durable to the next open:
+    /// stop the work of the backend, and never make them durable, not even
+    /// at the close. The store calls it when it cannot place the waiting
+    /// blobs of those commits. This default does nothing: a backend that
+    /// cannot defer a commit has none.
+    fn abandon(&self) {}
+
     /// Return the bytes stored under `key`, as stored. Only the test hook
     /// `testing` calls it. A backend without the hook gives a `Backend`
     /// error.

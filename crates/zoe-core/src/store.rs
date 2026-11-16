@@ -1108,9 +1108,16 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         // The close of the database makes the deferred commits durable, so
-        // their waiting blobs go into their place first.
+        // their waiting blobs go into their place first. When they cannot,
+        // the database stays open until the process ends, and those commits
+        // never become durable.
         if let Err(error) = self.blobs().place_waiting() {
-            tracing::error!(%error, "cannot place the waiting blob files at the close of the store");
+            tracing::error!(
+                %error,
+                "cannot place the waiting blob files: the store leaves its deferred commits to the next open"
+            );
+            self.backend.abandon();
+            return;
         }
         let halted = crate::lock(&self.sequencer).is_none() || self.backend.fold_failed();
         self.backend.close(!halted);

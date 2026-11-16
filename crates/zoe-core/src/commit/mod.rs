@@ -362,6 +362,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// blob places them first. So a copy of many blobs syncs them once
     /// for each durable commit, not once for each blob.
     ///
+    /// A failed placement fails each later one and each durable commit,
+    /// and the store never makes the commits of the waiting blobs durable:
+    /// its drop leaves them to the next open.
+    ///
     /// A crash before the next durable commit loses the commit, as for
     /// `begin_restore_deferred`. Its blob files are then temporary files,
     /// or files in their place that an intent file names, and the next

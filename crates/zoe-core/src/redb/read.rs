@@ -386,6 +386,10 @@ impl Backend for RedbBackend {
         let _ = self.before_sync.set(hook);
     }
 
+    fn abandon(&self) {
+        self.keep_open();
+    }
+
     #[cfg(feature = "testing")]
     fn read_stored(&self, key: crate::testing::Key) -> Result<Option<Bytes>> {
         use crate::testing::Key;

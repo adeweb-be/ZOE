@@ -103,8 +103,8 @@ pub trait Vfs: Send + Sync + 'static {
     /// directory of `dirs` durable, as `sync_file` and `sync_dir_at` do.
     /// The default syncs each file, then each directory, in order. A
     /// filesystem can make them all durable in one call: `OsVfs` on Linux
-    /// calls `syncfs(2)` once, which makes every write of the filesystem
-    /// durable. All the names must be on one filesystem.
+    /// 5.8 or later calls `syncfs(2)` once, which makes every write of the
+    /// filesystem durable. All the names must be on one filesystem.
     fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
         for file in files {
             self.sync_file(file)?;
