@@ -1,0 +1,21 @@
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:browser="http://namespaces.zope.org/browser"
+    >
+
+  <!-- The repair of a damaged catalog for the catalog mirror: a GET gives
+       the dry run as JSON, a POST with repair=1 and the token of
+       plone.protect repairs and commits. configure.zcml includes this
+       file. -->
+  <include
+      package="Products.Five"
+      file="meta.zcml"
+      />
+  <browser:page
+      name="zoe-catalog-repair"
+      for="Products.CMFCore.interfaces.ISiteRoot"
+      class=".catalog_repair.RepairView"
+      permission="cmf.ManagePortal"
+      />
+
+</configure>

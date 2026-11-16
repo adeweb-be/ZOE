@@ -96,6 +96,11 @@ The hook decides the reasons `unsupported`, `index`, `option`,
 the store decides the others. An error of `catalog_query` that the hook
 catches (`Unsupported`, `StorageError`) goes to the log once for each
 class, at WARNING, and the search takes the Python path (`unsupported`).
+A reply `refused`, and a reply `index_unavailable` whose text names a rid
+outside `paths` or the `_length` of a UUIDIndex, go to the log once for
+each catalog and each text, at WARNING, with the name of the view
+`@@zoe-catalog-repair` of `zoe.plone.catalog_repair`, which repairs that
+damage.
 
 The modes: `on`, the default, and `compare`, which also runs the stock
 search, logs each difference at ERROR with the indexes and the options of
@@ -802,6 +807,8 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
         if throwaway and reply["f"] == "refused":
             # The text names oids and records, never a value of a query.
             _count("refused", why[:200])
+        elif not throwaway:
+            _repair_hint(oid, reply["f"], why)
         return None, None, plan
     if split:
         result = _split_result(catalog, reply, query, sort_index, reverse, limit)
@@ -940,6 +947,43 @@ def _key_map(index, rs):
             # A container without positions.
             pos[rid] = 0
     return pos
+
+
+# The refusals that the repair of `zoe.plone.catalog_repair` can mend, and
+# that went to the log: (oid, reason, text).
+_hinted = set()
+
+# The texts of the store for damage that the repair mends.
+_REPAIRABLE = ("is not in paths", "the _length of the UUIDIndex differs")
+
+
+def _repair_hint(oid, reason, why):
+    """Log once for each catalog and each text a refusal that the repair
+    can mend: a refused catalog, and an index whose reverse map names a
+    rid outside `paths` or whose `_length` is off."""
+    if reason == "refused":
+        text = (
+            "catalog mirror: the store refused the catalog %s (%s); its"
+            " searches take the Python path. Run @@zoe-catalog-repair on"
+            " the site: a GET gives the dry run, a POST with repair=1"
+            " repairs the catalog. The mirror then builds at the next open"
+            " of the store."
+        )
+    elif reason == "index_unavailable" and any(t in why for t in _REPAIRABLE):
+        text = (
+            "catalog mirror: an index of the catalog %s is unavailable (%s);"
+            " the searches on it take the Python path. Run"
+            " @@zoe-catalog-repair on the site: a GET gives the dry run, a"
+            " POST with repair=1 repairs the index."
+        )
+    else:
+        return
+    key = (oid, reason, why)
+    with _counts_lock:
+        if key in _hinted:
+            return
+        _hinted.add(key)
+    logger.warning(text, "0x" + oid.hex(), why)
 
 
 def _shift(plan):
