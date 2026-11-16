@@ -1,7 +1,10 @@
 //! The values that the mirror keeps: owned copies of the keys of a decoded
-//! record, their order as Python orders them, and an arena of strs.
+//! record, their order as Python orders them, an arena of strs, and a set of
+//! the distinct byte strings of an arena.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 
 use zoe_pickle::python::{Heap, Made, Object, Value};
 
@@ -253,5 +256,100 @@ impl StrArena {
     pub fn shrink(&mut self) {
         self.bytes.shrink_to_fit();
         self.ends.shrink_to_fit();
+    }
+}
+
+impl Spans for StrArena {
+    fn span(&self, place: u32) -> &[u8] {
+        self.get(place).as_bytes()
+    }
+}
+
+/// An arena of byte strings, each found by its place, as `Dedup` reads it.
+pub trait Spans {
+    /// The bytes at `place`.
+    fn span(&self, place: u32) -> &[u8];
+}
+
+/// The places of the distinct byte strings of an arena: it finds the place
+/// of a byte string that the arena already holds. It is a hash table with
+/// open addressing and linear probing.
+#[derive(Clone, Debug, Default)]
+pub struct Dedup {
+    /// The place of a byte string in each slot, `EMPTY` for no string.
+    /// The length is 0 or a power of two.
+    slots: Vec<u32>,
+    /// The number of full slots.
+    count: usize,
+    /// The seed of the hashes.
+    seed: RandomState,
+}
+
+/// A slot without a byte string.
+const EMPTY: u32 = u32::MAX;
+
+impl Dedup {
+    /// A set with the room for `count` byte strings.
+    pub fn with_capacity(count: usize) -> Dedup {
+        Dedup {
+            slots: vec![EMPTY; (count * 2).next_power_of_two().max(16)],
+            count: 0,
+            seed: RandomState::new(),
+        }
+    }
+
+    /// The place of `data` in `arena`. When the arena does not hold it,
+    /// `push` appends it to the arena and gives its new place. A place is
+    /// never `u32::MAX`.
+    pub fn place<A: Spans, E>(
+        &mut self,
+        arena: &mut A,
+        data: &[u8],
+        push: impl FnOnce(&mut A) -> Result<u32, E>,
+    ) -> Result<u32, E> {
+        if (self.count + 1) * 2 > self.slots.len() {
+            self.grow(arena);
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.hash(data) as usize & mask;
+        loop {
+            match self.slots[i] {
+                EMPTY => {
+                    let place = push(arena)?;
+                    self.slots[i] = place;
+                    self.count += 1;
+                    return Ok(place);
+                }
+                place if arena.span(place) == data => return Ok(place),
+                _ => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    /// Doubles the slots.
+    fn grow(&mut self, arena: &impl Spans) {
+        let size = (self.slots.len() * 2).max(16);
+        let mask = size - 1;
+        let mut slots = vec![EMPTY; size];
+        for place in self.slots.iter().filter(|p| **p != EMPTY) {
+            let mut i = self.hash(arena.span(*place)) as usize & mask;
+            while slots[i] != EMPTY {
+                i = (i + 1) & mask;
+            }
+            slots[i] = *place;
+        }
+        self.slots = slots;
+    }
+
+    /// The bytes that the set takes.
+    pub fn heap_bytes(&self) -> usize {
+        self.slots.capacity() * 4
+    }
+
+    /// The hash of `data`, with the seed of the set.
+    fn hash(&self, data: &[u8]) -> u64 {
+        let mut hasher = self.seed.build_hasher();
+        hasher.write(data);
+        hasher.finish()
     }
 }
