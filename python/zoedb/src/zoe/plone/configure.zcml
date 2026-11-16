@@ -61,6 +61,9 @@
       permission="cmf.ManagePortal"
       />
 
+  <!-- The view @@zoe-catalog-repair: the repair of a damaged catalog. -->
+  <include file="catalog_repair.zcml" />
+
   <!-- The catalog mirror, when its backend is installed: the registration
        keys of the catalogs of the sites at the open of a database, at the
        creation of a site and at its removal (ADR 0059). -->

@@ -264,3 +264,13 @@ ValueError: no backend 'search' of zoe.plone: use locking, indexing or registry
 **Cause.** The registry of the site is a copy whose records stayed in the namespaces of another store: a copy through `zodbconvert`, `zoe convert --force`, a zexp or a copy of the site.
 
 **Fix.** On the source store, move the registry back with `zoe.plone.registry.move_back`, then copy again. When the source is gone, `zoe.plone.registry.reset` gives the copy empty records, and an import of the profiles of the site gives the default values back.
+
+### `the catalog 0x… gets no mirror` or `index_unavailable`
+
+```text
+the catalog 0x2a gets no mirror: uids is not the inverse of paths: they differ in length
+```
+
+**Cause.** The catalog of a site is damaged: a path catalogued twice, a ghost rid, a UUIDIndex without its forward entry, or a half-catalogued row. The mirror never guesses a value, so the store refuses the catalog or the index, and the searches take the Python path. `zoe.plone` logs a warning that names `@@zoe-catalog-repair`.
+
+**Fix.** Make a backup of the store. Open `@@zoe-catalog-repair` on the site as a Manager for the dry run, then POST `repair=1` with the token of plone.protect, or run `zoe.plone.catalog_repair.repair` in a script (see [The repair of a damaged catalog](plone.md#the-repair-of-a-damaged-catalog)). When the report gives `mirror` `next_open`, restart the process that opens the store: the mirror builds at its next open.
