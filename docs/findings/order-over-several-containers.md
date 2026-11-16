@@ -1,6 +1,6 @@
 # Finding: the order over several containers, the navigation and `navtree`
 
-Card ZOE-311, a spike. ADR 0059, its amendment of ZOE-302 (the order clause). The draft that follows from it: the amendment of ZOE-311 at the end of ADR 0059, status Proposed.
+Card ZOE-311, a spike. ADR 0059, its amendment of ZOE-302 (the order clause). The decision that follows from it: the amendment of ZOE-311 at the end of ADR 0059, accepted.
 
 **Verdict.** The sort is the cost of these searches, and the filter is not. On a site of the shape of B5 `xlarge-mini`, the global navigation (448 rows in 33 containers) takes 13.9 ms on the Python path: the filter 0.6 ms, the sort 13.3 ms. Of the sort, `getObjectPosition` takes 10.8 ms, 24 µs for each row, because each call looks up the ordering adapter and the annotations again. The positions themselves cost little: one `_pos()` for each container, then a lookup for each row, gives the same keys in 0.84 ms. So the recommendation needs no change of the wire: the mirror answers the filter, and the hook builds the key map of `documentToKeyMap` with one read of the positions for each folder, then calls the stock `sortResults`. That gives the order of the Python path by construction, with every ordering, and took 2.2 ms for the navigation (13.9 ms on the Python path) and 0.6 ms for `navtree` (1.4 ms). An order clause over several containers on the wire costs about the same at this size, and needs a second call, because the client does not know the containers of a depth search before the search.
 
@@ -75,7 +75,7 @@ Times in ms. "With brains" adds a read of `getPath`, `portal_type`, `exclude_fro
 
 1. **The split (recommended).** The mirror answers the filter with every rid; the hook builds the key map as `documentToKeyMap` does, with one `_pos()` for each folder of `DefaultOrdering` (it calls `getObjectPosition` for any other container and for an id outside the positions), and calls the stock `sortResults`. No change of the wire, of the server or of `zoe-catalog`. The order, the ties, the exceptions, `len()`, `actual_result_count` and the batches are those of the Python path by construction, for every ordering. It serves one container too, so it can also take the sorts on `getObjPositionInParent` that the order clause of ZOE-302 refuses (another ordering, another depth). Its cost grows with the rows: about 3 µs for each row in Python. The hook depends on `Catalog.sortResults` and `_sort_limit_arguments` of Products.ZCatalog 7, as it already depends on `instantiate`.
 2. **An order clause over several containers on the wire.** The plan names each container with the oids of its order and of its positions; the mirror reads the positions at the tid of the plan or from the overlay, and sorts in Rust with the three rules of ties. For a depth search the client does not know the containers, so the server replies `need` with the parents that the plan lacks, and the client resolves them and calls again (a hint of the last containers of the same path clause saves the second call on most pages). It costs about the same as the split on the probe: 0.90 + 1.58 + 0.32 ms, plus 0.44 ms on a `need`. It adds a key of the plan, a form of the reply, a second call and the read of a tree through the overlay. It saves about 3 µs for each row, which counts only with tens of thousands of rows.
-3. **The server finds the containers.** It would read the folders from the Zope root in Rust (`_tree`, `__annotations__`, the positions), at the tid and through the overlay: one call, no work on the client, but the containment of Zope in the server and three to four records of each folder at each query, or a containment index kept with the change sets. The deferred card ZOE-304 asks for such an index. If it builds one, a later amendment can take option 2 without the reply `need`.
+3. **The server finds the containers.** It would read the folders from the Zope root in Rust (`_tree`, `__annotations__`, the positions), at the tid and through the overlay: one call, no work on the client, but the containment of Zope in the server and three to four records of each folder at each query, or a containment index kept with the change sets. No such index exists: the path prefetch of ZOE-304 is not built (`docs/findings/path-prefetch.md`).
 4. **The stock `GopipIndex` on the rids of the mirror.** The order of the Python path, but it keeps the 24 µs of `getObjectPosition` for each row: 0.9 + 13.2 ms against 13.9 ms. It saves nothing.
 5. **`navtree` only, with its containers in the plan.** Its containers are the prefixes of the path, so it needs no reply `need`. It leaves the 934 searches of the navigation on the Python path.
 
@@ -87,7 +87,7 @@ The build (step 3) then touches `python/zoedb/src/zoe/plone/catalog.py` and its 
 
 ## The acceptance test
 
-The finding leaves the counting of a split search open (question 1), so it writes no skeleton. The cases of `python/zoedb/src/zoe/plone/tests/test_catalog_gopip.py`, a class of their own, on the layer of ZOE-286 with the backend on, a site of three levels (units, Folders, leaves of Documents, a Folder of News Items in each unit):
+The finding writes no skeleton. The cases of `python/zoedb/src/zoe/plone/tests/test_catalog_gopip.py`, a class of their own, on the layer of ZOE-286 with the backend on, a site of three levels (units, Folders, leaves of Documents, a Folder of News Items in each unit):
 
 - The global navigation (the query of the viewlet, depth 3) and `navtree` queries (from the root, and with `navtree_start` 2 on a Document of a leaf) give the rids, `len()` and `actual_result_count` of the Python path and count as native: in both orders, with `sort_limit` 5 and 200, and with a batch past the middle.
 - The same after moves in two containers, each in a transaction of its own (`moveObjectsByDelta` in a leaf, `moveObjectsToTop` in a unit), after a rename and a delete; and inside a transaction after a move, through the transaction overlay.
@@ -104,9 +104,9 @@ The finding leaves the counting of a split search open (question 1), so it write
 - The cost of option 2 on the server is the load and the decode measured apart, not a built clause.
 - The site had no folder of another ordering and no positions that disagree with the order, so the probe compared the orders on folders of `DefaultOrdering` only. The rules for the other cases come from the code of plone.folder 4.0.2 and Products.ZCatalog 7.2.1.
 
-## Open questions for the human
+## Decisions
 
-1. **Is the split native?** The acceptance test of the card asks the navigation to "count as native". In the split, the mirror filters and Python sorts. The draft counts it as native and counts it again as `client_sort`. The other way: a path of its own in `zoe_catalog_queries_total`.
-2. **The scope of the split.** The draft serves with the split every sort on one GopipIndex alone that the order clause of ZOE-302 does not take: several containers, and also one container of another ordering or at another depth. The narrower way: several containers only, as the card names.
-3. **The brains of a native reply.** They cost 53 µs each against 10 to 13 µs from `Catalog.__getitem__` on a warm cache (the `DateTime` cells). A card of its own, outside ZOE-311?
-4. **An order clause on the wire (option 2), or a containment index with ZOE-304 (option 3),** only after a B5 run of `xlarge` measures the navigation? The draft says yes, and keeps them as alternatives of the amendment.
+1. **The split is native.** A split search counts as native, and `zoe.plone` counts it once more as `client_sort`.
+2. **The scope.** The split serves every sort on one GopipIndex alone that the order clause of ZOE-302 does not take: several containers, and one container of another ordering or at another depth.
+3. **The brains of a native reply** are a card of their own, ZOE-316. The split takes its brains from `Catalog.__getitem__`.
+4. **Options 2 and 3 wait.** An order clause on the wire, or a containment index, comes up again only if a B5 run of `xlarge` shows the sort of each row in Python as a cost.
