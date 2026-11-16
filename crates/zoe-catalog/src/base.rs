@@ -10,7 +10,7 @@ use roaring::RoaringBitmap;
 
 use crate::security::{SECURITY_INDEX, SecurityIndex};
 use crate::table::Table;
-use crate::value::{StrArena, Val, py_cmp};
+use crate::value::{Dedup, StrArena, Val, py_cmp};
 
 /// The marker of a row without a key.
 pub const NONE: u32 = u32::MAX;
@@ -438,30 +438,21 @@ fn group(pairs: Pairs, mut each: impl FnMut(u32, u32)) -> Result<(Keys, Postings
             keys.shrink_to_fit();
             Keys::Int(keys)
         }
-        Pairs::Str(arena, mut v) => {
-            // Only the distinct texts sort as strs. Each pair takes the
-            // number of its text, then the slot of that text, and the pairs
-            // sort as numbers.
-            let mut ids: HashMap<&str, u32> = HashMap::new();
-            let mut texts: Vec<&str> = Vec::new();
-            for pair in &mut v {
-                let text = arena.get(pair.0);
-                let next = texts.len() as u32;
-                let id = *ids.entry(text).or_insert(next);
-                if id == next {
-                    texts.push(text);
-                }
-                pair.0 = id;
-            }
-            drop(ids);
-            let mut order: Vec<u32> = (0..texts.len() as u32).collect();
-            order.sort_unstable_by(|a, b| texts[*a as usize].cmp(texts[*b as usize]));
-            let mut slots = vec![0u32; texts.len()];
+        Pairs::Str(arena, dedup, mut v) => {
+            // The arena holds each text once, so only the distinct texts
+            // sort as strs. Each pair takes the slot of its text, and the
+            // pairs sort as numbers.
+            drop(dedup);
+            let mut order: Vec<u32> = (0..arena.len() as u32).collect();
+            order.sort_unstable_by(|a, b| arena.get(*a).cmp(arena.get(*b)));
+            let mut slots = vec![0u32; arena.len()];
             let mut keys = StrArena::default();
             for (slot, id) in order.iter().enumerate() {
                 slots[*id as usize] = slot as u32;
-                keys.push(texts[*id as usize]);
+                keys.push(arena.get(*id));
             }
+            drop(order);
+            drop(arena);
             for pair in &mut v {
                 pair.0 = slots[pair.0 as usize];
             }
@@ -669,38 +660,35 @@ impl KeywordIndex {
     }
 
     /// The transient bytes of a build from `pairs`, beside the pairs: the
-    /// row and the slot of each pair.
+    /// slot of each pair.
     pub fn build_bytes(pairs: &Pairs) -> usize {
-        pairs.len() * 8
+        pairs.len() * 4
     }
 
     /// Builds the index from the keys of `pairs`, one pair for each key of
     /// a row, for `rows` rows.
     pub fn build(pairs: Pairs, rows: usize) -> Result<KeywordIndex, String> {
-        let mut found: Vec<(u32, u32)> = Vec::new();
-        let (keys, postings) = group(pairs, |row, slot| {
-            if (row as usize) < rows {
-                found.push((row, slot));
-            }
-        })?;
-        // `group` gives the slots in ascending order. So a count of the
-        // slots of each row and one pass over `found` lay out the slots of
-        // each row in ascending order, and a repeated slot comes next to
-        // its twin.
+        // A count of the keys of each row gives where its slots start.
+        // `group` gives the slots in ascending order, so it lays out the
+        // slots of each row in ascending order, and a repeated slot comes
+        // next to its twin.
         let mut ends = vec![0u32; rows + 1];
-        for (row, _) in &found {
-            ends[*row as usize + 1] += 1;
-        }
+        pairs.each_row(|row| {
+            if (row as usize) < rows {
+                ends[row as usize + 1] += 1;
+            }
+        });
         for row in 0..rows {
             ends[row + 1] += ends[row];
         }
         let mut next = ends.clone();
-        let mut slots = vec![0u32; found.len()];
-        for (row, slot) in found {
-            let at = &mut next[row as usize];
-            slots[*at as usize] = slot;
-            *at += 1;
-        }
+        let mut slots = vec![0u32; ends[rows] as usize];
+        let (keys, postings) = group(pairs, |row, slot| {
+            if let Some(at) = next.get_mut(row as usize).filter(|_| (row as usize) < rows) {
+                slots[*at as usize] = slot;
+                *at += 1;
+            }
+        })?;
         drop(next);
         // Remove each repeated slot of a row, in place.
         let mut starts = Vec::with_capacity(rows + 1);
@@ -1158,8 +1146,9 @@ pub enum Pairs {
     Empty,
     /// Ints and bools.
     Int(Vec<(i64, u32)>),
-    /// Strs and `Message`s, by their text: the place in the arena.
-    Str(StrArena, Vec<(u32, u32)>),
+    /// Strs and `Message`s, by their text: the place in the arena, which
+    /// holds each text once, and the set of its texts.
+    Str(StrArena, Dedup, Vec<(u32, u32)>),
     /// Other values, or keys of several kinds.
     Any(Vec<(Val, u32)>),
 }
@@ -1192,12 +1181,11 @@ impl Pairs {
     pub fn push_str(&mut self, text: &str, row: u32) {
         match self {
             Pairs::Empty => {
-                let mut arena = StrArena::default();
-                let place = arena.push(text);
-                *self = Pairs::Str(arena, vec![(place, row)]);
+                *self = Pairs::Str(StrArena::default(), Dedup::default(), Vec::new());
+                self.push_str(text, row);
             }
-            Pairs::Str(arena, v) => {
-                let place = arena.push(text);
+            Pairs::Str(arena, dedup, v) => {
+                let place = intern(arena, dedup, text);
                 v.push((place, row));
             }
             Pairs::Any(v) => v.push((Val::Str(text.into()), row)),
@@ -1213,7 +1201,7 @@ impl Pairs {
         let any = match std::mem::replace(self, Pairs::Empty) {
             Pairs::Empty => Vec::new(),
             Pairs::Int(v) => v.into_iter().map(|(i, r)| (Val::Int(i), r)).collect(),
-            Pairs::Str(arena, v) => v
+            Pairs::Str(arena, _, v) => v
                 .into_iter()
                 .map(|(p, r)| (Val::Str(arena.get(p).into()), r))
                 .collect(),
@@ -1228,10 +1216,13 @@ impl Pairs {
             (_, Pairs::Empty) => {}
             (Pairs::Empty, other) => *self = other,
             (Pairs::Int(a), Pairs::Int(b)) => a.extend(b),
-            (Pairs::Str(arena, a), Pairs::Str(other, b)) => {
-                let offset = arena.len() as u32;
-                arena.extend(&other);
-                a.extend(b.into_iter().map(|(p, r)| (p + offset, r)));
+            (Pairs::Str(arena, dedup, a), Pairs::Str(other, _, b)) => {
+                // The place in this arena of each text of `other`.
+                let places: Vec<u32> = (0..other.len() as u32)
+                    .map(|p| intern(arena, dedup, other.get(p)))
+                    .collect();
+                drop(other);
+                a.extend(b.into_iter().map(|(p, r)| (places[p as usize], r)));
             }
             (_, mut other) => {
                 self.widen();
@@ -1243,12 +1234,22 @@ impl Pairs {
         }
     }
 
+    /// Calls `each` with the row of each pair.
+    fn each_row(&self, mut each: impl FnMut(u32)) {
+        match self {
+            Pairs::Empty => {}
+            Pairs::Int(v) => v.iter().for_each(|(_, row)| each(*row)),
+            Pairs::Str(_, _, v) => v.iter().for_each(|(_, row)| each(*row)),
+            Pairs::Any(v) => v.iter().for_each(|(_, row)| each(*row)),
+        }
+    }
+
     /// The number of pairs.
     pub fn len(&self) -> usize {
         match self {
             Pairs::Empty => 0,
             Pairs::Int(v) => v.len(),
-            Pairs::Str(_, v) => v.len(),
+            Pairs::Str(_, _, v) => v.len(),
             Pairs::Any(v) => v.len(),
         }
     }
@@ -1263,13 +1264,24 @@ impl Pairs {
         match self {
             Pairs::Empty => 0,
             Pairs::Int(v) => v.capacity() * 16,
-            Pairs::Str(arena, v) => arena.heap_bytes() + v.capacity() * 8,
+            Pairs::Str(arena, dedup, v) => {
+                arena.heap_bytes() + dedup.heap_bytes() + v.capacity() * 8
+            }
             Pairs::Any(v) => {
                 v.capacity() * (std::mem::size_of::<Val>() + 8)
                     + v.iter().map(|(k, _)| k.heap_bytes()).sum::<usize>()
             }
         }
     }
+}
+
+/// The place of `text` in `arena`, which holds each text once.
+fn intern(arena: &mut StrArena, dedup: &mut Dedup, text: &str) -> u32 {
+    dedup
+        .place(arena, text.as_bytes(), |arena| {
+            Ok::<_, std::convert::Infallible>(arena.push(text))
+        })
+        .unwrap_or_else(|never| match never {})
 }
 
 /// A mirrored index, or why the index has no structure.

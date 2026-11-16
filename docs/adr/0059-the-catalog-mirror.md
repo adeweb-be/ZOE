@@ -53,7 +53,9 @@ A mirror builds in the background after the open of the store, so `/readyz` and 
 
 - When `uids` is not the inverse of `paths`, or the decoder refuses a record of `paths`, `uids` or `data`, the catalog gets no mirror (`refused`). When the decoder refuses a record of an index, only that index is unavailable (`index_unavailable`). A guessed value is never served.
 - The build uses a pool of as many threads as the machine has hardware threads. A process builds one mirror at a time. The pool loads and decodes the nodes of a tree, and the structures of a tree build beside the walk of the next tree.
-- The build decodes each value straight into the structure of its index. It keeps its transient values in arenas that it frees whole at its end. So its memory goes back to the system, and the bound of section 6 counts the mirror, not the allocator.
+- The build decodes each value straight into the structure of its index. It keeps its transient values in arenas that it frees whole when the structure is built.
+- Amendment (ZOE-322): the intermediates of a build do not outlive their phase. The table builds from `data` before the walks of the indexes start. Each thread of the walk of `data` keeps the distinct cells of each column once, and a grid keeps the code of each cell of each row. The distinct cells of a thread become an arena of their column with no copy, or are freed when an earlier thread holds them. So no collected copy of `data` stays during the walks of the indexes. A thread of the walk of an index keeps each str key once, and hands its values over in parts of at most 65,536 pairs, so no thread grows a large buffer of its own. A KeywordIndex lays out the keys of each row from the sorted pairs, with 4 bytes for each pair beside them.
+- The peak of a build comes near its end: the mirror, the transient values of the last indexes, and the memory that the allocator of the C library keeps after the frees of the build. The bound of section 6 counts the bytes of the structures, not that memory. With 16 build threads and a page cache of 16 MiB, the peak resident memory (`VmHWM`) of the process grows by 1.7 times `zoe_catalog_mirror_bytes` on a synthetic catalog of 200,000 entries (174 MiB), and by 1.6 times on a production copy of a Plone 6 site of 250,000 entries (526 MiB); before the amendment, 4 times. More build threads keep more memory: 2 times with 22 threads on the synthetic catalog. `python/zoedb/tests/test_mirror_rss.py` checks at most 2 times with at most 16 threads.
 - The commits during a build stay in the store. When the base is ready, the mirror reads the commits after its tid through the transaction index and applies them in tid order. Then the mirror is ready.
 
 Until the mirror is ready, each query takes the Python path (`not_ready`). `zoe_catalog_mirror_ready` and `zoe_catalog_mirror_build_seconds` report the build.
@@ -91,14 +93,14 @@ Each store has a bound for its mirrors: `catalog-memory` in the configuration of
 
 - the bases, the change sets of the window, and the map of the oids of the trees;
 - the transaction overlays of the queries that run;
-- the transient memory of a build;
+- the transient memory of a build, as the bytes of its structures (section 2);
 - the second copy of the structures that a rebase or a shadow rebuild makes. Both make one structure at a time, so this copy is at most the largest structure: 148 MB for `object_provides` and 102 MB for the column `Description`, at one million entries.
 
 At the bytes of the finding, the default holds one catalog of 1,000,000 entries with the indexes and columns of `xlarge` (1.52 GB), a window of 10,000 change sets (about 216 MB) and the room of a rebase (about 150 MB): about 1.9 GB of 2.15 GB. It does not hold two stock catalogs of that size: 1.09 GB each, 2.19 GB together.
 
 A build, a rebase or a growth that would pass the bound drops the mirror of the store that answered a query least recently. `zoe_catalog_mirror_drops_total` counts the drop, and the queries of that mirror take the Python path (`dropped`). A dropped mirror builds again at the next open of the store, or when an uninstall frees its room.
 
-N6 bounds the resident memory of a server by its configuration. The mirrors add one term to that bound: `catalog-memory` for each store with a registered catalog, beside `cache-size` and the log. The test of N6 (a store of 100 GB under a limit of 2 GB) registers no catalog. A server with one mirror at the default needs a limit 2 GiB higher.
+N6 bounds the resident memory of a server by its configuration. The mirrors add one term to that bound: `catalog-memory` for each store with a registered catalog, beside `cache-size` and the log. The page cache of the store (`cache-size`) is a term of the resident memory in `zoe serve` and in the process alike: the reads of a build fill it. An in-process store takes it from `cache-size` of `<zoe>` or `cache_size` of `zoe.Storage`. The test of N6 (a store of 100 GB under a limit of 2 GB) registers no catalog. A server with one mirror at the default needs a limit 2 GiB higher.
 
 ### 7. What the mirror serves, and the reasons of a fallback
 

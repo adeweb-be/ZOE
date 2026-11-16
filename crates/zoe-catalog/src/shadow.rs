@@ -392,19 +392,17 @@ pub fn build(
             indexes.push(read.entry);
         }
         let table = if changed.table {
-            let (part, shape, _) = read_table(
+            let (table, shape, _) = read_table(
                 reads,
                 before,
                 meta.trees.data,
-                meta.schema.len(),
+                meta.schema,
                 &rows,
                 threads,
                 room,
                 held,
             )
             .map_err(failed)?;
-            // A table that does not build serves no row.
-            let table = part.build(meta.schema, rows.len()).unwrap_or_default();
             held += table.heap_bytes() + shape.heap_bytes();
             if !room(held) {
                 return Err(no_room());

@@ -5,12 +5,14 @@
 //! gives `_inputs` in the place of `_unindex`. It reads no `_index` tree.
 //! It decodes each value of a tree straight into the structure of its
 //! index: the keys go into arenas, which the build frees whole when the
-//! structure is built. The structure of a tree builds in a thread of its
-//! own, beside the walk of the next tree.
+//! structure is built. The table builds from `data` before the walks of the
+//! indexes start, so its collected cells are freed before them. The
+//! structure of an index builds in a thread of its own, beside the walk of
+//! the next tree.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use zoe_pickle::python::Value;
@@ -24,8 +26,12 @@ use crate::read::{
     RECORDS, Reads, Record, TreeShape, WalkStats, oid_of, walk_tree, walk_tree_with,
 };
 use crate::security::SecurityIndex;
-use crate::table::{Table, TablePart};
+use crate::table::{Grid, Table, TablePart};
 use crate::value::{StrArena, Val};
+
+/// The most values that a thread of the walk of an index keeps before it
+/// hands them over.
+const HAND_OVER: usize = 1 << 16;
 
 /// The class of the catalog object.
 pub const CATALOG: (&str, &str) = ("Products.ZCatalog.Catalog", "Catalog");
@@ -68,6 +74,15 @@ impl Part {
             Part::Ranges(v) => v.capacity() * 24,
             Part::Paths(texts, v) => texts.heap_bytes() + v.capacity() * 8,
             Part::Inputs(v) => v.iter().map(|(_, value)| value.heap_bytes() + 8).sum(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Part::Pairs(p) => p.len(),
+            Part::Ranges(v) => v.len(),
+            Part::Paths(_, v) => v.len(),
+            Part::Inputs(v) => v.len(),
         }
     }
 
@@ -291,6 +306,16 @@ pub(crate) fn read_index(
             .int_state()
             .ok_or("a _length that is not an int")?;
         watch.pop();
+        // Each thread hands its values over in small parts, so no thread
+        // grows a large buffer of its own.
+        let all: Mutex<Option<Part>> = Mutex::new(None);
+        let hand = |part: Part| {
+            let mut all = all.lock().unwrap_or_else(PoisonError::into_inner);
+            match all.as_mut() {
+                Some(all) => all.append(part),
+                None => *all = Some(part),
+            }
+        };
         let walked = walk_tree(
             reads,
             before,
@@ -305,6 +330,9 @@ pub(crate) fn read_index(
                         .ok_or_else(|| format!("the rid {rid} is not in paths"))?;
                     part.push(kind, value, row)?;
                 }
+                if part.len() >= HAND_OVER {
+                    hand(std::mem::replace(part, make()));
+                }
                 Ok(())
             },
         );
@@ -317,10 +345,13 @@ pub(crate) fn read_index(
         };
         stats.records += walk_stats.records;
         stats.bytes += walk_stats.bytes;
-        let mut all = make();
         for part in parts {
-            all.append(part);
+            hand(part);
         }
+        let all = all
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_else(make);
         Ok(Some((all, shape, bytes)))
     })();
     read.stats = stats;
@@ -402,34 +433,43 @@ pub(crate) fn add_index_shapes(
     }
 }
 
-/// Walks `data` as of before `before` over the rows `rows` into the cells
-/// of a table of `width` columns. The cells count against the bound as the
-/// walk collects them, beside the `held` bytes.
+/// Walks `data` as of before `before` over the rows `rows`, and builds the
+/// table of `schema` from its cells. The cells count against the bound as
+/// the walk collects them, beside the `held` bytes. The cells that the walk
+/// collects are freed before the function returns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_table(
     reads: &dyn Reads,
     before: u64,
     data: u64,
-    width: usize,
+    schema: HashMap<String, usize>,
     rows: &Rows,
     threads: usize,
     room: &(dyn Fn(usize) -> bool + Sync),
     held: usize,
-) -> Result<(TablePart, TreeShape, WalkStats), BuildError> {
+) -> Result<(Table, TreeShape, WalkStats), BuildError> {
+    let width = schema.len();
+    let grid = Grid::new(width, rows.len());
+    let held = held + grid.heap_bytes();
+    if !room(held) {
+        return Err(BuildError::Dropped);
+    }
     let walked = AtomicUsize::new(0);
     let over = AtomicBool::new(false);
+    let next_id = AtomicU32::new(0);
+    let grid_ref = &grid;
     let walk = walk_tree_with(
         reads,
         before,
         data,
         threads,
         RECORDS,
-        || TablePart::new(width),
+        || TablePart::new(next_id.fetch_add(1, AtomicOrdering::Relaxed), width),
         |part: &mut TablePart, items| {
             let start = part.heap_bytes();
             for (rid, value) in items {
                 if let Some(row) = rows.row(rid_of(&rid)?) {
-                    part.push(row, &value)?;
+                    part.push(grid_ref, row, &value)?;
                 }
             }
             let grown = part.heap_bytes().saturating_sub(start);
@@ -446,11 +486,8 @@ pub(crate) fn read_table(
     }
     let refused = |e: String| BuildError::Refused(format!("data: {e}"));
     let (shape, parts, stats) = walk.map_err(|e| refused(e.why))?;
-    let mut table_part = TablePart::new(width);
-    for part in parts {
-        table_part.append(part).map_err(refused)?;
-    }
-    Ok((table_part, shape, stats))
+    let table = grid.build(parts, schema, threads).map_err(refused)?;
+    Ok((table, shape, stats))
 }
 
 /// The shape of the tree and the pickle of the object of a mirrored
@@ -543,13 +580,15 @@ pub fn build(
             "uids is not the inverse of paths: they differ in length".into(),
         ));
     }
-    // The records of `data`, cell by cell. A record of a rid that `paths`
-    // does not hold is in no result: the table does not keep it.
-    let (table_part, data_shape, stats) = read_table(
+    // The table, from the records of `data`, cell by cell. A record of a
+    // rid that `paths` does not hold is in no result: the table does not
+    // keep it. The cells that the walk collects are freed before the
+    // indexes are read.
+    let (table, data_shape, stats) = read_table(
         reads,
         before,
         trees.data,
-        schema.len(),
+        schema,
         rows_ref,
         threads,
         room,
@@ -557,8 +596,8 @@ pub fn build(
     )?;
     read_records += stats.records;
     read_bytes += stats.bytes;
-    if !room(held.load(AtomicOrdering::Relaxed) + table_part.heap_bytes() + data_shape.heap_bytes())
-    {
+    held.fetch_add(table.heap_bytes(), AtomicOrdering::Relaxed);
+    if !room(held.load(AtomicOrdering::Relaxed) + data_shape.heap_bytes()) {
         return Err(BuildError::Dropped);
     }
     let mut shapes = Shapes::default();
@@ -574,16 +613,7 @@ pub fn build(
     // each unavailable index watches.
     let mut found: Vec<IndexFound> = Vec::with_capacity(names.len());
     let mut stopped = false;
-    let mut table = Table::default();
     std::thread::scope(|scope| {
-        let count = rows_ref.len();
-        let held_ref = &held;
-        let table_build = scope.spawn(move || {
-            // A table that does not build serves no row.
-            let table = table_part.build(schema, count).unwrap_or_default();
-            held_ref.fetch_add(table.heap_bytes(), AtomicOrdering::Relaxed);
-            table
-        });
         let mut pending = Vec::new();
         for (name, oid) in &names {
             let mut read = read_index(reads, before, name, *oid, rows_ref, threads);
@@ -624,11 +654,6 @@ pub fn build(
                     Err(_) => Index::Unavailable("the build of the index panicked".into()),
                 };
             }
-        }
-        // A table that did not build serves no row: each brain then comes
-        // from `data`.
-        if let Ok(built) = table_build.join() {
-            table = built;
         }
     });
     if stopped || !room(held.load(AtomicOrdering::Relaxed)) {
