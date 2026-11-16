@@ -12,6 +12,7 @@ server. `ZEO.ClientStorage` and the asyncio mode of
 `zoe.zeo.ClientStorage` have no `catalog_query`.
 """
 
+import pickle
 import time
 
 import pytest
@@ -205,6 +206,91 @@ def test_the_rows_of_the_native_client_stay_lazy(tmp_path):
             assert str(first[2]) in TYPES
         finally:
             remote.close()
+
+
+# The value of a slot that holds none.
+_UNSET = object()
+
+
+def slots_of(value):
+    """The value of each slot of the `DateTime` `value`."""
+    from DateTime import DateTime
+
+    return {name: getattr(value, name, _UNSET) for name in DateTime.__slots__}
+
+
+def read(rows):
+    """Each row of `rows`, decoded."""
+    return [rows[k] for k in range(len(rows))]
+
+
+def test_a_datetime_cell_copies_the_slots_of_a_kept_state(tmp_path):
+    from DateTime import DateTime
+
+    from zoe import _zoe
+
+    path = tmp_path / "store"
+    oid = make_catalog(path)
+    storage = zoe.Storage(str(path))
+    try:
+        tid = after(storage.lastTransaction())
+        rows = settled(storage, oid, tid, PLANS[1])["rows"]
+        assert _zoe._catalog_dates()["copy"]
+        column = COLUMNS.index("modified")
+        first = read(rows)
+        before = _zoe._catalog_dates()
+        second = read(rows)
+        done = _zoe._catalog_dates()
+        assert len(second) > 1
+        # Each cell of a state that the process keeps is a copy.
+        assert done["copies"] - before["copies"] == len(second)
+        assert done["states"] == before["states"]
+        for old, new in zip(first, second, strict=True):
+            date = new[column]
+            assert type(date) is DateTime
+            assert date is not old[column]
+            reference = DateTime.__new__(DateTime)
+            reference.__setstate__(date.__getstate__())
+            assert slots_of(date) == slots_of(reference) == slots_of(old[column])
+            assert date == reference
+            assert pickle.dumps(date, 3) == pickle.dumps(reference, 3)
+        # Without the copy, each cell calls `__setstate__`.
+        try:
+            _zoe._catalog_dates(copy=False)
+            mark = _zoe._catalog_dates()
+            third = read(rows)
+            end = _zoe._catalog_dates()
+        finally:
+            _zoe._catalog_dates(copy=True)
+        assert mark["kept"] == 0
+        assert end["copies"] == mark["copies"]
+        assert end["states"] - mark["states"] == len(third)
+        assert end["kept"] == 0
+        for new, plain in zip(second, third, strict=True):
+            assert slots_of(new[column]) == slots_of(plain[column])
+            assert new == plain
+    finally:
+        storage.close()
+
+
+def test_a_class_whose_instances_have_a_dict_gets_no_copy():
+    from DateTime import DateTime
+
+    from zoe import _zoe
+
+    class Loose(DateTime):
+        pass
+
+    class Slots:
+        __slots__ = ("a", "b")
+
+    class SlotsAndDict:
+        __slots__ = ("a", "__dict__")
+
+    assert _zoe._catalog_date_slots(DateTime) == list(DateTime.__slots__)
+    assert _zoe._catalog_date_slots(Slots) == ["a", "b"]
+    assert _zoe._catalog_date_slots(Loose) is None
+    assert _zoe._catalog_date_slots(SlotsAndDict) is None
 
 
 def test_catalog_supported_is_false_against_a_stock_zeo_server(tmp_path):

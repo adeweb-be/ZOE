@@ -22,7 +22,9 @@
 //! of the store (`catalog`, ADR 0059). Their thread starts at the open of a
 //! store with a registered catalog, never at the import of the module.
 //! `_catalog_throwaway` answers one query from a throwaway mirror, for the
-//! mode `compare` of `zoe.plone.catalog` on a test storage. The text
+//! mode `compare` of `zoe.plone.catalog` on a test storage.
+//! `_catalog_dates` and `_catalog_date_slots` show how the rows make their
+//! `DateTime` cells, for the tests. The text
 //! methods of the storages (`text`, ADR 0060) stage the text deltas and
 //! read the text index of each catalog, which the mirrors host.
 
@@ -44,7 +46,7 @@ mod _zoe {
     use pyo3::prelude::*;
 
     #[pymodule_export]
-    use crate::catalog::_catalog_throwaway;
+    use crate::catalog::{_catalog_date_slots, _catalog_dates, _catalog_throwaway};
     #[pymodule_export]
     use crate::cli::main;
     #[pymodule_export]

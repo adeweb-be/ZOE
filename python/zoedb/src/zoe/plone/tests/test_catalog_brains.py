@@ -11,6 +11,7 @@ zoe.plone` of the instance of the zoe scenario runs these tests, and
 """
 
 import contextlib
+import pickle
 import unittest
 from unittest import mock
 
@@ -97,6 +98,34 @@ def same(a, b):
     if isinstance(a, dict):
         return list(a) == list(b) and all(same(a[k], b[k]) for k in a)
     return a == b
+
+
+# The values that cannot change.
+_FIXED = (str, bytes, int, float, type(None))
+
+
+def changeable(value):
+    """The values in `value` that can change: each value that is not a
+    str, bytes, a number, None or `Missing.Value`, in a tuple too."""
+    if value is Missing.Value or isinstance(value, _FIXED):
+        return
+    if isinstance(value, tuple):
+        for item in value:
+            yield from changeable(item)
+        return
+    yield value
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from changeable(item)
+
+
+# The value of a slot that holds none.
+_UNSET = object()
+
+
+def slots_of(value):
+    """The value of each slot of the `DateTime` `value`."""
+    return {name: getattr(value, name, _UNSET) for name in DateTime.__slots__}
 
 
 def tree_oids(jar, root):
@@ -344,6 +373,56 @@ class TestTheBrainsOfTheCatalogMirror(unittest.TestCase):
                 self.assertEqual(bool(got._timezone_naive), naive, name)
                 if zone is not None:
                     self.assertEqual(got.timezone(), zone, name)
+
+    def test_each_column_equals_the_stock_brain_and_no_two_brains_share_a_value(
+        self,
+    ):
+        with opened(self.db) as site:
+            cat = site.portal_catalog._catalog
+            names = list(aq_base(cat).schema)
+            _, first, _ = self.native(site, LISTING)
+            dates = 0
+            for got in first:
+                want = cat[got.getRID()]
+                self.same_brain(got, want, names)
+                for name in names:
+                    a, b = getattr(got, name), getattr(want, name)
+                    self.assertEqual(a, b, name)
+                    self.assertEqual(
+                        pickle.dumps(a, 3), pickle.dumps(b, 3), f"{name}: {a!r}"
+                    )
+                    if isinstance(a, DateTime):
+                        dates += 1
+                        self.assertEqual(slots_of(a), slots_of(b), name)
+                        self.assertEqual(a.ISO8601(), b.ISO8601(), name)
+            self.assertGreater(dates, ITEMS)
+            _, again, _ = self.native(site, LISTING)
+            # A value that can change is in one brain only: in the brains of
+            # one reply, and in the brains of two replies of one query.
+            owner = {}
+            for k, brain in enumerate(first + again):
+                for name in names:
+                    for value in changeable(getattr(brain, name)):
+                        self.assertNotIn(id(value), owner, f"{name}: {value!r}")
+                        owner[id(value)] = k
+            self.assertTrue(owner)
+
+    def test_the_brains_are_the_stock_brains_when_each_cell_calls_setstate(self):
+        from zoe import _zoe
+
+        try:
+            _zoe._catalog_dates(copy=False)
+            with opened(self.db) as site:
+                mark = _zoe._catalog_dates()
+                found, brains, loaded = self.native(site, LISTING)
+                done = _zoe._catalog_dates()
+                self.assertEqual(loaded, set())
+                self.check(site, found, brains, LISTING)
+        finally:
+            _zoe._catalog_dates(copy=True)
+        self.assertEqual(done["copies"], mark["copies"])
+        self.assertGreater(done["states"] - mark["states"], ITEMS)
+        self.assertEqual(done["kept"], 0)
 
     def test_a_search_sorted_on_modified_with_sort_limit_gives_the_stock_brains(self):
         with opened(self.db) as site:
