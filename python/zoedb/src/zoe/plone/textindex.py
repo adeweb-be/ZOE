@@ -91,9 +91,17 @@ with `Unsupported`, and changes nothing, an instance without the backend
 `zoe.plone:text-uninstall` fills pending ZCTextIndex indexes with the same
 attributes and lexicons in the same way, then stages a clear delta for
 each `ZoeTextIndex` and puts the ZCTextIndex indexes in place.
+
+Both steps skip an object whose record or blob file cannot be read: its
+indexing raises `POSKeyError`. The object gets no text in the new
+indexes. The logger `zoe.plone.textindex` names its path, its oid and
+the oid of the missing record at WARNING, and at the end gives the count
+of the skipped objects and their first 10 paths. Any other exception
+stops the step.
 """
 
 import json
+import logging
 import math
 import threading
 import weakref
@@ -116,7 +124,7 @@ from Products.ZCTextIndex.QueryParser import QueryParser
 from ZODB.Connection import TransactionMetaData
 from ZODB.DemoStorage import DemoStorage
 from ZODB.POSException import POSKeyError, Unsupported
-from ZODB.utils import p64, u64
+from ZODB.utils import oid_repr, p64, u64
 
 import zoe.kv
 
@@ -152,6 +160,12 @@ BATCH_SIZE = 1000
 #: The prefix of the key of a pending index in a catalog: the index that a
 #: profile step fills while the old index serves.
 PENDING = "zoe-text-pending-"
+
+# The paths of the skipped objects that the summary of a profile step
+# names.
+_SKIPPED_SHOWN = 10
+
+logger = logging.getLogger("zoe.plone.textindex")
 
 # The cap of a call (ADR 0059, section 8): msgpack values and bytes.
 _CAP_VALUES = 50_000
@@ -1226,17 +1240,51 @@ def _check_site(tool):
     _check(jar.db().storage)
 
 
-def _reindex(tool, keys):
+def _reindex(tool, keys, step):
     """Index each catalogued object of `tool` in the indexes of the keys
     `keys`, with a commit after each `BATCH_SIZE` objects. The objects of
-    the last batch wait for the commit of the caller."""
-    paths = list(tool._catalog.uids.keys())
+    the last batch wait for the commit of the caller.
+
+    An object whose indexing raises `POSKeyError` (a missing record or
+    blob file) gets no text in these indexes: the step `step` logs its
+    path, its oid and the oid of the missing record at WARNING and goes
+    on. At the end it logs the count of the skipped objects and their
+    first paths."""
+    catalog = tool._catalog
+    paths = list(catalog.uids.keys())
+    skipped = []
     for k, path in enumerate(paths, 1):
-        obj = tool.resolve_path(path)
-        if obj is not None:
-            tool.catalog_object(obj, path, idxs=list(keys), update_metadata=0)
+        obj = None
+        try:
+            obj = tool.resolve_path(path)
+            if obj is not None:
+                tool.catalog_object(obj, path, idxs=list(keys), update_metadata=0)
+        except POSKeyError as error:
+            # An index before the failing one can hold a text of the
+            # object. Remove it.
+            rid = catalog.uids.get(path)
+            for key in keys:
+                catalog.getIndex(key).unindex_object(rid)
+            skipped.append(path)
+            oid = getattr(aq_base(obj), "_p_oid", None)
+            logger.warning(
+                "%s: skipped %s (oid %s): the record or the blob file of the"
+                " oid %s cannot be read",
+                step,
+                path,
+                "?" if oid is None else oid_repr(oid),
+                error,
+            )
         if k % BATCH_SIZE == 0 and k < len(paths):
             transaction.commit()
+    if skipped:
+        logger.warning(
+            "%s: skipped %d objects that cannot be read, with no text in"
+            " the new indexes; the first: %s",
+            step,
+            len(skipped),
+            ", ".join(skipped[:_SKIPPED_SHOWN]),
+        )
 
 
 def _drop_pending(catalog, keep):
@@ -1324,7 +1372,7 @@ def install_text(setup, mode="enhanced"):
         names.append(name)
     if names:
         settings_changed(catalog)
-        _reindex(tool, [PENDING + name for name in names])
+        _reindex(tool, [PENDING + name for name in names], "zoe.plone:text")
         _swap(catalog, names)
 
 
@@ -1375,7 +1423,7 @@ def uninstall_text(setup):
         extra.index_type = "Okapi BM25 Rank"
         pending = ZCTextIndex(PENDING + name, extra=extra, caller=tool)
         catalog.addIndex(PENDING + name, pending)
-    _reindex(tool, [PENDING + name for name in names])
+    _reindex(tool, [PENDING + name for name in names], "zoe.plone:text-uninstall")
     jar = aq_base(catalog)._p_jar
     deltas = _deltas(jar, create=True)
     for name in names:
