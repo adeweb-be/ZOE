@@ -71,12 +71,25 @@ path, the level 0, `depth` 1 and no `navtree`. The hook finds the folder
 of that path as `documentToKeyMap` finds it, from `getPhysicalRoot()` of
 the `ISiteRoot` utility. Its ordering must be a `DefaultOrdering`, and the
 order that `_order()` gives a `PersistentList` with an oid, in the
-Connection of the catalog. Else the search takes the Python path
-(`sort`): a sort on several indexes, several folders (several paths,
-another level or depth, `navtree`, no path clause), a folder that does not
-traverse or has another ordering, an order of another class, an order that
-is new in the transaction, or an order in another database. A
-`ConflictError` of these steps goes to the caller.
+Connection of the catalog. Else the hook splits the search (below):
+several folders (several paths, another level or depth, `navtree`, no path
+clause), a folder that does not traverse or has another ordering, an order
+of another class, an order that is new in the transaction, or an order in
+another database. A sort on the `GopipIndex` with another sort index
+takes the Python path (`sort`). A `ConflictError` of these steps goes to
+the caller.
+
+The split (ADR 0059, the amendment of the order over several containers).
+The hook splits a sort on the `GopipIndex` alone that the order clause
+does not take. It sends the plan without its sort, and the mirror gives
+every rid of the filter. The hook then calls the stock `sortResults` on
+these rids, with a sort index whose `documentToKeyMap` gives the keys of
+plone.folder: it reads the positions of a folder of `DefaultOrdering` once,
+and calls `getObjectPosition` for each row of another container and for an
+id outside the positions. So the order, the ties, the exceptions and the
+batches are those of the Python path, and each brain comes from
+`Catalog.__getitem__`. A split search counts as native, and once more as
+`client_sort`.
 
 The hook decides the reasons `unsupported`, `index`, `option`,
 `and_range`, `sort`, `too_large` and the `overlay` that it cannot pickle;
@@ -211,8 +224,9 @@ _stock_methods = {}
 # reasons of a reply, `("compared",)`, `("throwaways",)`, `("mismatches",)`,
 # `("cache_differences",)`, `("unchecked", why)`, `("stock_errors",)` for
 # a native answer whose stock search raised, `("overlay_bound",)` for
-# an overlay that does not fit `catalog-memory`, and `("refused", why)` for
-# the text of each refusal of a throwaway build.
+# an overlay that does not fit `catalog-memory`, `("refused", why)` for
+# the text of each refusal of a throwaway build, and `("client_sort",)` for
+# a native search that the hook sorts.
 _counts = collections.Counter()
 _counts_lock = threading.Lock()
 
@@ -589,11 +603,13 @@ def _counts_now():
     the queries by path, the fallbacks by reason and side (`client` for the
     reasons that the hook decided, `server` for the reasons of a reply),
     the comparisons of the mode `compare`, the throwaway mirrors, the
-    mismatches and the differences of the cache of the request."""
+    mismatches, the differences of the cache of the request, and the native
+    searches that the hook sorts (`client_sort`)."""
     with _counts_lock:
         counts = dict(_counts)
     out = {
         "queries": {},
+        "client_sort": counts.get(("client_sort",), 0),
         "fallbacks": {},
         "compared": counts.get(("compared",), 0),
         "throwaways": counts.get(("throwaways",), 0),
@@ -628,6 +644,7 @@ def _write_counts(path):
     line = {
         "pid": os.getpid(),
         "queries": counts["queries"],
+        "client_sort": counts["client_sort"],
         "fallbacks": [
             [reason, side, n]
             for (reason, side), n in sorted(counts["fallbacks"].items())
@@ -718,7 +735,9 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
     start = _start_of(jar)
     if start is None:
         return None, "unsupported", None
-    plan, reason = plan_of(catalog, query, sort_index, reverse, limit, merge)
+    plan, reason = plan_of(
+        catalog, query, sort_index, reverse, limit, merge, split=True
+    )
     if plan is None:
         return None, reason, None
     text = any(c["k"] == "t" for c in plan["c"])
@@ -726,6 +745,11 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
         # A throwaway mirror has no text index.
         return None, "unsupported", plan
     kept = {name: plan[name] for name in ("bs", "bz", "rn")}
+    split = "o" not in plan and _gopip_alone(sort_index) is not None
+    if split:
+        # The mirror gives every rid of the filter, with no row.
+        kept.update(s=plan["s"], l=plan["l"])
+        plan.update(s=[], l=None, bs=0, bz=None, cols=None, rn=0)
     shift = _shift(plan) if text else 0
     from ZODB.POSException import ConflictError, POSKeyError, StorageError, Unsupported
 
@@ -786,9 +810,143 @@ def _native(catalog, query, sort_index, reverse, limit, merge):
         elif not throwaway:
             _repair_hint(oid, reply["f"], why)
         return None, None, plan
+    if split:
+        result = _split_result(catalog, reply, query, sort_index, reverse, limit)
+        _count("client_sort")
+        return result, None, plan
     if shift:
         reply = _unshift(reply, shift)
     return _result(catalog, reply, jar, start, overlay is None), None, plan
+
+
+def _gopip_alone(sort_index):
+    """The `GopipIndex` of plone.folder when it is the one sort index of a
+    search, or None."""
+    if isinstance(sort_index, list):
+        if len(sort_index) != 1:
+            return None
+        sort_index = sort_index[0]
+    if sort_index is None or _class_of(sort_index) != _GOPIP:
+        return None
+    return sort_index
+
+
+def _split_result(catalog, reply, query, sort_index, reverse, limit):
+    """The result of a split search: the stock `sortResults` on the rids of
+    the reply, with the arguments of `Catalog.search`, and the keys of
+    `_key_map`."""
+    from BTrees.IIBTree import IISet
+    from ZTUtils.Lazy import LazyCat
+
+    rs = IISet(reply["r"])
+    if not rs:
+        return LazyCat([])
+    made = catalog.make_query(query)
+    b_start, b_size, limit, _ = catalog._sort_limit_arguments(
+        made, sort_index, reverse, limit
+    )
+    if isinstance(sort_index, list):
+        keys = [_SplitKeys(sort_index[0], rs)]
+    else:
+        keys = _SplitKeys(sort_index, rs)
+    return catalog.sortResults(
+        rs,
+        keys,
+        reverse,
+        limit,
+        True,
+        actual_result_count=len(rs),
+        b_start=b_start,
+        b_size=b_size,
+    )
+
+
+class _SplitKeys:
+    """The sort index that a split search gives `sortResults`: the
+    `GopipIndex` of the search, with the keys of `_key_map` for the rids
+    `rs`."""
+
+    def __init__(self, index, rs):
+        self._index = index
+        self._rs = rs
+
+    def __len__(self):
+        return len(self._index)
+
+    def getId(self):
+        return self._index.getId()
+
+    def documentToKeyMap(self):
+        return _key_map(self._index, self._rs)
+
+
+def _key_map(index, rs):
+    """The keys of `documentToKeyMap` of the `GopipIndex` `index` for the
+    rids `rs`. It reads the positions of a folder of `DefaultOrdering` once
+    for all its rows. For an id outside the positions, and for each row of
+    another container, it calls `getObjectPosition` as plone.folder does, so
+    the keys and the exceptions are those of plone.folder."""
+    from Acquisition import aq_base
+    from plone.folder.default import DefaultOrdering
+    from plone.folder.nogopip import traverse
+    from plone.folder.ordered import OrderedBTreeFolderBase
+    from Products.CMFCore.interfaces import ISiteRoot
+    from ZODB.POSException import ConflictError
+    from zope.component import getUtility
+
+    getpath = aq_base(index).catalog.paths.get
+    root = getUtility(ISiteRoot).getPhysicalRoot()
+    rids = {}
+    items = []
+    containers = {}
+    for rid in rs:
+        parent, id = getpath(rid).rsplit("/", 1)
+        container = containers.get(parent)
+        if container is None:
+            containers[parent] = container = traverse(root, parent)
+        rids[id] = rid
+        items.append((rid, parent, container, id))
+    pos = {}
+    if len(containers) == 1:
+        # One container: the place of each id in its order.
+        folder = list(containers.values())[0]
+        if getattr(aq_base(folder), "getOrdering", None):
+            ids = folder.getOrdering().idsInOrder()
+        else:
+            ids = folder.objectIds()
+        for idx, id in enumerate(ids):
+            rid = rids.get(id)
+            if rid:
+                pos[rid] = idx
+        return pos
+    stock = OrderedBTreeFolderBase.getObjectPosition
+    # The positions of each container, or None when its rows call
+    # `getObjectPosition`.
+    positions = {}
+    for rid, parent, container, id in items:
+        if parent not in positions:
+            positions[parent] = None
+            base = aq_base(container)
+            if getattr(type(base), "getObjectPosition", None) is stock:
+                try:
+                    ordering = container.getOrdering()
+                    if type(ordering) is DefaultOrdering:
+                        positions[parent] = ordering._pos()
+                except ConflictError:
+                    raise
+                except Exception:
+                    # `getObjectPosition` raises as it does on the Python
+                    # path.
+                    pass
+        found = positions[parent]
+        if found is not None and id in found:
+            pos[rid] = found[id]
+        elif getattr(aq_base(container), "getObjectPosition", None):
+            pos[rid] = container.getObjectPosition(id)
+        else:
+            # A container without positions.
+            pos[rid] = 0
+    return pos
 
 
 # The refusals that the repair of `zoe.plone.catalog_repair` can mend, and
@@ -1207,7 +1365,16 @@ def _wire(value):
     return False
 
 
-def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=True):
+def plan_of(
+    catalog,
+    query,
+    sort_index=None,
+    reverse=False,
+    limit=None,
+    merge=True,
+    *,
+    split=False,
+):
     """Return the plan of a search of `catalog`, in the form of ADR 0059,
     section 8, and None; or None and the reason of the Python path.
 
@@ -1215,6 +1382,10 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
     whose names are in the query after `make_query`, typed with ZCatalog's
     `IndexQuery` and the conversion of the index, and the sort as
     `searchResults` gives it.
+
+    A sort on the `GopipIndex` alone that the order clause does not take
+    gives `sort`. With `split`, it gives the plan without the key `o`: the
+    hook then splits the search.
     """
     from Products.ZCatalog.query import IndexQuery
 
@@ -1318,7 +1489,7 @@ def plan_of(catalog, query, sort_index=None, reverse=False, limit=None, merge=Tr
     order = None
     if gopip is not None:
         order = _order_clause(catalog, clauses, gopip)
-        if order is None:
+        if order is None and not split:
             return None, "sort"
     cols = _columns(catalog)
     if cols is None:
