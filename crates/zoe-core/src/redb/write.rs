@@ -199,13 +199,15 @@ impl<'a> RedbWrite<'a> {
                     .map_err(backend)?;
             }
         }
-        if !deferred {
+        if deferred {
+            // Set before the commit: a durable commit that takes the writer
+            // after it must run the hook.
+            self.unsynced.store(true, Ordering::Release);
+        } else {
             super::before_sync(self.unsynced, self.before_sync)?;
         }
         self.txn.commit().map_err(backend)?;
-        if deferred {
-            self.unsynced.store(true, Ordering::Release);
-        } else {
+        if !deferred {
             self.unsynced.store(false, Ordering::Release);
         }
         if let Some((stored, count)) = counts {

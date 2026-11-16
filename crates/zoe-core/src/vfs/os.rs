@@ -20,6 +20,11 @@ use crate::error::{Result, ZoeError};
 #[derive(Debug)]
 pub struct OsVfs {
     dir: PathBuf,
+    /// The directory, open from the open of the store. `syncfs(2)` on it
+    /// reports each writeback error of its filesystem since then, also an
+    /// error that another descriptor already saw.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    root: File,
     /// The lock file of the store. A directory that holds the blob
     /// directory of a store has none.
     _lock: Option<File>,
@@ -46,6 +51,7 @@ impl OsVfs {
         create_dir_durable(dir)?;
         Ok(Self {
             dir: dir.to_owned(),
+            root: File::open(dir)?,
             _lock: None,
         })
     }
@@ -80,6 +86,7 @@ impl OsVfs {
         match lock.try_lock() {
             Ok(()) => Ok(Self {
                 dir: dir.to_owned(),
+                root: File::open(dir)?,
                 _lock: Some(lock),
             }),
             Err(TryLockError::WouldBlock) => Err(ZoeError::Locked),
@@ -196,19 +203,26 @@ impl Vfs for OsVfs {
         sync(&file)
     }
 
-    /// On Linux 5.8 or later, one `syncfs(2)` of the filesystem that holds
-    /// the first name makes them all durable, except on FUSE, virtiofs
-    /// included. Elsewhere, each file and each directory is synced, as the
-    /// default does.
+    /// On Linux 5.8 or later, one `syncfs(2)` on the directory makes them
+    /// all durable, when every name is on the filesystem of the directory
+    /// and it is not FUSE, virtiofs included. Elsewhere, each file and each
+    /// directory is synced, as the default does.
     fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            let Some(first) = dirs.iter().chain(files).next() else {
-                return Ok(());
-            };
-            let file = File::open(self.dir.join(first))?;
-            if syncfs_is_sound(&file) {
-                return syncfs(&file);
+            use std::os::unix::fs::MetadataExt;
+            if syncfs_is_sound(&self.root) {
+                let dev = self.root.metadata()?.dev();
+                let mut same = true;
+                for name in dirs.iter().chain(files) {
+                    if fs::metadata(self.dir.join(name))?.dev() != dev {
+                        same = false;
+                        break;
+                    }
+                }
+                if same {
+                    return syncfs(&self.root);
+                }
             }
         }
         for file in files {
