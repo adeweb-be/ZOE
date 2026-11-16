@@ -85,6 +85,13 @@
         change between opens.
       </description>
     </key>
+    <key name="cache-size" datatype="string">
+      <description>
+        The most bytes that the page cache of the store holds, such as
+        512MB or 1GB. The default is 1GB. The page cache is a term of the
+        resident memory of the process.
+      </description>
+    </key>
     <key name="structural-merges" datatype="string">
       <description>
         The mode of the structural merges (tier 1) of each class that

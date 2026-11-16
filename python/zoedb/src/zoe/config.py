@@ -104,6 +104,15 @@ def class_modes(value):
     return modes
 
 
+def cache_size(value):
+    """Return the most bytes of the page cache of the store, as ZConfig's
+    byte-size gives them, such as 256MB. Refuse less than 0."""
+    size = stock_datatypes["byte-size"](value)
+    if size < 0:
+        raise ValueError("the cache size is 0 or more bytes")
+    return size
+
+
 def catalog_memory(value):
     """Return the bound of the catalog mirrors of the store, in bytes, as
     ZConfig's byte-size gives it, such as 2GB. Refuse 0 and less."""
@@ -149,6 +158,7 @@ KEYS = {
     "read-only": stock_datatypes["boolean"],
     "pack-gc": stock_datatypes["boolean"],
     "compression": compression,
+    "cache-size": cache_size,
     "structural-merges": merge_mode,
     "structural-merge-class": class_modes,
     "posting-dicts": merge_mode,
@@ -225,6 +235,7 @@ def open_storage(settings):
         blob_dir=os.path.expanduser(blob_dir) if blob_dir else None,
         pack_gc=settings.get("pack-gc", True),
         compression=settings.get("compression"),
+        cache_size=settings.get("cache-size"),
         structural_merges=settings.get("structural-merges"),
         structural_merge_classes=settings.get("structural-merge-class"),
         posting_dicts=settings.get("posting-dicts"),
