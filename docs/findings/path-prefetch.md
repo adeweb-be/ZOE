@@ -1,8 +1,8 @@
 # Finding: a prefetch of the chain of a path saves 2 to 5 % of a cold Plone request
 
-Card ZOE-304, steps 1 and 2. F33, "traversal prefetch of a path's chain from the path trie". Draft decision: ADR 0062, proposed.
+Card ZOE-304. The card asked for a traversal prefetch of the chain of a path from the path index of the mirror. Decision: not built. F33 does not name it, and no ADR records a design.
 
-**Verdict.** Do not build the path prefetch now. A chain is serial: the oid of each link is in the record of its parent, so the prefetch of references of ZOE-273 cannot shorten it, and a cold walk of a path of depth 5 waits for 5 to 16 round trips (two or three for each level of folders) with ZOE-273 on and off alike. A call that loads the whole chain at once brings that to one round trip: on the walk alone, 4 to 7 times faster. But a cold Plone request loads 850 to 2,600 objects, and its chain is 10 to 12 of them. With the chain loaded at once by an oracle, a cold document view takes 2.6 % less time on localhost and 5.1 % less behind a round trip of about 0.8 ms; a folder listing 2.5 % and 4.0 %. In a warm site, as in B5 `browse`, the chain is in the client cache and nothing changes. The cost is a wire extension and server code that knows two layouts of Zope.
+**Verdict.** Do not build the path prefetch. A chain is serial: the oid of each link is in the record of its parent, so the prefetch of references of ZOE-273 cannot shorten it, and a cold walk of a path of depth 5 waits for 5 to 16 round trips (two or three for each level of folders) with ZOE-273 on and off alike. A call that loads the whole chain at once brings that to one round trip: on the walk alone, 4 to 7 times faster. But a cold Plone request loads 850 to 2,600 objects, and its chain is 10 to 12 of them. With the chain loaded at once by an oracle, a cold document view takes 2.6 % less time on localhost and 5.1 % less behind a round trip of about 0.8 ms; a folder listing 2.5 % and 4.0 %. In a warm site, as in B5 `browse`, the chain is in the client cache and nothing changes. The cost is a wire extension and server code that knows two layouts of Zope.
 
 ## The question
 
@@ -86,22 +86,20 @@ The steady state of B5 `browse` is warm: the client cache of 128 MB holds the si
 - **A trigger.** ZODB does not know the path of a request. `zoe.plone` already subscribes to `IPubStart`; a subscriber would take the path of the request without the names of the virtual host monster and call the client before traversal starts.
 - **A walk in the client cache first**, so a warm chain sends nothing: the client resolves the chain in its own cache with the decoder of the reader of ZOE, and sends the call only from the first link that it misses.
 
-ADR 0062 drafts this design: the extension `load_path`, the client side, the trigger, the setting and the acceptance test.
+The design that follows is an extension `load_path`. It has no index and no format change.
 
 ## Options and their costs
 
 | option | gain on a cold request | cost |
 | --- | --- | --- |
-| A. Build ADR 0062: `load_path`, the walk in the client cache, the subscriber of `zoe.plone` | at most 2.5 to 5 % of a cold request, 0 on a warm one | a wire extension (a decision of the human); server code that knows two layouts of Zope; a walk in the client cache on each GET; tests in `zoe-server`, `zoe-client`, `zoe-py`, `zoe.plone` |
+| A. Build `load_path`: the extension, the walk in the client cache, the subscriber of `zoe.plone` | at most 2.5 to 5 % of a cold request, 0 on a warm one | a wire extension (a decision of the human); server code that knows two layouts of Zope; a walk in the client cache on each GET; tests in `zoe-server`, `zoe-client`, `zoe-py`, `zoe.plone` |
 | B. A containment index in the store | the same as A | A, plus a format change, a decode of the folders at each commit, and pack, restore and the converter |
 | C. A deeper prefetch of references in the client | none on a chain: each link still waits for its parent | more loads per level (all the children of each folder), already 1.7 to 3 times slower on a localhost chain |
 | D. No build | none | none; a restart keeps its cache file where it matters |
 
 ## Recommendation
 
-Option D: do not build the path prefetch, and close the card or leave it deferred. The gain over ZOE-273 is one round trip per level of a cold path, which is 1 to 2 % of the waits of a cold Plone request and 2.5 to 5 % of its time, and nothing on a warm site. What makes a cold request slow is the hundreds of objects beside the path, which ZOE-273 already overlaps in part, and a process that keeps its client cache file does not start cold.
-
-If the human wants F33 met as written, option A is the design: ADR 0062, without an index and without a format change.
+Option D: do not build the path prefetch, and close the card. The gain over ZOE-273 is one round trip per level of a cold path, which is 1 to 2 % of the waits of a cold Plone request and 2.5 to 5 % of its time, and nothing on a warm site. What makes a cold request slow is the hundreds of objects beside the path, which ZOE-273 already overlaps in part, and a process that keeps its client cache file does not start cold.
 
 ## Limits
 
@@ -110,13 +108,7 @@ If the human wants F33 met as written, option A is the design: ADR 0062, without
 - One machine, one fixture of B5 (`xlarge-mini`), 15 paths of each kind. The fixture is shallow: its documents sit at depth 3 to 5 below the site. A deeper site gives the chain a larger share, two records per level.
 - A cold request was measured in one thread. Several cold requests at once share the pool of the client and the server.
 
-## Open questions for the human
+## Decision
 
-1. Drop the path prefetch from F33 (and close ZOE-304), or keep the card deferred?
-2. If it is built: the extension `load_path` of ADR 0062 is a change of the wire protocol. Is a call that carries a path acceptable, and may the server know the attributes of an `ObjectManager` and the `_tree` of `BTreeFolder2Base`?
-3. If it is built: is `prefetch-paths` on or off by default?
-4. ZOE-273 makes a cold chain through large folders slower on localhost (the siblings that it loads). Is that worth a card, such as a cap on the prefetch of a bucket, or does the gain on a fan-out (the whole tree, the cold request) settle it?
-
-## The acceptance test, if the card is built
-
-The cases of `python/zoedb/tests/client/test_native_path_prefetch.py` are in ADR 0062, section 6. No skeleton is written: the finding recommends no build.
+- The path prefetch is not built. F33 and the roadmap row of phase 6 do not name it, the feature triage lists it as Won't, and the card ZOE-304 is closed.
+- ZOE-273 stays as it is. It makes a cold chain through large folders slower on localhost, because it loads the siblings. Its gain on a fan-out (the whole tree, the cold request) outweighs that, so the prefetch of a bucket gets no cap.
