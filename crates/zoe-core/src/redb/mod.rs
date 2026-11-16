@@ -61,7 +61,6 @@ const META_NEXT_OID: &str = "next_oid";
 const META_PACK_WATERMARK: &str = "pack_watermark";
 const META_OBJECT_COUNT: &str = "object_count";
 
-/// Wrap a redb error.
 /// Run `hook`, when it is set, if `unsynced` tells that the tables hold a
 /// deferred commit that no sync covered.
 fn before_sync(unsynced: &AtomicBool, hook: &OnceLock<Arc<dyn BeforeSync>>) -> Result<()> {
@@ -71,6 +70,7 @@ fn before_sync(unsynced: &AtomicBool, hook: &OnceLock<Arc<dyn BeforeSync>>) -> R
     }
 }
 
+/// Wrap a redb error.
 fn backend(error: impl Into<redb::Error>) -> ZoeError {
     ZoeError::Backend(Box::new(error.into()))
 }
