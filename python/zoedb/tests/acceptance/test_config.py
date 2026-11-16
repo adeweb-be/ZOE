@@ -39,6 +39,7 @@ KEYS = {
     "read-only",
     "pack-gc",
     "compression",
+    "cache-size",
     "structural-merges",
     "structural-merge-class",
     "posting-dicts",
