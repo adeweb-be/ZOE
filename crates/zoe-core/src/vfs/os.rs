@@ -196,6 +196,29 @@ impl Vfs for OsVfs {
         sync(&file)
     }
 
+    /// On Linux, one `syncfs(2)` of the filesystem that holds the first
+    /// name makes them all durable. On the other systems, each file and
+    /// each directory is synced, as the default does.
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(first) = dirs.iter().chain(files).next() else {
+                return Ok(());
+            };
+            syncfs(&File::open(self.dir.join(first))?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for file in files {
+                self.sync_file(file)?;
+            }
+            for dir in dirs {
+                self.sync_dir_at(dir)?;
+            }
+            Ok(())
+        }
+    }
+
     fn set_read_only(&self, name: &str) -> io::Result<()> {
         let path = self.dir.join(name);
         let mut permissions = fs::metadata(&path)?.permissions();
@@ -564,6 +587,23 @@ fn sync_data(file: &File) -> io::Result<()> {
     return fsync(file);
     #[cfg(not(target_vendor = "apple"))]
     file.sync_data()
+}
+
+/// Make every write of the filesystem that holds `file` durable, with
+/// `syncfs(2)`. Since Linux 5.8, the call reports an error of the
+/// write-back of the filesystem.
+#[cfg(target_os = "linux")]
+fn syncfs(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor belongs to `file`, which stays open for the
+    // call. syncfs(2) reads no memory of the process.
+    #[allow(unsafe_code)]
+    let done = unsafe { libc::syncfs(file.as_raw_fd()) };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(target_vendor = "apple")]

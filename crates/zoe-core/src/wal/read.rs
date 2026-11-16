@@ -14,8 +14,8 @@ use std::ops::Bound::{self, Excluded, Included};
 use std::sync::{Arc, RwLockReadGuard};
 
 use crate::backend::{
-    Backend, BatchPlan, BlobRecord, Bytes, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
-    TxnRecords, WriteTxn,
+    Backend, BatchPlan, BeforeSync, BlobRecord, Bytes, Record, RecordEncoding, RecordMeta, TxnIter,
+    TxnMeta, TxnRecords, WriteTxn,
 };
 use crate::commit::Observer;
 use crate::error::{Result, ZoeError};
@@ -528,6 +528,10 @@ impl Backend for Logged {
 
     fn sync(&self) -> Result<()> {
         self.core.redb.sync()
+    }
+
+    fn set_before_sync(&self, hook: Arc<dyn BeforeSync>) {
+        self.core.redb.set_before_sync(hook);
     }
 
     #[cfg(feature = "testing")]

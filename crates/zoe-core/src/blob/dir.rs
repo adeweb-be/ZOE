@@ -86,6 +86,11 @@ impl Dir for ReadOnlyDir {
         Err(self.refused(name))
     }
 
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        let name = files.iter().chain(dirs).next().map_or("", String::as_str);
+        Err(self.refused(name))
+    }
+
     fn set_read_only(&self, name: &str) -> io::Result<()> {
         Err(self.refused(name))
     }
@@ -218,6 +223,40 @@ impl Dir for Relocated {
     fn sync_file(&self, name: &str) -> io::Result<()> {
         let (dir, name) = self.locate(name);
         dir.sync_file(&name)
+    }
+
+    /// Names in one directory go to it in one call. Names in both
+    /// directories are synced one at a time.
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        let mut target: Option<&dyn Dir> = None;
+        let mut one = true;
+        let mut map = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| {
+                    let (dir, name) = self.locate(name);
+                    match target {
+                        Some(seen) if !std::ptr::addr_eq(seen, dir) => one = false,
+                        _ => target = Some(dir),
+                    }
+                    name
+                })
+                .collect()
+        };
+        let (mapped_files, mapped_dirs) = (map(files), map(dirs));
+        match target {
+            None => Ok(()),
+            Some(dir) if one => dir.sync_many(&mapped_files, &mapped_dirs),
+            Some(_) => {
+                for file in files {
+                    self.sync_file(file)?;
+                }
+                for dir in dirs {
+                    self.sync_dir_at(dir)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {

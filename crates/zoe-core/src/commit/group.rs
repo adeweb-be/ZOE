@@ -77,6 +77,9 @@ pub(super) struct Member {
     pub(super) tid: Option<Tid>,
     /// True for a restore transaction whose finish commits without a sync.
     pub(super) deferred: bool,
+    /// True for a deferred restore whose blobs wait for the next durable
+    /// commit.
+    pub(super) defer_blobs: bool,
     pub(super) staged: Staging,
     pub(super) blobs: BTreeMap<Oid, PendingBlob>,
     pub(super) user: Vec<u8>,
@@ -453,6 +456,12 @@ fn write(
         if let Some(oid) = member.staged.last_oid() {
             store.raise_next_oid(oid);
         }
+        if member.defer_blobs {
+            // The blobs wait, and go into their place before the next
+            // durable commit.
+            store.blobs().defer(finished.tid, &mut member.blobs);
+            continue;
+        }
         // The blob files are durable in their place before the backend
         // commit, so a blob record never lacks its file.
         intents.push(store.blobs().place(finished.tid, &mut member.blobs)?);
@@ -496,6 +505,9 @@ fn write(
     if deferred {
         write.commit_deferred()?;
     } else {
+        // The waiting blobs, those of this batch too, are durable in their
+        // place before the commit makes their records durable.
+        store.blobs().place_waiting()?;
         write.commit()?;
     }
     Ok(intents)

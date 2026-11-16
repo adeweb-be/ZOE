@@ -99,6 +99,22 @@ pub trait Vfs: Send + Sync + 'static {
     /// `name` is not a regular file: a symbolic link is refused too.
     fn sync_file(&self, name: &str) -> io::Result<()>;
 
+    /// Make the bytes of each file of `files` and the entries of each
+    /// directory of `dirs` durable, as `sync_file` and `sync_dir_at` do.
+    /// The default syncs each file, then each directory, in order. A
+    /// filesystem can make them all durable in one call: `OsVfs` on Linux
+    /// calls `syncfs(2)` once, which makes every write of the filesystem
+    /// durable. All the names must be on one filesystem.
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        for file in files {
+            self.sync_file(file)?;
+        }
+        for dir in dirs {
+            self.sync_dir_at(dir)?;
+        }
+        Ok(())
+    }
+
     /// Remove the write permissions of the file `name`.
     fn set_read_only(&self, name: &str) -> io::Result<()>;
 
@@ -178,6 +194,10 @@ impl<V: Vfs> Vfs for Arc<V> {
         (**self).sync_file(name)
     }
 
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        (**self).sync_many(files, dirs)
+    }
+
     fn set_read_only(&self, name: &str) -> io::Result<()> {
         (**self).set_read_only(name)
     }
@@ -208,6 +228,7 @@ pub(crate) trait Dir: Send + Sync {
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>>;
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
     fn sync_file(&self, name: &str) -> io::Result<()>;
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()>;
     fn set_read_only(&self, name: &str) -> io::Result<()>;
     fn lock_dir(&self, name: &str) -> io::Result<DirLock>;
     fn path(&self, name: &str) -> PathBuf;
@@ -264,6 +285,10 @@ impl<V: Vfs> Dir for V {
 
     fn sync_file(&self, name: &str) -> io::Result<()> {
         Vfs::sync_file(self, name)
+    }
+
+    fn sync_many(&self, files: &[String], dirs: &[String]) -> io::Result<()> {
+        Vfs::sync_many(self, files, dirs)
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {

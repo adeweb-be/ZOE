@@ -742,6 +742,7 @@ impl Store {
         // `Opened` holds the database and the directory here, so an error
         // drops them in order: the database closes before the lock goes.
         opened.blobs.open(&**opened, read_only)?;
+        opened.backend.set_before_sync(opened.blobs.before_sync());
         // The staging area of a read-only store removes no leftover and
         // creates no spill file.
         opened.staging.open()?;
@@ -854,6 +855,21 @@ impl Store {
         Txn::begin_restore_deferred(self, tid, user, description, extension)
     }
 
+    /// Begin a restore transaction that borrows the store, as
+    /// `tpc_begin_restore_deferred` does, whose blobs also wait for the
+    /// next durable commit. `Txn::begin_restore_deferred_blobs` tells what
+    /// the finish does. `sync` makes the commit and its blobs durable.
+    pub fn tpc_begin_restore_deferred_blobs(
+        &self,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Txn<&Self>> {
+        self.writable()?;
+        Txn::begin_restore_deferred_blobs(self, tid, user, description, extension)
+    }
+
     /// Make every commit before this call durable.
     ///
     /// The call runs the barrier `Backend::sync` under the commit
@@ -873,6 +889,9 @@ impl Store {
         };
         // The sequencer stays empty if the commit below fails.
         *sequencer = None;
+        // The waiting blobs are durable in their place before their
+        // records.
+        self.blobs().place_waiting()?;
         self.backend.sync()?;
         *sequencer = Some(last);
         self.blobs().release_kept();
@@ -1031,7 +1050,7 @@ impl Store {
     /// file is read-only. A read through the path checks no hash.
     pub fn blob_path(&self, oid: Oid, tid: Tid) -> Result<PathBuf> {
         self.blob_record(oid, tid)?;
-        Ok(self.blobs().path(oid, tid))
+        self.blobs().path(oid, tid)
     }
 
     /// Fail with `MissingBlobDir` when the store has blob records and its
@@ -1088,6 +1107,11 @@ impl Store {
 /// reference to it drops.
 impl Drop for Store {
     fn drop(&mut self) {
+        // The close of the database makes the deferred commits durable, so
+        // their waiting blobs go into their place first.
+        if let Err(error) = self.blobs().place_waiting() {
+            tracing::error!(%error, "cannot place the waiting blob files at the close of the store");
+        }
         let halted = crate::lock(&self.sequencer).is_none() || self.backend.fold_failed();
         self.backend.close(!halted);
     }

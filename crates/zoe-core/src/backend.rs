@@ -114,6 +114,15 @@ pub struct BatchPlan {
     pub(crate) deferred: bool,
 }
 
+/// The work that a backend runs before a durable commit that makes deferred
+/// commits durable. The blob store places the blobs that wait for that
+/// commit, so a durable blob record always has its file.
+pub trait BeforeSync: Send + Sync {
+    /// Make durable what the deferred commits need before they become
+    /// durable. An error fails the durable commit.
+    fn before_sync(&self) -> Result<()>;
+}
+
 /// A durable store of records and transactions.
 ///
 /// The trait is dyn-compatible, so that the configuration can select the
@@ -307,6 +316,15 @@ pub trait Backend: Send + Sync {
     /// barrier under the commit sequencer. A read-only backend has nothing
     /// to make durable.
     fn sync(&self) -> Result<()>;
+
+    /// Run `hook` before each durable commit that makes deferred commits
+    /// durable: `sync`, and each durable commit of a write while a commit
+    /// of `WriteTxn::commit_deferred` is not durable yet. The store sets it
+    /// once, when it opens. This default runs nothing: a backend that
+    /// cannot defer a commit has nothing to run it for.
+    fn set_before_sync(&self, hook: Arc<dyn BeforeSync>) {
+        let _ = hook;
+    }
 
     /// Return the bytes stored under `key`, as stored. Only the test hook
     /// `testing` calls it. A backend without the hook gives a `Backend`

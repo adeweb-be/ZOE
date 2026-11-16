@@ -53,6 +53,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let member = Member {
             tid: self.tid,
             deferred: self.deferred,
+            defer_blobs: self.defer_blobs,
             staged: std::mem::take(&mut self.staged),
             blobs: std::mem::take(&mut self.blobs),
             user: std::mem::take(&mut self.user),

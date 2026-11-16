@@ -27,12 +27,13 @@
 use std::ops::Bound::{self, Excluded};
 use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
 };
 
-use crate::backend::{Record, TxnMeta};
+use crate::backend::{BeforeSync, Record, TxnMeta};
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
 use crate::types::{Oid, Tid};
@@ -61,6 +62,15 @@ const META_PACK_WATERMARK: &str = "pack_watermark";
 const META_OBJECT_COUNT: &str = "object_count";
 
 /// Wrap a redb error.
+/// Run `hook`, when it is set, if `unsynced` tells that the tables hold a
+/// deferred commit that no sync covered.
+fn before_sync(unsynced: &AtomicBool, hook: &OnceLock<Arc<dyn BeforeSync>>) -> Result<()> {
+    match hook.get() {
+        Some(hook) if unsynced.load(Ordering::Acquire) => hook.before_sync(),
+        _ => Ok(()),
+    }
+}
+
 fn backend(error: impl Into<redb::Error>) -> ZoeError {
     ZoeError::Backend(Box::new(error.into()))
 }
@@ -261,6 +271,9 @@ pub(crate) struct RedbBackend {
     object_count: AtomicU64,
     /// True while the tables hold a deferred commit that no sync covered.
     unsynced: AtomicBool,
+    /// The work to run before a durable commit makes a deferred commit
+    /// durable. The store sets it once.
+    before_sync: OnceLock<Arc<dyn BeforeSync>>,
     /// How new records are written.
     compression: Compression,
 }
@@ -371,6 +384,7 @@ impl RedbBackend {
             last_tid: AtomicU64::new(last_tid),
             object_count: AtomicU64::new(object_count),
             unsynced: AtomicBool::new(false),
+            before_sync: OnceLock::new(),
             compression: Compression::default(),
         };
         Ok((backend, previous))
@@ -379,6 +393,12 @@ impl RedbBackend {
     /// Tell if the tables hold a deferred commit that no sync covered yet.
     pub(crate) fn unsynced(&self) -> bool {
         self.unsynced.load(Ordering::Acquire)
+    }
+
+    /// Run the work that a durable commit needs first, when a deferred
+    /// commit is not durable yet.
+    fn before_sync(&self) -> Result<()> {
+        before_sync(&self.unsynced, &self.before_sync)
     }
 
     /// Add `oids` new oids to the object count in memory. The log counts
