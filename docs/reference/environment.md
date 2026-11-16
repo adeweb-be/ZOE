@@ -47,7 +47,7 @@ One twin can serve several readers. For example, `ZOE_PATH` gives the store of e
 | `ZOE_INVALIDATION_QUEUE_SIZE` | `zoe serve` | the most transactions that `getInvalidations` covers |
 | `ZOE_INVALIDATION_AGE` | `zoe serve` | the age under which `getInvalidations` covers every transaction |
 | `ZOE_CLIENT_QUEUE_SIZE` | `zoe serve` | the most messages that wait for one client |
-| `ZOE_CACHE_SIZE` | `zoe serve` | the page cache of each store |
+| `ZOE_CACHE_SIZE` | `zoe serve`, `<zoe>` | the page cache of each store, as a byte size such as `1GB`; `1GB` when not set |
 | `ZOE_LOCK_WARN` | `zoe serve` | log each lock held longer than this |
 | `ZOE_TRANSACTION_WARN` | `zoe serve` | log each transaction open longer than this |
 | `ZOE_LOG_FORMAT` | `zoe serve` | `text` or `json` |

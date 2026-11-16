@@ -102,7 +102,7 @@ N6 bounds the resident memory of a server by its configuration. The mirrors add 
 
 ### 7. What the mirror serves, and the reasons of a fallback
 
-Served: the clauses of FieldIndex, DateIndex, UUIDIndex and KeywordIndex (`query`, `range`, `operator`, `not`), BooleanIndex (`query`), DateRangeIndex (`query`) and ExtendedPathIndex (`query`, `level`, `operator`, `depth`, `navtree`, `navtree_start`); a sort on one or several FieldIndex, DateIndex or UUIDIndex, with `sort_order`, `sort_limit`, `b_start` and `b_size`; a sort on one GopipIndex with an order clause (the amendment of ZOE-302); a query without sort. Each answer gives the rids in the order of ZCatalog, the length of its lazy result and `actual_result_count`.
+Served: the clauses of FieldIndex, DateIndex, UUIDIndex and KeywordIndex (`query`, `range`, `operator`, `not`), BooleanIndex (`query`), DateRangeIndex (`query`) and ExtendedPathIndex (`query`, `level`, `operator`, `depth`, `navtree`, `navtree_start`); a sort on one or several FieldIndex, DateIndex or UUIDIndex, with `sort_order`, `sort_limit`, `b_start` and `b_size`; a sort on one GopipIndex with an order clause (the amendment of ZOE-302), or split, the mirror for the filter and the hook for the sort (the amendment of ZOE-311); a query without sort. Each answer gives the rids in the order of ZCatalog, the length of its lazy result and `actual_result_count`.
 
 A query takes the Python path, whole, with one of these reasons:
 
@@ -114,7 +114,7 @@ A query takes the Python path, whole, with one of these reasons:
 | `index` | an index of the query is of another class: ZCTextIndex, DateRecurringIndex, any add-on index |
 | `option` | an option that the plan does not carry, such as `usage` |
 | `and_range` | a range with the operator `and` |
-| `sort` | a sort on another index (ExtendedPathIndex, a GopipIndex that the order clause of ZOE-302 does not serve), `merge=False`, a `sort_limit` of 0, or several sort indexes on the path of ZCatalog that iterates the index |
+| `sort` | a sort on another index (ExtendedPathIndex, a GopipIndex among several sort indexes), `merge=False`, a `sort_limit` of 0, or several sort indexes on the path of ZCatalog that iterates the index |
 | `transaction` | the transaction changed records before ZOE-291 merged: the interim rule of ZOE-286 (section 8) |
 | `too_large` | the plan and the transaction overlay pass the cap of a call (section 8) |
 | `plan` | the server does not know a key or a kind of clause of the plan: a client newer than the server (the order clause of ZOE-302, the text clause of ADR 0060) |
@@ -253,7 +253,7 @@ Alternatives:
 
 ## Amendment (ZOE-311): the order over several containers
 
-Status: accepted. Card ZOE-311, a spike (finding: `docs/findings/order-over-several-containers.md`). It adds to section 7 a sort on a GopipIndex over several containers, which the mirror filters and the hook sorts. It changes no key of the plan, no reply, no record, no on-disk format and no public Python API. "Order" and "positions" are the words of ADR 0052, section 1. The amendment of ZOE-302 does not change.
+Status: accepted. Card ZOE-311, a spike (finding: `docs/findings/order-over-several-containers.md`). It adds to section 7 a sort on a GopipIndex over several containers, which the mirror filters and the hook sorts. It changes no key of the plan, no reply, no record, no on-disk format and no public Python API. "Order" and "positions" are the words of ADR 0052, section 1. The amendment of ZOE-302 does not change. Built in `zoe.plone.catalog`; its acceptance test is the class `SplitTests` of `python/zoedb/src/zoe/plone/tests/test_catalog_gopip.py`.
 
 `documentToKeyMap` gives each row of a result over several containers the key `container.getObjectPosition(id)`: `pos[id]` for a folder of `DefaultOrdering`, a `ValueError` for an id outside `pos`, `None` for `UnorderedOrdering`, and 0 for a container that does not traverse or has no `getObjectPosition`. The keys of two containers repeat, so the order of the ties depends on the path of `sortResults`. The containers of a search at a depth of 2 or more are not known before the search. In the inventory of ZOE-283, 934 searches of the navigation (depth 3) and 234 of `navtree` sort so. The probe of the finding: of the 13.9 ms of the navigation of 448 rows on the Python path, the filter takes 0.6 ms and the sort 13.3 ms, of which `getObjectPosition` takes 10.8 ms (24 µs for each row: the lookup of the ordering adapter and of the annotations at each call).
 
@@ -263,7 +263,7 @@ Status: accepted. Card ZOE-311, a spike (finding: `docs/findings/order-over-seve
 
 3. **The transaction.** The filter reads the transaction overlay (section 8). The key map reads the Connection, which holds the changes of the transaction. So a search after a move in the transaction gives the order of the transaction.
 
-4. **The counts.** Such a search counts as native (`zoe_catalog_queries_total{path="native"}`), and `zoe.plone` counts it once more as `client_sort`. A refusal of the filter gives the Python path whole, with its reason. No reason is new: `sort` stays for a GopipIndex among several sort indexes.
+4. **The counts.** Such a search counts as native (`zoe_catalog_queries_total{path="native"}`), and `zoe.plone` counts it once more as `client_sort` (`client_sort` of `_counts_now()` and of the line of `ZOE_PLONE_CATALOG_COUNTS`). A refusal of the filter gives the Python path whole, with its reason. No reason is new: `sort` stays for a GopipIndex among several sort indexes.
 
 Alternatives:
 

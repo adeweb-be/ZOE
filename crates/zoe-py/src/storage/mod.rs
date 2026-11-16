@@ -442,7 +442,10 @@ impl Storage {
     /// the core takes it as `Options::pack_gc`. `compression` is the
     /// compression of the records that the store writes, as text: `none`,
     /// `zstd` or `zstd:LEVEL`; `None` keeps the default of the store. The
-    /// core takes it as `Options::compression`.
+    /// core takes it as `Options::compression`. `cache_size` is the most
+    /// bytes that the page cache of the store holds; `None` keeps the
+    /// default of the store, 1 GiB. The core takes it as
+    /// `Options::cache_size`.
     ///
     /// The open installs the handlers of SIGTERM and SIGHUP that close the
     /// stores of the process, each only when its action is the default
@@ -450,8 +453,9 @@ impl Storage {
     #[new]
     #[pyo3(signature = (
         path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true,
-        compression = None, structural_merges = None, structural_merge_classes = None,
-        posting_dicts = None, resolution_log = None, catalog_memory = None,
+        compression = None, cache_size = None, structural_merges = None,
+        structural_merge_classes = None, posting_dicts = None, resolution_log = None,
+        catalog_memory = None,
         catalog_window_tids = None, catalog_window_seconds = None, catalog_rebase_rows = None,
         catalog_wait = None
     ))]
@@ -464,6 +468,7 @@ impl Storage {
         blob_dir: Option<PathBuf>,
         pack_gc: bool,
         compression: Option<&str>,
+        cache_size: Option<u64>,
         structural_merges: Option<&str>,
         structural_merge_classes: Option<HashMap<String, String>>,
         posting_dicts: Option<&str>,
@@ -524,6 +529,12 @@ impl Storage {
             options.lock_timeout = Duration::try_from_secs_f64(seconds).map_err(|_| {
                 PyValueError::new_err("lock_timeout is a number of seconds, 0 or more")
             })?;
+        }
+        if let Some(bytes) = cache_size {
+            options.cache_size = Some(
+                usize::try_from(bytes)
+                    .map_err(|_| PyValueError::new_err("cache_size is too large"))?,
+            );
         }
         options.blob_dir = blob_dir;
         options.pack_gc = pack_gc;

@@ -23,7 +23,7 @@ The `zoedb` wheel gives the package `zoe`. The extension module `zoe._zoe` holds
 ```python
 zoe.Storage(
     path, *, read_only=False, lock_timeout=None, blob_dir=None, pack_gc=True,
-    compression=None, structural_merges=None, structural_merge_classes=None,
+    compression=None, cache_size=None, structural_merges=None, structural_merge_classes=None,
     posting_dicts=None, resolution_log=None, early_locks=False,
     early_lock_classes=None, native_reader=True,
 )
@@ -39,6 +39,7 @@ A ZODB storage in the directory `path`, in this process. The open creates the di
 | `blob_dir` | `None`, `blobs` in `path` | The directory of the blob files, in ZODB's BushyLayout. The store does not record it. A store with blobs refuses a `blob_dir` without the layout file of its blobs with `StorageError`. |
 | `pack_gc` | `True` | With `False`, a pack removes old revisions only, as the `pack-gc` of FileStorage does. |
 | `compression` | `None`, the default of the store: `"none"` | `"none"`, `"zstd"` or `"zstd:LEVEL"`. Another value raises `ValueError`. |
+| `cache_size` | `None`, the default of the store: 1 GiB | The most bytes that the page cache of the store holds, an `int`, 0 or more. The page cache is a term of the resident memory of the process. |
 | `structural_merges` | `None`, `"on"` | The mode of tier 1: `"on"`, `"shadow"` or `"off"`. |
 | `structural_merge_classes` | `None` | A dict of class, as `module.name`, to its own mode of tier 1. |
 | `posting_dicts` | `None`, `"off"` | The mode of the posting-dict rule and the first-key rule of ADR 0042. |

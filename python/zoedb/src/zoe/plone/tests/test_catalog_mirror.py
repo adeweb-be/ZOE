@@ -221,7 +221,8 @@ class TestTheCatalogMirror(unittest.TestCase):
             pc.unrestrictedSearchResults(SearchableText="Item")
             pc.unrestrictedSearchResults(Description="Item", portal_type="Document")
             pc.unrestrictedSearchResults(
-                portal_type="Document", sort_on="getObjPositionInParent"
+                portal_type="Document",
+                sort_on=["getObjPositionInParent", "sortable_title"],
             )
         counts = catalog._counts_now()
         self.assertEqual(counts["queries"].get("python"), 3)

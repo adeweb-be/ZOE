@@ -10,8 +10,9 @@ which names `portal_type`, and the log holds one WARNING with that text. A
 second such query adds to the count and logs nothing at WARNING.
 
 A second class checks the log of a text that the repair does not mend:
-the first text of a reason at WARNING, a later new text at DEBUG, a known
-text not again, and the bound on the texts of a reason.
+the first text of a reason at WARNING, or at INFO for `not_ready`, a later
+new text at DEBUG, a known text not again, and the bound on the texts of a
+reason.
 
 The layers of plone.app.testing need the interpreter of a Plone instance:
 `just plone zoe backends -t test_catalog_fallback_why` runs this module.
@@ -164,26 +165,29 @@ class TestTheLogOfACause(unittest.TestCase):
 
     def test_the_first_text_of_a_reason_warns_and_a_later_one_debugs(self):
         with self.assertLogs("zoe.plone.catalog", logging.DEBUG) as logs:
+            self.why("plan", "a plan key 'x'")
+            self.why("plan", "a plan key 'x'")
+            self.why("plan", "a plan key 'y'")
             self.why("not_ready", "the mirror is building")
             self.why("not_ready", "the mirror is building")
             self.why("not_ready", "the store is closed")
-            self.why("plan", "a plan key 'x'")
         levels = [
             (r.levelname, r.getMessage().rsplit(": ", 1)[1]) for r in logs.records
         ]
         self.assertEqual(
             levels,
             [
-                ("WARNING", "the mirror is building"),
-                ("DEBUG", "the store is closed"),
                 ("WARNING", "a plan key 'x'"),
+                ("DEBUG", "a plan key 'y'"),
+                ("INFO", "the mirror is building"),
+                ("DEBUG", "the store is closed"),
             ],
         )
         self.assertEqual(
             catalog._counts_now()["whys"],
             {
                 "not_ready": {"the mirror is building": 2, "the store is closed": 1},
-                "plan": {"a plan key 'x'": 1},
+                "plan": {"a plan key 'x'": 2, "a plan key 'y'": 1},
             },
         )
 
